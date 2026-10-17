@@ -10,7 +10,10 @@ use crate::_internal::db::cache_file::{
     protect_cache_bytes_with_key, validate_cache_encryption_configuration,
 };
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
-use crate::_internal::model::index::{IndexDefinition, IndexKey, IndexKeyKind, IndexOrder};
+use crate::_internal::model::index::{
+    IndexDefinition, IndexKey, IndexKeyKind, IndexOrder, IndexPredicate, KeyCollation, KeyOpclass,
+    ResolvedName,
+};
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::config::Host;
@@ -2532,7 +2535,15 @@ fn load_indexes(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
     schema_filter_nt: &str,
+    pg_version_num: u32,
 ) -> Result<Vec<IndexCache>> {
+    // `indnullsnotdistinct` exists from PostgreSQL 15; a layout without it can
+    // only hold indexes that are NULLS DISTINCT, so the literal is exact.
+    let nulls_not_distinct = if pg_version_num >= 150_000 {
+        "x.indnullsnotdistinct"
+    } else {
+        "FALSE"
+    };
     let query = format!(
         "
         SELECT
@@ -2576,19 +2587,69 @@ fn load_indexes(
             ) AS key_attnames,
             ARRAY(
                 SELECT CASE
-                    WHEN opc.opcdefault AND opc.opcmethod = i.relam THEN ''
-                    ELSE COALESCE(opc.opcname, '')
+                    WHEN opc.opcdefault AND opc.opcmethod = i.relam THEN true
+                    ELSE false
                 END
                 FROM generate_series(1, x.indnkeyatts) AS k(ord)
                 LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
                 ORDER BY k.ord
-            ) AS key_opclasses,
+            ) AS key_opclass_defaults,
+            ARRAY(
+                SELECT nf.nspname
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
+                LEFT JOIN pg_opfamily f ON f.oid = opc.opcfamily
+                LEFT JOIN pg_namespace nf ON nf.oid = f.opfnamespace
+                ORDER BY k.ord
+            ) AS key_opfamily_schemas,
+            ARRAY(
+                SELECT f.opfname
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
+                LEFT JOIN pg_opfamily f ON f.oid = opc.opcfamily
+                ORDER BY k.ord
+            ) AS key_opfamily_names,
             ARRAY(
                 SELECT CASE
-                    WHEN coll.oid IS NULL
-                      OR coll.oid = a.attcollation
-                      OR coll.oid = 100  -- the default collation, inherited
-                    THEN ''
+                    WHEN x.indcollation[k.ord - 1] = 0 THEN 'not_collatable'
+                    WHEN x.indkey[k.ord - 1] <> 0
+                         AND x.indcollation[k.ord - 1] = a.attcollation THEN 'derived'
+                    -- An expression key with the database default collation is
+                    -- the collation the expression inherits, not a choice.
+                    WHEN x.indkey[k.ord - 1] = 0
+                         AND x.indcollation[k.ord - 1] = 100 THEN 'derived'
+                    ELSE 'resolved'
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_collation_kinds,
+            ARRAY(
+                SELECT CASE
+                    WHEN x.indcollation[k.ord - 1] = 0 THEN NULL
+                    WHEN x.indkey[k.ord - 1] <> 0
+                         AND x.indcollation[k.ord - 1] = a.attcollation THEN NULL
+                    WHEN x.indkey[k.ord - 1] = 0
+                         AND x.indcollation[k.ord - 1] = 100 THEN NULL
+                    ELSE nc.nspname
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_collation coll ON coll.oid = x.indcollation[k.ord - 1]
+                LEFT JOIN pg_namespace nc ON nc.oid = coll.collnamespace
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_collation_schemas,
+            ARRAY(
+                SELECT CASE
+                    WHEN x.indcollation[k.ord - 1] = 0 THEN NULL
+                    WHEN x.indkey[k.ord - 1] <> 0
+                         AND x.indcollation[k.ord - 1] = a.attcollation THEN NULL
+                    WHEN x.indkey[k.ord - 1] = 0
+                         AND x.indcollation[k.ord - 1] = 100 THEN NULL
                     ELSE coll.collname
                 END
                 FROM generate_series(1, x.indnkeyatts) AS k(ord)
@@ -2596,9 +2657,8 @@ fn load_indexes(
                 LEFT JOIN pg_attribute a
                   ON a.attrelid = x.indrelid
                  AND a.attnum = x.indkey[k.ord - 1]
-                 AND a.attnum <> 0
                 ORDER BY k.ord
-            ) AS key_collations,
+            ) AS key_collation_names,
             ARRAY(
                 SELECT a.attname
                 FROM pg_depend d
@@ -2629,26 +2689,7 @@ fn load_indexes(
                 ARRAY[]::smallint[]
             ) AS indoption_bits,
             pg_catalog.pg_indexam_has_property(am.oid, 'can_order') AS am_can_order,
-            NOT EXISTS (
-                SELECT 1
-                FROM unnest(x.indclass::oid[]) WITH ORDINALITY AS opclass_part(opclass_oid, ordinality)
-                JOIN pg_opclass opclass ON opclass.oid = opclass_part.opclass_oid
-                WHERE opclass_part.ordinality <= x.indnkeyatts
-                  AND (NOT opclass.opcdefault OR opclass.opcmethod <> i.relam)
-            ) AS has_default_opclasses,
-            NOT EXISTS (
-                SELECT 1
-                FROM unnest(x.indcollation::oid[]) WITH ORDINALITY AS collation_part(collation_oid, ordinality)
-                JOIN unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, key_ordinality)
-                  ON key_part.key_ordinality = collation_part.ordinality
-                JOIN pg_attribute a
-                  ON a.attrelid = x.indrelid
-                 AND a.attnum = key_part.attnum
-                 AND NOT a.attisdropped
-                WHERE collation_part.ordinality <= x.indnkeyatts
-                  AND key_part.attnum <> 0
-                  AND collation_part.collation_oid <> a.attcollation
-            ) AS has_default_collations
+            {nulls_not_distinct} AS nulls_not_distinct
         FROM pg_index x
         JOIN pg_class i ON i.oid = x.indexrelid
         JOIN pg_am am ON am.oid = i.relam
@@ -2680,25 +2721,52 @@ fn load_indexes(
             .context("index included columns")?;
         let key_attnames: Vec<Option<String>> =
             row.try_get("key_attnames").context("index key attnames")?;
-        let key_opclasses: Vec<String> = row
-            .try_get("key_opclasses")
-            .context("index key opclasses")?;
-        let key_collations: Vec<String> = row
-            .try_get("key_collations")
-            .context("index key collations")?;
+        let key_opclass_defaults: Vec<bool> = row
+            .try_get("key_opclass_defaults")
+            .context("index key default opclass flags")?;
+        let key_opfamily_schemas: Vec<Option<String>> = row
+            .try_get("key_opfamily_schemas")
+            .context("index key opfamily schemas")?;
+        let key_opfamily_names: Vec<Option<String>> = row
+            .try_get("key_opfamily_names")
+            .context("index key opfamily names")?;
+        let key_collation_kinds: Vec<String> = row
+            .try_get("key_collation_kinds")
+            .context("index key collation kinds")?;
+        let key_collation_schemas: Vec<Option<String>> = row
+            .try_get("key_collation_schemas")
+            .context("index key collation schemas")?;
+        let key_collation_names: Vec<Option<String>> = row
+            .try_get("key_collation_names")
+            .context("index key collation names")?;
         let indoption_bits: Vec<i16> = row.try_get("indoption_bits").context("index sort bits")?;
         let am_can_order: bool = row.try_get("am_can_order").context("index access method")?;
+        let keys = key_attnames
+            .iter()
+            .enumerate()
+            .map(|(ord, attname)| {
+                synced_index_key(
+                    attname.as_ref(),
+                    key_opclass_defaults.get(ord).copied().unwrap_or(false),
+                    key_opfamily_schemas.get(ord).and_then(Option::as_deref),
+                    key_opfamily_names.get(ord).and_then(Option::as_deref),
+                    key_collation_kinds.get(ord).map(String::as_str),
+                    key_collation_schemas.get(ord).and_then(Option::as_deref),
+                    key_collation_names.get(ord).and_then(Option::as_deref),
+                    indoption_bits.get(ord).copied(),
+                    am_can_order,
+                )
+            })
+            .collect::<Vec<_>>();
         let definition = build_index_definition(
             row.try_get("using_method").context("index access method")?,
-            &key_attnames,
-            &key_opclasses,
-            &key_collations,
-            &indoption_bits,
-            am_can_order,
+            keys,
             &included_columns,
             row.try_get("is_unique").context("index uniqueness")?,
             row.try_get("has_predicate")
                 .context("index predicate flag")?,
+            row.try_get("nulls_not_distinct")
+                .context("index null treatment")?,
             row.try_get("is_valid").context("index validity flag")?,
             row.try_get("is_ready").context("index readiness flag")?,
             row.try_get("is_live").context("index liveness flag")?,
@@ -2937,15 +3005,61 @@ fn load_routines(
 /// because `DESC NULLS FIRST` is stored as `3` and is the same order as `0`.
 /// They are also ignored entirely when the access method cannot order, since
 /// `indoption` bits are access-method specific.
+/// One key's operator-class identity from the catalog: the resolved family,
+/// plus whether PostgreSQL chose it as the access method's default.
+fn synced_opclass(
+    is_default: bool,
+    family_schema: Option<&str>,
+    family_name: Option<&str>,
+) -> KeyOpclass {
+    match (family_schema, family_name) {
+        (Some(schema), Some(name)) => {
+            let family = ResolvedName {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            };
+            if is_default {
+                KeyOpclass::Default(Some(family))
+            } else {
+                KeyOpclass::Explicit(family)
+            }
+        }
+        // `pg_opfamily` cannot be missing for a live index; a gap stays
+        // unknown rather than becoming a false difference.
+        _ => KeyOpclass::Unresolved,
+    }
+}
+
+/// One key's collation identity from the catalog.
+fn synced_collation(kind: Option<&str>, schema: Option<&str>, name: Option<&str>) -> KeyCollation {
+    match kind {
+        Some("not_collatable") => KeyCollation::NotCollatable,
+        Some("derived") => KeyCollation::Derived,
+        Some("resolved") => match (schema, name) {
+            (Some(schema), Some(name)) => KeyCollation::Resolved(ResolvedName {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            }),
+            _ => KeyCollation::Unresolved,
+        },
+        _ => KeyCollation::Unresolved,
+    }
+}
+
 /// Build a key's description from the parallel catalog arrays.
 ///
 /// A NULL attname is an expression: `indkey` records it as 0 and PostgreSQL
 /// stores no identity for it, so the key is recorded as an expression and
 /// never compared by content.
-fn index_key(
+#[allow(clippy::too_many_arguments)]
+fn synced_index_key(
     attname: Option<&String>,
-    opclass: &str,
-    collation: &str,
+    opclass_default: bool,
+    opfamily_schema: Option<&str>,
+    opfamily_name: Option<&str>,
+    collation_kind: Option<&str>,
+    collation_schema: Option<&str>,
+    collation_name: Option<&str>,
     bits: Option<i16>,
     can_order: bool,
 ) -> IndexKey {
@@ -2954,8 +3068,8 @@ fn index_key(
             Some(name) => IndexKeyKind::Column(name.clone()),
             None => IndexKeyKind::Expression(None),
         },
-        opclass: (!opclass.is_empty()).then(|| opclass.to_string()),
-        collation: (!collation.is_empty()).then(|| collation.to_string()),
+        opclass: synced_opclass(opclass_default, opfamily_schema, opfamily_name),
+        collation: synced_collation(collation_kind, collation_schema, collation_name),
         order: IndexOrder::from_indoption(bits.unwrap_or(0) as u16, can_order),
     }
 }
@@ -2963,37 +3077,15 @@ fn index_key(
 #[allow(clippy::too_many_arguments)]
 fn build_index_definition(
     method: String,
-    key_attnames: &[Option<String>],
-    key_opclasses: &[String],
-    key_collations: &[String],
-    indoption_bits: &[i16],
-    can_order: bool,
+    keys: Vec<IndexKey>,
     included_attnames: &[String],
     unique: bool,
     predicate: bool,
+    nulls_not_distinct: bool,
     valid: bool,
     ready: bool,
     live: bool,
 ) -> IndexDefinition {
-    let keys = key_attnames
-        .iter()
-        .enumerate()
-        .map(|(ord, attname)| {
-            index_key(
-                attname.as_ref(),
-                key_opclasses
-                    .get(ord)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                key_collations
-                    .get(ord)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                indoption_bits.get(ord).copied(),
-                can_order,
-            )
-        })
-        .collect::<Vec<_>>();
     let expression_keys = keys
         .iter()
         .filter(|key| matches!(key.kind, IndexKeyKind::Expression(_)))
@@ -3007,7 +3099,13 @@ fn build_index_definition(
             .collect(),
         expression_keys,
         unique,
-        predicate,
+        nulls_not_distinct: Some(nulls_not_distinct),
+        predicate: if predicate {
+            IndexPredicate::Opaque
+        } else {
+            IndexPredicate::None
+        },
+        unestablished: false,
         valid,
         ready,
         live,
@@ -3030,11 +3128,15 @@ fn load_opclasses(
                     SELECT t.typname
                 ) AS aliases,
                 am.amname AS method,
-                o.opcdefault AS is_default
+                o.opcdefault AS is_default,
+                fn.nspname AS family_namespace,
+                f.opfname AS family_name
             FROM pg_catalog.pg_opclass o
             JOIN pg_catalog.pg_namespace n ON n.oid = o.opcnamespace
             JOIN pg_catalog.pg_type t ON t.oid = o.opcintype
             JOIN pg_catalog.pg_am am ON am.oid = o.opcmethod
+            JOIN pg_catalog.pg_opfamily f ON f.oid = o.opcfamily
+            JOIN pg_catalog.pg_namespace fn ON fn.oid = f.opfnamespace
             ",
             &[],
         )
@@ -3046,6 +3148,12 @@ fn load_opclasses(
                     Ok(crate::_internal::model::opclass::OpclassEntry {
                         name: row.try_get("name").context("operator class name")?,
                         namespace: row.try_get("namespace").context("operator class schema")?,
+                        family: ResolvedName {
+                            schema: row
+                                .try_get("family_namespace")
+                                .context("operator family schema")?,
+                            name: row.try_get("family_name").context("operator family name")?,
+                        },
                         intype: row.try_get("intype").context("operator class input type")?,
                         aliases: row
                             .try_get("aliases")
@@ -3056,6 +3164,35 @@ fn load_opclasses(
                         is_default: row
                             .try_get("is_default")
                             .context("operator class default flag")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    )
+}
+
+fn load_collations(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::collation::CollationCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                n.nspname AS schema,
+                c.collname AS name
+            FROM pg_catalog.pg_collation c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
+            ",
+            &[],
+        )
+        .context("Failed to load collations")?;
+    Ok(
+        crate::_internal::model::collation::CollationCatalogue::from_entries(
+            rows.into_iter()
+                .map(|row| {
+                    Ok(ResolvedName {
+                        schema: row.try_get("schema").context("collation schema")?,
+                        name: row.try_get("name").context("collation name")?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -3701,6 +3838,7 @@ fn populate_cache_from_client(
     // them to agree with what a migration would resolve.
     cache.builtin_types = Some(load_builtin_types(client)?);
     cache.opclasses = Some(load_opclasses(client)?);
+    cache.collations = Some(load_collations(client)?);
     let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's
@@ -3775,7 +3913,12 @@ fn populate_cache_from_client(
     cache.index_attachments = load_index_attachments(client, &schema_values)?;
     coverage.record(CatalogFamily::Inheritance);
 
-    cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;
+    cache.indexes = load_indexes(
+        client,
+        &schema_values,
+        schema_filter_nt,
+        cache.pg_version_num.unwrap_or_default(),
+    )?;
     coverage.record(CatalogFamily::Indexes);
 
     cache.functions = load_routines(client, &schema_values, schema_filter, builtin_types)?;

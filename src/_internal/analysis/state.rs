@@ -3,7 +3,9 @@ use crate::_internal::analysis::evidence::{
 };
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::namespace::{SESSION_TEMP_SCHEMA, is_session_temp_schema};
+use crate::_internal::analysis::namespace::{
+    SESSION_TEMP_SCHEMA, SYSTEM_CATALOG_SCHEMA, SearchPathEntry, is_session_temp_schema,
+};
 use crate::_internal::analysis::settings::ScopedSetting;
 use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::_internal::ast::identifiers::ObjectId;
@@ -169,16 +171,18 @@ pub(crate) struct LocalState {
     pub triggers: HashMap<ObjectId, TriggerOverlay>,
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
-    pub search_path: Vec<String>,
+    pub search_path: Vec<SearchPathEntry>,
     /// Built-in types of the synchronized cluster, used to resolve written
     /// type names. Empty only when no baseline supplied one.
     pub builtin_types: BuiltinTypeCatalogue,
     pub opclasses: crate::_internal::model::opclass::OpclassCatalogue,
+    /// Collations of the synchronized cluster, used to resolve written
+    /// `COLLATE` names. Empty only when no baseline supplied one.
+    pub collations: crate::_internal::model::collation::CollationCatalogue,
     /// Performance hint: a temporary object has been created in this session.
     /// `temp_namespace_exists` derives the real answer, so this only has to be
     /// a superset to stay correct across rollback and `ON COMMIT DROP`.
     pub saw_temp_object: bool,
-    pub default_search_path: Vec<String>,
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
     pub default_search_path_template: Vec<String>,
@@ -241,7 +245,7 @@ struct HydratedRelationTypes {
 #[cfg(test)]
 mod pre_state_tests {
     use super::*;
-    use crate::_internal::model::index::{IndexDefinition, index_keys};
+    use crate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 
     #[test]
     fn incremental_capture_matches_a_fresh_public_pre_state() {
@@ -280,7 +284,9 @@ mod pre_state_tests {
                     included: index_keys(Vec::new()),
                     expression_keys: 0,
                     unique: false,
-                    predicate: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
                     valid: true,
                     ready: true,
                     live: true,
@@ -373,7 +379,7 @@ impl AnalysisState {
                     self.local
                         .search_path
                         .first()
-                        .map(String::as_str)
+                        .and_then(SearchPathEntry::name)
                         .unwrap_or("public")
                 )
             }
@@ -585,6 +591,7 @@ impl AnalysisState {
                         .local
                         .search_path
                         .first()
+                        .and_then(SearchPathEntry::name)
                         .is_none_or(|schema| !schema_has_complete_inheritance(schema)),
                     crate::_internal::analysis::facts::PublicationObjectFact::Unknown => false,
                     _ => false,
@@ -869,7 +876,7 @@ impl AnalysisState {
 
     fn hydrate_relation_type_overlays(
         cache: &DbCache,
-        search_path: &[String],
+        search_path: &[SearchPathEntry],
     ) -> HydratedRelationTypes {
         let mut relations = HashMap::new();
         let mut baseline_relations = HashSet::new();
@@ -938,6 +945,7 @@ impl AnalysisState {
         let source_statement_timeout =
             baseline_available.then_some(cache.metadata.source_statement_timeout_ms);
         let default_search_path = cache.search_path.clone();
+        let catalog_search_path = SearchPathEntry::from_catalog_names(&default_search_path);
         // The template must be the path PostgreSQL actually searched. Under a
         // `--schemas` scope the cache's resolved path has already had every
         // out-of-scope entry dropped, so resolving against it would retarget an
@@ -991,7 +999,7 @@ impl AnalysisState {
             baseline_relations,
             baseline_fk_dependencies,
             types,
-        } = Self::hydrate_relation_type_overlays(&cache, &default_search_path);
+        } = Self::hydrate_relation_type_overlays(&cache, &catalog_search_path);
         let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
         let mut incomplete_fk_operator_evidence = false;
@@ -1279,7 +1287,7 @@ impl AnalysisState {
                         Self::resolve_type_reference_from_catalog(
                             raw,
                             &type_catalog,
-                            &default_search_path,
+                            &catalog_search_path,
                             |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                         )
                     })
@@ -1287,7 +1295,7 @@ impl AnalysisState {
                 function.return_type_id = Self::resolve_type_reference_from_catalog(
                     &function.return_type,
                     &type_catalog,
-                    &default_search_path,
+                    &catalog_search_path,
                     |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                 );
             }
@@ -1383,14 +1391,14 @@ impl AnalysisState {
                 triggers,
                 constraints,
                 graph,
-                search_path: default_search_path.clone(),
+                search_path: Vec::new(),
                 builtin_types: cache
                     .builtin_types
                     .clone()
                     .unwrap_or_else(BuiltinTypeCatalogue::fallback),
                 opclasses: cache.opclasses.clone().unwrap_or_default(),
+                collations: cache.collations.clone().unwrap_or_default(),
                 saw_temp_object: false,
-                default_search_path,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
                 default_search_path_template,
@@ -1417,7 +1425,6 @@ impl AnalysisState {
             },
         };
         state.refresh_role_sensitive_search_path();
-        state.local.default_search_path = state.local.search_path.clone();
         if baseline_available && incomplete_fk_operator_evidence {
             state.taint(
                 crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
@@ -1457,13 +1464,21 @@ impl AnalysisState {
         if let Some(schema) = &name.schema {
             return schema.resolve();
         }
-        for schema in &self.local.search_path {
-            let candidate = ObjectId::new(schema.clone(), sig_str.to_string());
+        for entry in &self.local.search_path {
+            let Some(schema) = entry.searched_schema() else {
+                continue;
+            };
+            let candidate = ObjectId::new(schema, sig_str.to_string());
             if self.routine_is_present(&candidate) {
-                return schema.clone();
+                return schema.to_string();
             }
         }
-        self.local.search_path.first().cloned().unwrap_or_default()
+        self.local
+            .search_path
+            .first()
+            .and_then(SearchPathEntry::name)
+            .unwrap_or_default()
+            .to_string()
     }
 
     pub(crate) fn resolve_relation_id(
@@ -1474,18 +1489,38 @@ impl AnalysisState {
             return ObjectId::new(schema.resolve(), name.name.resolve());
         }
         let resolved_name = name.name.resolve();
-        for schema in &self.local.search_path {
-            let mut candidate = ObjectId::new(schema.clone(), resolved_name.clone());
+        for entry in &self.local.search_path {
+            let Some(schema) = entry.searched_schema() else {
+                continue;
+            };
+            let mut candidate = ObjectId::new(schema, resolved_name.clone());
             if self.relation_namespace_object_is_present(&candidate) {
                 candidate.inferred_schema = true;
                 return candidate;
             }
         }
         // An empty path searches nothing, so no schema may be inferred.
-        let schema = self.local.search_path.first().cloned().unwrap_or_default();
+        let schema = self
+            .local
+            .search_path
+            .first()
+            .and_then(SearchPathEntry::name)
+            .unwrap_or_default();
         let mut id = ObjectId::new(schema, resolved_name);
         id.inferred_schema = true;
         id
+    }
+
+    /// The schema an unqualified creation targets: the first path entry whose
+    /// schema the model knows exists. The system catalog is not a valid target,
+    /// and an unresolved entry never is, because PostgreSQL may not create
+    /// there or may not have searched it at all.
+    pub(crate) fn creation_schema(&self) -> Option<&str> {
+        self.local.search_path.iter().find_map(|entry| {
+            entry
+                .searched_schema()
+                .filter(|schema| *schema != SYSTEM_CATALOG_SCHEMA)
+        })
     }
 
     pub(crate) fn relation_is_present(&self, id: &ObjectId) -> bool {
@@ -1546,8 +1581,35 @@ impl AnalysisState {
 
     /// Read-only search-path view for name resolution. Keeping resolution on
     /// this accessor prevents callers from coupling themselves to `LocalState`.
-    pub(crate) fn search_path(&self) -> &[String] {
+    pub(crate) fn search_path(&self) -> &[SearchPathEntry] {
         &self.local.search_path
+    }
+
+    /// The named schemas of the effective path, in order. Used where an
+    /// unresolved entry can neither match nor change the answer.
+    #[cfg(test)]
+    pub(crate) fn search_path_names(&self) -> Vec<String> {
+        self.local
+            .search_path
+            .iter()
+            .filter_map(|entry| entry.searched_schema())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether an unqualified lookup that resolved to `schema` could have
+    /// resolved elsewhere: an unresolved entry lies before it in the path, so
+    /// PostgreSQL may have searched a schema the model cannot see first.
+    pub(crate) fn path_shadows(&self, schema: &str) -> bool {
+        let mut shadow = false;
+        for entry in &self.local.search_path {
+            match entry {
+                SearchPathEntry::Schema(name) if name == schema => return shadow,
+                SearchPathEntry::Schema(_) => {}
+                SearchPathEntry::Unresolved(_) => shadow = true,
+            }
+        }
+        shadow
     }
 
     /// Built-in types of the synchronized cluster, used to resolve written type
@@ -1572,18 +1634,32 @@ impl AnalysisState {
                     .any(|id| is_session_temp_schema(&id.schema)))
     }
 
-    /// Schemas to search for an unqualified relation or type, implicit first.
-    pub(crate) fn relation_search_path(&self) -> Vec<String> {
-        if !self.temp_namespace_exists() {
+    /// Entries to search for an unqualified relation or type, implicit first.
+    ///
+    /// PostgreSQL searches the temporary namespace before every path entry
+    /// only when the path does not name it; a written `pg_temp` is searched at
+    /// its position like any other entry.
+    pub(crate) fn relation_search_path(&self) -> Vec<SearchPathEntry> {
+        if !self.temp_namespace_exists()
+            || self
+                .local
+                .search_path
+                .iter()
+                .any(|entry| entry.searched_schema() == Some(SESSION_TEMP_SCHEMA))
+        {
             return self.local.search_path.clone();
         }
-        let mut path = vec![SESSION_TEMP_SCHEMA.to_string()];
+        let mut path = Vec::with_capacity(self.local.search_path.len() + 1);
+        path.push(SearchPathEntry::Schema(SESSION_TEMP_SCHEMA.to_string()));
         path.extend(self.local.search_path.iter().cloned());
         path
     }
 
     pub(crate) fn note_temp_object_created(&mut self) {
         self.local.saw_temp_object = true;
+        // A path that names the temporary alias could not search it before the
+        // namespace existed; now it can, at its written position.
+        self.refresh_role_sensitive_search_path();
     }
 
     /// Column names and types of a present relation, for view projection.
@@ -1808,7 +1884,7 @@ impl AnalysisState {
                     && definition.is_usable()
                     && definition.unique
                     && !definition.has_expression_keys()
-                    && !definition.predicate
+                    && !definition.has_predicate()
             } else {
                 false
             }
@@ -1830,11 +1906,21 @@ impl AnalysisState {
         self.local.transaction_aborted = true;
     }
 
+    /// Whether an inferred identity cannot be relied on: an unresolved path
+    /// entry precedes the schema the search resolved to, so PostgreSQL may
+    /// have answered from a schema the model cannot see.
+    fn lookup_shadowed(&self, id: &ObjectId) -> bool {
+        id.inferred_schema && self.path_shadows(&id.schema)
+    }
+
     fn relation_lookup(
         &self,
         id: &ObjectId,
         expected: impl FnOnce(&RelationKind) -> bool,
     ) -> ObjectLookup {
+        if self.lookup_shadowed(id) {
+            return ObjectLookup::Unknown;
+        }
         match self.local.relations.get(id) {
             Some(RelationOverlay::Present(relation)) if expected(&relation.kind) => {
                 ObjectLookup::Present
@@ -1879,6 +1965,9 @@ impl AnalysisState {
     }
 
     fn type_lookup(&self, id: &ObjectId, expected: impl FnOnce(&TypeKind) -> bool) -> ObjectLookup {
+        if self.lookup_shadowed(id) {
+            return ObjectLookup::Unknown;
+        }
         match self.local.types.get(id) {
             Some(TypeOverlay::Present(state)) if expected(&state.kind) => ObjectLookup::Present,
             Some(TypeOverlay::Present(_)) => ObjectLookup::WrongKind,
@@ -1901,6 +1990,9 @@ impl AnalysisState {
         missing_reason: String,
         wrong_kind_reason: String,
     ) -> Result<(), MutationResult> {
+        if self.lookup_shadowed(id) {
+            return Err(self.unresolved(EvidenceCode::UnknownObjectState));
+        }
         match self.local.functions.get(id) {
             Some(FunctionOverlay::Present(function)) if function.routine_kind == expected => Ok(()),
             Some(FunctionOverlay::Present(_)) => Err(MutationResult::conflict(wrong_kind_reason)),
@@ -1914,6 +2006,21 @@ impl AnalysisState {
             }
             None => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
         }
+    }
+
+    /// Validate the namespace a creation targets, where an unqualified target
+    /// was inferred from the search path.
+    ///
+    /// An unresolved entry before the chosen schema means PostgreSQL may have
+    /// picked a different target entirely, which is uncertain — not a conflict.
+    pub(super) fn ensure_creation_target(&mut self, id: &ObjectId) -> Result<(), MutationResult> {
+        if is_session_temp_schema(&id.schema) {
+            return Ok(());
+        }
+        if self.lookup_shadowed(id) {
+            return Err(self.unresolved(EvidenceCode::UnknownObjectState));
+        }
+        self.ensure_schema_target(&id.schema)
     }
 
     /// Validate the namespace in which a newly-created object will live.
@@ -2040,10 +2147,20 @@ impl AnalysisState {
         )
     }
 
+    /// Whether any overload of `id`'s name is present in `id`'s schema, for a
+    /// routine reference that carries no argument types.
+    pub(crate) fn routine_named_is_present(&self, id: &ObjectId) -> bool {
+        self.local.functions.iter().any(|(candidate, overlay)| {
+            matches!(overlay, FunctionOverlay::Present(_))
+                && candidate.schema == id.schema
+                && bare_routine_name(&candidate.name) == id.name
+        })
+    }
+
     fn resolve_type_reference_from_catalog(
         raw: &str,
         types: &HashMap<ObjectId, TypeOverlay>,
-        search_path: &[String],
+        search_path: &[SearchPathEntry],
         row_type_exists: impl Fn(&ObjectId) -> bool,
     ) -> Option<ObjectId> {
         let (schema, name, is_array) = Self::parse_type_reference(raw)?;
@@ -2060,7 +2177,8 @@ impl AnalysisState {
                 || row_type_exists(&candidate))
             .then(|| as_array(candidate));
         }
-        search_path.iter().find_map(|schema| {
+        search_path.iter().find_map(|entry| {
+            let schema = entry.searched_schema()?;
             let candidate = ObjectId::new(schema, &name);
             (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
                 || row_type_exists(&candidate))
@@ -3042,55 +3160,56 @@ impl AnalysisState {
                 .is_none_or(|schemas| schemas.contains(name))
     }
 
+    /// Recompute the effective search path from the session template.
+    ///
+    /// PostgreSQL silently ignores a path entry that does not name an existing
+    /// schema, so the model drops entries it can prove absent and keeps every
+    /// other one — a schema it cannot prove anything about stays as an
+    /// unresolved placeholder rather than disappearing. Nothing is tainted
+    /// here: an unresolved entry only makes an answer uncertain when a lookup
+    /// actually resolves past it (`path_shadows`), which is where the taint
+    /// belongs.
     fn refresh_role_sensitive_search_path(&mut self) {
-        // PostgreSQL searches `pg_catalog` implicitly when the path omits it,
-        // but sync excludes every system schema from the model (`sync.rs`
-        // filters `pg_%` and `pg_catalog`), so searching it can never match.
-        // Adding it would only risk naming `pg_catalog` as a creation target.
-        let mut template = self.local.search_path_template.clone();
-        // A scoped sync must keep every requested schema reachable even when the
-        // session path does not name it. This belongs to the effective path
-        // rather than the template, which stands for the session's own setting.
-        if let Some(scope) = self.baseline_schemas.as_ref() {
-            let mut requested: Vec<&String> = scope.iter().collect();
-            requested.sort();
-            for schema in requested {
-                if !template.contains(schema) {
-                    template.push(schema.clone());
-                }
-            }
-        }
-        let mut effective = Vec::new();
-        let mut role_identity_unknown = false;
-        let mut schema_state_unknown = false;
+        let template = self.local.search_path_template.clone();
+        let mut effective: Vec<SearchPathEntry> = Vec::new();
         for entry in template {
-            let schema = if entry == "$user" {
+            if entry == "$user" {
                 if self.local.current_role_known {
-                    self.local.current_role.clone()
-                } else {
-                    role_identity_unknown = true;
-                    continue;
+                    let role_schema = self.local.current_role.clone();
+                    self.push_path_entry(&mut effective, role_schema);
+                } else if !effective.contains(&SearchPathEntry::Unresolved(None)) {
+                    effective.push(SearchPathEntry::Unresolved(None));
                 }
             } else {
-                entry
-            };
-            if self.schema_is_present(&schema) {
-                if !effective.contains(&schema) {
-                    effective.push(schema);
-                }
-            } else if !self.schema_absence_is_authoritative(&schema) {
-                schema_state_unknown = true;
-                if !effective.contains(&schema) {
-                    effective.push(schema);
-                }
+                self.push_path_entry(&mut effective, entry);
             }
         }
         self.local.search_path = effective;
-        if role_identity_unknown {
-            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-        }
-        if schema_state_unknown {
-            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+    }
+
+    fn push_path_entry(&self, effective: &mut Vec<SearchPathEntry>, schema: String) {
+        let entry = if is_session_temp_schema(&schema) {
+            // The alias names the session's own temporary schema and nothing
+            // else, so a path naming it searches nothing until that namespace
+            // exists; relation and type lookups add it themselves.
+            if !self.temp_namespace_exists() {
+                return;
+            }
+            SearchPathEntry::Schema(schema)
+        } else if schema == SYSTEM_CATALOG_SCHEMA {
+            // Every database has the system catalog even though sync models no
+            // objects inside it; dropping the entry would misstate the search
+            // order for what the model does know (operator classes).
+            SearchPathEntry::Schema(schema)
+        } else if self.schema_is_present(&schema) {
+            SearchPathEntry::Schema(schema)
+        } else if self.schema_absence_is_authoritative(&schema) {
+            return;
+        } else {
+            SearchPathEntry::Unresolved(Some(schema))
+        };
+        if !effective.contains(&entry) {
+            effective.push(entry);
         }
     }
 
@@ -4077,7 +4196,7 @@ mod evidence_tests {
     use super::*;
     use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
     use crate::_internal::db::cache::{CatalogFamily, SchemaCoverage};
-    use crate::_internal::model::index::IndexOrder;
+    use crate::_internal::model::index::{IndexOrder, IndexPredicate};
 
     /// Coverage for a hand-built baseline that retrieved `families`.
     fn covering(schemas: Option<&[String]>, families: &[CatalogFamily]) -> CatalogCoverage {
@@ -4776,17 +4895,15 @@ mod evidence_tests {
                 if_not_exists: false,
                 concurrently: true,
                 using_method: None,
-                has_predicate: false,
+                predicate: IndexPredicate::None,
                 unique: false,
+                nulls_not_distinct: false,
                 key_columns: vec!["id".to_string()],
                 key_expressions: vec![None],
                 key_orders: vec![IndexOrder::Default],
                 key_opclasses: vec![None],
                 key_collations: vec![None],
                 included_columns: Vec::new(),
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
         assert!(matches!(
             state.apply(&concurrent_create, None),
@@ -4825,17 +4942,15 @@ mod evidence_tests {
                 if_not_exists: false,
                 concurrently: true,
                 using_method: None,
-                has_predicate: false,
+                predicate: IndexPredicate::None,
                 unique: false,
+                nulls_not_distinct: false,
                 key_columns: vec!["id".to_string()],
                 key_expressions: vec![None],
                 key_orders: vec![IndexOrder::Default],
                 key_opclasses: vec![None],
                 key_collations: vec![None],
                 included_columns: Vec::new(),
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
         assert!(matches!(
             partition_state.apply(&concurrent_partition_index, None),
@@ -4859,17 +4974,15 @@ mod evidence_tests {
                     if_not_exists: false,
                     concurrently: false,
                     using_method: None,
-                    has_predicate: false,
+                    predicate: IndexPredicate::None,
                     unique: false,
+                    nulls_not_distinct: false,
                     key_columns: vec!["id".to_string()],
                     key_expressions: vec![None],
                     key_orders: vec![IndexOrder::Default],
                     key_opclasses: vec![None],
                     key_collations: vec![None],
                     included_columns: Vec::new(),
-                    has_default_sort_order: true,
-                    has_default_opclasses: true,
-                    has_default_collations: true,
                 }),
                 None,
             ),

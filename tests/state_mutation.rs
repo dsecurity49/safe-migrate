@@ -9,18 +9,19 @@ mod state_mutation_tests {
         AlterTable, AlterTableActionMutation, DropAggregateMutation, DropFunctionMutation,
         DropProcedureMutation, DropTable, Mutation,
     };
+    use safe_migrate::_internal::analysis::namespace::SearchPathEntry;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::_internal::db::cache::{
-        CatalogFamily, ConstraintDependencyCache, GeneratedColumnDependencyCache,
-        ViewDependencyCache,
+        CatalogCoverage, CatalogFamily, ConstraintDependencyCache, GeneratedColumnDependencyCache,
+        SchemaCoverage, ViewDependencyCache,
     };
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::constraint::ConstraintKind;
     use safe_migrate::_internal::model::function::{
         FunctionOverlay, FunctionState, RoutineKind, Volatility,
     };
-    use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
+    use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
     use safe_migrate::_internal::model::relation::{
         ColumnAction, Persistence, Privilege, RelationKind, RelationOverlay, RelationState,
     };
@@ -1041,7 +1042,9 @@ mod state_mutation_tests {
                     included: index_keys(Vec::new()),
                     expression_keys: 1,
                     unique: false,
-                    predicate: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
                     valid: true,
                     ready: true,
                     live: true,
@@ -5913,7 +5916,7 @@ mod state_mutation_tests {
         };
         assert_eq!(variants("sm_core"), ["core_final", "sm_core_only"]);
         assert_eq!(variants("public"), ["public_new", "public_only"]);
-        assert_eq!(state.local.search_path, ["sm_core", "public"]);
+        assert_eq!(state.search_path_names(), ["sm_core", "public"]);
     }
 
     #[test]
@@ -5922,6 +5925,14 @@ mod state_mutation_tests {
         let mut cache = synced_cache();
         cache.metadata.source_role = Some("app_user".into());
         for schema in ["app_user", "public"] {
+            cache.schemas.insert(
+                schema.to_string(),
+                SchemaState {
+                    name: schema.to_string(),
+                    owner: object_id("", "postgres"),
+                    generation: 0,
+                },
+            );
             let id = object_id(schema, "mood");
             cache.types.insert(
                 id.clone(),
@@ -5946,7 +5957,7 @@ mod state_mutation_tests {
 
         assert_eq!(state.local.current_role, "app_user");
         assert!(state.local.current_role_known);
-        assert_eq!(state.local.search_path, ["app_user", "public"]);
+        assert_eq!(state.search_path_names(), ["app_user", "public"]);
         assert_eq!(state.local.confidence, Confidence::Exact);
         let Some(TypeOverlay::Present(type_state)) =
             state.local.types.get(&object_id("app_user", "mood"))
@@ -5962,7 +5973,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn cache_without_role_provenance_taints_explicit_user_search_path() {
+    fn an_unknown_user_schema_taints_only_the_lookup_that_resolves_past_it() {
         let engine = setup_engine();
         let mut cache = synced_cache();
         let id = object_id("public", "mood");
@@ -5979,16 +5990,183 @@ mod state_mutation_tests {
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
-            .analyze(
-                "SET search_path TO \"$user\", public;
-                 ALTER TYPE mood RENAME VALUE 'old' TO 'new';",
-                &mut state,
-            )
+            .analyze("SET search_path TO \"$user\", public;", &mut state)
             .unwrap();
 
         assert!(!state.local.current_role_known);
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(
+            state.local.search_path,
+            [
+                SearchPathEntry::Unresolved(None),
+                SearchPathEntry::Schema("public".to_string())
+            ]
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Exact,
+            "an unresolved entry is only uncertain once a lookup resolves past it"
+        );
+
+        engine
+            .analyze("ALTER TYPE mood RENAME VALUE 'old' TO 'new';", &mut state)
+            .unwrap();
+
         assert_eq!(state.local.confidence, Confidence::Tainted);
+        let Some(TypeOverlay::Present(type_state)) = state.local.types.get(&id) else {
+            panic!("public.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["old".into()]
+            },
+            "a target behind the unresolved $user schema is reported, not mutated"
+        );
+    }
+
+    #[test]
+    fn a_scoped_baseline_does_not_make_its_scope_searchable() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(Some(&["app".to_string()])),
+            CatalogFamily::ALL,
+        );
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "app".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        // The sync session searched a schema the scope omits, so its contents
+        // are unknown; the scope itself must not become reachable instead.
+        cache.metadata.source_search_path = Some(vec!["public".to_string()]);
+        cache.search_path = Vec::new();
+        let id = object_id("app", "mood");
+        cache.types.insert(
+            id.clone(),
+            TypeState {
+                id,
+                generation: 0,
+                kind: TypeKind::Enum {
+                    variants: vec!["old".into()],
+                },
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("ALTER TYPE mood RENAME VALUE 'old' TO 'new';", &mut state)
+            .unwrap();
+
+        assert_eq!(state.search_path_names(), Vec::<String>::new());
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("app", "mood"))
+        else {
+            panic!("app.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["old".into()]
+            },
+            "the out-of-scope search path entry must not be replaced by the sync scope"
+        );
+    }
+
+    #[test]
+    fn a_creation_behind_an_unresolved_path_entry_is_reported_not_placed() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(Some(&["public".to_string()])),
+            CatalogFamily::ALL,
+        );
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.schemas.insert(
+            "public".to_string(),
+            SchemaState {
+                name: "public".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        cache.metadata.source_search_path = Some(vec!["app".to_string(), "public".to_string()]);
+        cache.search_path = vec!["public".to_string()];
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        assert_eq!(
+            state.local.search_path,
+            [
+                SearchPathEntry::Unresolved(Some("app".to_string())),
+                SearchPathEntry::Schema("public".to_string())
+            ]
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(
+            !state.relation_is_present(&object_id("public", "t")),
+            "PostgreSQL might have created the table in the unresolved schema"
+        );
+    }
+
+    #[test]
+    fn a_view_call_resolves_in_the_routine_namespace_not_the_relation_one() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        for schema in ["public", "other"] {
+            cache.schemas.insert(
+                schema.to_string(),
+                SchemaState {
+                    name: schema.to_string(),
+                    owner: object_id("", "postgres"),
+                    generation: 0,
+                },
+            );
+        }
+        let table = object_id("public", "f");
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("", "postgres"),
+                0,
+                Some(0),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let function = object_id("other", "f()");
+        cache.functions.insert(
+            function.clone(),
+            FunctionState {
+                return_type: "integer".into(),
+                ..FunctionState::with_inputs(function.clone(), RoutineKind::Function, Vec::new())
+            },
+        );
+        cache.metadata.source_search_path = Some(vec!["public".to_string(), "other".to_string()]);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE VIEW public.v AS SELECT f();", &mut state)
+            .unwrap();
+
+        assert!(
+            state.local.graph.edges().iter().any(|edge| {
+                edge.dependent == object_id("public", "v")
+                    && edge.referenced == function
+                    && matches!(edge.kind, DependencyKind::ViewUsesRoutine { .. })
+            }),
+            "the call must follow the routine namespace, not resolve to public.f the table"
+        );
     }
 
     #[test]
@@ -6458,7 +6636,7 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "t")));
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.search_path_names(), ["public"]);
     }
 
     #[test]
@@ -6474,7 +6652,7 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "t")));
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.search_path_names(), ["public"]);
     }
 
     #[test]
@@ -6496,7 +6674,7 @@ mod state_mutation_tests {
 
         assert!(state.relation_is_present(&object_id("tenant_app", "first")));
         assert!(state.relation_is_present(&object_id("tenant_app", "second")));
-        assert_eq!(state.local.search_path, ["tenant_app", "shared"]);
+        assert_eq!(state.search_path_names(), ["tenant_app", "shared"]);
     }
 
     #[test]
@@ -8769,7 +8947,9 @@ mod state_mutation_tests {
                     included: index_keys(Vec::new()),
                     expression_keys: 0,
                     unique: false,
-                    predicate: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
                     valid: true,
                     ready: true,
                     live: true,
@@ -9967,7 +10147,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.search_path_names(), ["public"]);
         let RelationOverlay::Present(relation) = state.get_relation(&table).unwrap() else {
             panic!("table missing");
         };
@@ -10897,6 +11077,380 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn attaching_indexes_that_differ_only_in_sort_order_is_accepted() {
+        // Verified live: `CompareIndexInfo` never reads `indoption`, so a
+        // child whose key is written with the opposite direction attaches.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_desc ON c (b DESC);
+             CREATE INDEX p_plain ON p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_desc;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_desc")
+                && edge.referenced == object_id("public", "p_plain")),
+            "a differing sort order must attach, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_indexes_with_different_nulls_not_distinct_is_refused() {
+        // Verified live: `CompareIndexInfo` compares `indnullsnotdistinct`;
+        // equal settings attach and a mismatch is refused.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_nnd ON c (b) NULLS NOT DISTINCT;
+             CREATE INDEX p_nnd ON p (b) NULLS NOT DISTINCT;
+             ALTER INDEX p_nnd ATTACH PARTITION c_nnd;
+             CREATE INDEX c_mix ON c (b) NULLS NOT DISTINCT;
+             CREATE INDEX p_lenient ON p (b);
+             ALTER INDEX p_lenient ATTACH PARTITION c_mix;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_nnd")
+                && edge.referenced == object_id("public", "p_nnd")),
+            "matching NULLS NOT DISTINCT must attach, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_mix")),
+            "a differing NULLS NOT DISTINCT must not attach"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("index definitions do not match")),
+            "expected a definition mismatch, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_an_index_with_a_non_default_collation_is_undecidable() {
+        // Live PostgreSQL refuses this pair — the child's key carries
+        // collation OID 950 and the parent's the database default 100. The
+        // simulator does not record a column's declared collation, so it
+        // cannot prove the pair differs (a column declared `COLLATE "C"`
+        // would make it one collation) and stays undecidable.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_c ON c (b COLLATE \"C\");
+             CREATE INDEX p_plain ON p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_c;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_c")),
+            "a child with an unresolvable-relative collation must not attach"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn writing_the_default_collation_leaves_attachment_undecidable() {
+        // Live PostgreSQL attaches: both spellings land on collation OID 100
+        // when the column carries no collation of its own. The simulator does
+        // not record column collations, so it cannot prove the written
+        // `default` is the same choice and refuses to equate them silently.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_def ON c (b COLLATE \"default\");
+             CREATE INDEX p_plain ON p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_def;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_def")),
+            "a written default collation must not be silently equated"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_expression_indexes_matches_expression_identity() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_lower ON c (lower(b));
+             CREATE INDEX p_lower ON p (lower(b));
+             ALTER INDEX p_lower ATTACH PARTITION c_lower;
+             CREATE INDEX c_upper ON c (upper(b));
+             CREATE INDEX p_upper ON p (lower(b));
+             ALTER INDEX p_upper ATTACH PARTITION c_upper;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_lower")
+                && edge.referenced == object_id("public", "p_lower")),
+            "equal expressions must attach, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_upper")),
+            "different expressions must not attach"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("index definitions do not match")),
+            "expected a definition mismatch, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_opclass_on_an_expression_leaves_attachment_undecidable() {
+        // Live PostgreSQL attaches: `lower(b)` on a text column is `text_ops`
+        // (OID 3126) whether written or not. The simulator does not infer an
+        // expression's result type, so it cannot prove the written class is
+        // the expression's default and refuses to guess.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (lower(b) text_ops);
+             CREATE INDEX p_lower ON p (lower(b));
+             ALTER INDEX p_lower ATTACH PARTITION c_ops;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_ops")),
+            "a written class on an expression must not be silently equated"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn opclasses_in_the_same_family_attach_despite_different_names() {
+        // Verified live: `varchar_pattern_ops` and `text_pattern_ops` both
+        // belong to family `text_pattern_ops`, and `CompareIndexInfo`
+        // compares family OIDs, so the attachment succeeds.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (b text_pattern_ops);
+             CREATE INDEX p_ops ON p (b varchar_pattern_ops);
+             ALTER INDEX p_ops ATTACH PARTITION c_ops;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_ops")
+                && edge.referenced == object_id("public", "p_ops")),
+            "same-family classes must attach, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_backed_child_index_leaves_attachment_undecidable() {
+        // Live PostgreSQL refuses this pair because the child's backing index
+        // carries exclusion operators the parent's does not. The constraint
+        // marker records the key columns but not the operators, so the
+        // simulator stays undecidable instead of claiming a mismatch it has
+        // not established.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_b ON p (b);
+             ALTER TABLE c ADD CONSTRAINT c_excl EXCLUDE USING btree (b WITH =);
+             ALTER INDEX p_b ATTACH PARTITION c_excl;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_excl")),
+            "an exclusion-backed child must not attach to a plain parent"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_backed_parent_index_leaves_attachment_undecidable() {
+        // Live PostgreSQL refuses this pair because the parent's backing
+        // constraint has no counterpart on the child. The simulator cannot
+        // model the constraint rule on a shape it has not established, so the
+        // outcome stays undecidable on both sides of the comparison.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             ALTER TABLE p ADD CONSTRAINT p_excl EXCLUDE USING btree (a WITH =);
+             ALTER INDEX p_excl ATTACH PARTITION c_a;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_a")),
+            "a plain child must not attach to an exclusion-backed parent"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_synced_index_attaches_to_a_statement_created_parent() {
+        // The catalog records the resolved opfamily (`text_ops`), and the
+        // statement normalizes the omitted default to the same family, so a
+        // synced child attaches to a statement-created parent.
+        use safe_migrate::_internal::db::cache::{IndexCache, InheritanceCache};
+        use safe_migrate::_internal::model::index::{
+            IndexKey, IndexKeyKind, IndexOrder, KeyCollation, KeyOpclass, ResolvedName,
+        };
+
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        let parent_id = object_id("public", "p");
+        let child_id = object_id("public", "c");
+        let owner = object_id("public", "postgres");
+        let synced_table = |id: &ObjectId| {
+            let mut table = RelationState::new(
+                id.clone(),
+                owner.clone(),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            );
+            table.columns.push(Column {
+                name: "b".to_string(),
+                data_type: Some("text".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: None,
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
+            });
+            table
+        };
+        let mut parent = synced_table(&parent_id);
+        parent.partition_type = Some("RANGE".to_string());
+        parent.partition_by = Some("PARTITION BY RANGE (b)".to_string());
+        cache.insert_baseline(parent_id.clone(), parent);
+        cache.insert_baseline(child_id.clone(), synced_table(&child_id));
+        cache.inheritances.push(InheritanceCache {
+            child: child_id.clone(),
+            parent: parent_id.clone(),
+            sequence: 0,
+            is_partition: true,
+            detach_pending: false,
+        });
+        cache.indexes.push(IndexCache {
+            index_id: object_id("public", "c_b"),
+            table_id: child_id,
+            definition: IndexDefinition {
+                method: Some("btree".to_string()),
+                keys: vec![IndexKey {
+                    kind: IndexKeyKind::Column("b".to_string()),
+                    opclass: KeyOpclass::Default(Some(ResolvedName {
+                        schema: "pg_catalog".to_string(),
+                        name: "text_ops".to_string(),
+                    })),
+                    collation: KeyCollation::Derived,
+                    order: IndexOrder::Default,
+                }],
+                included: Vec::new(),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
+            dependency_columns: vec!["b".to_string()],
+            dependency_columns_known: true,
+            is_immediate: true,
+        });
+        let mut state = AnalysisState::new(cache);
+        let violations = engine
+            .analyze(
+                "CREATE INDEX p_b ON p (b);
+                 ALTER INDEX p_b ATTACH PARTITION c_b;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_b")
+                && edge.referenced == object_id("public", "p_b")),
+            "a synced default opclass must attach to a statement parent, got {violations:?}"
+        );
+    }
+
+    #[test]
     fn an_attached_child_index_cannot_be_dropped_on_its_own() {
         let (state, violations) = attach_fixture(
             "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
@@ -11297,7 +11851,9 @@ mod state_mutation_tests {
             included: Vec::new(),
             expression_keys: 0,
             unique: true,
-            predicate: false,
+            nulls_not_distinct: Some(false),
+            predicate: IndexPredicate::None,
+            unestablished: false,
             valid: false,
             ready: false,
             live: true,

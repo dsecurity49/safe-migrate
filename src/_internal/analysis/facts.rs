@@ -1,6 +1,6 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
-use crate::_internal::model::index::IndexOrder;
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PersistenceFact {
@@ -257,8 +257,9 @@ pub(crate) enum StatementFact {
         if_not_exists: bool,
         concurrently: bool,
         using_method: Option<String>,
-        has_predicate: bool,
+        predicate: IndexPredicate,
         unique: bool,
+        nulls_not_distinct: bool,
         key_columns: Vec<String>,
         /// Aligned with key positions; `Some` is the parsed expression for an
         /// expression key and `None` for a plain column.
@@ -266,13 +267,10 @@ pub(crate) enum StatementFact {
         /// Aligned with key positions.
         key_orders: Vec<IndexOrder>,
         /// Aligned with key positions; `None` means the type's default.
-        key_opclasses: Vec<Option<String>>,
-        /// Aligned with key positions; `None` means not collatable.
-        key_collations: Vec<Option<String>>,
+        key_opclasses: Vec<Option<WrittenName>>,
+        /// Aligned with key positions; `None` means the derived collation.
+        key_collations: Vec<Option<WrittenName>>,
         included_columns: Vec<String>,
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
     },
     CreatePolicy {
         name: String,

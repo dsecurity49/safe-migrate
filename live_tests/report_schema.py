@@ -27,6 +27,10 @@ AUTO_SYNC_VALUES = {"not_requested", "refreshed", "failed", "bypassed"}
 SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 VIOLATION_REQUIRED = ("rule_id", "object_kind", "object_name", "tier", "reason", "recipe")
+VIOLATION_OPTIONAL = ("sql", "statement_index", "certainty", "location")
+# Documented field names a consumer may rely on, including nested location keys.
+VIOLATION_FIELDS = VIOLATION_REQUIRED + VIOLATION_OPTIONAL
+LOCATION_FIELDS = ("file", "line", "column")
 NOT_EVALUATED_REQUIRED = ("rule_id", "tier", "cause", "recipe")
 EVIDENCE_REQUIRED = ("code", "scope", "summary")
 TOP_LEVEL_REQUIRED = (
@@ -60,6 +64,11 @@ def _is_count(value, _what=None):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _is_position(value, _what=None):
+    # Lines and statement indexes are one-based, so zero is never valid.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def _check_enum(value, allowed, what):
     _require(value in allowed, f"{what} {value!r} is not one of {sorted(allowed)}")
 
@@ -79,14 +88,14 @@ def check_violation(violation):
     _require(isinstance(violation.get("object_name"), str), "violation.object_name must be a string")
     _check_enum(violation["tier"], TIER_VALUES, "violation.tier")
     _check_optional(violation, "sql", _is_string, "violation")
-    _check_optional(violation, "statement_index", _is_count, "violation")
+    _check_optional(violation, "statement_index", _is_position, "violation")
     _check_optional(violation, "certainty", lambda v, w: _check_enum(v, CERTAINTY_VALUES, w), "violation")
     location = violation.get("location")
     if location is not None:
         _require(isinstance(location, dict), "violation.location must be an object")
         _require(_is_count(location.get("file")) is False and _is_string(location.get("file")),
                  "violation.location.file must be a non-empty string")
-        _require(_is_count(location.get("line")), "violation.location.line must be a count")
+        _require(_is_position(location.get("line")), "violation.location.line must be a one-based position")
         _check_optional(location, "column", _is_count, "violation.location")
 
 
@@ -113,7 +122,7 @@ def check_evidence(entry):
     if location is not None:
         _require(isinstance(location, dict), "evidence.location must be an object")
         _require(_is_string(location.get("file")), "evidence.location.file must be a non-empty string")
-        _require(_is_count(location.get("statement_index")), "evidence.location.statement_index must be a count")
+        _require(_is_position(location.get("statement_index")), "evidence.location.statement_index must be a one-based position")
 
 
 def check_baseline(baseline):
@@ -178,15 +187,32 @@ def check_report(report):
             f"summary.tier{tier} is {summary[f'tier{tier}']} but {counted} findings are Tier{tier}",
         )
 
-    # A verdict is a function of the findings and of what could not be
-    # evaluated, so the two halves cannot be checked independently; what can be
-    # checked is that a report with no findings and nothing unevaluated is safe.
     not_evaluated = report["not_evaluated"]
     _require(isinstance(not_evaluated, list), "not_evaluated must be a list")
     for entry in not_evaluated:
         check_not_evaluated(entry)
-    if not violations and not not_evaluated:
-        _require(report["verdict"] == "SAFE", f"an empty report claims {report['verdict']!r}")
+
+    # Recompute the documented verdict ladder; a report may not claim a safer
+    # verdict than its findings and skipped checks allow.
+    has_tier1 = any(violation["tier"] == "Tier1" for violation in violations)
+    has_tier2 = any(violation["tier"] == "Tier2" for violation in violations)
+    has_irreversible = any(
+        violation["tier"] == "Tier3" and violation["rule_id"] == "irreversible-migration"
+        for violation in violations
+    )
+    skipped_tier1 = any(entry["tier"] == "Tier1" for entry in not_evaluated)
+    if has_tier1:
+        expected_verdict = "HALT"
+    elif has_tier2 or skipped_tier1:
+        expected_verdict = "CAUTIOUS"
+    elif has_irreversible:
+        expected_verdict = "SAFE WITH RISK"
+    else:
+        expected_verdict = "SAFE"
+    _require(
+        report["verdict"] == expected_verdict,
+        f"the findings and skipped checks imply {expected_verdict!r}, not {report['verdict']!r}",
+    )
 
     evidence = report["evidence"]
     _require(isinstance(evidence, list), "evidence must be a list")

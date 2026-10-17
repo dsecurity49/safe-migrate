@@ -916,7 +916,7 @@ impl DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::_internal::model::index::index_keys;
+    use crate::_internal::model::index::{IndexPredicate, index_keys};
 
     fn id(name: &str) -> ObjectId {
         ObjectId::new("public", name)
@@ -1155,7 +1155,9 @@ mod tests {
                     included: index_keys(Vec::new()),
                     expression_keys: 0,
                     unique: false,
-                    predicate: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
                     valid: true,
                     ready: true,
                     live: true,

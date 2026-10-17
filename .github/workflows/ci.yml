@@ -38,11 +38,13 @@ jobs:
       - name: Check shell syntax
         # A syntax error in any load-bearing shell script would make the fixture
         # suite silently skip. scripts/lib/ is a subdirectory not matched by
-        # scripts/*, so it is enumerated explicitly.
+        # scripts/*, so it is enumerated explicitly; non-shell helpers in these
+        # directories are not parsed as shell.
         run: |
           set -eu
           for script in scripts/* scripts/lib/* live_tests/*.sh install.sh; do
             [ -f "$script" ] || continue
+            case "$script" in *.py) continue ;; esac
             bash -n "$script"
           done
 

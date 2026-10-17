@@ -59,9 +59,22 @@ The report schema is version 3:
 {
   "schema_version": 3,
   "confidence": "Exact",
-  "verdict": "HALT",
+  "verdict": "SAFE",
+  "summary": { "total": 0, "tier1": 0, "tier2": 0, "tier3": 0 },
   "evidence": [],
   "not_evaluated": [],
+  "rules": {},
+  "baseline": {
+    "status": "available",
+    "created_at_unix_secs": 0,
+    "source_database": "app",
+    "schemas": ["public"],
+    "auto_sync": "not_requested",
+    "observed_settings": {
+      "lock_timeout_ms": 5000,
+      "statement_timeout_ms": 900000
+    }
+  },
   "violations": []
 }
 ```
@@ -144,8 +157,8 @@ Schema 3 is a breaking change from schema 2: `not_evaluated` is new, and
 | Verdict | Condition |
 | --- | --- |
 | `HALT` | At least one Tier 1 finding. |
-| `CAUTIOUS` | Tier 2, but no Tier 1. |
-| `SAFE WITH RISK` | Irreversible Tier 3, but no Tier 1 or Tier 2. |
+| `CAUTIOUS` | No Tier 1 finding, and a Tier 2 finding or an unevaluated Tier 1-capable check. |
+| `SAFE WITH RISK` | An `irreversible-migration` Tier 3 finding, but no Tier 1 or Tier 2 finding and no unevaluated Tier 1-capable check. |
 | `SAFE` | No higher verdict applies. |
 
 | Exit | Meaning |
@@ -154,7 +167,12 @@ Schema 3 is a breaking change from schema 2: `not_evaluated` is new, and
 | `1` | Invocation, configuration, I/O, cache, parser, or internal failure. |
 | `2` | Analysis completed with Tier 1. |
 
-Human, JSON, and Markdown modes must use the same exit-status policy.
+Human, JSON, and Markdown modes must use the same exit-status policy. An
+unevaluated Tier 1-capable check caps the verdict at `CAUTIOUS`; it does not
+change the exit status, because degraded analysis (no cache, or a baseline
+scoped away from the target) is a supported mode. The report lists every
+skipped check in `not_evaluated`, with the cause and what would make it
+evaluable, in each output mode.
 
 ## Confidence
 

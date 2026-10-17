@@ -245,6 +245,17 @@ impl ParsedDataType {
         let text = Self::strip_pg_catalog_qualifier(&text).to_string();
         let original_base = Self::strip_pg_catalog_qualifier(&original_base).to_string();
 
+        // `float(p)` is grammar over the two real types: the precision picks
+        // one, and neither stores a modifier (atttypmod -1). A precision the
+        // server rejects keeps its written form so classification fails closed.
+        let (text, typmods) = match (text.as_str(), typmods.as_deref()) {
+            ("float", Some(raw)) => match Self::float_precision(raw) {
+                Some(width) => (width.to_string(), None),
+                None => (text, typmods),
+            },
+            _ => (text, typmods),
+        };
+
         // `serial` is grammar, not a type: the server expands it to an integer
         // type and a sequence before the column exists.
         let text = match text.as_str() {
@@ -319,6 +330,15 @@ impl ParsedDataType {
         self.builtin
             .as_ref()
             .is_some_and(|b| b.requires_text_cast_for_comparison())
+    }
+
+    /// The real type `float(p)` selects. PostgreSQL accepts 1..=53 bits.
+    fn float_precision(raw: &str) -> Option<&'static str> {
+        match raw.trim().parse::<u32>() {
+            Ok(1..=24) => Some("real"),
+            Ok(25..=53) => Some("double precision"),
+            _ => None,
+        }
     }
 
     fn strip_pg_catalog_qualifier(name: &str) -> &str {
@@ -812,6 +832,32 @@ mod tests {
                 expected,
                 "{declaration}"
             );
+        }
+    }
+
+    #[test]
+    fn float_precision_selects_a_real_type_without_a_stored_modifier() {
+        // Verified live on PostgreSQL 18.6: float(1..24) is real, float(25..53)
+        // is double precision, and `pg_attribute.atttypmod` is -1 for every
+        // spelling, the bare type included.
+        for (declaration, canonical) in [
+            ("float", "double precision"),
+            ("float(1)", "real"),
+            ("float(24)", "real"),
+            ("float(25)", "double precision"),
+            ("float(53)", "double precision"),
+        ] {
+            let parsed = ParsedDataType::parse(declaration, catalogue());
+            assert_eq!(parsed.canonical_name(), canonical, "{declaration}");
+            assert_eq!(parsed.atttypmod(), None, "{declaration}");
+        }
+        let array = ParsedDataType::parse("float(24)[]", catalogue());
+        assert_eq!(array.canonical_name(), "real");
+        assert_eq!(array.array_dimensions, 1);
+        for declaration in ["float(0)", "float(54)", "float(10,2)", "float(x)"] {
+            let parsed = ParsedDataType::parse(declaration, catalogue());
+            assert_eq!(parsed.typmod, TypeTypmod::OutOfRange, "{declaration}");
+            assert_eq!(parsed.atttypmod(), None, "{declaration}");
         }
     }
 

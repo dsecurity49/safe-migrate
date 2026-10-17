@@ -1,6 +1,6 @@
 use crate::_internal::analysis::facts::StatementFact;
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
-use crate::_internal::analysis::namespace::temp_object_id;
+use crate::_internal::analysis::namespace::{SearchPathEntry, temp_object_id};
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
@@ -21,16 +21,27 @@ pub(crate) struct Resolver;
 
 impl Resolver {
     fn resolve_creation_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
-        // An empty path leaves PostgreSQL with no creation target, so the
-        // namespace is left empty for the state machine to reject rather than
-        // silently assuming `public`.
-        let schema = name
-            .schema
-            .as_ref()
-            .map(|i| i.resolve())
-            .unwrap_or_else(|| state.search_path().first().cloned().unwrap_or_default());
+        if let Some(schema) = &name.schema {
+            return ObjectId::new(schema.resolve(), name.name.resolve());
+        }
 
-        ObjectId::new(schema, name.name.resolve())
+        // An unqualified creation targets the first already-existing path
+        // schema.  An empty or unresolved path leaves no provable target, so
+        // the state machine taints or rejects it where the answer matters.
+        let schema = state
+            .creation_schema()
+            .map(str::to_string)
+            .or_else(|| {
+                state
+                    .search_path()
+                    .first()
+                    .and_then(SearchPathEntry::name)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let mut id = ObjectId::new(schema, name.name.resolve());
+        id.inferred_schema = true;
+        id
     }
 
     /// Creation target for a relation declared `TEMPORARY`, which PostgreSQL
@@ -53,13 +64,16 @@ impl Resolver {
         object_name: String,
         state: &AnalysisState,
         present: impl Fn(&AnalysisState, &ObjectId) -> bool,
-        search: impl Fn(&AnalysisState) -> Vec<String>,
+        search: impl Fn(&AnalysisState) -> Vec<SearchPathEntry>,
     ) -> ObjectId {
         if let Some(schema_ident) = &name.schema {
             return ObjectId::new(schema_ident.resolve(), object_name);
         }
 
-        for schema in search(state) {
+        for entry in search(state) {
+            let Some(schema) = entry.searched_schema() else {
+                continue;
+            };
             let mut candidate = ObjectId::new(schema, object_name.clone());
             if present(state, &candidate) {
                 candidate.inferred_schema = true;
@@ -68,7 +82,11 @@ impl Resolver {
         }
 
         // An empty path searches nothing, so no schema may be inferred.
-        let schema = state.search_path().first().cloned().unwrap_or_default();
+        let schema = state
+            .search_path()
+            .first()
+            .and_then(SearchPathEntry::name)
+            .unwrap_or_default();
         let mut id = ObjectId::new(schema, object_name);
         id.inferred_schema = true;
         id
@@ -109,6 +127,21 @@ impl Resolver {
             state,
             AnalysisState::type_is_present,
             AnalysisState::relation_search_path,
+        )
+    }
+
+    /// A routine reference that carries no argument types: the namespace is
+    /// the routine one, and the presence test matches any overload.
+    pub(super) fn resolve_routine_namespace_name(
+        name: &QualifiedName,
+        state: &AnalysisState,
+    ) -> ObjectId {
+        Self::resolve_in_namespace(
+            name,
+            name.name.resolve(),
+            state,
+            AnalysisState::routine_named_is_present,
+            |state| state.search_path().to_vec(),
         )
     }
 
@@ -373,17 +406,15 @@ impl Resolver {
                 if_not_exists,
                 concurrently,
                 using_method,
-                has_predicate,
+                predicate,
                 unique,
+                nulls_not_distinct,
                 key_columns,
                 key_expressions,
                 key_orders,
                 key_opclasses,
                 key_collations,
                 included_columns,
-                has_default_sort_order,
-                has_default_opclasses,
-                has_default_collations,
             } => {
                 mutations.push(Self::resolve_create_index(
                     name,
@@ -391,17 +422,15 @@ impl Resolver {
                     *if_not_exists,
                     *concurrently,
                     using_method,
-                    *has_predicate,
+                    predicate,
                     *unique,
+                    *nulls_not_distinct,
                     key_columns,
                     key_expressions,
                     key_orders,
                     key_opclasses,
                     key_collations,
                     included_columns,
-                    *has_default_sort_order,
-                    *has_default_opclasses,
-                    *has_default_collations,
                     state,
                 ));
             }

@@ -10,7 +10,9 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::data_type::{ParsedDataType, WIDENED_NUMERIC_SCALE_VERSION};
-use crate::_internal::model::index::{IndexComparability, IndexDefinition, index_keys};
+use crate::_internal::model::index::{
+    IndexComparability, IndexDefinition, IndexPredicate, index_keys,
+};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
@@ -657,15 +659,22 @@ impl AnalysisState {
         }
     }
 
+    /// The backing index of a locally created primary key or unique constraint.
+    ///
+    /// Constraint syntax admits neither expressions nor predicates, so the
+    /// shape is fully determined by the columns. `NULLS NOT DISTINCT` is not
+    /// modeled on constraint syntax, so the server default is recorded.
     fn constraint_index_dependency(columns: Vec<String>, is_unique: bool) -> DependencyKind {
         DependencyKind::IndexOnRelation {
             definition: IndexDefinition {
                 method: Some("btree".to_string()),
                 keys: index_keys(columns.clone()),
                 included: index_keys(Vec::new()),
-                expression_keys: usize::from(false),
+                expression_keys: 0,
                 unique: is_unique,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,
@@ -1303,7 +1312,7 @@ impl AnalysisState {
                 "cannot create temporary relation in non-temporary schema".to_string(),
             );
         }
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
@@ -1709,9 +1718,14 @@ impl AnalysisState {
                                 method: is_key.then(|| "btree".to_string()),
                                 keys: index_keys(columns.clone()),
                                 included: index_keys(Vec::new()),
-                                expression_keys: usize::from(!is_key),
+                                expression_keys: 0,
                                 unique: is_unique,
-                                predicate: false,
+                                nulls_not_distinct: Some(false),
+                                predicate: IndexPredicate::None,
+                                // An exclusion constraint's backing index carries
+                                // operators, procedures and possibly expressions
+                                // the constraint columns do not record.
+                                unestablished: !is_key,
                                 valid: true,
                                 ready: true,
                                 live: true,
@@ -3063,9 +3077,13 @@ impl AnalysisState {
                             method: None,
                             keys: index_keys(columns.clone()),
                             included: index_keys(Vec::new()),
-                            expression_keys: usize::from(true),
+                            expression_keys: 0,
                             unique: false,
-                            predicate: false,
+                            nulls_not_distinct: Some(false),
+                            predicate: IndexPredicate::None,
+                            // An exclusion constraint's backing index shape is
+                            // not established from the constraint columns alone.
+                            unestablished: true,
                             valid: true,
                             ready: true,
                             live: true,
@@ -4079,7 +4097,7 @@ impl AnalysisState {
                     .unwrap_or(false);
                 if !definition.is_usable()
                     || !definition.unique
-                    || definition.predicate
+                    || definition.has_predicate()
                     || definition.has_expression_keys()
                     || !*is_immediate
                     || !all_keys_not_null
@@ -4479,7 +4497,7 @@ impl AnalysisState {
                 // order, which a constraint index may not carry.
                 if !definition.is_usable()
                     || !definition.unique
-                    || definition.predicate
+                    || definition.has_predicate()
                     || definition.has_expression_keys()
                     || !definition
                         .keys
@@ -4640,7 +4658,7 @@ impl AnalysisState {
                             unknown_dependency = true;
                         } else if dependency_columns.iter().any(|column| column == name) {
                             drop_column_indexes.insert(dependent.clone());
-                        } else if !definition.has_expression_keys() && !definition.predicate {
+                        } else if !definition.has_expression_keys() && !definition.has_predicate() {
                             debug_assert!(
                                 definition
                                     .key_column_names()
@@ -5535,9 +5553,14 @@ impl AnalysisState {
                                     method: None,
                                     keys: index_keys(columns.clone()),
                                     included: index_keys(Vec::new()),
-                                    expression_keys: usize::from(true),
+                                    expression_keys: 0,
                                     unique: false,
-                                    predicate: false,
+                                    nulls_not_distinct: Some(false),
+                                    predicate: IndexPredicate::None,
+                                    // An exclusion constraint's backing index shape
+                                    // is not established from the constraint columns
+                                    // alone.
+                                    unestablished: true,
                                     valid: true,
                                     ready: true,
                                     live: true,

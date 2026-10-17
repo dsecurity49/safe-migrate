@@ -2,7 +2,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
-    use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
+    use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
@@ -20,7 +20,9 @@ mod phase10_bug_fixes_and_sorting_tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,

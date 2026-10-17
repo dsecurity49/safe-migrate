@@ -481,6 +481,12 @@ pub(crate) struct DbCache {
     /// against a real server.
     pub builtin_types: Option<BuiltinTypeCatalogue>,
     pub opclasses: Option<crate::_internal::model::opclass::OpclassCatalogue>,
+    /// Collations of the synchronized cluster, as `pg_collation` records them.
+    ///
+    /// `None` when no baseline was synchronized, which is distinct from an
+    /// empty catalogue: written collations stay unresolved rather than
+    /// equated.
+    pub collations: Option<crate::_internal::model::collation::CollationCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
     /// Dependencies from a view to a routine or type, which the relation
@@ -615,6 +621,7 @@ impl DbCache {
             schemas: HashMap::new(),
             builtin_types: None,
             opclasses: None,
+            collations: None,
             sequences: HashMap::new(),
             dependencies: Vec::new(),
             view_object_dependencies: Vec::new(),
@@ -1788,7 +1795,7 @@ impl DbCache {
             });
             if !index.definition.is_usable()
                 || !index.definition.unique
-                || index.definition.predicate
+                || index.definition.has_predicate()
                 || index.definition.has_expression_keys()
                 || !index.is_immediate
                 || !all_keys_not_null
@@ -2286,7 +2293,7 @@ impl DbCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::_internal::model::index::index_keys;
+    use crate::_internal::model::index::{IndexPredicate, index_keys};
 
     /// Coverage for a hand-built cache that retrieved the whole catalog.
     fn fully_covering(schemas: Option<&[String]>) -> CatalogCoverage {
@@ -2719,7 +2726,9 @@ mod tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,
@@ -3426,7 +3435,9 @@ mod tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,
@@ -3456,7 +3467,9 @@ mod tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,
@@ -3488,7 +3501,9 @@ mod tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,
@@ -3563,7 +3578,9 @@ mod tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,

@@ -112,8 +112,8 @@ notes are available on the
   scoped or incomplete baseline instead of being skipped, and report that the
   rest of the migration is no longer exact.
 - A constraint cloned onto a partition is named as PostgreSQL names it, and an
-  explicitly written default operator class, collation or sort direction counts
-  as the same as omitting it.
+  explicitly written default operator class or sort direction counts as the
+  same as omitting it.
 - `ALTER INDEX ... ATTACH PARTITION` is validated instead of accepted whenever
   both indexes exist. Mismatched definitions and children of unrelated tables
   are now reported.
@@ -142,20 +142,56 @@ notes are available on the
   invalid because partitions are missing, which is how `CREATE INDEX ON ONLY`
   is completed. An index whose equivalence cannot be decided no longer reports
   a conflict.
+- The attachment comparison now follows PostgreSQL's own `CompareIndexInfo`:
+  operator classes are compared by the operator family they resolve to, so
+  `text_pattern_ops` and `varchar_pattern_ops` attach to each other while a
+  class outside the family does not, and sort order is not compared because
+  PostgreSQL does not compare it. `NULLS NOT DISTINCT` and a written `WHERE`
+  predicate are compared; a predicate synchronized from the catalog stays
+  opaque, so comparing it leaves the attachment undecidable rather than equal.
+- Collations are compared by the identity they resolve to. A written
+  `COLLATE "default"` against an omitted one, a collation nothing resolves, and
+  an exclusion constraint's backing index are undecidable on attach instead of
+  equal. A collated column key such as `b COLLATE "C"` is recorded as the
+  column it is, carrying its collation, rather than as an expression key.
 - `REINDEX` marks a broken index usable, so rebuilding one and then constraining
   from it no longer fails.
 - A cloned partition constraint no longer has to share its parent's name to
   attach.
 - An explicitly written default operator class is recognized whether the column
   is spelled `integer` or `int4`.
-- The JSON report's verdict now matches the library's: a Tier 1 check that did
-  not run no longer serializes as `safe`.
+- A Tier 1 check that did not run now caps the verdict at `CAUTIOUS` in every
+  output mode: it no longer reads `safe` or `safe with risk`. The exit status
+  is unchanged, so a degraded run without a usable baseline keeps its
+  documented exit code while the report lists what could not be checked.
 - A check skipped for want of evidence names the out-of-scope schemas the
   boundary query observed instead of advising a bare resync.
 - Tier labels are colored only when standard output is a terminal, so
   redirected and piped reports contain no escape sequences.
 - Column identities are rendered as `schema.relation.column`, with an inferred
   schema annotated at the end.
+- The human report and the interactive viewer now list the checks that were
+  skipped for want of evidence, with their cause and remedy. A run without
+  findings previously said only `No violations detected.` while the JSON and
+  Markdown reports already carried the skipped checks; the interactive header
+  counts them as well.
+- Name resolution follows the search path the synchronized session actually
+  had instead of substituting the sync scope for it. A schema outside the
+  scope is kept as an unknown entry, so a lookup that could have resolved in
+  it is reported as uncertain rather than resolved against a schema the
+  session may not have searched. `$user` under a role the baseline does not
+  know taints only a lookup that resolves past it, not every statement after
+  `SET search_path`.
+- An unqualified `CREATE` targets the first schema the path searches, as the
+  server does; when an unknown entry precedes it, the statement is reported
+  rather than placed. `pg_temp` is searched or created only when the session's
+  temporary namespace exists, and stands at its written position in the path.
+- A view call resolves in the routine namespace, so a table of the same name
+  cannot capture it, and a default operator class follows the path with
+  `pg_catalog` first unless the path lists it.
+- `float(p)` is accepted: the precision selects `real` for 1–24 and `double
+  precision` for 25–53, an out-of-range precision is reported, and no modifier
+  is recorded because the server records none.
 
 ## v0.10.0 — 2026-10-02
 

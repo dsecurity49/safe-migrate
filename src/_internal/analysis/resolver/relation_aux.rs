@@ -14,7 +14,7 @@ use crate::_internal::analysis::mutations::{
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::ParsedDataType;
-use crate::_internal::model::index::IndexOrder;
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use crate::_internal::model::relation::RelationKind;
 
 impl Resolver {
@@ -143,7 +143,7 @@ impl Resolver {
         routines
             .iter()
             .map(|reference| {
-                let name = Self::resolve_relation_lookup_name(&reference.name, state);
+                let name = Self::resolve_routine_namespace_name(&reference.name, state);
                 let signature = reference.argument_types.as_ref().and_then(|arguments| {
                     arguments
                         .iter()
@@ -156,7 +156,7 @@ impl Resolver {
                         .collect::<Option<Vec<String>>>()
                 });
                 ViewRoutine {
-                    name: ObjectId::new(name.schema.clone(), name.name.clone()),
+                    name: name.clone(),
                     signature: signature
                         .map(|arguments| {
                             ObjectId::new(
@@ -396,17 +396,15 @@ impl Resolver {
         if_not_exists: bool,
         concurrently: bool,
         using_method: &Option<String>,
-        has_predicate: bool,
+        predicate: &IndexPredicate,
         unique: bool,
+        nulls_not_distinct: bool,
         key_columns: &[String],
         key_expressions: &[Option<ExprIr>],
         key_orders: &[IndexOrder],
-        key_opclasses: &[Option<String>],
-        key_collations: &[Option<String>],
+        key_opclasses: &[Option<WrittenName>],
+        key_collations: &[Option<WrittenName>],
         included_columns: &[String],
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
         state: &AnalysisState,
     ) -> Mutation {
         let table = Self::resolve_relation_lookup_name(relation, state);
@@ -423,17 +421,15 @@ impl Resolver {
             if_not_exists,
             concurrently,
             using_method: using_method.clone(),
-            has_predicate,
+            predicate: predicate.clone(),
             unique,
+            nulls_not_distinct,
             key_columns: key_columns.to_vec(),
             key_expressions: key_expressions.to_vec(),
             key_orders: key_orders.to_vec(),
             key_opclasses: key_opclasses.to_vec(),
             key_collations: key_collations.to_vec(),
             included_columns: included_columns.to_vec(),
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
         })
     }
 

@@ -384,6 +384,9 @@ impl AnalysisState {
     }
 
     fn sequence_lookup(&self, id: &ObjectId) -> SequenceLookup {
+        if self.lookup_shadowed(id) {
+            return SequenceLookup::Unknown;
+        }
         match self.local.sequences.get(id) {
             Some(SequenceOverlay::Present(_)) => SequenceLookup::Present,
             Some(SequenceOverlay::Dropped) => SequenceLookup::Tombstone,
@@ -402,7 +405,7 @@ impl AnalysisState {
         &mut self,
         create: &CreateSequenceMutation,
     ) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {

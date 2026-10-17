@@ -8,7 +8,7 @@ use crate::_internal::analysis::facts::{
     TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
-use crate::_internal::model::index::IndexOrder;
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterTrigger, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
@@ -16,8 +16,9 @@ use squawk_syntax::ast::{
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
     DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
-    Path, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
-    Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg, TableConstraint, Truncate,
+    Path, PathRef, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke,
+    RevokeCommand, Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg,
+    TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
 
@@ -2090,17 +2091,30 @@ impl AstVisitor {
         }
     }
 
-    /// The trailing name of a dotted reference, which is all that identifies an
-    /// operator class or collation inside one index definition.
-    fn index_item_ref_name<T: AstNode>(
+    /// Strip the wrappers PostgreSQL removes before deciding an index key's
+    /// kind, so `(col)`, `col COLLATE c`, and their compositions reduce the
+    /// same way the server reduces them.
+    fn strip_index_key_wrappers(expression: Option<ast::Expr>) -> Option<ast::Expr> {
+        match expression {
+            Some(ast::Expr::ParenExpr(paren)) => Self::strip_index_key_wrappers(paren.expr()),
+            Some(ast::Expr::Collate(collate)) => Self::strip_index_key_wrappers(collate.expr()),
+            other => other,
+        }
+    }
+
+    /// A dotted reference's written name, keeping the schema qualifier: a
+    /// collation or operator class resolved through the path is a different
+    /// identity from the same trailing name in the catalog.
+    fn index_item_written_name<T: AstNode>(
         reference: Option<T>,
-        child: impl Fn(&T) -> Option<PathSegmentRef>,
-    ) -> Option<String> {
+        child: impl Fn(&T) -> Option<PathRef>,
+    ) -> Option<WrittenName> {
         let reference = reference?;
-        let segment = child(&reference)?;
-        Some(Self::resolve_identifier_token(
-            segment.ident_token()?.text(),
-        ))
+        let qualified = Self::path_ref_to_qualified_name(&child(&reference)?)?;
+        Some(WrittenName {
+            schema: qualified.schema.map(|schema| schema.resolve()),
+            name: qualified.name.resolve(),
+        })
     }
 
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
@@ -2127,7 +2141,21 @@ impl AstVisitor {
                 .unwrap_or_default()
         });
 
-        let has_predicate = node.where_clause().is_some();
+        let predicate = match node.where_clause() {
+            None => IndexPredicate::None,
+            Some(clause) => match clause.expr() {
+                Some(expr) => IndexPredicate::Parsed(
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+                ),
+                None => IndexPredicate::Opaque,
+            },
+        };
+        // `NULLS NOT DISTINCT` is the `false` case of the catalog's
+        // `indnullsnotdistinct`, which reads "distinct is false".
+        let nulls_not_distinct = matches!(
+            node.nulls_distinct_option(),
+            Some(ast::NullsDistinctOption::NullsNotDistinct(_))
+        );
         let unique = node.unique_token().is_some();
         let included_columns = node
             .index_include_clause()
@@ -2142,26 +2170,27 @@ impl AstVisitor {
         let mut key_columns = Vec::new();
         let mut key_expressions: Vec<Option<ExprIr>> = Vec::new();
         let mut key_orders: Vec<IndexOrder> = Vec::new();
-        let mut key_opclasses: Vec<Option<String>> = Vec::new();
-        let mut key_collations: Vec<Option<String>> = Vec::new();
-        let mut has_default_sort_order = true;
-        let mut has_default_opclasses = true;
-        let mut has_default_collations = true;
+        let mut key_opclasses: Vec<Option<WrittenName>> = Vec::new();
+        let mut key_collations: Vec<Option<WrittenName>> = Vec::new();
         for item in node
             .partition_item_list()
             .into_iter()
             .flat_map(|items| items.partition_items())
         {
-            if item.sort_order().is_some() || item.nulls_order().is_some() {
-                has_default_sort_order = false;
-            }
-            if item.op_class_ref().is_some() {
-                has_default_opclasses = false;
-            }
-            if item.collate().is_some() {
-                has_default_collations = false;
-            }
-            match item.expr() {
+            // `DefineIndex` strips top-level `COLLATE` (and parentheses)
+            // before deciding a key is a column or an expression, so a
+            // collated bare column is a column key carrying the collation,
+            // not an expression.
+            let collate = match item.expr() {
+                Some(ast::Expr::Collate(collate)) => Some(collate),
+                _ => item.collate(),
+            };
+            let mut expression = match item.expr() {
+                Some(ast::Expr::Collate(collate)) => collate.expr(),
+                expression => expression,
+            };
+            expression = Self::strip_index_key_wrappers(expression);
+            match expression {
                 Some(ast::Expr::NameRef(name)) => {
                     key_columns.push(Self::resolve_identifier_token(name.text()));
                     key_expressions.push(None);
@@ -2172,12 +2201,12 @@ impl AstVisitor {
                 None => key_expressions.push(None),
             }
             key_orders.push(Self::index_key_order(item.sort_order(), item.nulls_order()));
-            key_opclasses.push(Self::index_item_ref_name(item.op_class_ref(), |r| {
-                r.path_ref().and_then(|path| path.segment())
+            key_opclasses.push(Self::index_item_written_name(item.op_class_ref(), |r| {
+                r.path_ref()
             }));
-            key_collations.push(Self::index_item_ref_name(
-                item.collate().and_then(|collate| collate.collation_ref()),
-                |r| r.path_ref().and_then(|path| path.segment()),
+            key_collations.push(Self::index_item_written_name(
+                collate.and_then(|collate| collate.collation_ref()),
+                |r| r.path_ref(),
             ));
         }
 
@@ -2187,17 +2216,15 @@ impl AstVisitor {
             if_not_exists: node.if_not_exists().is_some(),
             concurrently: node.concurrently_token().is_some(),
             using_method,
-            has_predicate,
+            predicate,
             unique,
+            nulls_not_distinct,
             key_columns,
             key_expressions,
             key_orders,
             key_opclasses,
             key_collations,
             included_columns,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
         })
     }
 

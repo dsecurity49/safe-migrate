@@ -3,7 +3,7 @@ use crate::_internal::db::cache::DbCache;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
-use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
+use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 
 #[cfg(test)]
 mod tests {
@@ -258,7 +258,9 @@ mod tests {
                 included: index_keys(Vec::new()),
                 expression_keys: 0,
                 unique: false,
-                predicate: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
                 valid: true,
                 ready: true,
                 live: true,

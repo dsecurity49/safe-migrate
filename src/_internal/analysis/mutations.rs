@@ -4,7 +4,7 @@ use crate::_internal::analysis::facts::{
     TimeoutSettingValue,
 };
 use crate::_internal::ast::identifiers::ObjectId;
-use crate::_internal::model::index::IndexOrder;
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use crate::_internal::model::relation::RelationKind;
 use crate::_internal::model::types::TypeKind;
 
@@ -547,18 +547,16 @@ pub(crate) struct CreateIndex {
     pub if_not_exists: bool,
     pub concurrently: bool,
     pub using_method: Option<String>,
-    pub has_predicate: bool,
+    pub predicate: IndexPredicate,
     pub unique: bool,
+    pub nulls_not_distinct: bool,
     pub key_columns: Vec<String>,
     /// Aligned with key positions; `Some` carries the parsed expression.
     pub key_expressions: Vec<Option<ExprIr>>,
     pub key_orders: Vec<IndexOrder>,
-    pub key_opclasses: Vec<Option<String>>,
-    pub key_collations: Vec<Option<String>>,
+    pub key_opclasses: Vec<Option<WrittenName>>,
+    pub key_collations: Vec<Option<WrittenName>>,
     pub included_columns: Vec<String>,
-    pub has_default_sort_order: bool,
-    pub has_default_opclasses: bool,
-    pub has_default_collations: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

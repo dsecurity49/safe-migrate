@@ -10,6 +10,7 @@ mod tests {
     };
     use crate::_internal::ast::identifiers::{Ident, QualifiedName};
     use crate::_internal::ast::visitor::AstVisitor;
+    use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
     use squawk_syntax::ast::SourceFile;
 
     // ========================================================================
@@ -1002,10 +1003,31 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateIndex { has_predicate, .. } => {
-                assert!(has_predicate);
+            StatementFact::CreateIndex { predicate, .. } => {
+                assert!(predicate.has_predicate());
+                assert!(matches!(predicate, IndexPredicate::Parsed(_)));
             }
             _ => panic!("Expected CreateIndex fact"),
+        }
+    }
+
+    #[test]
+    fn create_index_records_nulls_not_distinct() {
+        for (sql, expected) in [
+            (
+                "CREATE UNIQUE INDEX idx ON users(email) NULLS NOT DISTINCT;",
+                true,
+            ),
+            ("CREATE UNIQUE INDEX idx ON users(email);", false),
+        ] {
+            let facts = parse_and_extract_statement(sql);
+            let Some(StatementFact::CreateIndex {
+                nulls_not_distinct, ..
+            }) = facts
+            else {
+                panic!("Expected CreateIndex fact for: {sql}");
+            };
+            assert_eq!(nulls_not_distinct, expected, "for: {sql}");
         }
     }
 
@@ -3164,7 +3186,7 @@ mod tests {
         let Some(StatementFact::CreateIndex {
             unique,
             concurrently,
-            has_predicate,
+            predicate,
             key_columns,
             key_expressions,
             ..
@@ -3174,12 +3196,74 @@ mod tests {
         };
         assert!(unique);
         assert!(!concurrently);
-        assert!(!has_predicate);
+        assert!(!predicate.has_predicate());
         // An expression key names no column, so the columns list is empty while
         // the key itself is still present and carries its parsed identity.
         assert!(key_columns.is_empty());
         assert_eq!(key_expressions.len(), 1);
         assert!(key_expressions[0].is_some());
+    }
+
+    #[test]
+    fn a_collated_column_key_stays_a_column() {
+        // PostgreSQL strips top-level COLLATE and parentheses before deciding
+        // a key is a column, so a collated bare column is a column key that
+        // carries the written collation, not an expression.
+        for sql in [
+            "CREATE INDEX ON source (name COLLATE \"C\");",
+            "CREATE INDEX ON source ((name) COLLATE \"C\");",
+        ] {
+            let Some(StatementFact::CreateIndex {
+                key_columns,
+                key_expressions,
+                key_collations,
+                ..
+            }) = parse_and_extract_statement(sql)
+            else {
+                panic!("expected create index fact for: {sql}");
+            };
+            assert_eq!(key_columns, ["name"], "for: {sql}");
+            assert_eq!(key_expressions, [None], "for: {sql}");
+            assert_eq!(
+                key_collations,
+                [Some(WrittenName {
+                    schema: None,
+                    name: "C".to_string(),
+                })],
+                "for: {sql}"
+            );
+        }
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            key_expressions,
+            key_collations,
+            ..
+        }) = parse_and_extract_statement("CREATE INDEX ON source ((name));")
+        else {
+            panic!("expected create index fact");
+        };
+        assert_eq!(key_columns, ["name"]);
+        assert_eq!(key_expressions, [None]);
+        assert_eq!(key_collations, [None]);
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            key_expressions,
+            key_collations,
+            ..
+        }) = parse_and_extract_statement("CREATE INDEX ON source (lower(name) COLLATE \"C\");")
+        else {
+            panic!("expected create index fact");
+        };
+        assert!(key_columns.is_empty());
+        assert_eq!(key_expressions.len(), 1);
+        assert!(key_expressions[0].is_some());
+        assert_eq!(
+            key_collations,
+            [Some(WrittenName {
+                schema: None,
+                name: "C".to_string(),
+            })]
+        );
     }
 
     #[test]
@@ -3192,7 +3276,7 @@ mod tests {
             Some(StatementFact::CreateIndex {
                 unique: true,
                 concurrently: false,
-                has_predicate: false,
+                predicate: IndexPredicate::None,
                 ..
             })
         ));
@@ -3207,9 +3291,10 @@ mod tests {
             key_columns,
             key_expressions,
             included_columns,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
+            key_orders,
+            key_opclasses,
+            key_collations,
+            nulls_not_distinct,
             ..
         }) = AstVisitor::extract(&statement)
         else {
@@ -3219,9 +3304,10 @@ mod tests {
         // Key positions stay aligned: one plain column, no expressions.
         assert_eq!(key_expressions, [None]);
         assert_eq!(included_columns, ["id"]);
-        assert!(has_default_sort_order);
-        assert!(has_default_opclasses);
-        assert!(has_default_collations);
+        assert_eq!(key_orders, [IndexOrder::Default]);
+        assert_eq!(key_opclasses, [None]);
+        assert_eq!(key_collations, [None]);
+        assert!(!nulls_not_distinct);
     }
 
     #[test]

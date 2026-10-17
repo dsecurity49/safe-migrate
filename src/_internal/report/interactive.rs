@@ -1,6 +1,6 @@
 use crate::_internal::analysis::state::Confidence;
-use crate::_internal::report::reporter::{terminal_block, terminal_inline};
-use crate::_internal::report::violations::ReportFinding;
+use crate::_internal::report::reporter::{human_not_evaluated, terminal_block, terminal_inline};
+use crate::_internal::report::violations::{NotEvaluated, ReportFinding};
 use crate::api::Certainty;
 use anyhow::Result;
 use crossterm::{
@@ -41,13 +41,23 @@ fn require_interactive_terminal(stdin_is_terminal: bool, stdout_is_terminal: boo
     Ok(())
 }
 
-pub(crate) fn run_interactive(findings: &[ReportFinding], confidence: &Confidence) -> Result<()> {
+pub(crate) fn run_interactive(
+    findings: &[ReportFinding],
+    confidence: &Confidence,
+    not_evaluated: &[NotEvaluated],
+) -> Result<()> {
     if findings.is_empty() {
         println!("No findings found!");
+        if !not_evaluated.is_empty() {
+            println!();
+            print!("{}", human_not_evaluated(not_evaluated));
+        }
         return Ok(());
     }
 
     require_interactive_terminal(stdin().is_terminal(), stdout().is_terminal())?;
+
+    print!("{}", human_not_evaluated(not_evaluated));
 
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -62,6 +72,11 @@ pub(crate) fn run_interactive(findings: &[ReportFinding], confidence: &Confidenc
     )?;
 
     let mut selected: usize = 0;
+    let skipped = if not_evaluated.is_empty() {
+        String::new()
+    } else {
+        format!("; {} not evaluated", not_evaluated.len())
+    };
 
     loop {
         queue!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
@@ -69,8 +84,9 @@ pub(crate) fn run_interactive(findings: &[ReportFinding], confidence: &Confidenc
             stdout,
             SetForegroundColor(Color::Cyan),
             Print(format!(
-                "Safe-Migrate Interactive Viewer ({} findings) [Confidence: {:?}]\r\n\r\n",
+                "Safe-Migrate Interactive Viewer ({} findings{}) [Confidence: {:?}]\r\n\r\n",
                 findings.len(),
+                skipped,
                 confidence
             )),
             ResetColor,

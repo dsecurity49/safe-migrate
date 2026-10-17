@@ -454,7 +454,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert_eq!(definition.key_column_names(), ["note"]);
     assert!(definition.included_column_names().is_empty());
     assert!(!definition.has_expression_keys());
-    assert!(!definition.predicate);
+    assert!(!definition.has_predicate());
     assert!(definition.unique);
     assert!(definition.is_usable());
     // A plain single-column index names no explicit opclass, collation or
@@ -465,7 +465,11 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         .iter()
         .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_partial_key"))
         .expect("synchronized partial index");
-    assert!(partial.definition.predicate);
+    // The catalog states a predicate exists but carries no parsed identity.
+    assert_eq!(
+        partial.definition.predicate,
+        safe_migrate::_internal::model::index::IndexPredicate::Opaque
+    );
     assert_eq!(partial.definition.key_column_names(), ["id"]);
     assert_eq!(partial.dependency_columns, ["id", "note"]);
     assert!(partial.dependency_columns_known);

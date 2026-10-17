@@ -7,7 +7,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{
+    CACHE_MAGIC, CatalogCoverage, CatalogFamily, DbCacheVersioned, SchemaCoverage,
+};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::schema::SchemaState;
 
@@ -23,6 +25,17 @@ fn write_fresh_cache(path: &std::path::Path) {
             .unwrap()
             .as_secs(),
     );
+}
+
+fn write_cache_file(path: &std::path::Path, cache: safe_migrate::_internal::db::cache::DbCache) {
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    let config = bincode::config::standard().with_variable_int_encoding();
+    encoder.write_all(CACHE_MAGIC).unwrap();
+    bincode::serde::encode_into_std_write(DbCacheVersioned::current(cache), &mut encoder, config)
+        .unwrap();
+    encoder.finish().unwrap();
+    fs::write(path, compressed).unwrap();
 }
 
 fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64) {
@@ -41,14 +54,26 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
             0,
         ),
     );
-    let mut compressed = Vec::new();
-    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_MAGIC).unwrap();
-    bincode::serde::encode_into_std_write(DbCacheVersioned::current(cache), &mut encoder, config)
-        .unwrap();
-    encoder.finish().unwrap();
-    fs::write(path, compressed).unwrap();
+    write_cache_file(path, cache);
+}
+
+/// A cache synced for one schema only, so rules about public objects must
+/// decline with a remedy instead of guessing from an absent baseline.
+fn write_scoped_cache(path: &std::path::Path) {
+    let schemas = vec!["app".to_string()];
+    let mut cache = crate::common::synced_cache();
+    cache.metadata.created_at_unix_secs = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    cache.metadata.schemas = Some(schemas.clone());
+    cache.coverage = CatalogCoverage::for_families(
+        SchemaCoverage::from_sync_scope(Some(&schemas)),
+        CatalogFamily::ALL,
+    );
+    write_cache_file(path, cache);
 }
 
 #[test]
@@ -1211,6 +1236,81 @@ fn test_cli_human_halt_uses_blocking_exit_status() {
         .arg("--no-cache")
         .assert()
         .code(2);
+}
+
+#[test]
+fn test_cli_human_report_renders_checks_that_did_not_run() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("scoped.cache");
+    write_scoped_cache(&cache_path);
+
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "DROP TABLE public.secret_table CASCADE;").unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--cache")
+        .arg(&cache_path)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains("Checks not evaluated:"), "{stdout}");
+    assert!(stdout.contains("cause  : "), "{stdout}");
+    assert!(stdout.contains("remedy : "), "{stdout}");
+}
+
+#[test]
+fn test_cli_human_report_without_findings_still_renders_skipped_checks() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("scoped.cache");
+    write_scoped_cache(&cache_path);
+
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "GRANT SELECT ON public.secret_table TO app_user;").unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--cache")
+        .arg(&cache_path)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains("No violations detected."), "{stdout}");
+    assert!(stdout.contains("Checks not evaluated:"), "{stdout}");
+    assert!(stdout.contains("SUMMARY"), "{stdout}");
+}
+
+#[test]
+fn test_cli_interactive_without_findings_still_reports_skipped_checks() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("scoped.cache");
+    write_scoped_cache(&cache_path);
+
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "GRANT SELECT ON public.secret_table TO app_user;").unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--cache")
+        .arg(&cache_path)
+        .arg("--interactive")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains("No findings found!"), "{stdout}");
+    assert!(stdout.contains("Checks not evaluated:"), "{stdout}");
 }
 
 #[test]

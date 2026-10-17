@@ -56,7 +56,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if self.relation_namespace_is_taken(&create.id) {
@@ -360,7 +360,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_domain(&mut self, create: &CreateDomainMutation) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if self.relation_namespace_is_taken(&create.id) {

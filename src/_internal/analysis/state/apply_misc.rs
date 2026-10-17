@@ -379,9 +379,15 @@ impl AnalysisState {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                     && edge.dependent == *index
             })
-            .map(|edge| match &edge.kind {
+            .and_then(|edge| match &edge.kind {
                 DependencyKind::IndexOnRelation { definition, .. } => {
-                    definition.has_expression_keys()
+                    // A constraint-backed placeholder records its constraint
+                    // columns but not its expression keys, so its shape cannot
+                    // establish the answer.
+                    if definition.unestablished {
+                        return None;
+                    }
+                    Some(definition.has_expression_keys())
                 }
                 _ => unreachable!("index lookup matched an IndexOnRelation edge"),
             })

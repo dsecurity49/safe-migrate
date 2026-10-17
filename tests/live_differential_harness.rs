@@ -7,7 +7,7 @@ use safe_migrate::_internal::db::cache::DbCache;
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
-use safe_migrate::_internal::model::index::IndexOrder;
+use safe_migrate::_internal::model::index::{IndexOrder, KeyCollation, KeyOpclass};
 use safe_migrate::_internal::model::relation::{Privilege, RelationKind, RelationOverlay};
 use safe_migrate::_internal::model::schema::SchemaOverlay;
 use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay};
@@ -282,6 +282,7 @@ struct NormalizedIndex {
     has_expression_keys: bool,
     has_predicate: bool,
     is_unique: bool,
+    nulls_not_distinct: Option<bool>,
     is_immediate: bool,
     is_valid: bool,
     is_ready: bool,
@@ -2309,8 +2310,9 @@ fn snapshot_live_state(
                 key_columns: index.definition.key_column_names(),
                 included_columns: index.definition.included_column_names(),
                 has_expression_keys: index.definition.has_expression_keys(),
-                has_predicate: index.definition.predicate,
+                has_predicate: index.definition.has_predicate(),
                 is_unique: index.definition.unique,
+                nulls_not_distinct: index.definition.nulls_not_distinct,
                 is_immediate: index.is_immediate,
                 is_valid: index.definition.valid,
                 is_ready: index.definition.ready,
@@ -2324,12 +2326,13 @@ fn snapshot_live_state(
                     .definition
                     .keys
                     .iter()
-                    .all(|key| key.opclass.is_none()),
-                has_default_collations: index
-                    .definition
-                    .keys
-                    .iter()
-                    .all(|key| key.collation.is_none()),
+                    .all(|key| matches!(key.opclass, KeyOpclass::Default(_))),
+                has_default_collations: index.definition.keys.iter().all(|key| {
+                    matches!(
+                        key.collation,
+                        KeyCollation::NotCollatable | KeyCollation::Derived
+                    )
+                }),
             });
         }
     }
@@ -2757,7 +2760,7 @@ fn snapshot_simulator_state(
                             generation: normalize_generated_column(
                                 relation.generated_columns.get(&column.name),
                                 &known_function_ids,
-                                state.search_path(),
+                                &state.search_path_names(),
                             ),
                             identity_generation: relation
                                 .identity_columns
@@ -2800,8 +2803,9 @@ fn snapshot_simulator_state(
                     key_columns: definition.key_column_names(),
                     included_columns: definition.included_column_names(),
                     has_expression_keys: definition.has_expression_keys(),
-                    has_predicate: definition.predicate,
+                    has_predicate: definition.has_predicate(),
                     is_unique: definition.unique,
+                    nulls_not_distinct: definition.nulls_not_distinct,
                     is_immediate: *is_immediate,
                     is_valid: definition.valid,
                     is_ready: definition.ready,
@@ -2810,11 +2814,16 @@ fn snapshot_simulator_state(
                         .keys
                         .iter()
                         .all(|key| key.order == IndexOrder::Default),
-                    has_default_opclasses: definition.keys.iter().all(|key| key.opclass.is_none()),
-                    has_default_collations: definition
+                    has_default_opclasses: definition
                         .keys
                         .iter()
-                        .all(|key| key.collation.is_none()),
+                        .all(|key| matches!(key.opclass, KeyOpclass::Default(_))),
+                    has_default_collations: definition.keys.iter().all(|key| {
+                        matches!(
+                            key.collation,
+                            KeyCollation::NotCollatable | KeyCollation::Derived
+                        )
+                    }),
                 });
             }
             DependencyKind::ForeignKey {

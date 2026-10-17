@@ -260,7 +260,7 @@ mod invariant_sequences {
 
             assert!(state.local.transactions.is_empty());
             assert!(!state.local.transaction_aborted);
-            assert_eq!(state.local.search_path, ["public"]);
+            assert_eq!(state.search_path_names(), ["public"]);
             assert!(!state.local.schemas.contains_key("phase5"));
             assert!(state.local.relations.keys().all(|id| id.schema != "phase5"));
             assert!(state.local.functions.keys().all(|id| id.schema != "phase5"));

@@ -6,7 +6,7 @@ use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterViewFamily, CreateIndex, CreateMaterializedView, CreateView, DropIndex,
     DropMaterializedViewMutation, DropViewMutation, RefreshMaterializedViewMutation,
-    ReloptionTarget, ViewColumn,
+    ReloptionTarget, ViewColumn, ViewRoutine,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
@@ -303,6 +303,9 @@ impl AnalysisState {
     }
 
     fn index_lookup(&self, id: &ObjectId) -> IndexLookup {
+        if self.lookup_shadowed(id) {
+            return IndexLookup::Unknown;
+        }
         if self.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
         }) {
@@ -317,7 +320,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_view(&mut self, create: &CreateView) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         let existing_view = matches!(
@@ -403,19 +406,7 @@ impl AnalysisState {
                 },
             ));
         }
-        for routine in &create.routines {
-            self.local.graph.add_edge(DependencyEdge::new(
-                create.id.clone(),
-                routine
-                    .signature
-                    .clone()
-                    .unwrap_or_else(|| routine.name.clone()),
-                DependencyKind::ViewUsesRoutine {
-                    routine: routine.signature.clone(),
-                    name: routine.name.clone(),
-                },
-            ));
-        }
+        self.record_view_routine_dependencies(&create.id, &create.routines);
         self.add_view_type_dependencies(&create.id, &create.cast_types);
         MutationResult::Applied
     }
@@ -424,7 +415,7 @@ impl AnalysisState {
         &mut self,
         create: &CreateMaterializedView,
     ) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
@@ -478,19 +469,7 @@ impl AnalysisState {
                 },
             ));
         }
-        for routine in &create.routines {
-            self.local.graph.add_edge(DependencyEdge::new(
-                create.id.clone(),
-                routine
-                    .signature
-                    .clone()
-                    .unwrap_or_else(|| routine.name.clone()),
-                DependencyKind::ViewUsesRoutine {
-                    routine: routine.signature.clone(),
-                    name: routine.name.clone(),
-                },
-            ));
-        }
+        self.record_view_routine_dependencies(&create.id, &create.routines);
         self.add_view_type_dependencies(&create.id, &create.cast_types);
         MutationResult::Applied
     }
@@ -552,6 +531,30 @@ impl AnalysisState {
     /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
     /// statement. `IF EXISTS` guards the relation lookup, and an action the
     /// model does not represent makes the statement opaque.
+    /// Record the routines a view calls as dependency edges.
+    ///
+    /// A call PostgreSQL could have resolved in a schema the model cannot see
+    /// leaves the recorded edge untrustworthy, so the statement's claims are
+    /// tainted along with it.
+    fn record_view_routine_dependencies(&mut self, view: &ObjectId, routines: &[ViewRoutine]) {
+        for routine in routines {
+            if routine.name.inferred_schema && self.path_shadows(&routine.name.schema) {
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+            }
+            self.local.graph.add_edge(DependencyEdge::new(
+                view.clone(),
+                routine
+                    .signature
+                    .clone()
+                    .unwrap_or_else(|| routine.name.clone()),
+                DependencyKind::ViewUsesRoutine {
+                    routine: routine.signature.clone(),
+                    name: routine.name.clone(),
+                },
+            ));
+        }
+    }
+
     /// Record a view's dependency on each type its body casts to.
     fn add_view_type_dependencies(&mut self, view: &ObjectId, cast_types: &[ObjectId]) {
         for ty in cast_types {
@@ -647,7 +650,7 @@ impl AnalysisState {
         if create.concurrently && self.in_transaction() {
             return MutationResult::Conflict(ConflictKind::ConcurrentInTransaction);
         }
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         // `IF NOT EXISTS` guards the whole name, not just an index: PostgreSQL emits
@@ -722,7 +725,9 @@ impl AnalysisState {
                         .filter(|key| key.is_some())
                         .count(),
                     unique: create.unique,
-                    predicate: create.has_predicate,
+                    nulls_not_distinct: Some(create.nulls_not_distinct),
+                    predicate: create.predicate.clone(),
+                    unestablished: false,
                     valid: true,
                     ready: true,
                     live: true,
@@ -734,7 +739,7 @@ impl AnalysisState {
                     .cloned()
                     .collect(),
                 dependency_columns_known: create.key_expressions.iter().all(Option::is_none)
-                    && !create.has_predicate,
+                    && !create.predicate.has_predicate(),
                 is_concurrent: create.concurrently,
                 is_immediate: true,
                 eligibility_known: true,

@@ -858,6 +858,7 @@ impl AnalysisOutcome {
         crate::_internal::report::interactive::run_interactive(
             &self.inner.findings,
             &self.inner.confidence,
+            &self.not_evaluated,
         )
         .map_err(|error| {
             let message = error.to_string();

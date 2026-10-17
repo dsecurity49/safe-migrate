@@ -41,6 +41,9 @@ impl AnalysisState {
         id: &ObjectId,
         expected: impl FnOnce(RoutineKind) -> bool,
     ) -> ObjectLookup {
+        if self.lookup_shadowed(id) {
+            return ObjectLookup::Unknown;
+        }
         match self.local.functions.get(id) {
             Some(FunctionOverlay::Present(routine)) if expected(routine.routine_kind) => {
                 ObjectLookup::Present
@@ -270,7 +273,7 @@ impl AnalysisState {
         &mut self,
         function: &CreateFunctionMutation,
     ) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&function.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&function.id) {
             return result;
         }
         let routine_kind = if function
@@ -689,7 +692,7 @@ impl AnalysisState {
         &mut self,
         procedure: &CreateProcedureMutation,
     ) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&procedure.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&procedure.id) {
             return result;
         }
         match self.routine_lookup(&procedure.id, |kind| kind == RoutineKind::Procedure) {
@@ -1019,7 +1022,7 @@ impl AnalysisState {
         &mut self,
         aggregate: &CreateAggregateMutation,
     ) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&aggregate.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&aggregate.id) {
             return result;
         }
         match self.routine_lookup(&aggregate.id, |kind| kind == RoutineKind::Aggregate) {

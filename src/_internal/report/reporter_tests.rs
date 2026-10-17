@@ -6,8 +6,8 @@ mod tests {
     use crate::_internal::analysis::outcome::AnalysisOutcome;
     use crate::_internal::analysis::state::Confidence;
     use crate::_internal::report::reporter::{
-        Reporter, Verdict, color_enabled, compute_verdict, terminal_block, terminal_inline,
-        tier_label_with_color,
+        Reporter, Verdict, color_enabled, compute_verdict, human_not_evaluated, terminal_block,
+        terminal_inline, tier_label_with_color,
     };
     use crate::_internal::report::violations::{
         ObjectKind, ReportFinding, SourceLocation, Violation, ViolationTier,
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict_may_not_read_safe_while_a_blocking_rule_was_not_evaluated() {
+    fn verdict_may_not_read_safer_than_cautious_while_a_blocking_rule_was_not_evaluated() {
         let violations = vec![make_violation("test-rule", ViolationTier::Tier3, "safe")];
         assert_eq!(compute_verdict(&violations), Verdict::Safe);
 
@@ -344,6 +344,24 @@ mod tests {
             "SAFE must mean every blocking check actually ran"
         );
 
+        let irreversible = vec![Violation {
+            source_range: None,
+            rule_id: "irreversible-migration",
+            object_kind: ObjectKind::Table,
+            object_name: "public.test".to_string(),
+            tier: ViolationTier::Tier3,
+            reason: "irreversible operation on empty table".to_string(),
+            recipe: "ensure backups exist before deploying",
+            dedup_key: None,
+            sql: None,
+        }];
+        assert_eq!(compute_verdict(&irreversible), Verdict::SafeWithRisk);
+        assert_eq!(
+            crate::_internal::report::reporter::compute_verdict_with(&irreversible, &blocked),
+            Verdict::Cautious,
+            "an uncheckable blocking rule must cap SAFE WITH RISK as well"
+        );
+
         let low_tier = vec![crate::_internal::report::violations::NotEvaluated {
             rule_id: "prefer-timestamptz",
             tier: ViolationTier::Tier2,
@@ -357,6 +375,41 @@ mod tests {
             Verdict::Safe,
             "a skipped non-blocking rule does not block a SAFE verdict"
         );
+    }
+
+    #[test]
+    fn human_report_renders_skipped_checks_with_their_remedy() {
+        let skipped = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "destructive-cascade",
+            tier: ViolationTier::Tier1,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
+            sql: None,
+            recipe: "Re-sync without `--schemas`.".to_string(),
+            missing_schemas: Vec::new(),
+        }];
+
+        let rendered = human_not_evaluated(&skipped);
+        assert!(rendered.contains("Checks not evaluated:"));
+        assert!(rendered.contains("destructive-cascade [Tier1]"));
+        assert!(rendered.contains("cause  : catalog_coverage_incomplete"));
+        assert!(rendered.contains("remedy : Re-sync without `--schemas`."));
+        assert_eq!(human_not_evaluated(&[]), "");
+    }
+
+    #[test]
+    fn human_skipped_checks_render_controls_inertly() {
+        let skipped = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "destructive-cascade",
+            tier: ViolationTier::Tier1,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::UnmodeledState,
+            sql: None,
+            recipe: "run \u{1b}[2J sync".to_string(),
+            missing_schemas: Vec::new(),
+        }];
+
+        let rendered = human_not_evaluated(&skipped);
+        assert!(!rendered.contains('\x1b'));
+        assert!(rendered.contains("run \\u{1b}[2J sync"));
     }
 
     #[test]

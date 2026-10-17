@@ -3,7 +3,7 @@ use crate::common::{object_id, setup_engine, synced_cache};
 use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
-use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
+use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::role::RoleState;
 use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
@@ -210,10 +210,10 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
     );
     assert_eq!(state.local.search_path_template, ["schema_old", "public"]);
     // The template stays the session's own setting, so `SET search_path TO
-    // DEFAULT` restores it unchanged. The effective path additionally carries
-    // every scoped schema, which is what `cache_search_path` would have merged
-    // in at sync time.
-    assert_eq!(state.local.search_path, ["public", "schema_new"]);
+    // DEFAULT` restores it unchanged. The effective path searches it against
+    // current schema state: the renamed-away `schema_old` is now provably
+    // absent, while `public` still exists.
+    assert_eq!(state.search_path_names(), ["public"]);
     assert!(matches!(
         state.local.publications.get("app_publication"),
         Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
@@ -242,7 +242,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             .sequences
             .contains_key(&object_id("schema_old", "t_id_seq"))
     );
-    assert_eq!(state.local.search_path, ["schema_old", "public"]);
+    assert_eq!(state.search_path_names(), ["schema_old", "public"]);
     assert_eq!(
         state.baseline_schemas.as_ref(),
         Some(&std::collections::HashSet::from([
@@ -327,7 +327,9 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
             included: index_keys(Vec::new()),
             expression_keys: 0,
             unique: false,
-            predicate: false,
+            nulls_not_distinct: Some(false),
+            predicate: IndexPredicate::None,
+            unestablished: false,
             valid: true,
             ready: true,
             live: true,

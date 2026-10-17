@@ -54,14 +54,14 @@ pub(crate) fn compute_verdict(violations: &[Violation]) -> Verdict {
     compute_verdict_with(violations, &[])
 }
 
-/// As [`compute_verdict`], but a verdict may not read SAFE while a
-/// blocking-capable rule did not run: SAFE must mean every check happened.
+/// As [`compute_verdict`], but a verdict may not read safer than `CAUTIOUS`
+/// while a blocking-capable rule did not run: SAFE must mean every check ran.
 pub(crate) fn compute_verdict_with(
     violations: &[Violation],
     not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
 ) -> Verdict {
     let verdict = verdict_from_violations(violations);
-    let blocked_by_gap = verdict == Verdict::Safe
+    let blocked_by_gap = matches!(verdict, Verdict::Safe | Verdict::SafeWithRisk)
         && not_evaluated
             .iter()
             .any(|entry| entry.tier == ViolationTier::Tier1);
@@ -417,109 +417,113 @@ impl Reporter {
 
         if violations.is_empty() {
             println!("\n  No violations detected.\n");
-            return false;
-        }
-
-        println!();
-
-        let sep_width = (width as f32 * 0.82) as usize;
-
-        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-        let mut sql_to_group_idx: std::collections::HashMap<(&str, &str), usize> =
-            std::collections::HashMap::new();
-
-        for (i, v) in violations.iter().enumerate() {
-            if let Some(sql) = &v.sql {
-                let key = (sql.as_str(), v.object_name.as_str());
-                if let Some(&gi) = sql_to_group_idx.get(&key) {
-                    groups[gi].1.push(i);
-                    continue;
-                }
-
-                let new_gi = groups.len();
-                groups.push((i, Vec::new()));
-                sql_to_group_idx.insert(key, new_gi);
-            } else {
-                groups.push((i, Vec::new()));
+            print!("{}", human_not_evaluated(not_evaluated));
+            if not_evaluated.is_empty() {
+                return false;
             }
-        }
+        } else {
+            println!();
 
-        // Resolve styling once; asking the terminal per finding would repeat the
-        // syscall for every row.
-        let color = !no_color();
+            let sep_width = (width as f32 * 0.82) as usize;
 
-        for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {
-            let v = &violations[*primary_idx];
-            let tier_str = tier_label_with_color(&v.tier, color);
+            let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+            let mut sql_to_group_idx: std::collections::HashMap<(&str, &str), usize> =
+                std::collections::HashMap::new();
 
-            let descriptor = registry::find_primary_rule(v.rule_id);
-            let rule_label = descriptor
-                .map(|descriptor| format!("{} ({})", descriptor.title, v.rule_id))
-                .unwrap_or_else(|| v.rule_id.to_string());
-            println!(" [{}] {}", tier_str, rule_label);
+            for (i, v) in violations.iter().enumerate() {
+                if let Some(sql) = &v.sql {
+                    let key = (sql.as_str(), v.object_name.as_str());
+                    if let Some(&gi) = sql_to_group_idx.get(&key) {
+                        groups[gi].1.push(i);
+                        continue;
+                    }
 
-            let display_name = match &v.object_kind {
-                crate::_internal::report::violations::ObjectKind::Database
-                | crate::_internal::report::violations::ObjectKind::Role
-                | crate::_internal::report::violations::ObjectKind::Publication => {
-                    let step1 = if let Some(idx) = v.object_name.find('.') {
-                        &v.object_name[idx + 1..]
-                    } else {
-                        &v.object_name
-                    };
-                    step1
-                        .strip_suffix(" (inferred)")
-                        .unwrap_or(step1)
-                        .to_string()
-                }
-                _ => v.object_name.clone(),
-            };
-
-            if v.object_kind == crate::_internal::report::violations::ObjectKind::Unknown {
-                println!("   object : {}", terminal_inline(&display_name));
-            } else {
-                println!(
-                    "   object : {} {}",
-                    v.object_kind,
-                    terminal_inline(&display_name)
-                );
-            }
-
-            println!("   reason : {}", terminal_inline(&v.reason));
-
-            let clean_recipe = v
-                .recipe
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("   recipe : {}", terminal_inline(&clean_recipe));
-
-            if let Some(sql) = &v.sql {
-                let sql_trimmed = sql.trim();
-                if !sql_trimmed.is_empty() {
-                    println!("   sql    : {}", terminal_block(sql_trimmed));
+                    let new_gi = groups.len();
+                    groups.push((i, Vec::new()));
+                    sql_to_group_idx.insert(key, new_gi);
+                } else {
+                    groups.push((i, Vec::new()));
                 }
             }
 
-            for &sec_idx in secondary_idxs {
-                let sv = &violations[sec_idx];
-                println!(
-                    "   also   : [{}] {}",
-                    tier_label_with_color(&sv.tier, color),
-                    sv.rule_id
-                );
+            // Resolve styling once; asking the terminal per finding would repeat the
+            // syscall for every row.
+            let color = !no_color();
+
+            for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {
+                let v = &violations[*primary_idx];
+                let tier_str = tier_label_with_color(&v.tier, color);
+
+                let descriptor = registry::find_primary_rule(v.rule_id);
+                let rule_label = descriptor
+                    .map(|descriptor| format!("{} ({})", descriptor.title, v.rule_id))
+                    .unwrap_or_else(|| v.rule_id.to_string());
+                println!(" [{}] {}", tier_str, rule_label);
+
+                let display_name = match &v.object_kind {
+                    crate::_internal::report::violations::ObjectKind::Database
+                    | crate::_internal::report::violations::ObjectKind::Role
+                    | crate::_internal::report::violations::ObjectKind::Publication => {
+                        let step1 = if let Some(idx) = v.object_name.find('.') {
+                            &v.object_name[idx + 1..]
+                        } else {
+                            &v.object_name
+                        };
+                        step1
+                            .strip_suffix(" (inferred)")
+                            .unwrap_or(step1)
+                            .to_string()
+                    }
+                    _ => v.object_name.clone(),
+                };
+
+                if v.object_kind == crate::_internal::report::violations::ObjectKind::Unknown {
+                    println!("   object : {}", terminal_inline(&display_name));
+                } else {
+                    println!(
+                        "   object : {} {}",
+                        v.object_kind,
+                        terminal_inline(&display_name)
+                    );
+                }
+
+                println!("   reason : {}", terminal_inline(&v.reason));
+
+                let clean_recipe = v
+                    .recipe
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("   recipe : {}", terminal_inline(&clean_recipe));
+
+                if let Some(sql) = &v.sql {
+                    let sql_trimmed = sql.trim();
+                    if !sql_trimmed.is_empty() {
+                        println!("   sql    : {}", terminal_block(sql_trimmed));
+                    }
+                }
+
+                for &sec_idx in secondary_idxs {
+                    let sv = &violations[sec_idx];
+                    println!(
+                        "   also   : [{}] {}",
+                        tier_label_with_color(&sv.tier, color),
+                        sv.rule_id
+                    );
+                }
+
+                if gi < groups.len() - 1 {
+                    println!();
+                    println!(" {}", "─".repeat(sep_width));
+                    println!();
+                }
             }
 
-            if gi < groups.len() - 1 {
-                println!();
-                println!(" {}", "─".repeat(sep_width));
-                println!();
-            }
+            println!();
+            print!("{}", human_not_evaluated(not_evaluated));
         }
-
-        println!();
 
         let mut summary_table = Table::new();
         summary_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
@@ -592,6 +596,27 @@ fn append_markdown_not_evaluated(
             markdown_escape(&entry.recipe)
         ));
     }
+}
+
+/// Human rendering of skipped checks, shared by the report and interactive viewer.
+pub(crate) fn human_not_evaluated(
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) -> String {
+    if not_evaluated.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from(" Checks not evaluated:\n");
+    for entry in not_evaluated {
+        output.push_str(&format!(
+            "   - {} [{:?}]\n     cause  : {}\n     remedy : {}\n",
+            terminal_inline(entry.rule_id),
+            entry.tier,
+            terminal_inline(entry.cause.as_str()),
+            terminal_inline(&entry.recipe),
+        ));
+    }
+    output.push('\n');
+    output
 }
 
 fn append_markdown_evidence(output: &mut String, evidence: &[EvidenceRecord]) {
