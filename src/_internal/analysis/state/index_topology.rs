@@ -19,6 +19,7 @@ use crate::_internal::model::index::{
     statement_index_keys,
 };
 use crate::_internal::model::types::{TypeKind, TypeOverlay};
+use std::collections::HashSet;
 
 /// The outcome of comparing two index shapes.
 #[derive(PartialEq, Eq)]
@@ -34,12 +35,27 @@ pub(crate) enum AttachRefusal {
     NotAPartition,
     /// The child is already attached to some other parent index.
     AttachedElsewhere,
+    /// The partition's table already carries an index attached to this parent.
+    DuplicateAttachment,
     /// The two definitions do not match.
     DefinitionsDiffer,
     /// An opaque expression leaves equivalence undecidable, not unequal.
     EquivalenceUnknown,
-    /// The two indexes are not backed by the same kind of constraint.
-    ConstraintMismatch,
+    /// The parent index backs a constraint but the child backs none.
+    MissingConstraint,
+    /// The parent index backs a primary key and a covered column is nullable.
+    PrimaryKeyNotNull { column: String },
+}
+
+/// The reuse rules a partition-child lookup follows.
+///
+/// Creating an index only requires a constraint to exist on the child when the
+/// parent backs one (`DefineIndex`); attaching a partition table requires the
+/// kinds to match as well (`AttachPartitionEnsureIndexes`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChildReuseRule {
+    Creation,
+    TableAttach,
 }
 
 /// Build the definition's keys, resolving written operator classes and
@@ -307,14 +323,34 @@ impl AnalysisState {
         parent: &ObjectId,
         child: &ObjectId,
     ) -> Option<AttachRefusal> {
-        if let Some(current) = self.index_parent_of(child) {
-            let same =
-                self.local.graph.resolve_rename(current) == self.local.graph.resolve_rename(parent);
-            // Re-attaching to the same parent is a no-op, not an error.
-            if !same {
-                return Some(AttachRefusal::AttachedElsewhere);
-            }
+        let resolved_parent = self.local.graph.resolve_rename(parent);
+        let attached_here = self
+            .index_parent_of(child)
+            .is_some_and(|current| self.local.graph.resolve_rename(current) == resolved_parent);
+        // Re-attaching to the same parent is not an error; it re-triggers the
+        // parent's validation.
+        if attached_here {
             return None;
+        }
+        // `refuseDupeIndexAttach`: the partition's table already carries some
+        // index attached to this parent, whichever index that is.
+        if let Some(child_table) = self.index_table_of(child) {
+            let child_table = self.local.graph.resolve_rename(child_table);
+            let duplicate = self.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && self.local.graph.resolve_rename(&edge.referenced) == resolved_parent
+                    && self.local.graph.resolve_rename(&edge.dependent)
+                        != self.local.graph.resolve_rename(child)
+                    && self
+                        .index_table_of(&edge.dependent)
+                        .is_some_and(|owner| self.local.graph.resolve_rename(owner) == child_table)
+            });
+            if duplicate {
+                return Some(AttachRefusal::DuplicateAttachment);
+            }
+        }
+        if self.index_parent_of(child).is_some() {
+            return Some(AttachRefusal::AttachedElsewhere);
         }
         let (Some(parent_table), Some(child_table)) =
             (self.index_table_of(parent), self.index_table_of(child))
@@ -338,29 +374,69 @@ impl AnalysisState {
             IndexComparison::Undecidable => return Some(AttachRefusal::EquivalenceUnknown),
             IndexComparison::Match => {}
         }
-        let backing = (
-            self.constraint_backing(parent),
-            self.constraint_backing(child),
-        );
-        if backing.0 != backing.1 {
-            return Some(AttachRefusal::ConstraintMismatch);
+        let parent_backing = self.constraint_backing(parent);
+        let child_backing = self.constraint_backing(child);
+        // `CompareIndexInfo` compares exclusion-op presence and content, which
+        // the model records nowhere; an exclusion index on either side leaves
+        // that comparison unsettled.
+        match (
+            parent_backing == Some(ConstraintKind::Exclusion),
+            child_backing == Some(ConstraintKind::Exclusion),
+        ) {
+            (true, true) => return Some(AttachRefusal::EquivalenceUnknown),
+            (true, false) | (false, true) => return Some(AttachRefusal::DefinitionsDiffer),
+            (false, false) => {}
         }
-        // Exclusion constraints are the one thing `CompareIndexInfo` reads that
-        // the definition does not model — each key's operator, procedure and
-        // strategy. For two exclusion-backed indexes neither equality nor
-        // difference can be claimed.
-        if backing.0 == Some(ConstraintKind::Exclusion) {
-            return Some(AttachRefusal::EquivalenceUnknown);
+        // A parent that backs a constraint requires the child to back one too;
+        // this path does not compare their kinds.
+        if parent_backing.is_some() && child_backing.is_none() {
+            return Some(AttachRefusal::MissingConstraint);
+        }
+        if parent_backing == Some(ConstraintKind::PrimaryKey)
+            && let Some(refusal) = self.partition_key_nullability(child)
+        {
+            return Some(refusal);
         }
         None
     }
 
-    /// The kind of constraint backing an index, if any.
+    /// `verifyPartitionIndexNotNull`: every column a primary-key partition
+    /// index covers must be NOT NULL on the partition's table.
+    fn partition_key_nullability(&self, child: &ObjectId) -> Option<AttachRefusal> {
+        let (Some(table), Some(definition)) =
+            (self.index_table_of(child), self.index_definition_of(child))
+        else {
+            return Some(AttachRefusal::EquivalenceUnknown);
+        };
+        let Some(super::RelationOverlay::Present(relation)) = self.local.relations.get(table)
+        else {
+            return Some(AttachRefusal::EquivalenceUnknown);
+        };
+        definition
+            .key_column_names()
+            .into_iter()
+            .find_map(|column_name| {
+                match relation
+                    .columns
+                    .iter()
+                    .find(|column| column.name == column_name)
+                {
+                    Some(column) if column.is_nullable => Some(AttachRefusal::PrimaryKeyNotNull {
+                        column: column_name,
+                    }),
+                    Some(_) => None,
+                    // A covered column the model cannot see settles nothing.
+                    None => Some(AttachRefusal::EquivalenceUnknown),
+                }
+            })
+    }
+
+    /// The kind of constraint an index backs, if any.
     ///
-    /// PostgreSQL attaches a constraint alongside the indexes when both sides
-    /// have one of the same kind. Cloned partition constraints are renamed, so
-    /// the name cannot decide it.
-    fn constraint_backing(&self, index: &ObjectId) -> Option<ConstraintKind> {
+    /// The direct attachment path only asks whether a constraint exists; the
+    /// kind matters when reusing an index while a partition table is attached,
+    /// and when a primary key imposes NOT NULL on the partition.
+    pub(super) fn constraint_backing(&self, index: &ObjectId) -> Option<ConstraintKind> {
         self.local
             .constraints
             .values()
@@ -376,8 +452,12 @@ impl AnalysisState {
             .map(|constraint| constraint.kind)
     }
 
-    /// A partitioned parent carries no rows: it is valid exactly when its
-    /// partitions are covered. A leaf index has none to cover.
+    /// Whether every partition carries an attached child index that is itself
+    /// valid.
+    ///
+    /// PostgreSQL's `validatePartitionedIndex` counts attached children whose
+    /// `indisvalid` is set against the parent table's partition count; a child
+    /// that is attached but invalid does not cover its partition.
     pub(super) fn index_is_fully_attached(&self, index: &ObjectId) -> bool {
         let Some(table) = self.index_table_of(index) else {
             return false;
@@ -392,15 +472,19 @@ impl AnalysisState {
                 self.index_table_of(child).is_some_and(|owner| {
                     self.local.graph.resolve_rename(owner)
                         == self.local.graph.resolve_rename(partition)
-                })
+                }) && self
+                    .index_definition_of(child)
+                    .is_some_and(|definition| definition.valid)
             })
         })
     }
 
     /// Record `child` as a partition of `parent`.
     ///
-    /// Attaching the last partition is what makes a parent valid, which is why
-    /// re-attaching an already-attached child is not merely a no-op.
+    /// Whether this revalidates the parent is the caller's decision:
+    /// `ALTER INDEX ... ATTACH PARTITION` does, while creating a parent index
+    /// or attaching a partition table does not, matching PostgreSQL, which
+    /// only calls `validatePartitionedIndex` from the attach path.
     pub(super) fn record_index_partition(&mut self, parent: &ObjectId, child: &ObjectId) {
         self.snapshot_graph();
         self.local.graph.add_edge(DependencyEdge::new(
@@ -408,20 +492,150 @@ impl AnalysisState {
             parent.clone(),
             DependencyKind::IndexPartitionOf,
         ));
-        self.mark_index_valid(parent);
     }
 
-    /// Record that an index has finished being built and is usable.
+    /// PostgreSQL's `validatePartitionedIndex`: an invalid parent becomes valid
+    /// once every partition carries an attached valid child; a parent that is
+    /// itself attached then revalidates its own parent in turn.
+    pub(super) fn validate_partitioned_index(&mut self, index: &ObjectId) {
+        let Some(definition) = self.index_definition_of(index) else {
+            return;
+        };
+        if definition.valid {
+            return;
+        }
+        if !self.index_is_fully_attached(index) {
+            return;
+        }
+        self.snapshot_graph_full();
+        self.local.graph.update_index_definition(index, |stored| {
+            stored.valid = true;
+            stored.ready = true;
+            stored.live = true;
+        });
+        if let Some(parent) = self.index_parent_of(index).cloned() {
+            self.validate_partitioned_index(&parent);
+        }
+    }
+
+    /// PostgreSQL's partition-index recursion: ensure `table` carries a child
+    /// index for the partitioned `parent`, reusing an unattached equivalent
+    /// index when one qualifies and otherwise creating a clone, recursively
+    /// when the table is itself partitioned. Returns the chosen child and
+    /// whether it is valid.
+    pub(super) fn ensure_partition_index_child(
+        &mut self,
+        parent: &ObjectId,
+        table: &ObjectId,
+        template: &DependencyKind,
+        rule: ChildReuseRule,
+    ) -> (ObjectId, bool) {
+        let DependencyKind::IndexOnRelation {
+            definition: template_definition,
+            ..
+        } = template
+        else {
+            unreachable!("partition index templates are index edges")
+        };
+        let resolved_table = self.local.graph.resolve_rename(table).clone();
+        let parent_backing = self.constraint_backing(parent);
+        let reused = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                    && self.index_parent_of(&edge.dependent).is_none()
+                    && self.index_table_of(&edge.dependent).is_some_and(|owner| {
+                        self.local.graph.resolve_rename(owner) == &resolved_table
+                    })
+            })
+            .find(|edge| {
+                let DependencyKind::IndexOnRelation { definition, .. } = &edge.kind else {
+                    return false;
+                };
+                // A synthetic constraint marker settles nothing, so it never
+                // reuses or is reused through the shape comparison.
+                if template_definition.attach_equivalence(definition) != IndexEquivalence::Identical
+                {
+                    return false;
+                }
+                match (parent_backing, self.constraint_backing(&edge.dependent)) {
+                    (Some(_), None) => false,
+                    (Some(parent_kind), Some(child_kind)) => {
+                        rule == ChildReuseRule::Creation || parent_kind == child_kind
+                    }
+                    (None, _) => true,
+                }
+            })
+            .map(|edge| edge.dependent.clone());
+        if let Some(existing) = reused {
+            self.record_index_partition(parent, &existing);
+            return (
+                existing.clone(),
+                self.index_definition_of(&existing)
+                    .is_some_and(|definition| definition.valid),
+            );
+        }
+        let columns = template_definition.key_column_names();
+        let id = self.next_generated_relation_name_avoiding(
+            &table.schema,
+            &table.name,
+            (!columns.is_empty()).then(|| columns.join("_")).as_deref(),
+            "idx",
+            &HashSet::new(),
+        );
+        let mut kind = template.clone();
+        if let DependencyKind::IndexOnRelation { definition, .. } = &mut kind {
+            // The clone is freshly built; its own partitions decide whether it
+            // stays valid.
+            definition.valid = true;
+            definition.ready = true;
+            definition.live = true;
+        }
+        self.snapshot_graph();
+        self.local
+            .graph
+            .add_edge(DependencyEdge::new(id.clone(), table.clone(), kind));
+        self.record_index_partition(parent, &id);
+        let mut valid = true;
+        let partitions: Vec<ObjectId> = self
+            .local
+            .graph
+            .partitions_of(table)
+            .into_iter()
+            .cloned()
+            .collect();
+        for partition in partitions {
+            let (_, child_valid) =
+                self.ensure_partition_index_child(&id, &partition, template, rule);
+            valid &= child_valid;
+        }
+        if !valid {
+            self.snapshot_graph_full();
+            self.local
+                .graph
+                .update_index_definition(&id, |stored| stored.valid = false);
+        }
+        (id, valid)
+    }
+
+    /// Record that a leaf index has finished being built and is usable.
     ///
-    /// REINDEX rebuilds a broken index; a partitioned parent reaches the same
-    /// state once every partition is attached.
+    /// REINDEX rebuilds a broken index; a partitioned parent's validity
+    /// instead follows its attached children, so only attach events set it.
     pub(super) fn mark_index_valid(&mut self, index: &ObjectId) {
         let Some(definition) = self.index_definition_of(index).cloned() else {
             return;
         };
-        // A leaf index is rebuilt by REINDEX; a partitioned parent only once
-        // every partition is attached.
-        if definition.is_usable() || !self.index_is_fully_attached(index) {
+        if definition.is_usable() {
+            return;
+        }
+        if self
+            .index_table_of(index)
+            .is_some_and(|table| !self.local.graph.partitions_of(table).is_empty())
+        {
             return;
         }
         self.snapshot_graph_full();

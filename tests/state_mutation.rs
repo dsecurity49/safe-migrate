@@ -4262,6 +4262,184 @@ mod state_mutation_tests {
             range.contains("out of range"),
             "a bound outside the data type must be rejected: {range}"
         );
+        let invalid_type = reason(&format!("{setup} ALTER SEQUENCE s AS numeric;"));
+        assert!(
+            invalid_type.contains("sequence type must be smallint, integer, or bigint"),
+            "an unusable sequence data type must be rejected: {invalid_type}"
+        );
+        // RESTART is cross-checked against the final bounds in either clause
+        // order, and alone it derives the value from START.
+        let restart = reason(&format!(
+            "{setup} ALTER SEQUENCE s RESTART WITH 100 MAXVALUE 50;"
+        ));
+        assert!(
+            restart.contains("RESTART value (100) cannot be greater than MAXVALUE (50)"),
+            "RESTART is cross-checked after the bounds merge: {restart}"
+        );
+        assert_eq!(
+            reason(&format!(
+                "{setup} ALTER SEQUENCE s MAXVALUE 50 RESTART WITH 40;"
+            )),
+            "",
+            "a RESTART inside the merged bounds must be accepted"
+        );
+        // The create path reports the same precise reasons.
+        assert!(
+            reason("CREATE SEQUENCE s CACHE 0;").contains("CACHE (0) must be greater than zero"),
+            "a create-time cache must be validated with its value"
+        );
+        assert!(
+            reason("CREATE SEQUENCE s START WITH -1;")
+                .contains("START value (-1) cannot be less than MINVALUE (1)"),
+            "an omitted bound must be derived before START is checked"
+        );
+        assert!(
+            reason("CREATE SEQUENCE s AS numeric;")
+                .contains("sequence type must be smallint, integer, or bigint"),
+            "a create-time data type must be validated by name"
+        );
+        assert!(
+            reason("CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (CACHE 0));")
+                .contains("CACHE (0) must be greater than zero"),
+            "identity sequence options must report the same reason"
+        );
+    }
+
+    #[test]
+    fn sequence_parameter_merge_mirrors_postgresql_init_params() {
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let parameters = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("sequence statements should analyze");
+            let Some(SequenceOverlay::Present(sequence)) =
+                state.local.sequences.get(&object_id("public", "s"))
+            else {
+                panic!("sequence 's' should remain present");
+            };
+            sequence.parameters.clone()
+        };
+
+        // A bare type change re-derives a bound that sat at the old type's
+        // limit; an explicitly chosen bound is left alone.
+        let narrowed = parameters("CREATE SEQUENCE s; ALTER SEQUENCE s AS smallint;");
+        assert_eq!(narrowed.data_type, "smallint");
+        assert_eq!(narrowed.max_value, i16::MAX as i64);
+        assert_eq!(narrowed.min_value, 1);
+        assert_eq!(narrowed.start_value, 1);
+
+        let explicit = parameters("CREATE SEQUENCE s MAXVALUE 100; ALTER SEQUENCE s AS smallint;");
+        assert_eq!(explicit.data_type, "smallint");
+        assert_eq!(explicit.max_value, 100);
+
+        let overridden =
+            parameters("CREATE SEQUENCE s; ALTER SEQUENCE s AS smallint MAXVALUE 100;");
+        assert_eq!(overridden.max_value, 100);
+
+        // The reset is per bound: only the bound at the old type's limit moves.
+        let per_bound = parameters(
+            "CREATE SEQUENCE s MINVALUE -9223372036854775808 START WITH -32768;
+             ALTER SEQUENCE s AS smallint;",
+        );
+        assert_eq!(per_bound.min_value, i16::MIN as i64);
+        assert_eq!(per_bound.max_value, i16::MAX as i64);
+
+        // NO MINVALUE / NO MAXVALUE derive from the final increment, so the
+        // clause order cannot change the outcome.
+        let bounds_early = parameters(
+            "CREATE SEQUENCE s MINVALUE -10 START WITH -1;
+             ALTER SEQUENCE s NO MAXVALUE NO MINVALUE INCREMENT BY -1;",
+        );
+        let bounds_late = parameters(
+            "CREATE SEQUENCE s MINVALUE -10 START WITH -1;
+             ALTER SEQUENCE s INCREMENT BY -1 NO MINVALUE NO MAXVALUE;",
+        );
+        assert_eq!(bounds_early, bounds_late);
+        assert_eq!(bounds_late.increment, -1);
+        assert_eq!(bounds_late.max_value, -1);
+        assert_eq!(bounds_late.min_value, i64::MIN);
+
+        // The create path derives the start from the final bounds and the
+        // increment from the data type.
+        let created = parameters("CREATE SEQUENCE s MINVALUE 10;");
+        assert_eq!(created.start_value, 10);
+        assert_eq!(created.min_value, 10);
+        let descending = parameters("CREATE SEQUENCE s AS smallint INCREMENT BY -1;");
+        assert_eq!(descending.min_value, i16::MIN as i64);
+        assert_eq!(descending.max_value, -1);
+        assert_eq!(descending.start_value, -1);
+    }
+
+    #[test]
+    fn identity_sequence_parameters_mirror_postgresql() {
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("identity statements should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+        let parameters = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("identity statements should analyze");
+            let Some(SequenceOverlay::Present(identity)) =
+                state.local.sequences.get(&object_id("public", "t_id_seq"))
+            else {
+                panic!("identity sequence 't_id_seq' should be present");
+            };
+            identity.parameters.clone()
+        };
+
+        // The column type drives the bounds; the column type is the synthetic
+        // `AS`, so only these three integer types can back an identity column.
+        let ascending = parameters(
+            "CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (INCREMENT 2 START 5));",
+        );
+        assert_eq!(ascending.data_type, "smallint");
+        assert_eq!(ascending.increment, 2);
+        assert_eq!(ascending.start_value, 5);
+        assert_eq!(ascending.min_value, 1);
+        assert_eq!(ascending.max_value, i16::MAX as i64);
+
+        let bounded = parameters(
+            "CREATE TABLE t (id integer GENERATED BY DEFAULT AS IDENTITY (MINVALUE 3 MAXVALUE 900 START 10));",
+        );
+        assert_eq!(bounded.data_type, "integer");
+        assert_eq!(bounded.min_value, 3);
+        assert_eq!(bounded.max_value, 900);
+        assert_eq!(bounded.start_value, 10);
+
+        let descending =
+            parameters("CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (INCREMENT -1));");
+        assert_eq!(descending.increment, -1);
+        assert_eq!(descending.min_value, i16::MIN as i64);
+        assert_eq!(descending.max_value, -1);
+        assert_eq!(descending.start_value, -1);
+
+        let duplicate_as =
+            reason("CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY (AS smallint));");
+        assert!(
+            duplicate_as.contains("conflicting or redundant options")
+                && duplicate_as.contains("\"as\""),
+            "a written AS duplicates the column type: {duplicate_as}"
+        );
+        let bad_type = reason("CREATE TABLE t (id numeric GENERATED ALWAYS AS IDENTITY);");
+        assert!(
+            bad_type.contains("identity column type must be smallint, integer, or bigint"),
+            "only integer types can back an identity column: {bad_type}"
+        );
     }
 
     #[test]
@@ -5285,7 +5463,7 @@ mod state_mutation_tests {
                  DROP TYPE ct CASCADE;"
             ),
             0,
-            "CASCADE must clear the dependent view"
+            "CASCADE applies the drop; the view fallout is reported as unmodeled"
         );
         assert_eq!(
             conflicts(
@@ -5373,6 +5551,456 @@ mod state_mutation_tests {
                 .iter()
                 .any(|reason| reason.contains("is required by view")),
             "an unresolved reference must not report a conflict: {undecided:?}"
+        );
+    }
+
+    #[test]
+    fn a_view_reference_follows_a_rename_of_its_target() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        let blocked = |sql: &str| {
+            conflicts(sql)
+                .iter()
+                .any(|reason| reason.contains("is required by view"))
+        };
+
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 ALTER FUNCTION f(integer) RENAME TO g;
+                 DROP FUNCTION g(integer);"
+            ),
+            "a resolved call must follow the renamed routine"
+        );
+        assert!(
+            blocked(
+                "CREATE SCHEMA other;
+                 CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 ALTER FUNCTION f(integer) SET SCHEMA other;
+                 DROP FUNCTION other.f(integer);"
+            ),
+            "a resolved call must follow the moved routine"
+        );
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a + 1) AS fa FROM t;
+                 ALTER FUNCTION f(integer) RENAME TO g;
+                 DROP FUNCTION g(integer);"
+            ),
+            "a name-only reference must follow a fully moved name"
+        );
+        assert!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT a FROM t WHERE a::ct IS NOT NULL;
+                 ALTER TYPE ct RENAME TO renamed_ct;
+                 DROP TYPE renamed_ct;"
+            )
+            .iter()
+            .any(|reason| reason.contains("dependent objects")),
+            "a view cast must follow the renamed type"
+        );
+    }
+
+    #[test]
+    fn cascading_a_function_drop_covers_only_the_moved_name() {
+        let engine = setup_engine();
+        let state_after = |functions: &[&str], sql: &str| {
+            let mut cache = synced_cache();
+            cache.metadata.source_search_path = Some(vec!["public".to_string()]);
+            for ty in functions {
+                let id = object_id("public", &format!("f({ty})"));
+                cache.functions.insert(
+                    id.clone(),
+                    FunctionState {
+                        return_type: ty.to_string(),
+                        ..FunctionState::with_inputs(
+                            id.clone(),
+                            RoutineKind::Function,
+                            vec![ty.to_string()],
+                        )
+                    },
+                );
+            }
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+            engine.analyze(sql, &mut state).unwrap();
+            state
+        };
+        let view = object_id("public", "v");
+        let prefix = "CREATE TABLE t (a int);
+                      CREATE VIEW v AS SELECT a FROM t WHERE f(a + 1) > 0;";
+
+        // One overload survives, so the name-only reference may call it: the
+        // view is kept and the chain stops being exact.
+        let state = state_after(
+            &["integer", "text"],
+            &format!("{prefix} DROP FUNCTION f(integer) CASCADE;"),
+        );
+        assert!(
+            state.relation_is_present(&view),
+            "the view may call the surviving overload"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+
+        // The statement covers every overload, so the view is definitely gone.
+        let state = state_after(
+            &["integer", "text"],
+            &format!("{prefix} DROP FUNCTION f(integer), f(text) CASCADE;"),
+        );
+        assert!(!state.relation_is_present(&view));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+
+        // A lone overload resolves, so the view is dropped as before.
+        let state = state_after(
+            &["integer"],
+            &format!("{prefix} DROP FUNCTION f(integer) CASCADE;"),
+        );
+        assert!(!state.relation_is_present(&view));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn cascading_a_type_drop_applies_and_taints_for_the_fallout() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let ct = object_id("public", "ct");
+        engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1::ct AS r;
+                 DROP TYPE ct CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            matches!(state.local.types.get(&ct), Some(TypeOverlay::Dropped)),
+            "the cascade must not refuse to mark the type dropped"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        let violations = engine
+            .analyze("CREATE TYPE ct AS (z int);", &mut state)
+            .unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0,
+            "the name must be free again: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn cascading_a_domain_drop_applies_and_taints_for_the_fallout() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let domain = object_id("public", "d");
+        let violations = engine
+            .analyze(
+                "CREATE DOMAIN d AS int;
+                 CREATE TABLE t (a d);
+                 DROP DOMAIN d CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&domain),
+            Some(TypeOverlay::Dropped)
+        ));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cascading_a_procedure_drop_applies_like_a_plain_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
+                 DROP PROCEDURE p() CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "p()")),
+            Some(FunctionOverlay::Dropped)
+        ));
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn dropping_an_aggregate_a_view_calls_requires_cascade() {
+        let engine = setup_engine();
+        let setup = "CREATE TABLE t (a int);
+                     CREATE FUNCTION af(int, int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+                     CREATE AGGREGATE ag(int) (SFUNC = af, STYPE = int);
+                     CREATE VIEW v AS SELECT ag(a) AS x FROM t;";
+
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(&format!("{setup} DROP AGGREGATE ag(int);"), &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"
+                    && violation.reason.contains("required by view")),
+            "a view call must block dropping the aggregate: {violations:?}"
+        );
+
+        let mut state = setup_state();
+        engine
+            .analyze(
+                &format!("{setup} DROP AGGREGATE ag(int) CASCADE;"),
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.relation_is_present(&object_id("public", "v")));
+        assert!(matches!(
+            state
+                .local
+                .functions
+                .get(&object_id("public", "ag(integer)")),
+            Some(FunctionOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn cascading_a_function_drop_removes_transitive_view_dependents() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+                 CREATE VIEW v AS SELECT f() AS x;
+                 CREATE VIEW w AS SELECT * FROM v;
+                 CREATE MATERIALIZED VIEW m AS SELECT * FROM v;
+                 DROP FUNCTION f() CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.relation_is_present(&object_id("public", "v")));
+        assert!(!state.relation_is_present(&object_id("public", "w")));
+        assert!(!state.relation_is_present(&object_id("public", "m")));
+    }
+
+    #[test]
+    fn view_column_lists_rename_the_projection_prefix() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v (x) AS SELECT a, b FROM t;
+                 CREATE MATERIALIZED VIEW m (y) AS SELECT a, b FROM t;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .relation_column_types(&object_id("public", "v"))
+                .unwrap(),
+            vec![
+                ("x".to_string(), Some("integer".to_string())),
+                ("b".to_string(), Some("integer".to_string())),
+            ]
+        );
+        assert_eq!(
+            state
+                .relation_column_types(&object_id("public", "m"))
+                .unwrap(),
+            vec![
+                ("y".to_string(), Some("integer".to_string())),
+                ("b".to_string(), Some("integer".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_column_list_longer_than_the_projection_is_a_conflict() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v (x, y, z) AS SELECT a, b FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("CREATE VIEW specifies more column names than columns")),
+            "a view column list may not exceed the projection"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE MATERIALIZED VIEW m (x, y, z) AS SELECT a, b FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("too many column names were specified")),
+            "a materialized view column list may not exceed the projection"
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_requires_a_usable_unique_index() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let missing = conflicts(
+            "CREATE TABLE t (id int);
+             CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY m;",
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|reason| reason.contains("cannot refresh materialized view 'public.m")),
+            "a concurrent refresh without a unique index must conflict: {missing:?}"
+        );
+
+        let usable = conflicts(
+            "CREATE TABLE t (id int);
+             CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+             CREATE UNIQUE INDEX m_id_idx ON m (id);
+             REFRESH MATERIALIZED VIEW CONCURRENTLY m;",
+        );
+        assert!(
+            usable.is_empty(),
+            "a usable unique index must allow the concurrent refresh: {usable:?}"
+        );
+
+        for keys in ["(id) WHERE id > 0", "((id + 1))"] {
+            let partial = conflicts(&format!(
+                "CREATE TABLE t (id int);
+                 CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+                 CREATE UNIQUE INDEX m_id_idx ON m {keys};
+                 REFRESH MATERIALIZED VIEW CONCURRENTLY m;"
+            ));
+            assert!(
+                partial
+                    .iter()
+                    .any(|reason| reason.contains("cannot refresh materialized view 'public.m")),
+                "a partial or expression index is not usable: {partial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_view_creation_validates_its_options() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let bad_value =
+            conflicts("CREATE MATERIALIZED VIEW m WITH (fillfactor = 5) AS SELECT 1 AS id;");
+        assert!(
+            bad_value
+                .iter()
+                .any(|reason| reason.contains("invalid value for parameter \"fillfactor\"")),
+            "a value outside the option's domain must conflict: {bad_value:?}"
+        );
+
+        let view_only = conflicts(
+            "CREATE MATERIALIZED VIEW m WITH (check_option = 'cascaded') AS SELECT 1 AS id;",
+        );
+        assert!(
+            view_only
+                .iter()
+                .any(|reason| reason.contains("unrecognized parameter \"check_option\"")),
+            "a view-only option must not reach a materialized view: {view_only:?}"
+        );
+
+        let accepted =
+            conflicts("CREATE MATERIALIZED VIEW m WITH (fillfactor = 70) AS SELECT 1 AS id;");
+        assert!(
+            accepted.is_empty(),
+            "a valid option must not conflict: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_a_materialized_views_populated_state() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The rollback must undo the refresh, or the concurrent refresh below
+        // would reach the unique-index check instead of the populated one.
+        let after_rollback = conflicts(
+            "CREATE MATERIALIZED VIEW m AS SELECT 1 AS id WITH NO DATA;
+             BEGIN;
+             REFRESH MATERIALIZED VIEW m;
+             ROLLBACK;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY m;",
+        );
+        assert!(
+            after_rollback
+                .iter()
+                .any(|reason| reason.contains("is not populated")),
+            "a rolled-back refresh must restore the unpopulated state: {after_rollback:?}"
         );
     }
 
@@ -10926,7 +11554,11 @@ mod state_mutation_tests {
     }
 
     // The expected outcomes below were confirmed against a live PostgreSQL
-    // 18.6 server before being encoded here.
+    // 18.6 server before being encoded here. Fixtures that exercise the manual
+    // `ALTER INDEX ... ATTACH PARTITION` comparison build the parent `ON ONLY`:
+    // a plain `CREATE INDEX` on the partitioned parent first attaches a child
+    // for every partition, which turns a later manual attach into
+    // PostgreSQL's "another index is already attached" refusal.
     fn attach_fixture(sql: &str) -> (AnalysisState, Vec<Violation>) {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -10941,7 +11573,7 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text, d text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_b ON c (b);
-             CREATE INDEX p_d ON p (d);
+             CREATE INDEX p_d ON ONLY p (d);
              ALTER INDEX p_d ATTACH PARTITION c_b;",
         );
         // PostgreSQL: "cannot attach index ... the index definitions do not match"
@@ -10969,7 +11601,7 @@ mod state_mutation_tests {
              CREATE TABLE elsewhere (a integer);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX elsewhere_a ON elsewhere (a);
-             CREATE INDEX p_a ON p (a);
+             CREATE INDEX p_a ON ONLY p (a);
              ALTER INDEX p_a ATTACH PARTITION elsewhere_a;",
         );
         assert!(
@@ -11037,7 +11669,7 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_ops ON c (b varchar_pattern_ops);
-             CREATE INDEX p_plain ON p (b);
+             CREATE INDEX p_plain ON ONLY p (b);
              ALTER INDEX p_plain ATTACH PARTITION c_ops;",
         );
         assert!(
@@ -11111,7 +11743,7 @@ mod state_mutation_tests {
              CREATE INDEX p_nnd ON p (b) NULLS NOT DISTINCT;
              ALTER INDEX p_nnd ATTACH PARTITION c_nnd;
              CREATE INDEX c_mix ON c (b) NULLS NOT DISTINCT;
-             CREATE INDEX p_lenient ON p (b);
+             CREATE INDEX p_lenient ON ONLY p (b);
              ALTER INDEX p_lenient ATTACH PARTITION c_mix;",
         );
         assert!(
@@ -11151,7 +11783,7 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_c ON c (b COLLATE \"C\");
-             CREATE INDEX p_plain ON p (b);
+             CREATE INDEX p_plain ON ONLY p (b);
              ALTER INDEX p_plain ATTACH PARTITION c_c;",
         );
         assert!(
@@ -11180,7 +11812,7 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_def ON c (b COLLATE \"default\");
-             CREATE INDEX p_plain ON p (b);
+             CREATE INDEX p_plain ON ONLY p (b);
              ALTER INDEX p_plain ATTACH PARTITION c_def;",
         );
         assert!(
@@ -11205,10 +11837,10 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_lower ON c (lower(b));
-             CREATE INDEX p_lower ON p (lower(b));
+             CREATE INDEX p_lower ON ONLY p (lower(b));
              ALTER INDEX p_lower ATTACH PARTITION c_lower;
              CREATE INDEX c_upper ON c (upper(b));
-             CREATE INDEX p_upper ON p (lower(b));
+             CREATE INDEX p_upper ON ONLY p (lower(b));
              ALTER INDEX p_upper ATTACH PARTITION c_upper;",
         );
         assert!(
@@ -11247,7 +11879,7 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_ops ON c (lower(b) text_ops);
-             CREATE INDEX p_lower ON p (lower(b));
+             CREATE INDEX p_lower ON ONLY p (lower(b));
              ALTER INDEX p_lower ATTACH PARTITION c_ops;",
         );
         assert!(
@@ -11301,7 +11933,7 @@ mod state_mutation_tests {
              CREATE TABLE c (a integer, b text);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
              CREATE INDEX c_b ON c (b);
-             CREATE INDEX p_b ON p (b);
+             CREATE INDEX p_b ON ONLY p (b);
              ALTER TABLE c ADD CONSTRAINT c_excl EXCLUDE USING btree (b WITH =);
              ALTER INDEX p_b ATTACH PARTITION c_excl;",
         );
@@ -11836,6 +12468,277 @@ mod state_mutation_tests {
                 "attaching an incomplete parent must succeed"
             );
         }
+    }
+
+    /// `ON ONLY` declines the recursion into partitions, so the parent stays
+    /// invalid while partitions exist and is valid with none to cover — the
+    /// same rule as any other index on an uncovered table.
+    #[test]
+    fn creating_an_index_on_only_leaves_covered_partitioned_parents_invalid() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE c (a integer, b text);
+                 ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX p_only ON ONLY p (b);
+                 CREATE TABLE q (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE INDEX q_only ON ONLY q (b);
+                 CREATE TABLE r (a integer, b text);
+                 CREATE INDEX r_only ON ONLY r (b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "ON ONLY is legal everywhere the server accepts it: {violations:?}"
+        );
+        let valid = |name: &str| {
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .find_map(|edge| match &edge.kind {
+                    DependencyKind::IndexOnRelation { definition, .. }
+                        if edge.dependent == object_id("public", name) =>
+                    {
+                        Some(definition.valid)
+                    }
+                    _ => None,
+                })
+        };
+        assert_eq!(valid("p_only"), Some(false));
+        assert_eq!(valid("q_only"), Some(true));
+        assert_eq!(valid("r_only"), Some(true));
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "ON ONLY must not create or attach partition indexes"
+        );
+    }
+
+    /// A plain `CREATE INDEX` on a partitioned table creates and attaches a
+    /// child index for each partition, recursing when a partition is itself
+    /// partitioned; the whole chain is valid.
+    #[test]
+    fn creating_an_index_on_a_partitioned_table_clones_children_recursively() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE c (a integer, b text) PARTITION BY RANGE (a);
+                 ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+                 CREATE TABLE d (a integer, b text);
+                 ALTER TABLE c ATTACH PARTITION d FOR VALUES FROM (0) TO (5);
+                 CREATE INDEX p_idx ON p (b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "creating a partitioned index must be clean: {violations:?}"
+        );
+        let attached = |child: &str, parent: &str| {
+            state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", child)
+                    && edge.referenced == object_id("public", parent)
+            })
+        };
+        assert!(attached("c_b_idx", "p_idx"));
+        assert!(attached("d_b_idx", "c_b_idx"));
+        for name in ["p_idx", "c_b_idx", "d_b_idx"] {
+            assert!(
+                state.local.graph.edges().iter().any(|edge| {
+                    edge.dependent == object_id("public", name)
+                        && matches!(
+                            &edge.kind,
+                            DependencyKind::IndexOnRelation { definition, .. }
+                                if definition.valid
+                        )
+                }),
+                "{name} must be valid: {violations:?}"
+            );
+        }
+    }
+
+    /// A plain `CREATE INDEX` on a partitioned table adopts an existing
+    /// equivalent unattached child index instead of creating a second one.
+    #[test]
+    fn creating_an_index_on_a_partitioned_table_reuses_an_equivalent_child() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE c (a integer, b text);
+                 ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX c_existing ON c (b);
+                 CREATE INDEX p_idx ON p (b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "reusing an equivalent child must be clean: {violations:?}"
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c_existing")
+                    && edge.referenced == object_id("public", "p_idx")
+            }),
+            "the existing index must be attached"
+        );
+        assert!(
+            !state.index_is_present(&object_id("public", "c_b_idx")),
+            "no second index may be created on the partition"
+        );
+    }
+
+    /// Attaching a table does not revalidate an invalid parent index: the
+    /// parent flips valid only when the last partition's index is attached.
+    #[test]
+    fn attaching_a_table_does_not_revalidate_the_parent_index() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+                 CREATE TABLE c1 (a integer);
+                 ALTER TABLE p ATTACH PARTITION c1 FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX p_idx ON ONLY p (a);
+                 CREATE TABLE c2 (a integer);
+                 CREATE INDEX c2_idx ON c2 (a);
+                 ALTER TABLE p ATTACH PARTITION c2 FOR VALUES FROM (10) TO (20);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "the server accepts the whole sequence: {violations:?}"
+        );
+        fn parent_valid(state: &AnalysisState) -> Option<bool> {
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .find_map(|edge| match &edge.kind {
+                    DependencyKind::IndexOnRelation { definition, .. }
+                        if edge.dependent == object_id("public", "p_idx") =>
+                    {
+                        Some(definition.valid)
+                    }
+                    _ => None,
+                })
+        }
+        assert!(
+            state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c2_idx")
+                    && edge.referenced == object_id("public", "p_idx")
+            }),
+            "attaching the table adopts the partition's existing index"
+        );
+        assert_eq!(
+            parent_valid(&state),
+            Some(false),
+            "attaching a table must not revalidate the parent"
+        );
+        let violations = engine
+            .analyze(
+                "CREATE INDEX c1_idx ON c1 (a);
+                 ALTER INDEX p_idx ATTACH PARTITION c1_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "the last attachment is accepted: {violations:?}"
+        );
+        assert_eq!(
+            parent_valid(&state),
+            Some(true),
+            "the last attachment must validate the parent"
+        );
+    }
+
+    /// A partition's table cannot feed a second attached index to the same
+    /// parent: the server refuses with its own wording.
+    #[test]
+    fn attaching_a_second_index_for_the_same_partition_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text, d text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text, d text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_d ON p (d);
+             ALTER INDEX p_d ATTACH PARTITION c_b;",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("already attached")),
+            "expected the duplicate-attachment refusal, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c_b")
+            }),
+            "the manually named index must not be attached"
+        );
+    }
+
+    /// `verifyPartitionIndexNotNull`: a primary-key partition index cannot
+    /// cover a column the partition's table leaves nullable.
+    ///
+    /// Reaching this through the parser requires dropping the column's NOT
+    /// NULL after the key exists, which the server itself blocks; the check is
+    /// modeled for catalog states and for the simulator's own move set, which
+    /// does not yet recurse `ADD CONSTRAINT` into partitions.
+    #[test]
+    fn attaching_a_partition_index_over_a_nullable_key_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer NOT NULL);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             ALTER TABLE c ALTER COLUMN a DROP NOT NULL;
+             ALTER TABLE p ADD PRIMARY KEY (a);
+             ALTER TABLE c ADD CONSTRAINT c_u UNIQUE (a);
+             ALTER INDEX p_pkey ATTACH PARTITION c_u;",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("is not marked NOT NULL")),
+            "expected the primary-key nullability refusal, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c_u")
+            }),
+            "a nullable key must not attach to a primary key"
+        );
     }
 
     /// REINDEX rebuilds a broken index, so the index is usable afterwards.

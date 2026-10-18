@@ -217,7 +217,7 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     Some(RelationOverlay::Dropped)
                 ));
             }
-            DependencyKind::ViewUsesRoutine { routine, name } => {
+            DependencyKind::ViewUsesRoutine { unresolved_name } => {
                 let dependent_is_modeled_view = matches!(
                     local.relations.get(&edge.dependent),
                     Some(RelationOverlay::Present(relation))
@@ -231,21 +231,16 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     dependent_is_modeled_view || dependent_schema_is_omitted,
                     "routine dependency must have a modeled view or an explicitly omitted dependent schema"
                 );
-                // A resolved reference carries the exact routine identity, so
-                // the endpoint is that routine rather than the bare name.
-                assert_eq!(
-                    edge.referenced,
-                    routine.clone().unwrap_or_else(|| name.clone()),
-                    "routine edge endpoint must be the signature, or the name when unresolved"
-                );
-                assert_eq!(
-                    name.schema,
-                    routine
-                        .as_ref()
-                        .map_or(name.schema.clone(), |resolved| resolved.schema.clone())
-                );
+                // A name-only reference uses the written name as its endpoint:
+                // there is no other copy of the routine identity.
+                if let Some(name) = unresolved_name {
+                    assert_eq!(
+                        edge.referenced, *name,
+                        "a name-only routine edge must use the written name as its endpoint"
+                    );
+                }
             }
-            DependencyKind::ViewUsesType { ty } => {
+            DependencyKind::ViewUsesType => {
                 let dependent_is_modeled_view = matches!(
                     local.relations.get(&edge.dependent),
                     Some(RelationOverlay::Present(relation))
@@ -259,7 +254,6 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     dependent_is_modeled_view || dependent_schema_is_omitted,
                     "type dependency must have a modeled view or an explicitly omitted dependent schema"
                 );
-                assert_eq!(edge.referenced, *ty, "type edge endpoint must be the type");
             }
             DependencyKind::SequenceOwnedBy { column } => assert!(matches!(
                 local.sequences.get(&edge.dependent),

@@ -109,6 +109,7 @@ pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
 #[cfg(test)]
 mod tests {
     use super::TYPES;
+    use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 
     #[test]
     fn the_snapshot_is_sorted_and_free_of_duplicates() {
@@ -117,6 +118,22 @@ mod tests {
             TYPES.windows(2).all(|pair| pair[0].0 < pair[1].0),
             "entries must be sorted and unique by typname"
         );
+    }
+
+    #[test]
+    fn every_snapshot_spelling_resolves_back_to_its_type() {
+        let catalogue = BuiltinTypeCatalogue::fallback();
+        for entry in catalogue.types() {
+            for spelling in catalogue.spellings(entry) {
+                let resolved = catalogue
+                    .resolve(spelling)
+                    .unwrap_or_else(|| panic!("{spelling} did not resolve"));
+                assert_eq!(
+                    resolved.typname, entry.typname,
+                    "{spelling} resolved to the wrong type"
+                );
+            }
+        }
     }
 
     #[test]

@@ -214,6 +214,8 @@ pub(crate) enum StatementFact {
         name: QualifiedName,
         or_replace: bool,
         depends_on: Vec<QualifiedName>,
+        /// An explicit `v (a, b)` column list, which renames the outputs.
+        column_list: Vec<String>,
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
@@ -256,6 +258,7 @@ pub(crate) enum StatementFact {
         relation: QualifiedName,
         if_not_exists: bool,
         concurrently: bool,
+        only: bool,
         using_method: Option<String>,
         predicate: IndexPredicate,
         unique: bool,

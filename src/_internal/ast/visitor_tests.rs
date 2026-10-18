@@ -1032,6 +1032,20 @@ mod tests {
     }
 
     #[test]
+    fn create_index_records_only_recursion() {
+        for (sql, expected) in [
+            ("CREATE INDEX idx ON ONLY users(email);", true),
+            ("CREATE INDEX idx ON users(email);", false),
+        ] {
+            let facts = parse_and_extract_statement(sql);
+            let Some(StatementFact::CreateIndex { only, .. }) = facts else {
+                panic!("Expected CreateIndex fact for: {sql}");
+            };
+            assert_eq!(only, expected, "for: {sql}");
+        }
+    }
+
+    #[test]
     fn test_create_index_using_method() {
         let sql = "CREATE INDEX idx_users_gin ON users USING GIN(data);";
         let facts = parse_and_extract_statement(sql);
@@ -3083,6 +3097,40 @@ mod tests {
                 "unsupported CREATE VIEW semantics must use the opaque engine path: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn create_view_carries_its_explicit_column_list() {
+        let names = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("view fact") {
+                StatementFact::CreateView { column_list, .. } => column_list,
+                other => panic!("expected CreateView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            names("CREATE VIEW renamed (x, y) AS SELECT a, b FROM source;"),
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert!(names("CREATE VIEW plain AS SELECT a FROM source;").is_empty());
+    }
+
+    #[test]
+    fn create_materialized_view_carries_its_explicit_column_list() {
+        let names = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("materialized view fact") {
+                StatementFact::CreateMaterializedView { column_list, .. } => column_list,
+                other => panic!("expected CreateMaterializedView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            names("CREATE MATERIALIZED VIEW renamed (x) AS SELECT a FROM source;"),
+            vec!["x".to_string()]
+        );
+        assert!(names("CREATE MATERIALIZED VIEW plain AS SELECT a FROM source;").is_empty());
     }
 
     #[test]

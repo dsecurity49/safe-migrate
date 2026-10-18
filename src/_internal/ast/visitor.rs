@@ -2118,7 +2118,8 @@ impl AstVisitor {
     }
 
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
-        let relation = node.table_relation_name()?.table_name_ref()?.path_ref()?;
+        let table_relation = node.table_relation_name()?;
+        let relation = table_relation.table_name_ref()?.path_ref()?;
         let relation = Self::path_ref_to_qualified_name(&relation)?;
 
         let index_ident = if let Some(name) = node
@@ -2215,6 +2216,7 @@ impl AstVisitor {
             relation,
             if_not_exists: node.if_not_exists().is_some(),
             concurrently: node.concurrently_token().is_some(),
+            only: table_relation.only_token().is_some(),
             using_method,
             predicate,
             unique,
@@ -2398,6 +2400,16 @@ impl AstVisitor {
             name: Self::path_to_qualified_name(&path)?,
             or_replace: node.or_replace().is_some(),
             depends_on: Self::extract_view_dependencies(node.syntax()),
+            column_list: node
+                .column_list()
+                .map(|list| {
+                    list.column_names()
+                        .filter_map(|name| {
+                            Some(Self::resolve_identifier_token(name.ident_token()?.text()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             select_projection_complete: select_source.is_some() && projection_was_complete,
             select_outputs,
             select_source,

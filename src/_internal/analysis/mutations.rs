@@ -289,6 +289,8 @@ pub(crate) struct CreateMaterializedView {
     pub if_not_exists: bool,
     pub with_no_data: bool,
     pub columns: Vec<ViewColumn>,
+    /// Explicit output-column names, applied to the projection prefix.
+    pub column_list: Vec<String>,
     pub projection_complete: bool,
     pub routines: Vec<ViewRoutine>,
     pub cast_types: Vec<ObjectId>,
@@ -527,6 +529,8 @@ pub(crate) struct CreateView {
     pub cast_types: Vec<ObjectId>,
     /// Projected columns, empty when the projection could not be derived.
     pub columns: Vec<ViewColumn>,
+    /// Explicit output-column names, applied to the projection prefix.
+    pub column_list: Vec<String>,
     pub projection_complete: bool,
 }
 
@@ -546,6 +550,8 @@ pub(crate) struct CreateIndex {
     pub table: ObjectId,
     pub if_not_exists: bool,
     pub concurrently: bool,
+    /// `ON ONLY`: recursion into partitions is declined.
+    pub only: bool,
     pub using_method: Option<String>,
     pub predicate: IndexPredicate,
     pub unique: bool,

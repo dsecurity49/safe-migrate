@@ -7,34 +7,75 @@ use crate::_internal::analysis::mutations::{
     DropSequenceMutation, SequenceOptionMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
-use crate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
+use crate::_internal::model::sequence::{
+    SequenceKind, SequenceOverlay, SequencePersistence, SequenceState,
+};
 use std::collections::HashSet;
 
 type SequenceLookup = ObjectLookup;
 
-/// The value range a sequence data type admits, which is what bounds an
-/// omitted `MINVALUE` or `MAXVALUE`.
-fn sequence_type_bounds(data_type: &str) -> Option<(i64, i64)> {
+/// The canonical name and value range of a sequence data type.
+pub(super) fn sequence_type(data_type: &str) -> Option<(&'static str, i64, i64)> {
     match data_type.trim().to_ascii_lowercase().as_str() {
-        "smallint" | "int2" => Some((i16::MIN as i64, i16::MAX as i64)),
-        "integer" | "int" | "int4" => Some((i32::MIN as i64, i32::MAX as i64)),
-        "bigint" | "int8" => Some((i64::MIN, i64::MAX)),
+        "smallint" | "int2" => Some(("smallint", i16::MIN as i64, i16::MAX as i64)),
+        "integer" | "int" | "int4" => Some(("integer", i32::MIN as i64, i32::MAX as i64)),
+        "bigint" | "int8" => Some(("bigint", i64::MIN, i64::MAX)),
         _ => None,
     }
 }
 
-/// The parameter set an `ALTER SEQUENCE` statement produces.
-///
-/// PostgreSQL merges every option into one parameter set and then cross-checks
-/// the result, so the options are not independent clauses: a repeated option is
-/// rejected, and an omitted bound follows the increment's sign.
-fn merged_sequence_parameters(
-    current: &crate::_internal::model::sequence::SequenceParameters,
-    options: &[SequenceOptionMutation],
-) -> Result<crate::_internal::model::sequence::SequenceParameters, MutationResult> {
-    use crate::_internal::model::sequence::SequencePersistence;
+/// The option bag of a `CREATE`/`ALTER SEQUENCE` statement, keyed the way
+/// PostgreSQL keys the underlying `DefElem`s.
+#[derive(Default)]
+pub(super) struct SequenceOptionSet {
+    pub(super) as_type: Option<String>,
+    pub(super) increment: Option<i64>,
+    pub(super) cycle: Option<bool>,
+    pub(super) max_value: Option<Option<i64>>,
+    pub(super) min_value: Option<Option<i64>>,
+    pub(super) start: Option<i64>,
+    pub(super) restart: Option<Option<i64>>,
+    pub(super) cache: Option<i64>,
+    pub(super) logged: Option<bool>,
+}
 
+impl SequenceOptionSet {
+    /// The shared shape of `CREATE SEQUENCE` and identity-column options.
+    pub(super) fn from_identity_options(
+        options: &crate::_internal::analysis::mutations::IdentitySequenceOptionsMutation,
+    ) -> Self {
+        Self {
+            as_type: options.data_type.clone(),
+            increment: options.increment,
+            cycle: options.cycle,
+            max_value: options.max_value,
+            min_value: options.min_value,
+            start: options.start_value,
+            restart: None,
+            cache: options.cache_size,
+            logged: options.persistence,
+        }
+    }
+
+    /// The persistence a `LOGGED`/`UNLOGGED` option selects, if any.
+    pub(super) fn persistence(&self) -> Option<SequencePersistence> {
+        self.logged.map(|logged| {
+            if logged {
+                SequencePersistence::Permanent
+            } else {
+                SequencePersistence::Unlogged
+            }
+        })
+    }
+}
+
+/// Reject a repeated option and collect the bag by name, as PostgreSQL does
+/// before it applies anything.
+pub(super) fn sequence_option_set(
+    options: &[SequenceOptionMutation],
+) -> Result<SequenceOptionSet, MutationResult> {
     let mut seen = std::collections::BTreeSet::new();
+    let mut set = SequenceOptionSet::default();
     for option in options {
         if !seen.insert(option.name()) {
             return Err(MutationResult::conflict(format!(
@@ -42,118 +83,134 @@ fn merged_sequence_parameters(
                 option.name()
             )));
         }
-    }
-
-    let mut merged = current.clone();
-    // A changed data type re-derives bounds that still sat at the old type's
-    // limits, which is what PostgreSQL's reset_max_value/reset_min_value do.
-    let mut reset_bounds = false;
-    for option in options {
         match option {
-            SequenceOptionMutation::As(data_type) => {
-                let Some(new_bounds) = sequence_type_bounds(data_type) else {
-                    return Err(MutationResult::conflict(format!(
-                        "sequence data type \"{}\" is invalid",
-                        data_type
-                    )));
-                };
-                if let Some((_, old_max)) = sequence_type_bounds(&current.data_type)
-                    && current.max_value == old_max
-                {
-                    reset_bounds = true;
-                }
-                if let Some((old_min, _)) = sequence_type_bounds(&current.data_type)
-                    && current.min_value == old_min
-                {
-                    reset_bounds = true;
-                }
-                merged.data_type = data_type.clone();
-                let _ = new_bounds;
-            }
-            SequenceOptionMutation::Cache(value) => {
-                if *value <= 0 {
-                    return Err(MutationResult::conflict(
-                        "CACHE must be greater than zero".to_string(),
-                    ));
-                }
-                merged.cache_size = *value;
-            }
-            SequenceOptionMutation::Cycle(value) => merged.cycle = *value,
-            SequenceOptionMutation::Increment(value) => {
-                if *value == 0 {
-                    return Err(MutationResult::conflict(
-                        "INCREMENT must not be zero".to_string(),
-                    ));
-                }
-                merged.increment = *value;
-            }
-            SequenceOptionMutation::Logged(value) => {
-                merged.persistence = if *value {
-                    SequencePersistence::Permanent
-                } else {
-                    SequencePersistence::Unlogged
-                };
-            }
-            SequenceOptionMutation::MaxValue(value) => {
-                merged.max_value = match value {
-                    Some(maximum) => *maximum,
-                    None if merged.increment > 0 || reset_bounds => {
-                        let (_, max) =
-                            sequence_type_bounds(&merged.data_type).ok_or_else(|| {
-                                MutationResult::conflict(format!(
-                                    "sequence data type \"{}\" is invalid",
-                                    merged.data_type
-                                ))
-                            })?;
-                        max
-                    }
-                    None => -1,
-                };
-            }
-            SequenceOptionMutation::MinValue(value) => {
-                merged.min_value = match value {
-                    Some(minimum) => *minimum,
-                    None if merged.increment < 0 || reset_bounds => {
-                        let (min, _) =
-                            sequence_type_bounds(&merged.data_type).ok_or_else(|| {
-                                MutationResult::conflict(format!(
-                                    "sequence data type \"{}\" is invalid",
-                                    merged.data_type
-                                ))
-                            })?;
-                        min
-                    }
-                    None => 1,
-                };
-            }
-            // Ownership is a graph transition rather than a parameter, and the
-            // sequence name is documentation.
+            SequenceOptionMutation::As(data_type) => set.as_type = Some(data_type.clone()),
+            SequenceOptionMutation::Cache(value) => set.cache = Some(*value),
+            SequenceOptionMutation::Cycle(value) => set.cycle = Some(*value),
+            SequenceOptionMutation::Increment(value) => set.increment = Some(*value),
+            SequenceOptionMutation::Logged(value) => set.logged = Some(*value),
+            SequenceOptionMutation::MaxValue(value) => set.max_value = Some(*value),
+            SequenceOptionMutation::MinValue(value) => set.min_value = Some(*value),
+            SequenceOptionMutation::Start(value) => set.start = Some(*value),
+            SequenceOptionMutation::Restart(value) => set.restart = Some(*value),
+            // Ownership is a graph transition and the sequence name is
+            // documentation, neither a sequence parameter.
             SequenceOptionMutation::OwnedBy(_) | SequenceOptionMutation::SequenceName(_) => {}
-            SequenceOptionMutation::Start(value) => merged.start_value = *value,
-            // RESTART moves the current value rather than the parameters.
-            SequenceOptionMutation::Restart(_) => {}
         }
+    }
+    Ok(set)
+}
+
+/// A literal port of PostgreSQL's `init_params` (`sequence.c`).
+///
+/// The options form one bag, not a clause sequence: PostgreSQL walks it once
+/// to reject a repeated option, then applies the values in a fixed order — data
+/// type, increment, cycle, bounds, start, restart, cache — so the textual order
+/// of the clauses cannot change the result. `is_init` covers `CREATE SEQUENCE`
+/// (and the sequence an identity column generates), where omitted options take
+/// defaults; `ALTER SEQUENCE` keeps the current values instead.
+pub(super) fn init_sequence_parameters(
+    current: &crate::_internal::model::sequence::SequenceParameters,
+    options: &SequenceOptionSet,
+    is_init: bool,
+) -> Result<crate::_internal::model::sequence::SequenceParameters, MutationResult> {
+    let mut merged = current.clone();
+    // A bare `AS` re-derives a bound that still sat at the old type's limit;
+    // an explicit bound always wins.
+    let mut reset_max_value = false;
+    let mut reset_min_value = false;
+
+    if let Some(data_type) = options.as_type.as_deref() {
+        let Some((name, _, _)) = sequence_type(data_type) else {
+            return Err(MutationResult::conflict(
+                "sequence type must be smallint, integer, or bigint".to_string(),
+            ));
+        };
+        if !is_init && let Some((_, old_min, old_max)) = sequence_type(&current.data_type) {
+            reset_max_value = current.max_value == old_max;
+            reset_min_value = current.min_value == old_min;
+        }
+        merged.data_type = name.to_string();
+    }
+    let Some((_, type_min, type_max)) = sequence_type(&merged.data_type) else {
+        return Err(MutationResult::conflict(format!(
+            "sequence data type \"{}\" is invalid",
+            merged.data_type
+        )));
+    };
+
+    if let Some(increment) = options.increment {
+        if increment == 0 {
+            return Err(MutationResult::conflict(
+                "INCREMENT must not be zero".to_string(),
+            ));
+        }
+        merged.increment = increment;
+    } else if is_init {
+        merged.increment = 1;
     }
 
-    if let Some((min, max)) = sequence_type_bounds(&merged.data_type) {
-        if !(min..=max).contains(&merged.min_value) {
-            return Err(MutationResult::conflict(format!(
-                "MINVALUE ({}) is out of range for sequence data type {}",
-                merged.min_value, merged.data_type
-            )));
-        }
-        if !(min..=max).contains(&merged.max_value) {
-            return Err(MutationResult::conflict(format!(
-                "MAXVALUE ({}) is out of range for sequence data type {}",
-                merged.max_value, merged.data_type
-            )));
-        }
+    if let Some(cycle) = options.cycle {
+        merged.cycle = cycle;
+    } else if is_init {
+        merged.cycle = false;
     }
+
+    match options.max_value {
+        Some(Some(maximum)) => merged.max_value = maximum,
+        Some(None) if merged.increment > 0 || reset_max_value => merged.max_value = type_max,
+        Some(None) => merged.max_value = -1,
+        None if is_init || reset_max_value => {
+            merged.max_value = if merged.increment > 0 || reset_max_value {
+                type_max
+            } else {
+                -1
+            };
+        }
+        None => {}
+    }
+    if merged.max_value < type_min || merged.max_value > type_max {
+        return Err(MutationResult::conflict(format!(
+            "MAXVALUE ({}) is out of range for sequence data type {}",
+            merged.max_value, merged.data_type
+        )));
+    }
+
+    match options.min_value {
+        Some(Some(minimum)) => merged.min_value = minimum,
+        Some(None) if merged.increment < 0 || reset_min_value => merged.min_value = type_min,
+        Some(None) => merged.min_value = 1,
+        None if is_init || reset_min_value => {
+            merged.min_value = if merged.increment < 0 || reset_min_value {
+                type_min
+            } else {
+                1
+            };
+        }
+        None => {}
+    }
+    if merged.min_value < type_min || merged.min_value > type_max {
+        return Err(MutationResult::conflict(format!(
+            "MINVALUE ({}) is out of range for sequence data type {}",
+            merged.min_value, merged.data_type
+        )));
+    }
+
     if merged.min_value >= merged.max_value {
         return Err(MutationResult::conflict(format!(
             "MINVALUE ({}) must be less than MAXVALUE ({})",
             merged.min_value, merged.max_value
         )));
+    }
+
+    if let Some(start) = options.start {
+        merged.start_value = start;
+    } else if is_init {
+        merged.start_value = if merged.increment > 0 {
+            merged.min_value
+        } else {
+            merged.max_value
+        };
     }
     if merged.start_value < merged.min_value {
         return Err(MutationResult::conflict(format!(
@@ -167,10 +224,10 @@ fn merged_sequence_parameters(
             merged.start_value, merged.max_value
         )));
     }
-    if let Some(restart) = options.iter().find_map(|option| match option {
-        SequenceOptionMutation::Restart(value) => Some(*value),
-        _ => None,
-    }) {
+
+    // PostgreSQL also cross-checks the sequence's current value here, which is
+    // runtime state this model does not track; a written RESTART is checkable.
+    if let Some(restart) = options.restart {
         let restart = restart.unwrap_or(merged.start_value);
         if restart < merged.min_value {
             return Err(MutationResult::conflict(format!(
@@ -184,6 +241,17 @@ fn merged_sequence_parameters(
                 merged.max_value
             )));
         }
+    }
+
+    if let Some(cache) = options.cache {
+        if cache <= 0 {
+            return Err(MutationResult::conflict(format!(
+                "CACHE ({cache}) must be greater than zero"
+            )));
+        }
+        merged.cache_size = cache;
+    } else if is_init {
+        merged.cache_size = 1;
     }
     Ok(merged)
 }
@@ -462,15 +530,21 @@ impl AnalysisState {
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
         let generation = self.local.generation_counter;
-        let Some(parameters) = Self::apply_identity_sequence_options(
-            crate::_internal::model::sequence::SequenceParameters {
+        let option_set = SequenceOptionSet::from_identity_options(&create.options);
+        let mut parameters = match init_sequence_parameters(
+            &crate::_internal::model::sequence::SequenceParameters {
                 persistence: create.persistence,
                 ..Default::default()
             },
-            &create.options,
-        ) else {
-            return MutationResult::conflict("invalid sequence parameters".to_string());
+            &option_set,
+            true,
+        ) {
+            Ok(parameters) => parameters,
+            Err(result) => return result,
         };
+        if let Some(persistence) = option_set.persistence() {
+            parameters.persistence = persistence;
+        }
         self.local.sequences.insert(
             create.id.clone(),
             SequenceOverlay::Present(SequenceState {
@@ -529,10 +603,21 @@ impl AnalysisState {
 
         // The value options merge into one parameter set first: a conflict
         // there must be found before the statement's other effects land.
-        let merged = match merged_sequence_parameters(&current.parameters, &alter.options) {
+        let option_set = match sequence_option_set(&alter.options) {
+            Ok(option_set) => option_set,
+            Err(result) => return result,
+        };
+        let mut merged = match init_sequence_parameters(&current.parameters, &option_set, false) {
             Ok(merged) => merged,
             Err(result) => return result,
         };
+        if let Some(logged) = option_set.logged {
+            merged.persistence = if logged {
+                SequencePersistence::Permanent
+            } else {
+                SequencePersistence::Unlogged
+            };
+        }
         let owned_by = alter.options.iter().find_map(|option| match option {
             SequenceOptionMutation::OwnedBy(owned_by) => Some(owned_by),
             _ => None,

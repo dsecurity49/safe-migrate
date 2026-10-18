@@ -302,10 +302,24 @@ impl AnalysisState {
                     let parent_name = alter.index_id.name.as_str();
                     let child_name = partition_id.name.as_str();
                     match self.index_attach_refusal(&alter.index_id, partition_id) {
-                        None => self.record_index_partition(&alter.index_id, partition_id),
+                        None => {
+                            // The attach path revalidates the parent, including
+                            // when the child is already attached to it.
+                            self.record_index_partition(&alter.index_id, partition_id);
+                            self.validate_partitioned_index(&alter.index_id);
+                        }
                         Some(AttachRefusal::AttachedElsewhere) => {
                             return MutationResult::conflict(format!(
                                 "cannot attach index \"{child_name}\" as partition of index \"{parent_name}\""
+                            ));
+                        }
+                        Some(AttachRefusal::DuplicateAttachment) => {
+                            let partition_table = self
+                                .index_table_of(partition_id)
+                                .map(|table| table.to_string())
+                                .unwrap_or_else(|| child_name.to_string());
+                            return MutationResult::conflict(format!(
+                                "another index is already attached for partition \"{partition_table}\""
                             ));
                         }
                         Some(AttachRefusal::NotAPartition) => {
@@ -317,9 +331,18 @@ impl AnalysisState {
                                 "index \"{child_name}\" is not an index on any partition of table \"{parent_table}\""
                             ));
                         }
-                        Some(AttachRefusal::ConstraintMismatch) => {
+                        Some(AttachRefusal::MissingConstraint) => {
                             return MutationResult::conflict(format!(
                                 "parent index \"{parent_name}\" has a constraint but partition index \"{child_name}\" does not"
+                            ));
+                        }
+                        Some(AttachRefusal::PrimaryKeyNotNull { column }) => {
+                            let partition_table = self
+                                .index_table_of(partition_id)
+                                .map(|table| table.to_string())
+                                .unwrap_or_else(|| child_name.to_string());
+                            return MutationResult::conflict(format!(
+                                "invalid primary key definition: column \"{column}\" of relation \"{partition_table}\" is not marked NOT NULL"
                             ));
                         }
                         Some(AttachRefusal::DefinitionsDiffer) => {

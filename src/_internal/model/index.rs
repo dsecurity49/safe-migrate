@@ -121,11 +121,6 @@ impl IndexKeyKind {
             Self::Expression(_) => None,
         }
     }
-
-    /// Whether this expression's identity is unknown.
-    pub(crate) fn is_opaque_expression(&self) -> bool {
-        matches!(self, Self::Expression(None))
-    }
 }
 
 /// The operator-class identity of one key.
@@ -255,23 +250,6 @@ impl IndexPredicate {
     }
 }
 
-/// Whether two descriptions can be compared at all.
-///
-/// Used by the partition-clone reuse check, which requires comparable
-/// expression identities; [`IndexDefinition::attach_equivalence`] answers the
-/// same question more precisely for the attach paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IndexComparability {
-    /// Every field is exact, so equality means what it says.
-    Comparable,
-    /// An expression key is present, and PostgreSQL's guarantee is insufficient
-    /// to call the two equal or different.
-    Unknown,
-    /// The access methods belong to different families. A hash index and a
-    /// btree index are not "different", they are a different question.
-    DifferentFamily,
-}
-
 /// The structural description of one index.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct IndexDefinition {
@@ -360,11 +338,6 @@ impl IndexDefinition {
         self.predicate.has_predicate()
     }
 
-    /// Whether any key is an expression whose identity is unknown.
-    pub(crate) fn has_opaque_expression(&self) -> bool {
-        self.keys.iter().any(|key| key.kind.is_opaque_expression())
-    }
-
     pub(crate) fn is_usable(&self) -> bool {
         self.valid && self.ready && self.live
     }
@@ -381,26 +354,6 @@ impl IndexDefinition {
             .iter()
             .filter_map(|key| key.kind.as_column().map(str::to_string))
             .collect()
-    }
-
-    /// Whether these two can be decided at all, before asking whether they are
-    /// equal.
-    ///
-    /// PostgreSQL compares parsed expression trees, so two expressions the
-    /// simulator parsed are comparable. Only an opaque expression — one that
-    /// came from the catalog without identity — leaves the answer unknown, and
-    /// the same goes for a placeholder whose shape is not established.
-    pub(crate) fn comparability(&self, other: &Self) -> IndexComparability {
-        if !same_access_method_family(self.method.as_deref(), other.method.as_deref()) {
-            return IndexComparability::DifferentFamily;
-        }
-        if self.unestablished || other.unestablished {
-            return IndexComparability::Unknown;
-        }
-        if self.has_opaque_expression() || other.has_opaque_expression() {
-            return IndexComparability::Unknown;
-        }
-        IndexComparability::Comparable
     }
 
     /// Whether PostgreSQL's `CompareIndexInfo` would hold between these two.
@@ -510,32 +463,6 @@ fn compare_collations(left: &KeyCollation, right: &KeyCollation) -> IndexEquival
         (Unresolved, _) | (_, Unresolved) => IndexEquivalence::Unknown,
         (NotCollatable, Resolved(_)) | (Resolved(_), NotCollatable) => IndexEquivalence::Different,
         (Derived, Resolved(_)) | (Resolved(_), Derived) => IndexEquivalence::Unknown,
-    }
-}
-
-/// Access methods grouped by what their indexes can be compared for.
-///
-/// Grouping is by capability rather than by name, so an access method added
-/// later lands in a family by what it can do.
-fn access_method_family(method: Option<&str>) -> u8 {
-    match method {
-        Some("btree") => 0,
-        Some("hash") => 1,
-        Some("gist") | Some("spgist") => 2,
-        Some("gin") => 3,
-        Some("brin") => 4,
-        // An unknown or absent method is its own question, never assumed equal.
-        _ => 5,
-    }
-}
-
-fn same_access_method_family(left: Option<&str>, right: Option<&str>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => {
-            access_method_family(Some(left)) == access_method_family(Some(right))
-        }
-        (None, None) => true,
-        _ => false,
     }
 }
 

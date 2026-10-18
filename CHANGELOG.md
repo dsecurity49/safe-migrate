@@ -20,7 +20,9 @@ notes are available on the
   option on any version; it is a routine attribute, and PostgreSQL 15 added
   `security_invoker` beside `security_barrier` rather than replacing it. A
   materialized view no longer inherits the view options, and a name absent
-  from the tables still taints rather than conflicting.
+  from the tables still taints rather than conflicting. The same checks run
+  when `CREATE MATERIALIZED VIEW` carries `WITH (...)`, where PostgreSQL
+  validates before it creates anything.
 - `REINDEX` now follows PostgreSQL's legality rules instead of modelling every
   form as acceptable. `REINDEX SYSTEM CONCURRENTLY` is rejected, `REINDEX
   SCHEMA`/`DATABASE`/`SYSTEM` are rejected inside a transaction block, `REINDEX
@@ -61,11 +63,34 @@ notes are available on the
   through a catalog class the model does not hold, such as an operator, is
   reported when the scope is suggested to be widened.
 - `certainty` is reported only when it is not `exact`.
-- `ALTER SEQUENCE` now applies every option the statement carries. Options used
-  to be read one at a time, so the result depended on clause order and a
-  conflict could be lost entirely. A repeated option, a zero `INCREMENT`, a
-  non-positive `CACHE`, unordered bounds, and a `START` outside the merged
-  bounds are now reported the way PostgreSQL reports them.
+- `CREATE SEQUENCE` and `ALTER SEQUENCE` now merge their options the way
+  PostgreSQL's `init_params` does: the clauses form one bag applied in a fixed
+  order, so the result cannot depend on clause order. A repeated option, a zero
+  `INCREMENT`, a non-positive `CACHE`, unordered bounds, and a `START` or
+  `RESTART` outside the merged bounds are reported with PostgreSQL's own
+  wording and values. `CREATE SEQUENCE` derives the start from the final bounds
+  (`MINVALUE 10` starts at 10), an `ALTER SEQUENCE ... AS <type>` re-derives a
+  bound only where it still sat at the old type's limit, and `NO MINVALUE`/
+  `NO MAXVALUE` derive from the final increment in either clause order. An
+  identity column's backing sequence takes its type from the column, reporting
+  a written `AS` and a type other than smallint, integer, or bigint the way
+  PostgreSQL does, and a `CREATE SEQUENCE` conflict now carries the same
+  precise reason instead of a generic invalid-parameters message.
+- `DROP TYPE` and `DROP DOMAIN` with `CASCADE` now apply the drop; the
+  dependent objects the model does not enumerate (table columns, routines and
+  domains over the type) are reported as unmodeled fallout instead of leaving
+  the type in place and refusing to say what happened. `DROP PROCEDURE ...
+  CASCADE` applies like a plain drop, because PostgreSQL records no dependents
+  of a procedure. `DROP AGGREGATE` now refuses when a view calls the aggregate
+  and clears the view under `CASCADE`.
+- A cascading routine drop now removes everything that depends on the views it
+  drops, the way PostgreSQL's cascade is transitive: a view over a dropped
+  view, and a materialized view with its indexes, go with it.
+- Renaming or moving a routine or type a view references now keeps the view's
+  dependency, so dropping the new name is reported instead of succeeding. A
+  cascading `DROP FUNCTION` that covers only some overloads of a view call that
+  never named one no longer drops the view; the view survives and the chain
+  reports that it is no longer exact.
 - Remediation is labelled `recipe` in every output. `rules --json` moved to its
   own version 3, which is what tells consumers `remediation` became `recipe`.
 - `CREATE MATERIALIZED VIEW IF NOT EXISTS`, and `ALTER [MATERIALIZED] VIEW IF
@@ -75,7 +100,11 @@ notes are available on the
   ... WITH NO DATA` are modeled instead of being treated as unsupported: a
   materialized view created or left unpopulated can no longer be refreshed
   concurrently, and `CONCURRENTLY` with `WITH NO DATA` is reported the way
-  PostgreSQL reports it.
+  PostgreSQL reports it. A concurrent refresh now also requires the unique
+  index the server demands — unique, valid, immediate, non-partial, over plain
+  columns — and reports its refusal when none exists on the materialized view.
+  A refresh that is rolled back now restores the view's populated state;
+  previously the statement escaped the transaction snapshot.
 - Every action of a comma-separated `ALTER MATERIALIZED VIEW` is now applied,
   so an unsupported action no longer disappears behind a modeled one in front
   of it.
@@ -99,7 +128,10 @@ notes are available on the
   longer reported as missing.
 - `CREATE MATERIALIZED VIEW` records its columns, access method, tablespace and
   storage parameters. A view selecting `*` from a materialized view now sees the
-  columns it actually has, and an explicit column list renames them.
+  columns it actually has. An explicit column list renames the leading columns
+  the way PostgreSQL applies it — a list longer than the projection is
+  reported with the server's refusal instead of silently clearing the column
+  names. `CREATE VIEW` applies its list by the same rule.
 - Built-in types are read from `pg_catalog.pg_type` instead of a hand-written
   table, so `bytea`, `jsonb`, `inet`, `xml`, `uuid` and the range types now
   carry their own routine signatures and type identities rather than collapsing
@@ -154,6 +186,19 @@ notes are available on the
   an exclusion constraint's backing index are undecidable on attach instead of
   equal. A collated column key such as `b COLLATE "C"` is recorded as the
   column it is, carrying its collation, rather than as an expression key.
+- `CREATE INDEX ... ON ONLY` on a partitioned table is modeled: the parent is
+  left invalid while partitions are missing. A plain `CREATE INDEX` on a
+  partitioned table now creates and attaches a child index on every partition,
+  using the name PostgreSQL generates, recursing while a partition is itself
+  partitioned, and reusing an equivalent index the partition already carries.
+- A partitioned index's validity now follows its attachments: an invalid parent
+  becomes valid once every partition's child index is attached and valid, and
+  revalidates its own parent in turn when it is itself a partition. Attaching a
+  partition table does not revalidate a parent index by itself.
+- `ALTER INDEX ... ATTACH PARTITION` refuses a second index for a partition
+  that already has one attached, requires a child constraint only when the
+  parent index backs one, without comparing the kinds, and refuses a
+  primary-key parent's index over a column the partition table leaves nullable.
 - `REINDEX` marks a broken index usable, so rebuilding one and then constraining
   from it no longer fails.
 - A cloned partition constraint no longer has to share its parent's name to

@@ -192,6 +192,9 @@ impl AnalysisState {
         }
 
         self.snapshot_namespace();
+        self.local
+            .graph
+            .propagate_type_rename(&rename.old_id, &rename.new_id);
         if let Some(TypeOverlay::Present(mut state)) = self.local.types.remove(&rename.old_id) {
             state.id = rename.new_id.clone();
             self.local
@@ -433,18 +436,24 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
         }
-        if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
-            if !drop.cascade {
-                return MutationResult::conflict(format!(
-                    "domain '{}' has dependent objects; use CASCADE",
-                    dependent
-                ));
-            }
-            return self.unresolved(EvidenceCode::UnmodeledState);
+        let dependent = present.iter().find(|id| self.has_type_dependents(id));
+        if let Some(dependent) = dependent
+            && !drop.cascade
+        {
+            return MutationResult::conflict(format!(
+                "domain '{}' has dependent objects; use CASCADE",
+                dependent
+            ));
         }
         for id in &present {
             self.snapshot_type(id);
             self.local.types.insert(id.clone(), TypeOverlay::Dropped);
+        }
+        if dependent.is_some() {
+            // PostgreSQL removes the dependents too: table columns, routines
+            // and domains over the type are not enumerated here, so the chain
+            // stops being exact even though the drop applies.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
         MutationResult::Applied
     }
@@ -485,18 +494,24 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
         }
-        if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
-            if !drop.cascade {
-                return MutationResult::conflict(format!(
-                    "type '{}' has dependent objects; use CASCADE",
-                    dependent
-                ));
-            }
-            return self.unresolved(EvidenceCode::UnmodeledState);
+        let dependent = present.iter().find(|id| self.has_type_dependents(id));
+        if let Some(dependent) = dependent
+            && !drop.cascade
+        {
+            return MutationResult::conflict(format!(
+                "type '{}' has dependent objects; use CASCADE",
+                dependent
+            ));
         }
         for id in &present {
             self.snapshot_type(id);
             self.local.types.insert(id.clone(), TypeOverlay::Dropped);
+        }
+        if dependent.is_some() {
+            // PostgreSQL removes the dependents too: table columns, routines
+            // and domains over the type are not enumerated here, so the chain
+            // stops being exact even though the drop applies.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
         MutationResult::Applied
     }

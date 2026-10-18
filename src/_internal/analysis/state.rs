@@ -1139,20 +1139,11 @@ impl AnalysisState {
             }
             match dependency.target {
                 crate::_internal::db::cache::ViewDependencyTarget::Routine { routine } => {
-                    let name = ObjectId::new(
-                        routine.schema.clone(),
-                        routine
-                            .name
-                            .split_once('(')
-                            .map_or(routine.name.as_str(), |(name, _)| name)
-                            .to_string(),
-                    );
                     graph.add_edge(DependencyEdge::new(
                         dependent,
                         routine.clone(),
                         DependencyKind::ViewUsesRoutine {
-                            routine: Some(routine),
-                            name,
+                            unresolved_name: None,
                         },
                     ));
                 }
@@ -1160,7 +1151,7 @@ impl AnalysisState {
                     graph.add_edge(DependencyEdge::new(
                         dependent,
                         ty.clone(),
-                        DependencyKind::ViewUsesType { ty },
+                        DependencyKind::ViewUsesType,
                     ));
                 }
             }
@@ -1875,12 +1866,16 @@ impl AnalysisState {
         self.local.graph.edges().iter().any(|edge| {
             if let crate::_internal::analysis::graph::DependencyKind::IndexOnRelation {
                 definition,
+                is_immediate,
                 eligibility_known,
                 ..
             } = &edge.kind
             {
+                // Mirrors `is_usable_unique_index` (matview.c): unique, valid,
+                // immediate, non-partial, and over plain columns.
                 edge.referenced == *relation_id
                     && *eligibility_known
+                    && *is_immediate
                     && definition.is_usable()
                     && definition.unique
                     && !definition.has_expression_keys()
@@ -3713,6 +3708,27 @@ impl AnalysisState {
             new_id.clone(),
             DependencyKind::RenameTo,
         ));
+
+        // A name-only view reference follows the move only when the whole
+        // written name moved. If an overload of the old name remains, the
+        // reference may name either routine, so the chain stops being exact.
+        let (old_schema, old_name) = DependencyGraph::split_routine_signature(old_id);
+        let old_written_name = ObjectId::new(old_schema, old_name.to_string());
+        if self
+            .local
+            .graph
+            .has_view_reference_to_name(&old_written_name)
+        {
+            if self.routine_overloads_under(&old_written_name).count() > 0 {
+                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
+            } else {
+                let (new_schema, new_name) = DependencyGraph::split_routine_signature(new_id);
+                self.local.graph.propagate_view_reference_rename(
+                    &old_written_name,
+                    &ObjectId::new(new_schema, new_name.to_string()),
+                );
+            }
+        }
     }
 
     pub(super) fn validate_function_move(
@@ -4777,7 +4793,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn routine_cascade_without_dependency_edges_is_not_applied_partially() {
+    fn routine_cascade_without_known_dependents_applies_the_drop() {
         let id = ObjectId::new("public", "work(integer)");
         let routine = |kind| crate::_internal::model::function::FunctionState {
             return_type: "integer".to_string(),
@@ -4814,15 +4830,12 @@ mod evidence_tests {
                 ),
                 None,
             ),
-            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
+            MutationResult::Applied
         );
-        assert!(
-            procedure_state
-                .evidence()
-                .iter()
-                .any(|record| record.code == EvidenceCode::UnmodeledState)
-        );
-        assert!(procedure_state.local.functions.contains_key(&id));
+        assert!(matches!(
+            procedure_state.local.functions.get(&id),
+            Some(crate::_internal::model::function::FunctionOverlay::Dropped)
+        ));
 
         let mut aggregate_cache = DbCache::new();
         aggregate_cache.functions.insert(
@@ -4841,15 +4854,12 @@ mod evidence_tests {
                 ),
                 None,
             ),
-            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
+            MutationResult::Applied
         );
-        assert!(
-            aggregate_state
-                .evidence()
-                .iter()
-                .any(|record| record.code == EvidenceCode::UnmodeledState)
-        );
-        assert!(aggregate_state.local.functions.contains_key(&id));
+        assert!(matches!(
+            aggregate_state.local.functions.get(&id),
+            Some(crate::_internal::model::function::FunctionOverlay::Dropped)
+        ));
     }
 
     #[test]
@@ -4894,6 +4904,7 @@ mod evidence_tests {
                 table: ObjectId::new("public", "table"),
                 if_not_exists: false,
                 concurrently: true,
+                only: false,
                 using_method: None,
                 predicate: IndexPredicate::None,
                 unique: false,
@@ -4941,6 +4952,7 @@ mod evidence_tests {
                 table: partitioned_table,
                 if_not_exists: false,
                 concurrently: true,
+                only: false,
                 using_method: None,
                 predicate: IndexPredicate::None,
                 unique: false,
@@ -4973,6 +4985,7 @@ mod evidence_tests {
                     table: partition_drop_table,
                     if_not_exists: false,
                     concurrently: false,
+                    only: false,
                     using_method: None,
                     predicate: IndexPredicate::None,
                     unique: false,

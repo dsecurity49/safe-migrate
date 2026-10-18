@@ -56,6 +56,7 @@ impl Resolver {
         name: &QualifiedName,
         or_replace: bool,
         depends_on: &[QualifiedName],
+        column_list: &[String],
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
@@ -73,6 +74,7 @@ impl Resolver {
                 .map(|dependency| Self::resolve_relation_lookup_name(dependency, state))
                 .collect(),
             columns,
+            column_list: column_list.to_vec(),
             projection_complete,
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
@@ -278,19 +280,7 @@ impl Resolver {
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
-        let mut columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
-        // An explicit column list renames the outputs in order.
-        if !column_list.is_empty() {
-            if column_list.len() == columns.len() {
-                for (column, name) in columns.iter_mut().zip(column_list) {
-                    column.name = name.clone();
-                }
-            } else {
-                // PostgreSQL refuses a list that does not match the projection,
-                // and the mismatch is not modelled, so claim nothing.
-                columns.clear();
-            }
-        }
+        let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
         Mutation::CreateMaterializedView(CreateMaterializedView {
             id: Self::resolve_creation_name(name, state),
             depends_on: depends_on
@@ -300,6 +290,7 @@ impl Resolver {
             if_not_exists,
             with_no_data,
             columns,
+            column_list: column_list.to_vec(),
             projection_complete,
             routines: Self::resolve_view_routines(view_routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
@@ -395,6 +386,7 @@ impl Resolver {
         relation: &QualifiedName,
         if_not_exists: bool,
         concurrently: bool,
+        only: bool,
         using_method: &Option<String>,
         predicate: &IndexPredicate,
         unique: bool,
@@ -420,6 +412,7 @@ impl Resolver {
             table,
             if_not_exists,
             concurrently,
+            only,
             using_method: using_method.clone(),
             predicate: predicate.clone(),
             unique,

@@ -3,7 +3,7 @@ use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{
     AlterFunctionAction, FuncOptionFact, ParamModeFact, RetTypeFact, SecurityKind, VolatilityKind,
 };
-use crate::_internal::analysis::graph::DependencyKind;
+use crate::_internal::analysis::graph::{DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, CreateAggregateMutation,
     CreateFunctionMutation, CreateProcedureMutation, DropAggregateMutation, DropFunctionMutation,
@@ -14,11 +14,18 @@ use crate::_internal::model::function::{
     FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
 };
 use crate::_internal::model::trigger::TriggerOverlay;
+use std::collections::HashSet;
 
 type RoutineLookup = ObjectLookup;
 
 /// A routine a drop would take, with the triggers and views that depend on it.
-type DropTarget = (ObjectId, Vec<(ObjectId, ObjectId)>, Vec<ObjectId>);
+/// A view entry carries the written name when its reference never resolved to
+/// a signature, because such a reference matches every overload of the name.
+type DropTarget = (
+    ObjectId,
+    Vec<(ObjectId, ObjectId)>,
+    Vec<(ObjectId, Option<ObjectId>)>,
+);
 
 /// The identity constraints `CREATE OR REPLACE` places on an existing routine.
 ///
@@ -506,21 +513,19 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
-    /// Whether a view depends on `routine` only through a reference that never
-    /// named an overload, while other overloads of that name exist.
-    fn view_routine_reference_is_ambiguous(&self, routine: &ObjectId) -> bool {
+    /// Present routines that share a written qualified name.
+    pub(super) fn routine_overloads_under(
+        &self,
+        name: &ObjectId,
+    ) -> impl Iterator<Item = &ObjectId> {
         self.local
-            .graph
-            .views_for_function(routine)
+            .functions
             .iter()
-            .any(|edge| {
-                matches!(
-                    edge.kind,
-                    crate::_internal::analysis::graph::DependencyKind::ViewUsesRoutine {
-                        routine: None,
-                        ..
-                    }
-                )
+            .filter_map(move |(id, overlay)| {
+                (matches!(overlay, FunctionOverlay::Present(_))
+                    && id.schema == name.schema
+                    && DependencyGraph::split_routine_signature(id).1 == name.name)
+                    .then_some(id)
             })
     }
 
@@ -589,24 +594,34 @@ impl AnalysisState {
                     }
                     // PostgreSQL refuses the drop because a view depends on the
                     // routine, reporting `view ... depends on function`.
-                    let dependent_views: Vec<ObjectId> = self
+                    let dependent_views: Vec<(ObjectId, Option<ObjectId>)> = self
                         .local
                         .graph
                         .views_for_function(&id)
                         .into_iter()
-                        .map(|edge| edge.dependent.clone())
+                        .filter_map(|edge| {
+                            let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind
+                            else {
+                                return None;
+                            };
+                            Some((edge.dependent.clone(), unresolved_name.clone()))
+                        })
                         .collect();
                     if !dependent_views.is_empty() && !function.cascade {
                         // A reference that never resolved names the routine
-                        // only, and only when several overloads share the name
-                        // is it undecidable which one the view calls.
-                        let ambiguous = self.view_routine_reference_is_ambiguous(&id);
+                        // only; only when another overload share the name is
+                        // it undecidable which one the view calls.
+                        let ambiguous = dependent_views.iter().any(|(_, unresolved_name)| {
+                            unresolved_name
+                                .as_ref()
+                                .is_some_and(|name| self.routine_overloads_under(name).count() > 1)
+                        });
                         if ambiguous {
                             return self.unresolved(EvidenceCode::UnresolvedReference);
                         }
                         return MutationResult::conflict(format!(
                             "function '{}' is required by view '{}'; use CASCADE",
-                            id, dependent_views[0]
+                            id, dependent_views[0].0
                         ));
                     }
                     if !targets.iter().any(|(existing, _, _)| existing == &id) {
@@ -631,6 +646,12 @@ impl AnalysisState {
         }
 
         let any_applied = !targets.is_empty();
+        // A name-only view reference is definitely cleared by this statement
+        // only when every overload of its written name is being dropped.
+        // Otherwise the view may call a surviving overload: it stays, and the
+        // chain stops being exact.
+        let dropped_ids: HashSet<&ObjectId> = targets.iter().map(|(id, _, _)| id).collect();
+        let mut surviving_reference = false;
         for (id, dependent_triggers, dependent_views) in &targets {
             self.snapshot_function(id);
             self.local
@@ -638,18 +659,21 @@ impl AnalysisState {
                 .insert(id.clone(), FunctionOverlay::Dropped);
 
             if function.cascade {
-                for view_id in dependent_views {
-                    self.snapshot_relation(view_id);
-                    self.local
-                        .relations
-                        .insert(view_id.clone(), RelationOverlay::Dropped);
+                let mut dropped_views: Vec<ObjectId> = Vec::new();
+                for (view_id, unresolved_name) in dependent_views {
+                    let covered = match unresolved_name {
+                        None => true,
+                        Some(name) => self
+                            .routine_overloads_under(name)
+                            .all(|overload| dropped_ids.contains(overload)),
+                    };
+                    if covered {
+                        dropped_views.push(view_id.clone());
+                    } else {
+                        surviving_reference = true;
+                    }
                 }
-                if !dependent_views.is_empty() {
-                    self.snapshot_graph_full();
-                    self.local
-                        .graph
-                        .retain_edges(|edge| !dependent_views.contains(&edge.dependent));
-                }
+                self.drop_cascaded_views(&dropped_views);
                 for (trigger_id, table_id) in dependent_triggers.iter() {
                     let trigger_name =
                         self.local
@@ -680,6 +704,9 @@ impl AnalysisState {
                     });
                 }
             }
+        }
+        if surviving_reference {
+            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
         }
         if any_applied {
             MutationResult::Applied
@@ -928,12 +955,9 @@ impl AnalysisState {
         }) {
             return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
-        if procedure.cascade && !targets.is_empty() {
-            // Procedure dependents are not yet represented as typed graph
-            // edges. Applying CASCADE would therefore remove only the routine
-            // while leaving PostgreSQL-owned dependents in simulated state.
-            return self.unresolved(EvidenceCode::UnmodeledState);
-        }
+        // PostgreSQL records no dependents of a procedure (CALL is not
+        // allowed in atomic bodies and string bodies are untracked), so
+        // CASCADE behaves like RESTRICT here.
         for id in &targets {
             self.snapshot_function(id);
             self.local
@@ -1142,6 +1166,28 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Drop views a routine cascade removes, together with everything that
+    /// depends on them: PostgreSQL's CASCADE is transitive.
+    fn drop_cascaded_views(&mut self, views: &[ObjectId]) {
+        let mut seeds: Vec<ObjectId> = Vec::new();
+        for view in views {
+            if !seeds.contains(view) {
+                seeds.push(view.clone());
+            }
+        }
+        if seeds.is_empty() {
+            return;
+        }
+        let closure = self.cascade_for_relations(&seeds);
+        for relation in &closure.dropped_relations {
+            self.snapshot_relation(relation);
+            self.local
+                .relations
+                .insert(relation.clone(), RelationOverlay::Dropped);
+        }
+        self.remove_dropped_relation_edges(&closure.dropped_relations, &closure.dropped_indexes);
+    }
+
     pub(super) fn apply_drop_aggregate(
         &mut self,
         aggregate: &DropAggregateMutation,
@@ -1174,6 +1220,9 @@ impl AnalysisState {
                 }
             }
         }
+        if targets.is_empty() {
+            return MutationResult::NoOp;
+        }
         if targets.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
@@ -1182,10 +1231,50 @@ impl AnalysisState {
         }) {
             return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
-        if aggregate.cascade && !targets.is_empty() {
-            // Aggregate implementation-function and dependent-object edges
-            // are not modeled yet; CASCADE must not claim a partial closure.
-            return self.unresolved(EvidenceCode::UnmodeledState);
+        let dependent_views: Vec<(ObjectId, Option<ObjectId>)> = targets
+            .iter()
+            .flat_map(|id| {
+                self.local
+                    .graph
+                    .views_for_function(id)
+                    .into_iter()
+                    .filter_map(|edge| {
+                        let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind else {
+                            return None;
+                        };
+                        Some((edge.dependent.clone(), unresolved_name.clone()))
+                    })
+            })
+            .collect();
+        if !dependent_views.is_empty() && !aggregate.cascade {
+            let ambiguous = dependent_views.iter().any(|(_, unresolved_name)| {
+                unresolved_name
+                    .as_ref()
+                    .is_some_and(|name| self.routine_overloads_under(name).count() > 1)
+            });
+            if ambiguous {
+                return self.unresolved(EvidenceCode::UnresolvedReference);
+            }
+            return MutationResult::conflict(format!(
+                "aggregate '{}' is required by view '{}'; use CASCADE",
+                targets[0], dependent_views[0].0
+            ));
+        }
+        let dropped_ids: HashSet<&ObjectId> = targets.iter().collect();
+        let mut surviving_reference = false;
+        let mut dropped_views: Vec<ObjectId> = Vec::new();
+        for (view_id, unresolved_name) in &dependent_views {
+            let covered = match unresolved_name {
+                None => true,
+                Some(name) => self
+                    .routine_overloads_under(name)
+                    .all(|overload| dropped_ids.contains(overload)),
+            };
+            if covered {
+                dropped_views.push(view_id.clone());
+            } else {
+                surviving_reference = true;
+            }
         }
         for id in &targets {
             self.snapshot_function(id);
@@ -1193,11 +1282,13 @@ impl AnalysisState {
                 .functions
                 .insert(id.clone(), FunctionOverlay::Dropped);
         }
-        if !targets.is_empty() {
-            MutationResult::Applied
-        } else {
-            MutationResult::NoOp
+        if aggregate.cascade {
+            self.drop_cascaded_views(&dropped_views);
         }
+        if surviving_reference {
+            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
+        }
+        MutationResult::Applied
     }
 
     fn function_option_unmodeled(option: &FuncOptionFact) -> bool {

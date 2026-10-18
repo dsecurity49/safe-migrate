@@ -24,20 +24,19 @@ pub(crate) enum DependencyKind {
     },
     /// A routine a view calls, which a drop of that routine must clear.
     ///
-    /// `routine` is the exact routine identity when the call resolved to one.
-    /// When it is `None` the call could not be pinned to a signature, so only
-    /// the qualified name is known and any overload of it is a dependent.
+    /// `unresolved_name` is `Some` when the call could not be pinned to a
+    /// signature. The edge endpoint is then the written name, and every
+    /// overload of that name is a dependent. A move of only some overloads
+    /// cannot be expressed that way and taints the chain instead. `None` means
+    /// the endpoint is the resolved routine identity itself.
     ViewUsesRoutine {
-        routine: Option<ObjectId>,
-        name: ObjectId,
+        unresolved_name: Option<ObjectId>,
     },
     /// A type a view body casts to, which a drop of that type must clear.
     ///
     /// PostgreSQL records this from the cast alone: a view that selects a
-    /// column of a type creates no such dependency.
-    ViewUsesType {
-        ty: ObjectId,
-    },
+    /// column of a type creates no such dependency. The endpoint is the type.
+    ViewUsesType,
     IndexOnRelation {
         definition: IndexDefinition,
         dependency_columns: Vec<String>,
@@ -562,8 +561,6 @@ impl DependencyGraph {
                 DependencyKind::IndexPartitionOf => {}
                 DependencyKind::ForeignKey { .. }
                 | DependencyKind::ViewDependency { .. }
-                | DependencyKind::ViewUsesRoutine { .. }
-                | DependencyKind::ViewUsesType { .. }
                 | DependencyKind::InheritanceOf
                 | DependencyKind::PartitionOf
                 | DependencyKind::PartitionDetachPending
@@ -574,6 +571,13 @@ impl DependencyGraph {
                     }
                     if edge.referenced == *old_id {
                         edge.referenced = new_id.clone();
+                    }
+                }
+                // A view reference follows only on the dependent side: the
+                // referenced routine or type may share the relation's name.
+                DependencyKind::ViewUsesRoutine { .. } | DependencyKind::ViewUsesType => {
+                    if edge.dependent == *old_id {
+                        edge.dependent = new_id.clone();
                     }
                 }
                 DependencyKind::ColumnDefaultOnSequence { .. } => {
@@ -656,13 +660,66 @@ impl DependencyGraph {
         self.invalidate_indexes();
     }
 
-    /// Propagate a function rename through trigger dependency payloads.
+    /// Propagate a routine rename through its typed endpoints: trigger
+    /// dependencies and resolved view references. A name-only view reference
+    /// is the caller's decision, because only it can see the remaining
+    /// overloads of the written name.
     pub(crate) fn propagate_function_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
-            if let DependencyKind::TriggerOnTable { function_id, .. } = &mut edge.kind
-                && *function_id == *old_id
+            match &mut edge.kind {
+                DependencyKind::TriggerOnTable { function_id, .. } if *function_id == *old_id => {
+                    *function_id = new_id.clone();
+                }
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: None,
+                } if edge.referenced == *old_id => {
+                    edge.referenced = new_id.clone();
+                }
+                _ => {}
+            }
+        }
+        self.deduplicate_edges();
+        self.invalidate_indexes();
+    }
+
+    /// Propagate a type rename through view cast references.
+    pub(crate) fn propagate_type_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        for edge in &mut self.edges {
+            if matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *old_id {
+                edge.referenced = new_id.clone();
+            }
+        }
+        self.deduplicate_edges();
+        self.invalidate_indexes();
+    }
+
+    /// Whether any view references `name` without a resolved signature.
+    pub(crate) fn has_view_reference_to_name(&self, name: &ObjectId) -> bool {
+        self.edges.iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: Some(reference),
+                } if reference == name
+            )
+        })
+    }
+
+    /// Follow a name-only view reference to a moved name; the caller has
+    /// established that every overload of the old name moved with it.
+    pub(crate) fn propagate_view_reference_rename(
+        &mut self,
+        old_name: &ObjectId,
+        new_name: &ObjectId,
+    ) {
+        for edge in &mut self.edges {
+            if let DependencyKind::ViewUsesRoutine {
+                unresolved_name: Some(reference),
+            } = &mut edge.kind
+                && reference == old_name
             {
-                *function_id = new_id.clone();
+                *reference = new_name.clone();
+                edge.referenced = new_name.clone();
             }
         }
         self.deduplicate_edges();
@@ -865,21 +922,18 @@ impl DependencyGraph {
         let (schema, signature) = Self::split_routine_signature(function_id);
         self.edges
             .iter()
-            .filter(|edge| {
-                let DependencyKind::ViewUsesRoutine { routine, name } = &edge.kind else {
-                    return false;
-                };
-                name.schema == schema
-                    && match routine {
-                        Some(resolved) => resolved == function_id,
-                        None => name.name == signature,
-                    }
+            .filter(|edge| match &edge.kind {
+                DependencyKind::ViewUsesRoutine { unresolved_name } => match unresolved_name {
+                    None => &edge.referenced == function_id,
+                    Some(name) => name.schema == schema && name.name == signature,
+                },
+                _ => false,
             })
             .collect()
     }
 
     /// The schema and bare name of a routine whose identity is `name(arguments)`.
-    fn split_routine_signature(routine: &ObjectId) -> (&str, &str) {
+    pub(crate) fn split_routine_signature(routine: &ObjectId) -> (&str, &str) {
         match routine.name.split_once('(') {
             Some((name, _)) => (routine.schema.as_str(), name),
             None => (routine.schema.as_str(), routine.name.as_str()),
@@ -891,7 +945,7 @@ impl DependencyGraph {
         self.edges
             .iter()
             .filter(|edge| {
-                matches!(&edge.kind, DependencyKind::ViewUsesType { ty: referenced } if referenced == ty)
+                matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *ty
             })
             .collect()
     }

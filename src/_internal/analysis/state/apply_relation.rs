@@ -10,9 +10,7 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::data_type::{ParsedDataType, WIDENED_NUMERIC_SCALE_VERSION};
-use crate::_internal::model::index::{
-    IndexComparability, IndexDefinition, IndexPredicate, index_keys,
-};
+use crate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
@@ -430,46 +428,10 @@ impl AnalysisState {
         }
     }
 
-    /// Whether a child index is acceptable as a partition of the parent's.
-    ///
-    /// An index carrying an expression key is never accepted: the catalog gives no
-    /// reliable way to prove two expression trees equal, so claiming the parent is
-    /// covered would be a claim we cannot support.
-    fn partition_indexes_equivalent(left: &DependencyKind, right: &DependencyKind) -> bool {
-        match (left, right) {
-            (
-                DependencyKind::IndexOnRelation {
-                    definition: left_definition,
-                    dependency_columns: left_dependencies,
-                    dependency_columns_known: left_dependencies_known,
-                    is_concurrent: left_concurrent,
-                    is_immediate: left_immediate,
-                    eligibility_known: left_eligibility,
-                },
-                DependencyKind::IndexOnRelation {
-                    definition: right_definition,
-                    dependency_columns: right_dependencies,
-                    dependency_columns_known: right_dependencies_known,
-                    is_concurrent: right_concurrent,
-                    is_immediate: right_immediate,
-                    eligibility_known: right_eligibility,
-                },
-            ) => {
-                left_definition.is_usable()
-                    && right_definition.is_usable()
-                    && left_definition.comparability(right_definition)
-                        == IndexComparability::Comparable
-                    && left_definition == right_definition
-                    && left_dependencies == right_dependencies
-                    && left_dependencies_known == right_dependencies_known
-                    && left_concurrent == right_concurrent
-                    && left_immediate == right_immediate
-                    && left_eligibility == right_eligibility
-            }
-            _ => false,
-        }
-    }
-
+    /// `AttachPartitionEnsureIndexes`: every partitioned index of the parent
+    /// table gains an attached child index on the partition — reusing an
+    /// equivalent same-kind one when available and creating a clone otherwise —
+    /// and every key constraint backing such an index is cloned alongside it.
     fn ensure_partition_indexes_and_constraints(&mut self, parent: &ObjectId, child: &ObjectId) {
         let parent_indexes: Vec<DependencyEdge> = self
             .local
@@ -478,17 +440,6 @@ impl AnalysisState {
             .iter()
             .filter(|edge| {
                 edge.referenced == *parent
-                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-            })
-            .cloned()
-            .collect();
-        let child_indexes: Vec<DependencyEdge> = self
-            .local
-            .graph
-            .edges()
-            .iter()
-            .filter(|edge| {
-                edge.referenced == *child
                     && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
             })
             .cloned()
@@ -502,41 +453,12 @@ impl AnalysisState {
             .collect();
 
         for parent_index in parent_indexes {
-            let child_index = child_indexes
-                .iter()
-                .find(|candidate| {
-                    Self::partition_indexes_equivalent(&parent_index.kind, &candidate.kind)
-                })
-                .map(|edge| edge.dependent.clone())
-                .unwrap_or_else(|| {
-                    let columns = match &parent_index.kind {
-                        DependencyKind::IndexOnRelation { definition, .. } => {
-                            let names = definition.key_column_names();
-                            (!names.is_empty()).then(|| names.join("_"))
-                        }
-                        _ => None,
-                    };
-                    let id = self.next_generated_relation_name_avoiding(
-                        &child.schema,
-                        &child.name,
-                        columns.as_deref(),
-                        "idx",
-                        &HashSet::new(),
-                    );
-                    self.snapshot_graph();
-                    self.local.graph.add_edge(DependencyEdge::new(
-                        id.clone(),
-                        child.clone(),
-                        parent_index.kind.clone(),
-                    ));
-                    id
-                });
-
-            // PostgreSQL attaches the partition's index to the parent's as part
-            // of the same operation, so the child cannot be dropped alone.
-            if self.index_parent_of(&child_index).is_none() {
-                self.record_index_partition(&parent_index.dependent, &child_index);
-            }
+            let (child_index, _valid) = self.ensure_partition_index_child(
+                &parent_index.dependent,
+                child,
+                &parent_index.kind,
+                super::index_topology::ChildReuseRule::TableAttach,
+            );
 
             let Some(parent_constraint) = parent_constraints.iter().find(|constraint| {
                 constraint.backing_index.as_ref() == Some(&parent_index.dependent)
@@ -547,16 +469,15 @@ impl AnalysisState {
             }) else {
                 continue;
             };
-            if self
-                .local
-                .constraints
-                .contains_key(&(child.clone(), parent_constraint.name.clone()))
-            {
+            // A reused child index already backs the same-kind constraint,
+            // which PostgreSQL adopts as the clone rather than restructuring.
+            if self.constraint_backing(&child_index).is_some() {
                 continue;
             }
-            // A unique or primary key constraint cloned onto a partition is renamed
-            // `<partition>_<column>_key`; a check constraint keeps the
-            // parent's name. Verified against a live server.
+            // A unique or primary key constraint cloned onto a partition is
+            // renamed; a primary key becomes `<partition>_pkey`, a unique
+            // constraint `<partition>_<columns>_key`. Verified against a live
+            // server for range, list and hash partitions.
             let columns = self
                 .local
                 .graph
@@ -575,17 +496,13 @@ impl AnalysisState {
                     }
                     _ => None,
                 });
-            // A constraint cloned onto a partition is renamed: a primary key becomes
-            // `<partition>_pkey`, a unique constraint `<partition>_<column>_key`,
-            // and a check constraint keeps the parent's name. Verified against
-            // a live server for range, list and hash partitions.
             let cloned_name = match parent_constraint.kind {
                 ConstraintKind::PrimaryKey => format!("{}_pkey", child.name),
                 ConstraintKind::Unique => {
                     let column = columns
-                        .as_ref()
-                        .and_then(|columns| columns.first())
-                        .cloned()
+                        .as_deref()
+                        .filter(|columns| !columns.is_empty())
+                        .map(|columns| columns.join("_"))
                         .unwrap_or_else(|| child.name.clone());
                     format!("{}_{}_key", child.name, column)
                 }
@@ -644,17 +561,7 @@ impl AnalysisState {
         SequenceParameters {
             data_type: data_type.to_string(),
             max_value,
-            persistence: match persistence {
-                crate::_internal::model::relation::Persistence::Permanent => {
-                    SequencePersistence::Permanent
-                }
-                crate::_internal::model::relation::Persistence::Temporary => {
-                    SequencePersistence::Temporary
-                }
-                crate::_internal::model::relation::Persistence::Unlogged => {
-                    SequencePersistence::Unlogged
-                }
-            },
+            persistence: Self::sequence_persistence(persistence),
             ..SequenceParameters::default()
         }
     }
@@ -687,86 +594,67 @@ impl AnalysisState {
         }
     }
 
-    pub(super) fn apply_identity_sequence_options(
-        mut parameters: SequenceParameters,
-        options: &crate::_internal::analysis::mutations::IdentitySequenceOptionsMutation,
-    ) -> Option<SequenceParameters> {
-        if let Some(increment) = options.increment {
-            parameters.increment = increment;
-        }
-        if let Some(data_type) = options.data_type.as_deref() {
-            let normalized = data_type.trim().to_ascii_lowercase();
-            let (minimum, maximum) = match normalized.as_str() {
-                "smallint" | "int2" => (i16::MIN as i64, i16::MAX as i64),
-                "integer" | "int" | "int4" => (i32::MIN as i64, i32::MAX as i64),
-                "bigint" | "int8" => (i64::MIN, i64::MAX),
-                _ => return None,
-            };
-            parameters.data_type = match normalized.as_str() {
-                "smallint" | "int2" => "smallint",
-                "integer" | "int" | "int4" => "integer",
-                _ => "bigint",
-            }
-            .to_string();
-            parameters.min_value = if parameters.increment > 0 { 1 } else { minimum };
-            parameters.max_value = if parameters.increment > 0 {
-                maximum
-            } else {
-                -1
-            };
-        }
-        let type_bounds = match parameters.data_type.as_str() {
-            "smallint" => (i16::MIN as i64, i16::MAX as i64),
-            "integer" => (i32::MIN as i64, i32::MAX as i64),
-            "bigint" => (i64::MIN, i64::MAX),
-            _ => return None,
-        };
-        parameters.min_value = match options.min_value {
-            Some(Some(value)) => value,
-            Some(None) => {
-                if parameters.increment > 0 {
-                    1
-                } else {
-                    type_bounds.0
-                }
-            }
-            None => parameters.min_value,
-        };
-        parameters.max_value = match options.max_value {
-            Some(Some(value)) => value,
-            Some(None) => {
-                if parameters.increment > 0 {
-                    type_bounds.1
-                } else {
-                    -1
-                }
-            }
-            None => parameters.max_value,
-        };
-        if let Some(start) = options.start_value {
-            parameters.start_value = start;
-        } else if options.increment.is_some() && options.increment.unwrap_or(1) < 0 {
-            parameters.start_value = parameters.max_value;
-        }
-        if let Some(cache_size) = options.cache_size {
-            parameters.cache_size = cache_size;
-        }
-        if let Some(cycle) = options.cycle {
-            parameters.cycle = cycle;
-        }
-        if let Some(logged) = options.persistence {
-            parameters.persistence = if logged {
+    fn sequence_persistence(
+        persistence: &crate::_internal::model::relation::Persistence,
+    ) -> SequencePersistence {
+        match persistence {
+            crate::_internal::model::relation::Persistence::Permanent => {
                 SequencePersistence::Permanent
-            } else {
+            }
+            crate::_internal::model::relation::Persistence::Temporary => {
+                SequencePersistence::Temporary
+            }
+            crate::_internal::model::relation::Persistence::Unlogged => {
                 SequencePersistence::Unlogged
-            };
+            }
         }
-        (parameters.increment != 0
-            && parameters.cache_size > 0
-            && parameters.min_value < parameters.max_value
-            && parameters.start_value >= parameters.min_value
-            && parameters.start_value <= parameters.max_value)
-            .then_some(parameters)
+    }
+
+    /// Parameters for the sequence backing an identity column.
+    ///
+    /// PostgreSQL folds the column type into the option list as a synthetic
+    /// `AS` clause, so the column type drives the bounds and a written `AS`
+    /// is a duplicate option.
+    fn identity_sequence_parameters(
+        column_type: Option<&str>,
+        persistence: &crate::_internal::model::relation::Persistence,
+        options: Option<&crate::_internal::analysis::mutations::IdentitySequenceOptionsMutation>,
+    ) -> Result<SequenceParameters, MutationResult> {
+        let data_type = match column_type {
+            Some(column_type) => match super::apply_sequence::sequence_type(column_type) {
+                Some((data_type, _, _)) => data_type,
+                None => {
+                    return Err(MutationResult::conflict(
+                        "identity column type must be smallint, integer, or bigint".to_string(),
+                    ));
+                }
+            },
+            None => "bigint",
+        };
+        if options.is_some_and(|options| options.data_type.is_some()) {
+            return Err(MutationResult::conflict(
+                "conflicting or redundant options: \"as\" specified more than once".to_string(),
+            ));
+        }
+        let mut option_set = options.map_or_else(
+            super::apply_sequence::SequenceOptionSet::default,
+            super::apply_sequence::SequenceOptionSet::from_identity_options,
+        );
+        // The column type is the synthetic `AS`; a written one is a duplicate.
+        option_set.as_type = None;
+        let mut parameters = super::apply_sequence::init_sequence_parameters(
+            &SequenceParameters {
+                data_type: data_type.to_string(),
+                persistence: Self::sequence_persistence(persistence),
+                ..Default::default()
+            },
+            &option_set,
+            true,
+        )?;
+        if let Some(persistence) = option_set.persistence() {
+            parameters.persistence = persistence;
+        }
+        Ok(parameters)
     }
 
     fn normalized_constraint_expression(definition: &str) -> String {
@@ -2270,23 +2158,20 @@ impl AnalysisState {
                         sequence_id
                     ));
                 }
-                let default_parameters = Self::default_column_sequence_parameters(
-                    column.ty.as_deref(),
-                    &resolved_persistence,
-                );
-                let parameters = match column.identity_sequence.as_ref() {
-                    Some(options) => {
-                        let Some(parameters) =
-                            Self::apply_identity_sequence_options(default_parameters, options)
-                        else {
-                            return MutationResult::conflict(format!(
-                                "identity sequence options for '{}.{}' are invalid",
-                                create.id, column.name
-                            ));
-                        };
-                        parameters
+                let parameters = if kind == SequenceKind::SerialLike {
+                    Self::default_column_sequence_parameters(
+                        column.ty.as_deref(),
+                        &resolved_persistence,
+                    )
+                } else {
+                    match Self::identity_sequence_parameters(
+                        column.ty.as_deref(),
+                        &resolved_persistence,
+                        column.identity_sequence.as_ref(),
+                    ) {
+                        Ok(parameters) => parameters,
+                        Err(result) => return result,
                     }
-                    None => default_parameters,
                 };
                 reserved_sequences.insert(sequence_id.clone());
                 implicit_sequences.push((sequence_id, column.name.clone(), kind, parameters));
@@ -6025,35 +5910,34 @@ impl AnalysisState {
             }
         }
         if let Some((sequence_id, column_name, kind, identity_options)) = implicit_add {
-            let default_parameters = self
+            let (column_type, persistence) = self
                 .local
                 .relations
                 .get(&alter.id)
                 .and_then(|overlay| match overlay {
-                    RelationOverlay::Present(table) => {
-                        Some(Self::default_column_sequence_parameters(
-                            table
-                                .get_column(&column_name)
-                                .and_then(|column| column.data_type.as_deref()),
-                            &table.persistence,
-                        ))
-                    }
+                    RelationOverlay::Present(table) => Some((
+                        table
+                            .get_column(&column_name)
+                            .and_then(|column| column.data_type.clone()),
+                        table.persistence.clone(),
+                    )),
                     RelationOverlay::Dropped => None,
                 })
-                .unwrap_or_default();
-            let parameters = match identity_options.as_ref() {
-                Some(options) => {
-                    let Some(parameters) =
-                        Self::apply_identity_sequence_options(default_parameters, options)
-                    else {
-                        return MutationResult::conflict(format!(
-                            "identity sequence options for '{}.{}' are invalid",
-                            alter.id, column_name
-                        ));
-                    };
-                    parameters
+                .unwrap_or((
+                    None,
+                    crate::_internal::model::relation::Persistence::Permanent,
+                ));
+            let parameters = if kind == SequenceKind::SerialLike {
+                Self::default_column_sequence_parameters(column_type.as_deref(), &persistence)
+            } else {
+                match Self::identity_sequence_parameters(
+                    column_type.as_deref(),
+                    &persistence,
+                    identity_options.as_ref(),
+                ) {
+                    Ok(parameters) => parameters,
+                    Err(result) => return result,
                 }
-                None => default_parameters,
             };
             self.snapshot_sequence(&sequence_id);
             self.snapshot_generation_counter();

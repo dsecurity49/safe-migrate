@@ -57,40 +57,8 @@ impl AnalysisState {
         kind: ReloptionTarget,
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> MutationResult {
-        let version = self.pg_version();
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for attribute in attributes {
-            // PostgreSQL rejects a repeated option before applying anything.
-            if !seen.insert(attribute.name.as_str()) {
-                return MutationResult::conflict(format!(
-                    "parameter \"{}\" specified more than once",
-                    attribute.name
-                ));
-            }
-            match evaluate(&attribute.name, Some(&attribute.value), kind, version) {
-                ReloptionOutcome::Unrecognized { name } => {
-                    // A name the table does not hold at all may belong to a
-                    // release this build does not model, so it taints: a false
-                    // conflict on a valid migration is worse than stated
-                    // uncertainty. A name the table holds but the running
-                    // version predates is a real rejection.
-                    if spec_by_name(&name).is_some() {
-                        return MutationResult::conflict(format!(
-                            "unrecognized parameter \"{name}\""
-                        ));
-                    }
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
-                }
-                ReloptionOutcome::BadValue { name, value } => {
-                    return MutationResult::conflict(format!(
-                        "invalid value for parameter \"{name}\": {value}"
-                    ));
-                }
-                ReloptionOutcome::Unplaced => {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
-                }
-                ReloptionOutcome::Accepted => {}
-            }
+        if let Err(result) = self.validate_reloptions(attributes, kind) {
+            return result;
         }
 
         if !matches!(
@@ -108,6 +76,75 @@ impl AnalysisState {
             }
         }
         MutationResult::Applied
+    }
+
+    /// Validate a `WITH (...)` option list the way PostgreSQL does for `SET`
+    /// and for creation: a repeated name, a value outside its domain, and a
+    /// name the running version predates are conflicts; a name the option
+    /// table cannot place taints, because the accepted surface grows between
+    /// releases and a false conflict would be worse.
+    fn validate_reloptions(
+        &mut self,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+        kind: ReloptionTarget,
+    ) -> Result<(), MutationResult> {
+        let version = self.pg_version();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for attribute in attributes {
+            // PostgreSQL rejects a repeated option before applying anything.
+            if !seen.insert(attribute.name.as_str()) {
+                return Err(MutationResult::conflict(format!(
+                    "parameter \"{}\" specified more than once",
+                    attribute.name
+                )));
+            }
+            match evaluate(&attribute.name, Some(&attribute.value), kind, version) {
+                ReloptionOutcome::Unrecognized { name } => {
+                    if spec_by_name(&name).is_some() {
+                        return Err(MutationResult::conflict(format!(
+                            "unrecognized parameter \"{name}\""
+                        )));
+                    }
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                }
+                ReloptionOutcome::BadValue { name, value } => {
+                    return Err(MutationResult::conflict(format!(
+                        "invalid value for parameter \"{name}\": {value}"
+                    )));
+                }
+                ReloptionOutcome::Unplaced => {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                }
+                ReloptionOutcome::Accepted => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply an explicit output-column list to derived projection columns.
+    /// PostgreSQL rejects a list longer than the projection and renames the
+    /// prefix otherwise; the rest keep their derived names.
+    fn name_view_columns(
+        &self,
+        id: &ObjectId,
+        columns: &[ViewColumn],
+        column_list: &[String],
+        projection_complete: bool,
+        too_many_message: &str,
+    ) -> Result<Vec<ViewColumn>, MutationResult> {
+        let mut columns = columns.to_vec();
+        if column_list.is_empty() || !projection_complete {
+            return Ok(columns);
+        }
+        if column_list.len() > columns.len() {
+            return Err(MutationResult::conflict(format!(
+                "{too_many_message} for '{id}'"
+            )));
+        }
+        for (column, name) in columns.iter_mut().zip(column_list) {
+            column.name = name.clone();
+        }
+        Ok(columns)
     }
 
     /// Apply `RESET (...)` on a view or materialized view. `RESET` of an option
@@ -168,7 +205,7 @@ impl AnalysisState {
         cascade
     }
 
-    fn remove_dropped_relation_edges(
+    pub(super) fn remove_dropped_relation_edges(
         &mut self,
         dropped_relations: &HashSet<ObjectId>,
         dropped_indexes: &HashSet<ObjectId>,
@@ -333,6 +370,16 @@ impl AnalysisState {
         if let Err(result) = self.validate_view_dependencies(&create.id, &create.depends_on) {
             return result;
         }
+        let columns = match self.name_view_columns(
+            &create.id,
+            &create.columns,
+            &create.column_list,
+            create.projection_complete,
+            "CREATE VIEW specifies more column names than columns",
+        ) {
+            Ok(columns) => columns,
+            Err(result) => return result,
+        };
         let owner = self
             .local
             .relations
@@ -374,12 +421,12 @@ impl AnalysisState {
             // its columns are unknown, so any column-level claim is unsound.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
         } else if create.or_replace && existing_view {
-            if let Err(result) = self.check_replaced_view_columns(&create.id, &create.columns) {
+            if let Err(result) = self.check_replaced_view_columns(&create.id, &columns) {
                 return result;
             }
-            relation.columns = view_state_columns(&create.columns);
+            relation.columns = view_state_columns(&columns);
         } else {
-            relation.columns = view_state_columns(&create.columns);
+            relation.columns = view_state_columns(&columns);
         }
         self.local
             .relations
@@ -392,7 +439,7 @@ impl AnalysisState {
                         edge.kind,
                         DependencyKind::ViewDependency { .. }
                             | DependencyKind::ViewUsesRoutine { .. }
-                            | DependencyKind::ViewUsesType { .. }
+                            | DependencyKind::ViewUsesType
                     ))
             });
         }
@@ -427,6 +474,21 @@ impl AnalysisState {
         if let Err(result) = self.validate_view_dependencies(&create.id, &create.depends_on) {
             return result;
         }
+        if let Err(result) =
+            self.validate_reloptions(&create.options, ReloptionTarget::MaterializedView)
+        {
+            return result;
+        }
+        let columns = match self.name_view_columns(
+            &create.id,
+            &create.columns,
+            &create.column_list,
+            create.projection_complete,
+            "too many column names were specified",
+        ) {
+            Ok(columns) => columns,
+            Err(result) => return result,
+        };
         self.snapshot_relation(&create.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -453,7 +515,7 @@ impl AnalysisState {
             // its columns are unknown, so any column-level claim is unsound.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
         } else {
-            relation.columns = view_state_columns(&create.columns);
+            relation.columns = view_state_columns(&columns);
         }
         self.local
             .relations
@@ -508,6 +570,22 @@ impl AnalysisState {
                         "CONCURRENTLY and WITH NO DATA options cannot be used together".to_string(),
                     );
                 }
+                if refresh.concurrently {
+                    match self.refresh_unique_index_state(&refresh.id) {
+                        RefreshIndexState::Usable => {}
+                        RefreshIndexState::Missing => {
+                            return MutationResult::conflict(format!(
+                                "cannot refresh materialized view '{}' concurrently; create a unique index with no WHERE clause on one or more columns of the materialized view",
+                                refresh.id
+                            ));
+                        }
+                        RefreshIndexState::Unknown => {
+                            return self
+                                .unresolved_statement(EvidenceCode::CatalogCoverageIncomplete);
+                        }
+                    }
+                }
+                self.snapshot_relation(&refresh.id);
                 if let Some(RelationOverlay::Present(relation)) =
                     self.local.relations.get_mut(&refresh.id)
                 {
@@ -528,6 +606,22 @@ impl AnalysisState {
         }
     }
 
+    /// Whether a concurrent refresh finds a unique index PostgreSQL can use,
+    /// mirroring `is_usable_unique_index` (matview.c).
+    fn refresh_unique_index_state(&self, matview: &ObjectId) -> RefreshIndexState {
+        if self.has_usable_unique_index(matview) {
+            return RefreshIndexState::Usable;
+        }
+        // A scoped cache may omit the index that would satisfy the check.
+        if self.baseline_scoped_family_object(
+            matview,
+            crate::_internal::db::cache::CatalogFamily::Indexes,
+        ) {
+            return RefreshIndexState::Unknown;
+        }
+        RefreshIndexState::Missing
+    }
+
     /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
     /// statement. `IF EXISTS` guards the relation lookup, and an action the
     /// model does not represent makes the statement opaque.
@@ -541,16 +635,14 @@ impl AnalysisState {
             if routine.name.inferred_schema && self.path_shadows(&routine.name.schema) {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
             }
+            let (referenced, unresolved_name) = match &routine.signature {
+                Some(signature) => (signature.clone(), None),
+                None => (routine.name.clone(), Some(routine.name.clone())),
+            };
             self.local.graph.add_edge(DependencyEdge::new(
                 view.clone(),
-                routine
-                    .signature
-                    .clone()
-                    .unwrap_or_else(|| routine.name.clone()),
-                DependencyKind::ViewUsesRoutine {
-                    routine: routine.signature.clone(),
-                    name: routine.name.clone(),
-                },
+                referenced,
+                DependencyKind::ViewUsesRoutine { unresolved_name },
             ));
         }
     }
@@ -561,7 +653,7 @@ impl AnalysisState {
             self.local.graph.add_edge(DependencyEdge::new(
                 view.clone(),
                 ty.clone(),
-                DependencyKind::ViewUsesType { ty: ty.clone() },
+                DependencyKind::ViewUsesType,
             ));
         }
     }
@@ -708,43 +800,73 @@ impl AnalysisState {
             ));
         }
         self.snapshot_graph();
+        // `ON ONLY` declines recursion into partitions: the parent stays
+        // invalid while partitions exist (indexcmds.c's INDEX_CREATE_INVALID),
+        // and is valid with none to cover.
+        let partitions: Vec<ObjectId> = self
+            .local
+            .graph
+            .partitions_of(&create.table)
+            .into_iter()
+            .cloned()
+            .collect();
+        let declined = create.only && !partitions.is_empty();
+        let kind = DependencyKind::IndexOnRelation {
+            definition: IndexDefinition {
+                method: create
+                    .using_method
+                    .clone()
+                    .or_else(|| Some("btree".to_string())),
+                keys: self.resolved_statement_index_keys(create),
+                included: index_keys(create.included_columns.clone()),
+                expression_keys: create
+                    .key_expressions
+                    .iter()
+                    .filter(|key| key.is_some())
+                    .count(),
+                unique: create.unique,
+                nulls_not_distinct: Some(create.nulls_not_distinct),
+                predicate: create.predicate.clone(),
+                unestablished: false,
+                valid: !declined,
+                ready: true,
+                live: true,
+            },
+            dependency_columns: create
+                .key_columns
+                .iter()
+                .chain(&create.included_columns)
+                .cloned()
+                .collect(),
+            dependency_columns_known: create.key_expressions.iter().all(Option::is_none)
+                && !create.predicate.has_predicate(),
+            is_concurrent: create.concurrently,
+            is_immediate: true,
+            eligibility_known: true,
+        };
         self.local.graph.add_edge(DependencyEdge::new(
             create.id.clone(),
             create.table.clone(),
-            DependencyKind::IndexOnRelation {
-                definition: IndexDefinition {
-                    method: create
-                        .using_method
-                        .clone()
-                        .or_else(|| Some("btree".to_string())),
-                    keys: self.resolved_statement_index_keys(create),
-                    included: index_keys(create.included_columns.clone()),
-                    expression_keys: create
-                        .key_expressions
-                        .iter()
-                        .filter(|key| key.is_some())
-                        .count(),
-                    unique: create.unique,
-                    nulls_not_distinct: Some(create.nulls_not_distinct),
-                    predicate: create.predicate.clone(),
-                    unestablished: false,
-                    valid: true,
-                    ready: true,
-                    live: true,
-                },
-                dependency_columns: create
-                    .key_columns
-                    .iter()
-                    .chain(&create.included_columns)
-                    .cloned()
-                    .collect(),
-                dependency_columns_known: create.key_expressions.iter().all(Option::is_none)
-                    && !create.predicate.has_predicate(),
-                is_concurrent: create.concurrently,
-                is_immediate: true,
-                eligibility_known: true,
-            },
+            kind.clone(),
         ));
+        if !declined && !partitions.is_empty() {
+            for partition in &partitions {
+                self.ensure_partition_index_child(
+                    &create.id,
+                    partition,
+                    &kind,
+                    super::index_topology::ChildReuseRule::Creation,
+                );
+            }
+            // `DefineIndex` invalidates the parent when any partition's
+            // resulting child is invalid; the children were ensured above, so
+            // coverage is exactly the invalidate-parent check.
+            let covered = self.index_is_fully_attached(&create.id);
+            self.snapshot_graph_full();
+            self.local
+                .graph
+                .update_index_definition(&create.id, |stored| stored.valid = covered);
+        }
         MutationResult::Applied
     }
 
@@ -999,6 +1121,13 @@ impl AnalysisState {
         });
         MutationResult::Applied
     }
+}
+
+/// The modelled verdict on a materialized view's concurrent-refresh index.
+enum RefreshIndexState {
+    Usable,
+    Missing,
+    Unknown,
 }
 
 /// A view's projected columns as relation columns.
