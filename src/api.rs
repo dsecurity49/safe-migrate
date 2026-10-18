@@ -850,7 +850,12 @@ impl AnalysisOutcome {
 
     /// Print the human report and return whether it contains a halt result.
     pub fn print_human(&self) -> bool {
-        InternalReporter::print_outcome(&self.inner, &self.not_evaluated)
+        InternalReporter::print_outcome(&self.inner, &self.not_evaluated, false)
+    }
+
+    /// As [`print_human`](Self::print_human), without ANSI styling.
+    pub fn print_human_without_color(&self) -> bool {
+        InternalReporter::print_outcome(&self.inner, &self.not_evaluated, true)
     }
 
     /// Run the terminal report viewer.

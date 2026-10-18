@@ -201,14 +201,6 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.no_color {
-        // SAFETY: CLI parsing happens sequentially at process startup before safe-migrate
-        // spawns any worker threads. Mutating the environment here is safe from data races.
-        unsafe {
-            std::env::set_var("NO_COLOR", "1");
-        }
-    }
-
     match cli.command {
         Commands::Init { command } => cli_init::run(command),
         Commands::Lint {
@@ -227,6 +219,7 @@ fn run() -> Result<()> {
             no_cache,
             no_auto_sync,
             OutputMode::from_flags(json, markdown, interactive),
+            cli.no_color,
         ),
         Commands::LintChain {
             dir,
@@ -244,6 +237,7 @@ fn run() -> Result<()> {
             no_cache,
             no_auto_sync,
             OutputMode::from_flags(json, markdown, interactive),
+            cli.no_color,
         ),
         Commands::Sync {
             out,
@@ -364,6 +358,7 @@ fn run_lint(
     no_cache: bool,
     no_auto_sync: bool,
     output_mode: OutputMode,
+    no_color: bool,
 ) -> Result<()> {
     let sql = fs::read_to_string(file)
         .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
@@ -378,7 +373,7 @@ fn run_lint(
     let outcome = api::analyze(&config, file.display().to_string(), sql, &baseline)
         .map_err(anyhow::Error::new)?;
 
-    finish_analysis(outcome, auto_sync, output_mode)
+    finish_analysis(outcome, auto_sync, output_mode, no_color)
 }
 
 fn run_lint_chain(
@@ -388,6 +383,7 @@ fn run_lint_chain(
     no_cache: bool,
     no_auto_sync: bool,
     output_mode: OutputMode,
+    no_color: bool,
 ) -> Result<()> {
     let mut files = Vec::new();
     for entry in
@@ -435,7 +431,7 @@ fn run_lint_chain(
     )
     .map_err(anyhow::Error::new)?;
 
-    finish_analysis(outcome, auto_sync, output_mode)
+    finish_analysis(outcome, auto_sync, output_mode, no_color)
 }
 
 fn run_sync(out: &Path, config_path: Option<&Path>, schemas: Option<&[String]>) -> Result<()> {
@@ -682,12 +678,17 @@ fn finish_analysis(
     outcome: AnalysisOutcome,
     auto_sync: AutoSyncStatus,
     output_mode: OutputMode,
+    no_color: bool,
 ) -> Result<()> {
     let outcome = outcome.with_auto_sync_status(auto_sync);
     let should_halt = outcome.should_halt();
     match output_mode {
         OutputMode::Human => {
-            outcome.print_human();
+            if no_color {
+                outcome.print_human_without_color();
+            } else {
+                outcome.print_human();
+            }
         }
         OutputMode::Json => {
             println!("{}", serde_json::to_string_pretty(&outcome.json())?);

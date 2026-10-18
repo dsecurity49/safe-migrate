@@ -33,7 +33,7 @@ mod tests {
     fn test_reporter_print_empty() {
         let violations: Vec<Violation> = vec![];
         let confidence = Confidence::Exact;
-        let has_failures = Reporter::print_report(&violations, &confidence, &[]);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[], false);
         assert!(!has_failures);
     }
 
@@ -50,7 +50,7 @@ mod tests {
         ];
 
         let confidence = Confidence::Tainted;
-        let has_failures = Reporter::print_report(&violations, &confidence, &[]);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[], false);
         assert!(has_failures);
 
         let report = Reporter::json_report(&violations, &confidence, &[]);
@@ -553,7 +553,7 @@ mod tests {
             },
         ];
         let confidence = Confidence::Exact;
-        let has_failures = Reporter::print_report(&violations, &confidence, &[]);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[], false);
         assert!(!has_failures);
     }
 

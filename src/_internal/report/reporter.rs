@@ -95,9 +95,9 @@ pub(crate) fn color_enabled(no_color_env: bool, stdout_is_terminal: bool) -> boo
     !no_color_env && stdout_is_terminal
 }
 
-fn no_color() -> bool {
+fn no_color(no_color_flag: bool) -> bool {
     !color_enabled(
-        std::env::var_os("NO_COLOR").is_some(),
+        no_color_flag || std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
     )
 }
@@ -375,6 +375,7 @@ impl Reporter {
         violations: &[Violation],
         confidence: &Confidence,
         not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+        no_color_flag: bool,
     ) -> bool {
         let mut tier1 = 0usize;
         let mut tier2 = 0usize;
@@ -448,7 +449,7 @@ impl Reporter {
 
             // Resolve styling once; asking the terminal per finding would repeat the
             // syscall for every row.
-            let color = !no_color();
+            let color = !no_color(no_color_flag);
 
             for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {
                 let v = &violations[*primary_idx];
@@ -547,13 +548,19 @@ impl Reporter {
     pub(crate) fn print_outcome(
         outcome: &AnalysisOutcome<ReportFinding>,
         not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+        no_color_flag: bool,
     ) -> bool {
         let violations: Vec<_> = outcome
             .findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let should_halt = Self::print_report(&violations, &outcome.confidence, not_evaluated);
+        let should_halt = Self::print_report(
+            &violations,
+            &outcome.confidence,
+            not_evaluated,
+            no_color_flag,
+        );
         if !outcome.evidence.is_empty() {
             println!("Analysis evidence:");
             for evidence in &outcome.evidence {
