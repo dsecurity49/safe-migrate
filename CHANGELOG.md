@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.11.0 — Unreleased
+## v0.11.0 — 2026-10-18
 
 - Report schema version 3. Violations no longer carry `operation_kind`,
   `dedup_key`, `fk_dependency_related`, `rule_title`, `rule_summary`, or
