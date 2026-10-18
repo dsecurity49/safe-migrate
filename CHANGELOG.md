@@ -11,232 +11,88 @@ notes are available on the
   `dedup_key`, `fk_dependency_related`, `rule_title`, `rule_summary`, or
   `impact`; rule titles are cited once through a new top-level `rules` object
   keyed by rule id. Consumers must branch on `schema_version`.
-- Relation options (`ALTER VIEW/MATERIALIZED VIEW SET (...)`) are now checked
-  against the server's own option tables, by relation kind. A value outside its
-  option's domain is reported where PostgreSQL reports it — `check_option` is
-  compared whole while a boolean accepts an unambiguous prefix, so `casc` is
-  rejected and `of` is not — and integer bounds are the server's. A repeated
-  option is rejected. `security_definer` is no longer accepted as a view
-  option on any version; it is a routine attribute, and PostgreSQL 15 added
-  `security_invoker` beside `security_barrier` rather than replacing it. A
-  materialized view no longer inherits the view options, and a name absent
-  from the tables still taints rather than conflicting. The same checks run
-  when `CREATE MATERIALIZED VIEW` carries `WITH (...)`, where PostgreSQL
-  validates before it creates anything.
-- `REINDEX` now follows PostgreSQL's legality rules instead of modelling every
-  form as acceptable. `REINDEX SYSTEM CONCURRENTLY` is rejected, `REINDEX
-  SCHEMA`/`DATABASE`/`SYSTEM` are rejected inside a transaction block, `REINDEX
-  TABLE` rejects a view, and `REINDEX TABLE` on a partitioned table is rejected
-  inside a transaction block. A temporary relation is no longer reported as
-  needing `CONCURRENTLY` when named as an index, which the old check could not
-  see. `REINDEX DATABASE` without a name now resolves to the session's
-  database, as the grammar allows.
-- `CREATE INDEX` now validates its key and `INCLUDE` columns against the target
-  relation, reporting an unknown column where PostgreSQL does. `IF NOT EXISTS`
-  now skips a name held by any relation, as PostgreSQL's guard covers the whole
-  name rather than only an index.
 - `CREATE OR REPLACE` of a routine is checked against every identity rule
-  PostgreSQL applies, in its order: return type and `SETOF`, the `RETURNS record`
-  row descriptor, an already-named input parameter, and the default count. A
-  procedure gaining or losing output parameters is named as such. Comparing the
-  *type* of a retained default needs a parse tree only the server can type, so
-  that case taints rather than claiming a check it cannot make. `ALTER
-  PROCEDURE` applies the option list it carries instead of degrading to an
-  unmodeled statement. Replacing a routine with a different kind reports
-  PostgreSQL's distinct "cannot change routine kind". `CREATE AGGREGATE` now
-  keeps its definition and refuses a state type no catalog holds; its support
-  functions are not yet resolved, because a safe check needs PostgreSQL's
-  aggregate kind and type-coercion rules and a narrower one would reject
-  definitions the server accepts.
-- A synchronized baseline records `proretset`, parameter names and modes, and
-  `pronargdefaults`, so the replacement checks above also apply to a routine
-  that already exists.
-- A report's `rules` object now titles every `rule_id` it names, including a
-  check listed in `not_evaluated` and the auxiliary ids a primary rule reports.
-  Those findings previously reached a consumer with no title.
-- `REINDEX DATABASE <name>` and `REINDEX SYSTEM <name>` are refused unless the
-  name is the database the migration runs against. The new `target_database`
-  setting states it; without it the name is reported as unknown rather than
-  assumed safe. A baseline's `source_database` is where it was synchronized
-  *from* and is never used for this.
-- A schema outside the synchronized scope that depends on an in-scope object
-  through a catalog class the model does not hold, such as an operator, is
-  reported when the scope is suggested to be widened.
-- `certainty` is reported only when it is not `exact`.
-- `CREATE SEQUENCE` and `ALTER SEQUENCE` now merge their options the way
-  PostgreSQL's `init_params` does: the clauses form one bag applied in a fixed
-  order, so the result cannot depend on clause order. A repeated option, a zero
-  `INCREMENT`, a non-positive `CACHE`, unordered bounds, and a `START` or
-  `RESTART` outside the merged bounds are reported with PostgreSQL's own
-  wording and values. `CREATE SEQUENCE` derives the start from the final bounds
-  (`MINVALUE 10` starts at 10), an `ALTER SEQUENCE ... AS <type>` re-derives a
-  bound only where it still sat at the old type's limit, and `NO MINVALUE`/
-  `NO MAXVALUE` derive from the final increment in either clause order. An
-  identity column's backing sequence takes its type from the column, reporting
-  a written `AS` and a type other than smallint, integer, or bigint the way
-  PostgreSQL does, and a `CREATE SEQUENCE` conflict now carries the same
-  precise reason instead of a generic invalid-parameters message.
-- `DROP TYPE` and `DROP DOMAIN` with `CASCADE` now apply the drop; the
-  dependent objects the model does not enumerate (table columns, routines and
-  domains over the type) are reported as unmodeled fallout instead of leaving
-  the type in place and refusing to say what happened. `DROP PROCEDURE ...
-  CASCADE` applies like a plain drop, because PostgreSQL records no dependents
-  of a procedure. `DROP AGGREGATE` now refuses when a view calls the aggregate
-  and clears the view under `CASCADE`.
-- A cascading routine drop now removes everything that depends on the views it
-  drops, the way PostgreSQL's cascade is transitive: a view over a dropped
-  view, and a materialized view with its indexes, go with it.
-- Renaming or moving a routine or type a view references now keeps the view's
-  dependency, so dropping the new name is reported instead of succeeding. A
-  cascading `DROP FUNCTION` that covers only some overloads of a view call that
-  never named one no longer drops the view; the view survives and the chain
-  reports that it is no longer exact.
-- Remediation is labelled `recipe` in every output. `rules --json` moved to its
-  own version 3, which is what tells consumers `remediation` became `recipe`.
-- `CREATE MATERIALIZED VIEW IF NOT EXISTS`, and `ALTER [MATERIALIZED] VIEW IF
-  EXISTS`, now skip the way PostgreSQL skips them instead of reporting a
-  conflict. The guard still does not hide a relation of the wrong kind.
-- `CREATE MATERIALIZED VIEW ... WITH NO DATA` and `REFRESH MATERIALIZED VIEW
-  ... WITH NO DATA` are modeled instead of being treated as unsupported: a
-  materialized view created or left unpopulated can no longer be refreshed
-  concurrently, and `CONCURRENTLY` with `WITH NO DATA` is reported the way
-  PostgreSQL reports it. A concurrent refresh now also requires the unique
-  index the server demands — unique, valid, immediate, non-partial, over plain
-  columns — and reports its refusal when none exists on the materialized view.
-  A refresh that is rolled back now restores the view's populated state;
-  previously the statement escaped the transaction snapshot.
-- Every action of a comma-separated `ALTER MATERIALIZED VIEW` is now applied,
-  so an unsupported action no longer disappears behind a modeled one in front
-  of it.
-- A view now depends on every routine its query calls, wherever the call sits —
-  target list, `WHERE`, `HAVING` or a join condition — so dropping such a
-  routine is reported instead of succeeding. `CASCADE` drops the dependent
-  view. A call that cannot be tied to a signature is reported as unresolved
-  rather than as a conflict, and an exact signature does not block a different
-  overload.
-- Dropping a type a view body casts to is reported, as `CASCADE` clears it.
-  A view that only selects a column of a type is not a dependent, matching the
-  server: PostgreSQL records the dependency from the cast, not the output
-  column.
-- A view synchronized from the catalog now carries its dependencies on routines
-  and types, the way a view created in this migration already did. Run
-  `safe-migrate sync` to pick them up.
-- `CREATE OR REPLACE VIEW` is validated the way the server validates it: a
-  leading column may not be renamed, have its type changed, or disappear, and a
-  new column may only be appended. Appending columns no longer leaves the view
-  with its old column list, so altering a column the replacement added is no
-  longer reported as missing.
-- `CREATE MATERIALIZED VIEW` records its columns, access method, tablespace and
-  storage parameters. A view selecting `*` from a materialized view now sees the
-  columns it actually has. An explicit column list renames the leading columns
-  the way PostgreSQL applies it — a list longer than the projection is
-  reported with the server's refusal instead of silently clearing the column
-  names. `CREATE VIEW` applies its list by the same rule.
-- Built-in types are read from `pg_catalog.pg_type` instead of a hand-written
-  table, so `bytea`, `jsonb`, `inet`, `xml`, `uuid` and the range types now
-  carry their own routine signatures and type identities rather than collapsing
-  into one. Type widths come from the catalog too.
-- `citext` is no longer assumed to be built in; it resolves only when the
-  extension is installed, so a user type of the same name is no longer shadowed.
-- Cache format V10; run `safe-migrate sync`. V1–V9 are rejected.
-- `DROP TABLE`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, `DROP DOMAIN`,
-  `DROP TYPE` and `ALTER TABLE ... DROP COLUMN` now drop their target under a
-  scoped or incomplete baseline instead of being skipped, and report that the
-  rest of the migration is no longer exact.
-- A constraint cloned onto a partition is named as PostgreSQL names it, and an
-  explicitly written default operator class or sort direction counts as the
-  same as omitting it.
-- `ALTER INDEX ... ATTACH PARTITION` is validated instead of accepted whenever
-  both indexes exist. Mismatched definitions and children of unrelated tables
-  are now reported.
-- `DROP INDEX` on an index attached to a parent index is reported, and is not
+  PostgreSQL applies: return type, `SETOF`, named input parameters, and default
+  count. `ALTER PROCEDURE` applies its option list. Replacing a routine with a
+  different kind, or a procedure gaining or losing output parameters, is now
+  named. A synchronized baseline records parameter modes and default count, so
+  these checks also apply to a routine that already exists.
+- `REINDEX` follows PostgreSQL's legality rules: `REINDEX SYSTEM CONCURRENTLY`
+  is rejected, `SCHEMA`/`DATABASE`/`SYSTEM` forms are rejected inside a
+  transaction block, and `REINDEX TABLE` rejects a view and a partitioned table
+  inside a transaction block. `REINDEX DATABASE <name>` and `REINDEX SYSTEM
+  <name>` are refused unless the name matches `target_database`. `REINDEX`
+  marks a broken index usable, so rebuilding and then constraining from it no
+  longer fails.
+- `CREATE INDEX` validates its key and `INCLUDE` columns against the target
+  relation. `IF NOT EXISTS` skips a name held by any relation, not only an
+  index. `CREATE INDEX ... ON ONLY` leaves the parent invalid until partitions
+  attach. A plain `CREATE INDEX` on a partitioned table creates and attaches
+  child indexes on every partition, reusing an equivalent index it already
+  carries.
+- Partition index attachments are fully modeled: a parent becomes valid once
+  every partition's child is attached and valid, a second child for the same
+  partition is refused, and a primary-key parent's index over a nullable column
+  is refused. Operator classes are compared by family, so `text_pattern_ops`
+  and `varchar_pattern_ops` attach to each other. Collations resolve to their
+  identity; a collated column key is recorded as a column, not an expression.
+  Creating, attaching or detaching a partition now maintains its index
+  attachments. `DROP INDEX` on a partition-attached index is reported and not
   bypassed by `CASCADE` or `IF EXISTS`.
-- Creating, attaching or detaching a partition maintains its index attachments,
-  and two indexes on different expressions are no longer interchangeable.
-- A scoped baseline now records cross-schema dependents for types, routines and
-  indexes as well as relations, so a scoped `sync` no longer overlooks
-  dependents outside the schemas it loaded.
-- Foreign tables are read from a baseline, so `ALTER TABLE`, `GRANT`,
-  `TRUNCATE` and partition operations on one no longer report that it does not
-  exist. `DROP TABLE` still refuses one, as the server does.
-- Subscription options are checked against the server version, and an option
-  PostgreSQL does not recognise is rejected.
-- An array argument names the element's array type, so `DROP FUNCTION` and
-  `ALTER FUNCTION` on one resolve to the function PostgreSQL would. Previously
-  `name[]` was treated as `name` and `name[][]` matched nothing at all.
-- A type declaration the server would refuse is reported: a length or
-  precision outside its range, a type nothing resolves to, an enum label
-  declared twice, and a composite, domain or range naming a missing type.
-- The type-change rewrite warning now matches what PostgreSQL actually does.
-  Changing a numeric's scale, or converting between `character` and `varchar`,
-  rewrites the table and is reported; two spellings of one type are not.
-- `ALTER INDEX ... ATTACH PARTITION` accepts a parent index that is still
-  invalid because partitions are missing, which is how `CREATE INDEX ON ONLY`
-  is completed. An index whose equivalence cannot be decided no longer reports
-  a conflict.
-- The attachment comparison now follows PostgreSQL's own `CompareIndexInfo`:
-  operator classes are compared by the operator family they resolve to, so
-  `text_pattern_ops` and `varchar_pattern_ops` attach to each other while a
-  class outside the family does not, and sort order is not compared because
-  PostgreSQL does not compare it. `NULLS NOT DISTINCT` and a written `WHERE`
-  predicate are compared; a predicate synchronized from the catalog stays
-  opaque, so comparing it leaves the attachment undecidable rather than equal.
-- Collations are compared by the identity they resolve to. A written
-  `COLLATE "default"` against an omitted one, a collation nothing resolves, and
-  an exclusion constraint's backing index are undecidable on attach instead of
-  equal. A collated column key such as `b COLLATE "C"` is recorded as the
-  column it is, carrying its collation, rather than as an expression key.
-- `CREATE INDEX ... ON ONLY` on a partitioned table is modeled: the parent is
-  left invalid while partitions are missing. A plain `CREATE INDEX` on a
-  partitioned table now creates and attaches a child index on every partition,
-  using the name PostgreSQL generates, recursing while a partition is itself
-  partitioned, and reusing an equivalent index the partition already carries.
-- A partitioned index's validity now follows its attachments: an invalid parent
-  becomes valid once every partition's child index is attached and valid, and
-  revalidates its own parent in turn when it is itself a partition. Attaching a
-  partition table does not revalidate a parent index by itself.
-- `ALTER INDEX ... ATTACH PARTITION` refuses a second index for a partition
-  that already has one attached, requires a child constraint only when the
-  parent index backs one, without comparing the kinds, and refuses a
-  primary-key parent's index over a column the partition table leaves nullable.
-- `REINDEX` marks a broken index usable, so rebuilding one and then constraining
-  from it no longer fails.
-- A cloned partition constraint no longer has to share its parent's name to
-  attach.
-- An explicitly written default operator class is recognized whether the column
-  is spelled `integer` or `int4`.
-- A Tier 1 check that did not run now caps the verdict at `CAUTIOUS` in every
-  output mode: it no longer reads `safe` or `safe with risk`. The exit status
-  is unchanged, so a degraded run without a usable baseline keeps its
-  documented exit code while the report lists what could not be checked.
-- A check skipped for want of evidence names the out-of-scope schemas the
-  boundary query observed instead of advising a bare resync.
-- Tier labels are colored only when standard output is a terminal, so
-  redirected and piped reports contain no escape sequences.
-- Column identities are rendered as `schema.relation.column`, with an inferred
-  schema annotated at the end.
-- The human report and the interactive viewer now list the checks that were
-  skipped for want of evidence, with their cause and remedy. A run without
-  findings previously said only `No violations detected.` while the JSON and
-  Markdown reports already carried the skipped checks; the interactive header
-  counts them as well.
-- Name resolution follows the search path the synchronized session actually
-  had instead of substituting the sync scope for it. A schema outside the
-  scope is kept as an unknown entry, so a lookup that could have resolved in
-  it is reported as uncertain rather than resolved against a schema the
-  session may not have searched. `$user` under a role the baseline does not
-  know taints only a lookup that resolves past it, not every statement after
-  `SET search_path`.
-- An unqualified `CREATE` targets the first schema the path searches, as the
-  server does; when an unknown entry precedes it, the statement is reported
-  rather than placed. `pg_temp` is searched or created only when the session's
-  temporary namespace exists, and stands at its written position in the path.
-- A view call resolves in the routine namespace, so a table of the same name
-  cannot capture it, and a default operator class follows the path with
-  `pg_catalog` first unless the path lists it.
-- `float(p)` is accepted: the precision selects `real` for 1–24 and `double
-  precision` for 25–53, an out-of-range precision is reported, and no modifier
-  is recorded because the server records none.
+- `DROP TYPE`/`DROP DOMAIN` `CASCADE` now applies the drop and reports
+  dependent objects the model does not enumerate as unmodeled fallout.
+  `DROP AGGREGATE` refuses when a view calls it and removes the view under
+  `CASCADE`. A cascading drop is transitive: views over dropped views and
+  materialized views with their indexes go with it. Renaming or moving a
+  routine or type a view references keeps the dependency, so dropping the new
+  name is reported. A partial overload cascade no longer drops the view; it
+  survives and the chain reports it is no longer exact.
+- A view depends on every routine its query calls (target list, `WHERE`,
+  `HAVING`, join conditions) and on every type its body casts to. Dropping one
+  is reported; `CASCADE` clears the view. A view synchronized from the catalog
+  now carries these dependencies — run `safe-migrate sync` to pick them up.
+- `CREATE OR REPLACE VIEW` is validated: a leading column may not be renamed,
+  change type, or disappear; new columns may only be appended. `CREATE VIEW`
+  and `CREATE MATERIALIZED VIEW` apply an explicit column list — a list longer
+  than the projection is reported, a shorter one renames the prefix.
+- `CREATE MATERIALIZED VIEW` records its columns, access method, tablespace,
+  and storage options, validated before creation. `REFRESH MATERIALIZED VIEW
+  CONCURRENTLY` requires a usable unique index and is reported when none exists;
+  `CONCURRENTLY` with `WITH NO DATA` is reported; an unpopulated view cannot be
+  refreshed concurrently. `ALTER MATERIALIZED VIEW IF EXISTS` and
+  `CREATE MATERIALIZED VIEW IF NOT EXISTS` now skip as the server skips them.
+- `CREATE SEQUENCE` and `ALTER SEQUENCE` merge options in PostgreSQL's order:
+  a repeated option, zero increment, non-positive cache, unordered bounds, and
+  a start outside the bounds are reported. An identity column's sequence takes
+  its type from the column.
+- View and materialized view `SET (...)` options are validated by kind and
+  version — invalid values, wrong-kind options, and repeated names are
+  reported. `security_definer` is no longer accepted as a view option.
+- `DROP TABLE`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, `DROP DOMAIN`,
+  `DROP TYPE` and `ALTER TABLE ... DROP COLUMN` apply under a scoped baseline
+  and report that the rest of the migration is no longer exact.
+- Built-in types are read from `pg_catalog.pg_type`; `bytea`, `jsonb`, `inet`,
+  `xml`, `uuid` and range types now carry their own identities. `citext`
+  resolves only when the extension is installed. Type declarations the server
+  would refuse are reported. `float(p)` selects `real` or `double precision`
+  by precision; out-of-range precisions are reported.
+- A scoped baseline records cross-schema dependents for types, routines and
+  indexes. Foreign tables are read from a baseline. Subscription options are
+  checked against the server version. Array arguments resolve to the correct
+  overload. A schema outside scope that depends on an in-scope object through
+  an unmodeled catalog class is reported when widening is suggested.
+- A Tier 1 check that did not run caps the verdict at `CAUTIOUS`. Skipped
+  checks name the out-of-scope schemas observed. The human report and
+  interactive viewer list skipped checks with cause and remedy.
+- Name resolution follows the synchronized session's search path. `$user` under
+  an unknown role taints only lookups that resolve past it. An unqualified
+  `CREATE` is placed at the first writable schema; an unknown entry before it
+  reports the statement rather than placing it blindly. A view call resolves in
+  the routine namespace; a default operator class searches `pg_catalog` first.
+- Tier labels are colored only when stdout is a terminal. Column identities
+  render as `schema.relation.column`. Remediation is labelled `recipe`.
+  `certainty` is omitted when exact. Cache format V10; run `safe-migrate sync`.
+  A constraint cloned onto a partition is named as PostgreSQL names it.
 
 ## v0.10.0 — 2026-10-02
 
