@@ -3343,6 +3343,7 @@ fn load_types(
                 },
                 "r" => crate::_internal::model::types::TypeKind::Range {
                     subtype: row.try_get("range_subtype").context("range subtype")?,
+                    subtype_id: None,
                 },
                 "m" => crate::_internal::model::types::TypeKind::Multirange,
                 "b" => crate::_internal::model::types::TypeKind::Base {
@@ -3366,6 +3367,7 @@ fn load_types(
                                 crate::_internal::model::types::CompositeFieldState {
                                     name,
                                     data_type,
+                                    data_type_id: None,
                                 }
                             })
                             .collect(),

@@ -5676,10 +5676,11 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn cascading_a_type_drop_applies_and_taints_for_the_fallout() {
+    fn cascading_a_type_drop_removes_a_dependent_view_and_frees_the_name() {
         let engine = setup_engine();
         let mut state = setup_state();
         let ct = object_id("public", "ct");
+        let view = object_id("public", "v");
         engine
             .analyze(
                 "CREATE TYPE ct AS (z int);
@@ -5692,9 +5693,16 @@ mod state_mutation_tests {
             matches!(state.local.types.get(&ct), Some(TypeOverlay::Dropped)),
             "the cascade must not refuse to mark the type dropped"
         );
-        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(
+            !state.relation_is_present(&view),
+            "the view casting to the type goes with it"
+        );
         let violations = engine
-            .analyze("CREATE TYPE ct AS (z int);", &mut state)
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1 AS r;",
+                &mut state,
+            )
             .unwrap();
         assert_eq!(
             violations
@@ -5702,15 +5710,16 @@ mod state_mutation_tests {
                 .filter(|violation| violation.rule_id == "chain-conflict")
                 .count(),
             0,
-            "the name must be free again: {violations:?}"
+            "both names must be free again: {violations:?}"
         );
     }
 
     #[test]
-    fn cascading_a_domain_drop_applies_and_taints_for_the_fallout() {
+    fn cascading_a_domain_drop_removes_dependent_columns() {
         let engine = setup_engine();
         let mut state = setup_state();
         let domain = object_id("public", "d");
+        let table = object_id("public", "t");
         let violations = engine
             .analyze(
                 "CREATE DOMAIN d AS int;
@@ -5723,7 +5732,14 @@ mod state_mutation_tests {
             state.local.types.get(&domain),
             Some(TypeOverlay::Dropped)
         ));
-        assert_eq!(state.local.confidence, Confidence::Tainted);
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("the table survives a column cascade");
+        };
+        assert!(
+            !relation.has_column("a"),
+            "the column of the dropped domain goes with it"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
         assert_eq!(
             violations
                 .iter()
@@ -5731,6 +5747,347 @@ mod state_mutation_tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn a_type_dependent_the_gate_must_see_blocks_a_plain_drop() {
+        let engine = setup_engine();
+        let conflicts = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        for sql in [
+            // A composite field typed by the type.
+            "CREATE TYPE inner_t AS ENUM ('a');
+             CREATE TYPE outer_t AS (f inner_t);
+             DROP TYPE inner_t;",
+            // A range built on the type.
+            "CREATE TYPE sub_t AS ENUM ('a');
+             CREATE TYPE span_t AS RANGE (subtype = sub_t);
+             DROP TYPE sub_t;",
+            // An array column collapsed onto the element's array identity.
+            "CREATE TYPE tag_t AS ENUM ('a');
+             CREATE TABLE t (tags tag_t[]);
+             DROP TYPE tag_t;",
+            // A routine whose signature names the type.
+            "CREATE TYPE mood AS ENUM ('a');
+             CREATE FUNCTION m(mood) RETURNS mood AS 'SELECT $1' LANGUAGE sql;
+             DROP TYPE mood;",
+        ] {
+            assert!(
+                conflicts(sql)
+                    .iter()
+                    .any(|reason| reason.contains("dependent objects")),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn cascading_a_type_drop_removes_dependent_columns_and_fields() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE inner_t AS ENUM ('a');
+                 CREATE TYPE outer_t AS (f inner_t);
+                 CREATE TABLE t1 (a inner_t);
+                 CREATE TABLE t2 (tags inner_t[]);",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze("DROP TYPE inner_t CASCADE;", &mut state)
+            .unwrap();
+        let inner = object_id("public", "inner_t");
+        assert!(matches!(
+            state.local.types.get(&inner),
+            Some(TypeOverlay::Dropped)
+        ));
+        let Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Composite { fields },
+            ..
+        })) = state.local.types.get(&object_id("public", "outer_t"))
+        else {
+            panic!("the composite survives a field cascade");
+        };
+        assert!(
+            fields.iter().all(|field| field.name != "f"),
+            "the field of the dropped type goes with it"
+        );
+        for (table, column) in [("t1", "a"), ("t2", "tags")] {
+            let RelationOverlay::Present(relation) = state
+                .local
+                .relations
+                .get(&object_id("public", table))
+                .unwrap()
+            else {
+                panic!("{table} survives a column cascade");
+            };
+            assert!(
+                !relation.has_column(column),
+                "column {column} of {table} goes with the type"
+            );
+        }
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cascading_a_type_drop_takes_the_ranges_built_on_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE sub_t AS ENUM ('a');
+                 CREATE TYPE span_t AS RANGE (subtype = sub_t);
+                 DROP TYPE sub_t CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                state.local.types.get(&object_id("public", "span_t")),
+                Some(TypeOverlay::Dropped)
+            ),
+            "the range built on the type goes with it"
+        );
+    }
+
+    #[test]
+    fn cascading_a_type_drop_removes_typed_tables_and_routines() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let tof = object_id("public", "tof");
+        engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;
+                 CREATE FUNCTION uses_ct(ct) RETURNS ct AS 'SELECT $1' LANGUAGE sql;
+                 DROP TYPE ct CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&tof),
+            "a typed table is dropped whole by the cascade"
+        );
+        assert!(
+            !state.local.functions.iter().any(|(id, overlay)| {
+                matches!(overlay, FunctionOverlay::Present(_))
+                    && DependencyGraph::split_routine_signature(id).1 == "uses_ct"
+            }),
+            "the routine naming the type in its signature goes with it"
+        );
+        let violations = engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0,
+            "both names must be free again: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_type_drop_is_refused_when_a_typed_table_depends_on_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let ct = object_id("public", "ct");
+        let tof = object_id("public", "tof");
+        engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;
+                 DROP TYPE ct;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.relation_is_present(&tof));
+        assert!(matches!(
+            state.local.types.get(&ct),
+            Some(TypeOverlay::Present(_))
+        ));
+        let violations = engine.analyze("DROP TYPE ct CASCADE;", &mut state).unwrap();
+        assert!(!state.relation_is_present(&tof));
+        assert!(matches!(
+            state.local.types.get(&ct),
+            Some(TypeOverlay::Dropped)
+        ));
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0,
+            "typed table must be free to recreate: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn cascading_a_schema_drop_removes_type_dependents_outside_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SCHEMA s;
+                 CREATE TYPE s.ct AS (z int);
+                 CREATE TABLE t (a s.ct);
+                 DROP SCHEMA s CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&object_id("s", "ct")),
+            Some(TypeOverlay::Dropped)
+        ));
+        let RelationOverlay::Present(relation) = state
+            .local
+            .relations
+            .get(&object_id("public", "t"))
+            .unwrap()
+        else {
+            panic!("the table outside the schema survives");
+        };
+        assert!(
+            !relation.has_column("a"),
+            "the column typing itself with the dropped schema's type goes"
+        );
+    }
+
+    #[test]
+    fn a_routine_cascade_drops_triggers_of_cascaded_views() {
+        use safe_migrate::_internal::model::trigger::TriggerOverlay;
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f() RETURNS trigger AS 'BEGIN RETURN NULL; END' LANGUAGE plpgsql;
+                 CREATE FUNCTION g(int) RETURNS int AS 'SELECT $1' LANGUAGE sql;
+                 CREATE VIEW v AS SELECT g(a) AS ga FROM t;
+                 CREATE TRIGGER trg INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f();
+                 DROP FUNCTION g(integer) CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&object_id("public", "v")),
+            "the view calling the routine goes with it"
+        );
+        assert!(
+            !state.local.triggers.values().any(|overlay| matches!(
+                overlay,
+                TriggerOverlay::Present(trigger) if trigger.name == "trg"
+            )),
+            "the trigger on the cascaded view goes with it"
+        );
+    }
+
+    #[test]
+    fn a_ranges_multirange_companion_blocks_and_cascades_with_it() {
+        let engine = setup_engine();
+        let sub = object_id("public", "sub_t");
+        let range = object_id("public", "span_t");
+        let companion = object_id("public", "span_t_multirange");
+        let table_id = object_id("public", "t");
+        let build = || {
+            let mut cache = synced_cache();
+            for (id, kind) in [
+                (
+                    sub.clone(),
+                    TypeKind::Enum {
+                        variants: vec!["a".to_string()],
+                    },
+                ),
+                (
+                    range.clone(),
+                    TypeKind::Range {
+                        subtype: Some("sub_t".to_string()),
+                        subtype_id: Some(sub.clone()),
+                    },
+                ),
+                (companion.clone(), TypeKind::Multirange),
+            ] {
+                cache.types.insert(
+                    id.clone(),
+                    TypeState {
+                        id: id.clone(),
+                        generation: 0,
+                        kind,
+                    },
+                );
+            }
+            let mut table = RelationState::new(
+                table_id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            );
+            let mut column = Column::migration_created(
+                "c".to_string(),
+                Some("span_t_multirange".to_string()),
+                true,
+                None,
+            );
+            column.type_id = Some(companion.clone());
+            table.columns.push(column);
+            cache.insert_baseline(table_id.clone(), table);
+            AnalysisState::new(cache)
+        };
+
+        // A column of the companion blocks the plain drop, as PostgreSQL
+        // reports it as a dependent of the range.
+        let mut state = build();
+        let violations = engine.analyze("DROP TYPE span_t;", &mut state).unwrap();
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict"
+                    && violation.reason.contains("dependent objects")
+            }),
+            "{violations:?}"
+        );
+
+        // The cascade removes the companion and the column, not the table.
+        let mut state = build();
+        engine
+            .analyze("DROP TYPE span_t CASCADE;", &mut state)
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&range),
+            Some(TypeOverlay::Dropped)
+        ));
+        assert!(matches!(
+            state.local.types.get(&companion),
+            Some(TypeOverlay::Dropped)
+        ));
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table_id).unwrap()
+        else {
+            panic!("the table survives");
+        };
+        assert!(!relation.has_column("c"));
     }
 
     #[test]

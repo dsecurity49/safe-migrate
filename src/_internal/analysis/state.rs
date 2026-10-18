@@ -39,6 +39,7 @@ mod apply_transaction;
 mod apply_type;
 mod apply_view_index;
 mod index_topology;
+mod type_cascade;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Confidence {
@@ -911,21 +912,44 @@ impl AnalysisState {
             }
         }
         for overlay in types.values_mut() {
-            if let TypeOverlay::Present(TypeState {
-                kind:
+            if let TypeOverlay::Present(TypeState { kind, .. }) = overlay {
+                match kind {
                     TypeKind::Domain {
                         base_type,
                         base_type_id,
-                    },
-                ..
-            }) = overlay
-            {
-                *base_type_id = Self::resolve_type_reference_from_catalog(
-                    base_type,
-                    &type_catalog,
-                    search_path,
-                    |id| row_types.contains(id),
-                );
+                    } => {
+                        *base_type_id = Self::resolve_type_reference_from_catalog(
+                            base_type,
+                            &type_catalog,
+                            search_path,
+                            |id| row_types.contains(id),
+                        );
+                    }
+                    TypeKind::Composite { fields } => {
+                        for field in fields {
+                            field.data_type_id = Self::resolve_type_reference_from_catalog(
+                                &field.data_type,
+                                &type_catalog,
+                                search_path,
+                                |id| row_types.contains(id),
+                            );
+                        }
+                    }
+                    TypeKind::Range {
+                        subtype,
+                        subtype_id,
+                    } => {
+                        if let Some(subtype) = subtype {
+                            *subtype_id = Self::resolve_type_reference_from_catalog(
+                                subtype,
+                                &type_catalog,
+                                search_path,
+                                |id| row_types.contains(id),
+                            );
+                        }
+                    }
+                    TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange => {}
+                }
             }
         }
         HydratedRelationTypes {
@@ -1646,6 +1670,20 @@ impl AnalysisState {
         path
     }
 
+    /// Entries to search for an unqualified routine.
+    ///
+    /// PostgreSQL never searches the temporary schema for function or operator
+    /// names, even when a path entry names it explicitly, so the entry is
+    /// dropped rather than searched in place.
+    pub(crate) fn routine_search_path(&self) -> Vec<SearchPathEntry> {
+        self.local
+            .search_path
+            .iter()
+            .filter(|entry| entry.name() != Some(SESSION_TEMP_SCHEMA))
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn note_temp_object_created(&mut self) {
         self.local.saw_temp_object = true;
         // A path that names the temporary alias could not search it before the
@@ -2290,6 +2328,31 @@ impl AnalysisState {
     /// type per element, so however many `[]` were written, they name this.
     pub(crate) fn array_type_id(element: &ObjectId) -> ObjectId {
         ObjectId::new(&element.schema, format!("{}[]", element.name))
+    }
+
+    /// The multirange companion PostgreSQL creates for a range type, named
+    /// after it with the identifier limit applied exactly like the server.
+    pub(crate) fn multirange_companion_id(range: &ObjectId) -> ObjectId {
+        const SUFFIX: &str = "_multirange";
+        let mut end = range.name.len().min(63 - SUFFIX.len());
+        while end > 0 && !range.name.is_char_boundary(end) {
+            end -= 1;
+        }
+        ObjectId::new(&range.schema, format!("{}{}", &range.name[..end], SUFFIX))
+    }
+
+    /// Whether a resolved type reference names `id` or its array form.
+    pub(crate) fn type_reference_matches(reference: Option<&ObjectId>, id: &ObjectId) -> bool {
+        reference.is_some_and(|reference| reference == id || reference == &Self::array_type_id(id))
+    }
+
+    /// Whether a resolved type reference names any of `ids` or an array form.
+    pub(crate) fn type_reference_matches_victims(
+        reference: Option<&ObjectId>,
+        ids: &HashSet<ObjectId>,
+    ) -> bool {
+        ids.iter()
+            .any(|id| Self::type_reference_matches(reference, id))
     }
 
     fn remapped_type_display(raw: &str, new_id: &ObjectId, schema_changed: bool) -> String {

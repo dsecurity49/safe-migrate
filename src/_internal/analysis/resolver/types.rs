@@ -18,6 +18,9 @@ impl Resolver {
             },
             TypeCreationKind::Range { subtype } => TypeKind::Range {
                 subtype: subtype.clone(),
+                subtype_id: subtype
+                    .as_deref()
+                    .and_then(|subtype| state.resolve_type_reference(subtype)),
             },
             TypeCreationKind::Composite { fields } => TypeKind::Composite {
                 fields: fields
@@ -26,6 +29,7 @@ impl Resolver {
                         |field| crate::_internal::model::types::CompositeFieldState {
                             name: field.name.clone(),
                             data_type: field.data_type.clone(),
+                            data_type_id: state.resolve_type_reference(&field.data_type),
                         },
                     )
                     .collect(),

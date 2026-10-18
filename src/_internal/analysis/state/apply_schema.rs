@@ -200,6 +200,25 @@ impl AnalysisState {
             self.snapshot_namespace();
             let dropped_schema_names: std::collections::HashSet<String> =
                 present_names.iter().cloned().collect();
+            // Types in the schema go with it, and their dependents outside it
+            // (views casting to them, routines naming them, columns typed by
+            // them) are the same closure a CASCADE type drop applies.
+            let schema_types: Vec<ObjectId> = self
+                .local
+                .types
+                .iter()
+                .filter(|(id, overlay)| {
+                    dropped_schema_names.contains(&id.schema)
+                        && matches!(overlay, TypeOverlay::Present(_))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !schema_types.is_empty() && !self.apply_type_cascade(&schema_types) {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+            }
             let relation_roots: Vec<ObjectId> = self
                 .local
                 .relations

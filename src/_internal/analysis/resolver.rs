@@ -81,9 +81,10 @@ impl Resolver {
             }
         }
 
-        // An empty path searches nothing, so no schema may be inferred.
-        let schema = state
-            .search_path()
+        // An empty path searches nothing, so no schema may be inferred. The
+        // inference follows the path the lookup actually searched.
+        let path = search(state);
+        let schema = path
             .first()
             .and_then(SearchPathEntry::name)
             .unwrap_or_default();
@@ -121,6 +122,18 @@ impl Resolver {
     }
 
     fn resolve_type_lookup_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
+        if name.schema.is_none() {
+            // An array type is never independently addressable: it resolves
+            // through its element, whose schema decides the identity. The
+            // namespace walk cannot see that, because no overlay carries an
+            // array name.
+            let reference = name.name.resolve();
+            if reference.ends_with("[]")
+                && let Some(array) = state.resolve_type_reference(&reference)
+            {
+                return array;
+            }
+        }
         Self::resolve_in_namespace(
             name,
             name.name.resolve(),
@@ -141,7 +154,7 @@ impl Resolver {
             name.name.resolve(),
             state,
             AnalysisState::routine_named_is_present,
-            |state| state.search_path().to_vec(),
+            AnalysisState::routine_search_path,
         )
     }
 
@@ -156,13 +169,12 @@ impl Resolver {
             .collect::<Vec<_>>()
             .join(",");
         let object_name = format!("{}({signature})", name.name.resolve());
-        // Routines deliberately skip the temporary schema; PostgreSQL does too.
         Self::resolve_in_namespace(
             name,
             object_name,
             state,
             AnalysisState::routine_is_present,
-            |state| state.search_path().to_vec(),
+            AnalysisState::routine_search_path,
         )
     }
 

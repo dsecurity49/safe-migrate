@@ -2586,6 +2586,7 @@ mod tests {
                     fields: vec![crate::_internal::model::types::CompositeFieldState {
                         name: "street".to_string(),
                         data_type: "text".to_string(),
+                        data_type_id: None,
                     }],
                 },
             },

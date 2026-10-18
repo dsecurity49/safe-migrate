@@ -39,8 +39,9 @@ notes are available on the
   Creating, attaching or detaching a partition now maintains its index
   attachments. `DROP INDEX` on a partition-attached index is reported and not
   bypassed by `CASCADE` or `IF EXISTS`.
-- `DROP TYPE`/`DROP DOMAIN` `CASCADE` now applies the drop and reports
-  dependent objects the model does not enumerate as unmodeled fallout.
+- `DROP TYPE`/`DROP DOMAIN` `CASCADE` removes its PostgreSQL dependents
+  (fields, ranges, columns, typed tables, routine signatures, views); a plain
+  drop names them. `DROP SCHEMA ... CASCADE` applies the same closure.
   `DROP AGGREGATE` refuses when a view calls it and removes the view under
   `CASCADE`. A cascading drop is transitive: views over dropped views and
   materialized views with their indexes go with it. Renaming or moving a
@@ -89,6 +90,7 @@ notes are available on the
   `CREATE` is placed at the first writable schema; an unknown entry before it
   reports the statement rather than placing it blindly. A view call resolves in
   the routine namespace; a default operator class searches `pg_catalog` first.
+  A routine never resolves in `pg_temp`; a type still does.
 - Tier labels are colored only when stdout is a terminal. Column identities
   render as `schema.relation.column`. Remediation is labelled `recipe`.
   `certainty` is omitted when exact. Cache format V10; run `safe-migrate sync`.

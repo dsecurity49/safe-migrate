@@ -274,12 +274,15 @@ impl AnalysisState {
             && result
                 .dropped_relations
                 .iter()
-                .any(|id| !self.relation_is_present(id))
+                .any(|id| !self.local.relations.contains_key(id))
         {
             // A scoped cache can expose a dependency edge for a relation whose
             // metadata was intentionally omitted. CASCADE will remove that
             // relation in PostgreSQL, but the simulator cannot reproduce its
-            // full state, so the result is necessarily tainted.
+            // full state, so the result is necessarily tainted. A tombstone is
+            // modeled state instead: the relation was known and a statement in
+            // this session already removed it, so repeating the drop for
+            // another root is exact.
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
                 EvidenceScope::Chain,

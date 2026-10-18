@@ -646,63 +646,23 @@ impl AnalysisState {
         }
 
         let any_applied = !targets.is_empty();
-        // A name-only view reference is definitely cleared by this statement
-        // only when every overload of its written name is being dropped.
-        // Otherwise the view may call a surviving overload: it stays, and the
-        // chain stops being exact.
-        let dropped_ids: HashSet<&ObjectId> = targets.iter().map(|(id, _, _)| id).collect();
+        let dropped_ids: HashSet<ObjectId> = targets.iter().map(|(id, _, _)| id.clone()).collect();
         let mut surviving_reference = false;
         for (id, dependent_triggers, dependent_views) in &targets {
-            self.snapshot_function(id);
-            self.local
-                .functions
-                .insert(id.clone(), FunctionOverlay::Dropped);
-
             if function.cascade {
-                let mut dropped_views: Vec<ObjectId> = Vec::new();
-                for (view_id, unresolved_name) in dependent_views {
-                    let covered = match unresolved_name {
-                        None => true,
-                        Some(name) => self
-                            .routine_overloads_under(name)
-                            .all(|overload| dropped_ids.contains(overload)),
-                    };
-                    if covered {
-                        dropped_views.push(view_id.clone());
-                    } else {
-                        surviving_reference = true;
-                    }
+                if self.apply_routine_cascade_drop(
+                    id,
+                    dependent_triggers,
+                    dependent_views,
+                    &dropped_ids,
+                ) {
+                    surviving_reference = true;
                 }
-                self.drop_cascaded_views(&dropped_views);
-                for (trigger_id, table_id) in dependent_triggers.iter() {
-                    let trigger_name =
-                        self.local
-                            .triggers
-                            .get(trigger_id)
-                            .and_then(|overlay| match overlay {
-                                TriggerOverlay::Present(trigger) => Some(trigger.name.clone()),
-                                TriggerOverlay::Dropped => None,
-                            });
-                    self.snapshot_trigger(trigger_id);
-                    self.local
-                        .triggers
-                        .insert(trigger_id.clone(), TriggerOverlay::Dropped);
-                    self.snapshot_relation(table_id);
-                    if let Some(RelationOverlay::Present(relation)) =
-                        self.local.relations.get_mut(table_id)
-                        && let Some(trigger_name) = trigger_name
-                    {
-                        relation.triggers.remove(&trigger_name);
-                    }
-                }
-                if !dependent_triggers.is_empty() {
-                    self.snapshot_graph_full();
-                    self.local.graph.retain_edges(|edge| {
-                        !dependent_triggers
-                            .iter()
-                            .any(|(trigger_id, _)| edge.dependent == *trigger_id)
-                    });
-                }
+            } else {
+                self.snapshot_function(id);
+                self.local
+                    .functions
+                    .insert(id.clone(), FunctionOverlay::Dropped);
             }
         }
         if surviving_reference {
@@ -1166,6 +1126,75 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Drop one routine and the objects a routine CASCADE takes with it: the
+    /// views that call it, and every trigger defined on it.
+    ///
+    /// `dropped` carries every routine the statement is dropping, so a view
+    /// whose call never resolved survives while any overload of its written
+    /// name remains. Returns whether such a surviving reference exists.
+    pub(super) fn apply_routine_cascade_drop(
+        &mut self,
+        id: &ObjectId,
+        dependent_triggers: &[(ObjectId, ObjectId)],
+        dependent_views: &[(ObjectId, Option<ObjectId>)],
+        dropped: &HashSet<ObjectId>,
+    ) -> bool {
+        self.snapshot_function(id);
+        self.local
+            .functions
+            .insert(id.clone(), FunctionOverlay::Dropped);
+
+        // A name-only view reference is definitely cleared by this statement
+        // only when every overload of its written name is being dropped.
+        // Otherwise the view may call a surviving overload: it stays, and the
+        // chain stops being exact.
+        let mut surviving_reference = false;
+        let mut dropped_views: Vec<ObjectId> = Vec::new();
+        for (view_id, unresolved_name) in dependent_views {
+            let covered = match unresolved_name {
+                None => true,
+                Some(name) => self
+                    .routine_overloads_under(name)
+                    .all(|overload| dropped.contains(overload)),
+            };
+            if covered {
+                dropped_views.push(view_id.clone());
+            } else {
+                surviving_reference = true;
+            }
+        }
+        self.drop_cascaded_views(&dropped_views);
+        for (trigger_id, table_id) in dependent_triggers.iter() {
+            let trigger_name =
+                self.local
+                    .triggers
+                    .get(trigger_id)
+                    .and_then(|overlay| match overlay {
+                        TriggerOverlay::Present(trigger) => Some(trigger.name.clone()),
+                        TriggerOverlay::Dropped => None,
+                    });
+            self.snapshot_trigger(trigger_id);
+            self.local
+                .triggers
+                .insert(trigger_id.clone(), TriggerOverlay::Dropped);
+            self.snapshot_relation(table_id);
+            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(table_id)
+                && let Some(trigger_name) = trigger_name
+            {
+                relation.triggers.remove(&trigger_name);
+            }
+        }
+        if !dependent_triggers.is_empty() {
+            self.snapshot_graph_full();
+            self.local.graph.retain_edges(|edge| {
+                !dependent_triggers
+                    .iter()
+                    .any(|(trigger_id, _)| edge.dependent == *trigger_id)
+            });
+        }
+        surviving_reference
+    }
+
     /// Drop views a routine cascade removes, together with everything that
     /// depends on them: PostgreSQL's CASCADE is transitive.
     fn drop_cascaded_views(&mut self, views: &[ObjectId]) {
@@ -1178,14 +1207,7 @@ impl AnalysisState {
         if seeds.is_empty() {
             return;
         }
-        let closure = self.cascade_for_relations(&seeds);
-        for relation in &closure.dropped_relations {
-            self.snapshot_relation(relation);
-            self.local
-                .relations
-                .insert(relation.clone(), RelationOverlay::Dropped);
-        }
-        self.remove_dropped_relation_edges(&closure.dropped_relations, &closure.dropped_indexes);
+        let _ = self.apply_drop_relation_family(&seeds, true, "view");
     }
 
     pub(super) fn apply_drop_aggregate(

@@ -703,6 +703,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
             "score_span",
             TypeKind::Range {
                 subtype: Some("int4".to_string()),
+                subtype_id: None,
             },
         ),
         ("score_span_multirange", TypeKind::Multirange),

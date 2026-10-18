@@ -33,7 +33,7 @@ impl AnalysisState {
                 .map(|field| field.data_type.as_str())
                 .collect(),
             TypeKind::Domain { base_type, .. } => vec![base_type.as_str()],
-            TypeKind::Range { subtype } => subtype.as_deref().into_iter().collect(),
+            TypeKind::Range { subtype, .. } => subtype.as_deref().into_iter().collect(),
             TypeKind::Base { element } => element.as_deref().into_iter().collect(),
             TypeKind::Multirange => Vec::new(),
         };
@@ -220,29 +220,61 @@ impl AnalysisState {
             }
         }
         for overlay in self.local.types.values_mut() {
-            if let TypeOverlay::Present(TypeState {
-                kind:
-                    TypeKind::Domain {
-                        base_type,
-                        base_type_id,
-                    },
-                ..
-            }) = overlay
-                && base_type_id
-                    .as_ref()
-                    .and_then(|id| Self::renamed_type_id(id, rename))
-                    .is_some()
-            {
-                let new_base_id = base_type_id
-                    .as_ref()
-                    .and_then(|id| Self::renamed_type_id(id, rename))
-                    .expect("presence checked above");
-                *base_type = Self::remapped_type_display(
+            let TypeOverlay::Present(TypeState { kind, .. }) = overlay else {
+                continue;
+            };
+            match kind {
+                TypeKind::Domain {
                     base_type,
-                    &rename.new_id,
-                    rename.old_id.schema != rename.new_id.schema,
-                );
-                *base_type_id = Some(new_base_id);
+                    base_type_id,
+                } => {
+                    if let Some(new_id) = base_type_id
+                        .as_ref()
+                        .and_then(|id| Self::renamed_type_id(id, rename))
+                    {
+                        *base_type = Self::remapped_type_display(
+                            base_type,
+                            &rename.new_id,
+                            rename.old_id.schema != rename.new_id.schema,
+                        );
+                        *base_type_id = Some(new_id);
+                    }
+                }
+                TypeKind::Composite { fields } => {
+                    for field in fields {
+                        if let Some(new_id) = field
+                            .data_type_id
+                            .as_ref()
+                            .and_then(|id| Self::renamed_type_id(id, rename))
+                        {
+                            field.data_type = Self::remapped_type_display(
+                                &field.data_type,
+                                &rename.new_id,
+                                rename.old_id.schema != rename.new_id.schema,
+                            );
+                            field.data_type_id = Some(new_id);
+                        }
+                    }
+                }
+                TypeKind::Range {
+                    subtype,
+                    subtype_id,
+                } => {
+                    if let Some(new_id) = subtype_id
+                        .as_ref()
+                        .and_then(|id| Self::renamed_type_id(id, rename))
+                    {
+                        if let Some(subtype) = subtype {
+                            *subtype = Self::remapped_type_display(
+                                subtype,
+                                &rename.new_id,
+                                rename.old_id.schema != rename.new_id.schema,
+                            );
+                        }
+                        *subtype_id = Some(new_id);
+                    }
+                }
+                TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange => {}
             }
         }
         for (old_id, new_id, arg_types, return_type) in remapped_functions {
@@ -423,39 +455,7 @@ impl AnalysisState {
         if present.is_empty() {
             return MutationResult::NoOp;
         }
-        // A scoped baseline cannot enumerate every dependent, which widens what
-        // CASCADE removes. PostgreSQL still drops the domain.
-        if present.iter().any(|id| {
-            self.baseline_scoped_family_object(
-                id,
-                crate::_internal::db::cache::CatalogFamily::Types,
-            )
-        }) {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-        }
-        let dependent = present.iter().find(|id| self.has_type_dependents(id));
-        if let Some(dependent) = dependent
-            && !drop.cascade
-        {
-            return MutationResult::conflict(format!(
-                "domain '{}' has dependent objects; use CASCADE",
-                dependent
-            ));
-        }
-        for id in &present {
-            self.snapshot_type(id);
-            self.local.types.insert(id.clone(), TypeOverlay::Dropped);
-        }
-        if dependent.is_some() {
-            // PostgreSQL removes the dependents too: table columns, routines
-            // and domains over the type are not enumerated here, so the chain
-            // stops being exact even though the drop applies.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-        }
-        MutationResult::Applied
+        self.finish_type_drop(&present, drop.cascade, "domain")
     }
 
     pub(super) fn apply_drop_type(&mut self, drop: &DropTypeMutation) -> MutationResult {
@@ -481,8 +481,22 @@ impl AnalysisState {
         if present.is_empty() {
             return MutationResult::NoOp;
         }
+        self.finish_type_drop(&present, drop.cascade, "type")
+    }
+
+    /// Complete a type-family drop whose targets are known present.
+    ///
+    /// Without CASCADE a dependent blocks the drop, as PostgreSQL refuses it;
+    /// with CASCADE the deletion closure is applied, and the chain stays exact
+    /// unless a dependency could not be enumerated.
+    fn finish_type_drop(
+        &mut self,
+        present: &[ObjectId],
+        cascade: bool,
+        label: &str,
+    ) -> MutationResult {
         // A scoped baseline cannot enumerate every dependent, which widens what
-        // CASCADE removes. PostgreSQL still drops the type.
+        // CASCADE removes. PostgreSQL still drops the object.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
@@ -496,48 +510,87 @@ impl AnalysisState {
         }
         let dependent = present.iter().find(|id| self.has_type_dependents(id));
         if let Some(dependent) = dependent
-            && !drop.cascade
+            && !cascade
         {
             return MutationResult::conflict(format!(
-                "type '{}' has dependent objects; use CASCADE",
+                "{label} '{}' has dependent objects; use CASCADE",
                 dependent
             ));
         }
-        for id in &present {
-            self.snapshot_type(id);
-            self.local.types.insert(id.clone(), TypeOverlay::Dropped);
-        }
-        if dependent.is_some() {
-            // PostgreSQL removes the dependents too: table columns, routines
-            // and domains over the type are not enumerated here, so the chain
-            // stops being exact even though the drop applies.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        if cascade {
+            if !self.apply_type_cascade(present) {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+            }
+        } else {
+            for id in present {
+                self.snapshot_type(id);
+                self.local.types.insert(id.clone(), TypeOverlay::Dropped);
+            }
         }
         MutationResult::Applied
     }
 
+    /// Identities whose dependents block dropping `id`: the type itself and,
+    /// for a range, its multirange companion — PostgreSQL reports a companion
+    /// column as a dependent of the range.
+    fn type_dependent_ids(&self, id: &ObjectId) -> Vec<ObjectId> {
+        let mut ids = vec![id.clone()];
+        if matches!(
+            self.local.types.get(id),
+            Some(TypeOverlay::Present(state)) if matches!(state.kind, TypeKind::Range { .. })
+        ) {
+            ids.push(Self::multirange_companion_id(id));
+        }
+        ids
+    }
+
     fn has_type_dependents(&self, id: &ObjectId) -> bool {
+        let ids = self.type_dependent_ids(id);
+        let matches_id = |reference: Option<&ObjectId>| {
+            ids.iter()
+                .any(|id| Self::type_reference_matches(reference, id))
+        };
         self.local.relations.values().any(|overlay| {
             matches!(overlay, RelationOverlay::Present(relation)
-                if relation.columns.iter().any(|column| column.type_id.as_ref() == Some(id)))
+                if relation.of_type.as_ref() == Some(id)
+                    || relation.columns.iter().any(|column| matches_id(column.type_id.as_ref())))
         }) || self.local.functions.values().any(|overlay| {
             matches!(overlay, FunctionOverlay::Present(function)
                 // A routine PostgreSQL created as an internal part of the type
                 // (a range constructor) is dropped with it, so it does not
                 // require CASCADE.
                 if function.internal_type_owner.as_ref() != Some(id)
-                    && (function.arg_type_ids.iter().flatten().any(|type_id| type_id == id)
-                        || function.return_type_id.as_ref() == Some(id)))
+                    && (function.arg_type_ids.iter().flatten().any(|type_id| matches_id(Some(type_id)))
+                        || matches_id(function.return_type_id.as_ref())))
         }) || self.local.types.values().any(|overlay| {
             matches!(overlay, TypeOverlay::Present(TypeState {
                 kind: TypeKind::Domain { base_type_id: Some(base), .. },
                 ..
-            }) if base == id)
-        }) || self.local.graph.views_for_type(id).iter().any(|edge| {
-            matches!(
-                self.local.relations.get(&edge.dependent),
-                Some(RelationOverlay::Present(_))
-            )
+            }) if matches_id(Some(base)))
+        }) || self.local.types.values().any(|overlay| {
+            matches!(overlay, TypeOverlay::Present(TypeState {
+                kind: TypeKind::Composite { fields },
+                ..
+            }) if fields.iter().any(|f| matches_id(f.data_type_id.as_ref())))
+        }) || self.local.types.values().any(|overlay| {
+            matches!(overlay, TypeOverlay::Present(TypeState {
+                kind: TypeKind::Range { subtype_id: Some(sub_id), .. },
+                ..
+            }) if matches_id(Some(sub_id)))
+        }) || ids.iter().any(|blocking| {
+            [blocking.clone(), Self::array_type_id(blocking)]
+                .iter()
+                .any(|probe| {
+                    self.local.graph.views_for_type(probe).iter().any(|edge| {
+                        matches!(
+                            self.local.relations.get(&edge.dependent),
+                            Some(RelationOverlay::Present(_))
+                        )
+                    })
+                })
         })
     }
 }
