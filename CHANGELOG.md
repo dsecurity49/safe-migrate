@@ -5,74 +5,58 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.11.0 — 2026-10-18
+## v0.11.0 — 2026-10-19
 
-- Report JSON schema version 3; violations drop `operation_kind`, `dedup_key`,
-  `fk_dependency_related`, `rule_title`, `rule_summary` and `impact`, and rule
-  titles move to a top-level `rules` map. Consumers must branch on
-  `schema_version`.
-- Routine identity is checked as PostgreSQL checks it: return type and `SETOF`,
-  named input parameters, default count, and `RETURNS TABLE`/`OUT` parameters
-  compared as the row they define. A synchronized baseline records parameter
-  modes and defaults, so this also applies to an existing routine.
-- `REINDEX` follows PostgreSQL's legality rules, rejecting `SYSTEM CONCURRENTLY`
-  and the `SCHEMA`/`DATABASE`/`SYSTEM` forms inside a transaction block, resolves
-  toast and catalog relations correctly, and marks a rebuilt index usable.
-- `CREATE INDEX` validates key and `INCLUDE` columns, skips an `IF NOT EXISTS`
-  name held by any relation, and models a partitioned table's child indexes
-  (including `ON ONLY` and equivalent-index reuse). An index over a column from a
-  projection we could not derive is no longer a false conflict.
-- Partition index attachments are fully modeled, and `DROP INDEX` on an attached
-  index is reported and not bypassed by `CASCADE` or `IF EXISTS`; dropping an
-  attached child alongside its parent in one statement is allowed.
-- `DROP TYPE`/`DROP DOMAIN`/`DROP SCHEMA` `CASCADE` is transitive and names its
-  dependents otherwise; renaming or moving a referenced routine or type keeps the
-  dependency, so dropping the new name is reported.
-- A view depends on every routine and type its body uses; catalog-synchronized
-  views now carry these — run `safe-migrate sync`.
+- Report JSON schema version 3: violation fields are dropped, rule titles move
+  to a top-level `rules` map, and consumers must branch on `schema_version`.
+- Routine identity is checked as PostgreSQL does: return type and `SETOF`, named
+  parameters, default count, and `RETURNS TABLE`/`OUT` as the row they define.
+- `REINDEX` rejects `SYSTEM CONCURRENTLY` and the `SCHEMA`/`DATABASE`/`SYSTEM`
+  forms inside a transaction block.
+- `CREATE INDEX` validates key and `INCLUDE` columns and skips an `IF NOT EXISTS`
+  name held by any relation; an index over a projection we could not derive is no
+  longer a false conflict.
+- Partitioned child indexes, including `ON ONLY` and equivalent-index reuse, are
+  modeled, and `DROP INDEX` on an attached index is reported, not bypassed by
+  `CASCADE` or `IF EXISTS`.
+- `DROP TYPE`/`DROP DOMAIN`/`DROP SCHEMA` `CASCADE` is transitive and otherwise
+  names its dependents; renaming or moving a referenced routine or type still
+  reports dropping the new name.
+- A view depends on every routine and type in its body, which catalog-synchronized
+  views now carry — run `safe-migrate sync`.
 - `CREATE OR REPLACE VIEW` rejects a renamed, retyped or dropped leading column;
-  `CREATE VIEW`/`CREATE MATERIALIZED VIEW` apply an explicit column list.
-- `CREATE MATERIALIZED VIEW` records its columns, access method, tablespace and
-  storage options; `REFRESH ... CONCURRENTLY` requires a usable unique index;
-  `IF [NOT] EXISTS` skips as the server does, and statements the server skips
-  draw no findings.
-- `CREATE SEQUENCE` and `ALTER SEQUENCE` merge options in PostgreSQL's order and
-  report a repeated option, zero increment, non-positive cache, unordered bounds
-  and an out-of-range start, plus a malformed `OWNED BY`.
-- `SET (...)`/`RESET (...)` options are validated by relation kind and version:
-  a view by its own set, a table and materialized view by the heap set, a column
-  by the attribute set, an index by its access method's set, a partitioned table
-  refused any storage parameter and a foreign table the action, and the `toast.`
-  namespace checked against the TOAST table's own set, dropped when none exists,
-  with any other namespace refused. A name written without a value means `true`,
-  kept apart from an explicitly empty string, which stays empty rather than its
-  quotes; an option name folds like any identifier and a string literal is the
-  value it spells, and `RESET` refuses an option that carries a value. A
-  `check_option`
-  option is refused unless the view query is automatically updatable, an
-  unqualified call is placed against the search path by name and argument types,
-  matched through the server's own implicit casts (`pg_cast`) and built-in
-  aggregate signatures (`pg_proc`),
-  before it counts as an aggregate, and an `ALTER TABLE` action is permitted only
-  on the relation kinds PostgreSQL allows.
-- Built-in types are read from `pg_catalog.pg_type` with their own identities;
-  type declarations the server would refuse are reported, and a `character(n)`
-  length change is a rewrite because `bpchar` has no length-coercion support
-  function. `ALTER TABLE`/`VIEW`
-  `SET`/`RESET` options are modeled, rejected by version, or tainted, not dropped.
-- A scoped baseline records cross-schema dependents and the schemas that existed
-  at synchronization, so search-path resolution no longer taints on a schema that
-  was absent, and a routine never resolves in `pg_temp`.
-- A Tier 1 check that did not run, or that a rule declined because its target is
-  outside the baseline, is recorded as not evaluated and caps the verdict at
-  `CAUTIOUS`.
-- `GRANT`/`REVOKE` per-membership options are refused only when the version is
-  known to predate PostgreSQL 16; a grantee named by the statement (`PUBLIC`,
-  `WITH GRANT OPTION`) is reported even outside the baseline; `assume_pg_version`
-  accepts only 14–18.
-- Name resolution follows the synchronized session's search path, an unqualified
-  `CREATE` places at the first writable schema, and tier labels are colored only
-  on a terminal. Cache format V10; run `safe-migrate sync`.
+  `CREATE VIEW`/`CREATE MATERIALIZED VIEW` apply an explicit column list, and
+  `REFRESH ... CONCURRENTLY` needs a usable unique index.
+- `CREATE SEQUENCE`/`ALTER SEQUENCE` merge options in PostgreSQL's order and
+  report a repeat, zero increment, non-positive cache, unordered bounds or an
+  out-of-range start.
+- `SET (...)`/`RESET (...)` options are validated by relation kind and version: a
+  view by its own set, a table or materialized view by the heap set, a column by
+  the attribute set, an index by its access method's set; a partitioned table
+  refuses any storage parameter and a foreign table the action.
+- Any namespace other than `toast.` is refused; a `toast.` option is checked
+  against the TOAST table's own set and dropped when the relation has none, and a
+  name the option table cannot place taints.
+- A name without a value means `true`, apart from an explicitly empty string,
+  which stays empty rather than its quotes; `RESET` refuses a value.
+- An option name folds like any identifier, a string literal is the value it
+  spells, a `check_option` is refused unless the view is automatically updatable,
+  and an `ALTER TABLE` action only where PostgreSQL allows one.
+- An unqualified call is placed against the search path by name and argument types
+  before it counts as an aggregate.
+- Built-in types are read from `pg_catalog.pg_type`; a type declaration the server
+  would refuse is reported, and a `character(n)` length change is a rewrite.
+- A scoped baseline remembers the schemas that existed at synchronization, so
+  resolution no longer taints on an absent schema, and a routine never resolves in
+  `pg_temp`.
+- A Tier 1 check that did not run, or a rule declined for an out-of-baseline
+  target, is recorded as not evaluated and caps the verdict at `CAUTIOUS`.
+- `GRANT`/`REVOKE` per-membership options are refused only for a known pre-16
+  version, a grantee named by the statement is reported even outside the baseline,
+  and `assume_pg_version` accepts only 14–18.
+- Name resolution follows the synchronized session's search path, and an
+  unqualified `CREATE` places at the first writable schema. Cache format V10; run
+  `safe-migrate sync`.
 
 ## v0.10.0 — 2026-10-02
 

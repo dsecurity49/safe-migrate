@@ -22,6 +22,23 @@ use std::collections::{BTreeSet, HashSet};
 type RelationLookup = ObjectLookup;
 type IndexLookup = ObjectLookup;
 
+/// Record the options PostgreSQL keeps in the relation's own `reloptions`. A
+/// `toast.` option configures the TOAST relation instead, so it is left out.
+pub(super) fn store_relation_options(
+    options: &mut std::collections::BTreeMap<String, String>,
+    attributes: &[crate::_internal::analysis::facts::AttributeFact],
+) {
+    for attribute in attributes.iter().filter(|a| a.namespace.is_none()) {
+        options.insert(
+            attribute.key(),
+            attribute
+                .value
+                .clone()
+                .unwrap_or_else(|| "true".to_string()),
+        );
+    }
+}
+
 impl AnalysisState {
     /// Record or clear a view column default, which PostgreSQL applies to
     /// `INSERT` through the view.
@@ -82,15 +99,7 @@ impl AnalysisState {
         }
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
-            for attribute in attributes {
-                relation.table_options.insert(
-                    attribute.key(),
-                    attribute
-                        .value
-                        .clone()
-                        .unwrap_or_else(|| "true".to_string()),
-                );
-            }
+            store_relation_options(&mut relation.table_options, attributes);
         }
         MutationResult::Applied
     }
@@ -745,12 +754,7 @@ impl AnalysisState {
         // an empty one; a fresh view starts from the options it was given.
         relation.view_updatability = Self::view_updatability_state(create.updatability);
         relation.table_options.clear();
-        for option in &create.options {
-            relation.table_options.insert(
-                option.key(),
-                option.value.clone().unwrap_or_else(|| "true".to_string()),
-            );
-        }
+        store_relation_options(&mut relation.table_options, &create.options);
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
@@ -830,12 +834,7 @@ impl AnalysisState {
         relation.is_populated = Some(!create.with_no_data);
         relation.access_method = create.access_method.clone();
         relation.tablespace = create.tablespace.clone();
-        for option in &create.options {
-            relation.table_options.insert(
-                option.key(),
-                option.value.clone().unwrap_or_else(|| "true".to_string()),
-            );
-        }
+        store_relation_options(&mut relation.table_options, &create.options);
         if !create.projection_complete {
             // A view whose output list could not be derived still exists, but
             // its columns are unknown, so any column-level claim is unsound.

@@ -2473,6 +2473,44 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn a_toast_option_is_not_stored_on_the_relation() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // A `toast.` option configures the TOAST relation, so PostgreSQL keeps
+        // it out of the relation's own `reloptions` for every relation kind.
+        engine
+            .analyze(
+                "CREATE TABLE base (id int);
+                 CREATE VIEW v WITH (toast.autovacuum_enabled = false) AS SELECT id FROM base;
+                 ALTER VIEW v SET (toast.fillfactor = 70, security_barrier = true);
+                 CREATE MATERIALIZED VIEW mv WITH (fillfactor = 70, toast.autovacuum_enabled = false) AS SELECT id FROM base;
+                 ALTER TABLE base SET (fillfactor = 70, toast.autovacuum_enabled = false);",
+                &mut state,
+            )
+            .unwrap();
+
+        for (name, main, value) in [
+            ("v", "security_barrier", "true"),
+            ("mv", "fillfactor", "70"),
+            ("base", "fillfactor", "70"),
+        ] {
+            let relation = state
+                .get_relation(&object_id("public", name))
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                matches!(relation, RelationOverlay::Present(r)
+                    if r.table_options.get(main) == Some(&value.to_string())
+                        && !r.table_options.keys().any(|key| key.starts_with("toast."))),
+                "{name} must keep {main} and drop every toast. option: {relation:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_unknown_reloption_namespace_is_a_conflict() {
         let engine = setup_engine();
         let mut cache = crate::common::synced_cache();

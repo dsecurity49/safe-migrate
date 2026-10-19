@@ -5663,15 +5663,10 @@ impl AnalysisState {
                     rel.of_type = type_id.clone();
                 }
                 AlterTableActionMutation::SetTableOptions { attributes } => {
-                    for attribute in attributes {
-                        rel.table_options.insert(
-                            attribute.key(),
-                            attribute
-                                .value
-                                .clone()
-                                .unwrap_or_else(|| "true".to_string()),
-                        );
-                    }
+                    super::apply_view_index::store_relation_options(
+                        &mut rel.table_options,
+                        attributes,
+                    );
                 }
                 AlterTableActionMutation::ResetTableOptions { attributes } => {
                     for attribute in attributes {
