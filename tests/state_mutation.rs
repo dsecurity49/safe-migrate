@@ -6783,7 +6783,7 @@ mod state_mutation_tests {
             ("varchar(50)", "varchar(10)", true),
             ("int", "integer", false),
             ("int", "bigint", true),
-            ("character(5)", "character(10)", false),
+            ("character(5)", "character(10)", true),
             ("character(5)", "varchar(5)", true),
             ("character(5)", "text", true),
         ] {
@@ -8802,9 +8802,9 @@ mod state_mutation_tests {
         };
         assert_eq!(subscription.publications, ["renamed_changes"]);
         assert!(subscription.params.as_ref().is_some_and(|params| {
-            params
-                .iter()
-                .any(|param| param.name == "streaming" && param.value == "parallel")
+            params.iter().any(|param| {
+                param.name == "streaming" && param.value.as_deref() == Some("parallel")
+            })
         }));
 
         engine.analyze("DROP TABLE second;", &mut state).unwrap();

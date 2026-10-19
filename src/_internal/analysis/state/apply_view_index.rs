@@ -83,9 +83,13 @@ impl AnalysisState {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
             for attribute in attributes {
-                relation
-                    .table_options
-                    .insert(attribute.key(), attribute.value.clone());
+                relation.table_options.insert(
+                    attribute.key(),
+                    attribute
+                        .value
+                        .clone()
+                        .unwrap_or_else(|| "true".to_string()),
+                );
             }
         }
         MutationResult::Applied
@@ -366,7 +370,7 @@ impl AnalysisState {
             match evaluate(
                 &attribute.name,
                 namespace,
-                Some(&attribute.value),
+                attribute.value.as_deref(),
                 kind,
                 version,
             ) {
@@ -451,7 +455,7 @@ impl AnalysisState {
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> Result<Vec<String>, MutationResult> {
         for attribute in attributes {
-            if !attribute.value.is_empty() {
+            if attribute.value.is_some() {
                 return Err(MutationResult::conflict(
                     "RESET must not include values for parameters".to_string(),
                 ));
@@ -742,9 +746,10 @@ impl AnalysisState {
         relation.view_updatability = Self::view_updatability_state(create.updatability);
         relation.table_options.clear();
         for option in &create.options {
-            relation
-                .table_options
-                .insert(option.key(), option.value.clone());
+            relation.table_options.insert(
+                option.key(),
+                option.value.clone().unwrap_or_else(|| "true".to_string()),
+            );
         }
         self.local
             .relations
@@ -826,9 +831,10 @@ impl AnalysisState {
         relation.access_method = create.access_method.clone();
         relation.tablespace = create.tablespace.clone();
         for option in &create.options {
-            relation
-                .table_options
-                .insert(option.key(), option.value.clone());
+            relation.table_options.insert(
+                option.key(),
+                option.value.clone().unwrap_or_else(|| "true".to_string()),
+            );
         }
         if !create.projection_complete {
             // A view whose output list could not be derived still exists, but

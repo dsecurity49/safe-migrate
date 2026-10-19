@@ -1,5 +1,9 @@
+pub(crate) mod aggregate;
+pub(crate) mod aggregate_fallback;
 pub(crate) mod builtin_type;
 pub(crate) mod builtin_type_fallback;
+pub(crate) mod cast;
+pub(crate) mod cast_fallback;
 pub(crate) mod collation;
 pub(crate) mod column;
 pub(crate) mod constraint;

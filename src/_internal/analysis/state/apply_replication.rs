@@ -116,6 +116,8 @@ impl AnalysisState {
                 .iter()
                 .filter(|operation| {
                     fact.value
+                        .as_deref()
+                        .unwrap_or("")
                         .split(',')
                         .any(|part| part.trim().eq_ignore_ascii_case(operation))
                 })
@@ -128,27 +130,31 @@ impl AnalysisState {
             AttributeFact {
                 name: "publish".to_string(),
                 namespace: None,
-                value: publish_value,
+                value: Some(publish_value),
             },
             AttributeFact {
                 name: "publish_via_partition_root".to_string(),
                 namespace: None,
-                value: explicit
-                    .iter()
-                    .find(|fact| fact.name == "publish_via_partition_root")
-                    .map(|fact| fact.value.clone())
-                    .unwrap_or_else(|| "false".to_string()),
+                value: Some(
+                    explicit
+                        .iter()
+                        .find(|fact| fact.name == "publish_via_partition_root")
+                        .and_then(|fact| fact.value.clone())
+                        .unwrap_or_else(|| "false".to_string()),
+                ),
             },
         ];
         if self.pg_version().conservative_num() >= 180_000 {
             params.push(AttributeFact {
                 name: "publish_generated_columns".to_string(),
                 namespace: None,
-                value: explicit
-                    .iter()
-                    .find(|fact| fact.name == "publish_generated_columns")
-                    .map(|fact| fact.value.clone())
-                    .unwrap_or_else(|| "none".to_string()),
+                value: Some(
+                    explicit
+                        .iter()
+                        .find(|fact| fact.name == "publish_generated_columns")
+                        .and_then(|fact| fact.value.clone())
+                        .unwrap_or_else(|| "none".to_string()),
+                ),
             });
         }
         params
@@ -686,7 +692,8 @@ impl AnalysisState {
                 let forbidden_in_transaction = options.iter().any(|option| {
                     option.name.eq_ignore_ascii_case("failover")
                         || (option.name.eq_ignore_ascii_case("two_phase")
-                            && Self::postgres_boolean(&option.value) == Some(false))
+                            && Self::postgres_boolean(option.value.as_deref().unwrap_or("true"))
+                                == Some(false))
                 });
                 if in_transaction && forbidden_in_transaction {
                     return MutationResult::conflict(format!(
@@ -782,8 +789,9 @@ impl AnalysisState {
                     for option in options {
                         Self::set_subscription_option(subscription, option);
                         if option.name.eq_ignore_ascii_case("slot_name") {
-                            subscription.slot_name = (!option.value.eq_ignore_ascii_case("none"))
-                                .then(|| option.value.clone());
+                            let slot = option.value.as_deref().unwrap_or("true");
+                            subscription.slot_name =
+                                (!slot.eq_ignore_ascii_case("none")).then(|| slot.to_string());
                         }
                     }
                 }

@@ -1,11 +1,11 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::IndexStatisticsColumn;
 use crate::_internal::analysis::facts::{
-    AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
-    CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
-    ReindexTargetKindFact, RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget,
-    SearchPathTarget, StatementFact, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-    TypeCreationKind,
+    AggregateArgumentFact, AggregateCandidateFact, AlterIndexActionFact, AlterTableActionFact,
+    AlterTypeActionFact, AlterTypeFact, ColumnFact, CreateTypeFact, FkFact, LikePropertiesFact,
+    LikeSourceFact, LockModeFact, PersistenceFact, ReindexTargetKindFact, RelationTargetFact,
+    ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact, TableConstraintFact,
+    TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
@@ -82,6 +82,32 @@ const BUILTIN_AGGREGATES: &[&str] = &[
     "variance",
     "xmlagg",
 ];
+
+/// A view query's updatability under two readings of its unqualified
+/// aggregate-named calls, plus those calls for the resolver to place.
+///
+/// The visitor cannot know the search path, so it hands both readings and the
+/// calls to the resolver, which can tell a built-in aggregate from a
+/// same-named overload.
+struct ViewUpdatabilityOutcome {
+    /// The verdict when every unqualified aggregate-named call is its built-in
+    /// aggregate.
+    with_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+    /// The verdict when none of them is.
+    without_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+    aggregate_candidates: Vec<AggregateCandidateFact>,
+}
+
+impl ViewUpdatabilityOutcome {
+    /// A verdict no search path can change, carrying nothing to resolve.
+    fn settled(verdict: crate::_internal::analysis::facts::ViewUpdatabilityFact) -> Self {
+        Self {
+            with_aggregates: verdict,
+            without_aggregates: verdict,
+            aggregate_candidates: Vec::new(),
+        }
+    }
+}
 
 pub(crate) struct AstVisitor;
 
@@ -1815,15 +1841,15 @@ impl AstVisitor {
     ) -> Option<Vec<crate::_internal::analysis::facts::AttributeFact>> {
         let mut attributes = Self::extract_attribute_options_raw(list)?;
         for attribute in &mut attributes {
-            if attribute.value.is_empty() {
-                attribute.value = "true".to_string();
+            if attribute.value.is_none() {
+                attribute.value = Some("true".to_string());
             }
         }
         Some(attributes)
     }
 
-    /// The options of a `SET`/`RESET` list with the value exactly as written. An
-    /// absent value stays empty, which is how a `RESET` tells that PostgreSQL
+    /// The options of a `SET`/`RESET` list with the value exactly as written. A
+    /// missing value stays `None`, which is how a `RESET` tells that PostgreSQL
     /// would refuse the value it carries.
     fn extract_attribute_options_raw(
         list: Option<ast::AttributeList>,
@@ -1832,11 +1858,17 @@ impl AstVisitor {
             .attribute_options()
             .map(|option| {
                 Some(crate::_internal::analysis::facts::AttributeFact {
-                    name: option.name()?.syntax().text().to_string(),
-                    value: option
-                        .attribute_value()
-                        .map(|value| value.syntax().text().to_string())
-                        .unwrap_or_default(),
+                    name: Self::resolve_identifier_token(
+                        option.name()?.syntax().text().to_string().trim(),
+                    ),
+                    // A string literal is read as the value it spells, so an
+                    // explicitly empty one is the empty string, not its quotes.
+                    value: option.attribute_value().map(|value| {
+                        value
+                            .literal()
+                            .and_then(|literal| Self::resolve_string_literal(&literal))
+                            .unwrap_or_else(|| value.syntax().text().to_string().trim().to_string())
+                    }),
                     namespace: Self::attribute_namespace(&option),
                 })
             })
@@ -2485,10 +2517,11 @@ impl AstVisitor {
             );
             options.push(crate::_internal::analysis::facts::AttributeFact {
                 name: "check_option".to_string(),
-                value: if local { "local" } else { "cascaded" }.to_string(),
+                value: Some(if local { "local" } else { "cascaded" }.to_string()),
                 namespace: None,
             });
         }
+        let outcome = Self::view_updatability(query);
         Some(StatementFact::CreateView {
             name: Self::path_to_qualified_name(&path)?,
             or_replace: node.or_replace().is_some(),
@@ -2504,7 +2537,9 @@ impl AstVisitor {
                 })
                 .unwrap_or_default(),
             options,
-            updatability: Self::view_updatability(query),
+            updatability: outcome.with_aggregates,
+            updatability_without_aggregates: outcome.without_aggregates,
+            aggregate_candidates: outcome.aggregate_candidates,
             select_projection_complete: select_source.is_some() && projection_was_complete,
             select_outputs,
             select_source,
@@ -2514,30 +2549,30 @@ impl AstVisitor {
     }
 
     /// Whether PostgreSQL would accept `WITH CHECK OPTION` on this view query,
-    /// mirroring `view_query_is_auto_updatable(query, true)`. The syntactic
-    /// disqualifiers are exact; a target expression the analyzer cannot place
-    /// stays unknown rather than guessing.
-    fn view_updatability(
-        query: Option<ast::SelectVariant>,
-    ) -> crate::_internal::analysis::facts::ViewUpdatabilityFact {
+    /// mirroring `view_query_is_auto_updatable(query, true)`. Only the
+    /// unambiguous syntax is settled here; a query whose verdict depends on
+    /// the search path is read twice, and an unplaceable target stays unknown.
+    fn view_updatability(query: Option<ast::SelectVariant>) -> ViewUpdatabilityOutcome {
         use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
         use crate::_internal::model::relation::ViewUpdatabilityReason as R;
         match query {
             Some(ast::SelectVariant::Select(select)) => Self::select_updatability(&select),
             Some(ast::SelectVariant::ParenSelect(paren)) => Self::view_updatability(paren.select()),
-            Some(ast::SelectVariant::CompoundSelect(_)) => V::NotUpdatable(R::SetOperation),
-            Some(ast::SelectVariant::Values(_)) => V::NotUpdatable(R::SingleRelation),
+            Some(ast::SelectVariant::CompoundSelect(_)) => {
+                ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::SetOperation))
+            }
+            Some(ast::SelectVariant::Values(_)) => {
+                ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::SingleRelation))
+            }
             // `TABLE t` and `SELECT ... INTO` are not a plain projection the
             // rest of the analysis expects, so do not claim a verdict.
             Some(ast::SelectVariant::Table(_)) | Some(ast::SelectVariant::SelectInto(_)) | None => {
-                V::Unknown
+                ViewUpdatabilityOutcome::settled(V::Unknown)
             }
         }
     }
 
-    fn select_updatability(
-        select: &ast::Select,
-    ) -> crate::_internal::analysis::facts::ViewUpdatabilityFact {
+    fn select_updatability(select: &ast::Select) -> ViewUpdatabilityOutcome {
         use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
         use crate::_internal::model::relation::ViewUpdatabilityReason as R;
         if select
@@ -2547,28 +2582,28 @@ impl AstVisitor {
                 matches!(quantifier, ast::SelectQuantifier::DistinctClause(_))
             })
         {
-            return V::NotUpdatable(R::Distinct);
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::Distinct));
         }
         if select.group_by_clause().is_some() {
-            return V::NotUpdatable(R::GroupBy);
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::GroupBy));
         }
         if select.having_clause().is_some() {
-            return V::NotUpdatable(R::Having);
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::Having));
         }
         if select.with_clause().is_some() {
-            return V::NotUpdatable(R::With);
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::With));
         }
         if select.limit_clause().is_some()
             || select.offset_clause().is_some()
             || select.fetch_clause().is_some()
         {
-            return V::NotUpdatable(R::Limit);
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::Limit));
         }
-        // An aggregate or window function in the target list makes each output
-        // row a summary, never a row of the base relation; a set-returning
-        // function multiplies rows. Aggregates and windows are recognised by
-        // name, and a call that is neither might be a set-returning function
-        // the analyzer cannot identify, so it taints.
+        // An aggregate or window function in the target list makes each row a
+        // summary; a set-returning function multiplies rows. An explicit
+        // `pg_catalog` aggregate is settled here, an unqualified possible
+        // aggregate is settled by the resolver, and a call that is neither
+        // might be a set-returning function the analyzer cannot identify.
         let targets = select
             .select_clause()
             .and_then(|clause| clause.target_list())
@@ -2577,39 +2612,61 @@ impl AstVisitor {
         let mut aggregate = false;
         let mut window = false;
         let mut unknown_call = false;
+        let mut aggregate_candidates: Vec<AggregateCandidateFact> = Vec::new();
         for target in targets.iter() {
-            let Some(expr) = target.expr() else { continue };
-            if let ast::Expr::CallExpr(call) = Self::unwrap_parens(expr) {
+            for call in Self::target_list_calls(target) {
                 if call.over_clause().is_some() {
                     window = true;
-                } else if Self::is_builtin_aggregate(&call) {
+                } else if Self::is_pg_catalog_aggregate(&call) {
                     aggregate = true;
-                } else {
+                } else if let Some(candidate) = Self::unqualified_aggregate_candidate(&call) {
+                    aggregate_candidates.push(candidate);
+                } else if call.expr().is_some() {
+                    // An identifier call the analyzer cannot identify might be
+                    // a set-returning function. A keyword form (`EXISTS`,
+                    // `ANY`, `substring`, ...) has no callee and never is.
                     unknown_call = true;
                 }
             }
         }
-        if aggregate {
-            return V::NotUpdatable(R::Aggregate);
-        }
-        if window {
-            return V::NotUpdatable(R::Window);
-        }
-        if unknown_call {
-            return V::Unknown;
-        }
-        let whole_row = match Self::single_source_relation(select) {
-            Ok(whole_row) => whole_row,
-            Err(reason) => return V::NotUpdatable(reason),
+        let structural = match Self::single_source_relation(select) {
+            Ok(whole_row) => {
+                // With `check_cols`, PostgreSQL requires at least one updatable
+                // column: a star, or a reference to a user column of the base
+                // relation.
+                if targets.iter().any(|target| {
+                    target.star_token().is_some() || Self::is_column_reference(target, &whole_row)
+                }) {
+                    V::Updatable
+                } else {
+                    V::NotUpdatable(R::NoUpdatableColumns)
+                }
+            }
+            Err(reason) => V::NotUpdatable(reason),
         };
-        // With `check_cols`, PostgreSQL requires at least one updatable column:
-        // a star, or a reference to a user column of the base relation.
-        if targets.iter().any(|target| {
-            target.star_token().is_some() || Self::is_column_reference(target, &whole_row)
-        }) {
-            V::Updatable
+        // The reading that ignores the unqualified calls still honours an
+        // explicit aggregate, which no path can redirect.
+        let without_aggregates = if aggregate {
+            V::NotUpdatable(R::Aggregate)
+        } else if window {
+            V::NotUpdatable(R::Window)
+        } else if unknown_call {
+            V::Unknown
         } else {
-            V::NotUpdatable(R::NoUpdatableColumns)
+            structural
+        };
+        // PostgreSQL checks aggregates before window functions and before the
+        // from-shape, so any aggregate-named call decides the reading that
+        // counts them.
+        let with_aggregates = if aggregate || !aggregate_candidates.is_empty() {
+            V::NotUpdatable(R::Aggregate)
+        } else {
+            without_aggregates
+        };
+        ViewUpdatabilityOutcome {
+            with_aggregates,
+            without_aggregates,
+            aggregate_candidates,
         }
     }
 
@@ -2698,21 +2755,105 @@ impl AstVisitor {
         )
     }
 
-    /// Whether a call names a `pg_catalog` aggregate. A function of the same
-    /// name in another schema is not that aggregate.
-    fn is_builtin_aggregate(call: &ast::CallExpr) -> bool {
+    /// Every call a target's expression makes, but not calls inside a nested
+    /// query: a subquery, `EXISTS`, `ANY`/`ALL` or `ARRAY` carries its own
+    /// `SELECT`, whose aggregates and windows belong to it, not the view.
+    fn target_list_calls(target: &ast::Target) -> Vec<ast::CallExpr> {
+        let boundary = target.syntax();
+        target
+            .syntax()
+            .descendants()
+            .filter_map(ast::CallExpr::cast)
+            .filter(|call| {
+                !call
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|ancestor| ancestor != boundary)
+                    .any(|ancestor| {
+                        matches!(
+                            ancestor.kind(),
+                            SyntaxKind::SELECT
+                                | SyntaxKind::PAREN_SELECT
+                                | SyntaxKind::COMPOUND_SELECT
+                                | SyntaxKind::SELECT_INTO
+                                | SyntaxKind::VALUES
+                                | SyntaxKind::TABLE
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Whether a call spells `pg_catalog.<aggregate>`, which no search path can
+    /// redirect to another schema.
+    fn is_pg_catalog_aggregate(call: &ast::CallExpr) -> bool {
         let Some(callee) = call.expr() else {
             return false;
         };
         let text = callee.syntax().text().to_string();
-        let (schema, name) = match text.rsplit_once('.') {
-            Some((schema, name)) => (Some(schema.trim_matches('"').to_ascii_lowercase()), name),
-            None => (None, text.as_str()),
-        };
-        if schema.is_some_and(|schema| schema != "pg_catalog") {
+        let Some((schema, name)) = text.rsplit_once('.') else {
             return false;
+        };
+        Self::resolve_identifier_token(schema) == "pg_catalog"
+            && Self::is_aggregate_name(&Self::resolve_identifier_token(name))
+    }
+
+    /// Candidate facts for an unqualified call that spells a built-in
+    /// aggregate: its name and the argument types the visitor can see.
+    fn unqualified_aggregate_candidate(call: &ast::CallExpr) -> Option<AggregateCandidateFact> {
+        let callee = call.expr()?;
+        let text = callee.syntax().text().to_string();
+        if text.contains('.') {
+            return None;
         }
-        BUILTIN_AGGREGATES.contains(&name.trim_matches('"').to_ascii_lowercase().as_str())
+        let name = Self::resolve_identifier_token(&text);
+        if !Self::is_aggregate_name(&name) {
+            return None;
+        }
+        // `count(*)` is a star form with no arguments; a named-notation
+        // argument pins a type the visitor cannot see.
+        let arguments = match call.arg_list() {
+            Some(args) if args.star_token().is_none() => args
+                .args()
+                .map(|arg| match arg.func_arg_expr() {
+                    Some(ast::FuncArgExpr::Expr(expr)) => Self::aggregate_argument(expr),
+                    _ => AggregateArgumentFact::Unknown,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(AggregateCandidateFact { name, arguments })
+    }
+
+    /// One argument of a candidate call, typed as far as the visitor can see
+    /// without the schema.
+    fn aggregate_argument(expr: ast::Expr) -> AggregateArgumentFact {
+        use AggregateArgumentFact as A;
+        match Self::unwrap_parens(expr) {
+            // A cast is the type it converts to.
+            ast::Expr::CastExpr(cast) => cast
+                .ty()
+                .map(|ty| A::Typed(ty.syntax().text().to_string()))
+                .unwrap_or(A::Unknown),
+            ast::Expr::NameRef(name) => A::Column(Self::resolve_identifier_token(
+                name.syntax().text().to_string(),
+            )),
+            // `t.amount` addresses the base relation's column; `t.*` does not.
+            ast::Expr::FieldExpr(field) if field.star_token().is_none() => field
+                .field()
+                .map(|name| {
+                    A::Column(Self::resolve_identifier_token(
+                        name.syntax().text().to_string(),
+                    ))
+                })
+                .unwrap_or(A::Unknown),
+            _ => A::Unknown,
+        }
+    }
+
+    fn is_aggregate_name(name: &str) -> bool {
+        BUILTIN_AGGREGATES.contains(&name)
     }
 
     /// The qualified name a cast target writes.
@@ -3536,7 +3677,7 @@ impl AstVisitor {
         attributes
             .into_iter()
             .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
-            .map(|attribute| attribute.value)
+            .and_then(|attribute| attribute.value)
     }
 
     fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
@@ -4175,13 +4316,21 @@ impl AstVisitor {
                 .iter()
                 .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
                 .filter(|attribute| {
-                    !matches!(attribute.value.to_ascii_lowercase().as_str(), "any" | "*")
+                    !matches!(
+                        attribute
+                            .value
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "any" | "*"
+                    )
                 })
                 .map(|attribute| {
                     vec![crate::_internal::analysis::facts::ParamFact {
                         mode: crate::_internal::analysis::facts::ParamModeFact::In,
                         name: None,
-                        ty: attribute.value.clone(),
+                        ty: attribute.value.clone().unwrap_or_default(),
                         default: None,
                     }]
                 })
@@ -4202,7 +4351,7 @@ impl AstVisitor {
                     .map(
                         |attribute| crate::_internal::analysis::facts::AggregateOptionFact {
                             name: attribute.name,
-                            value: attribute.value,
+                            value: attribute.value.unwrap_or_default(),
                         },
                     )
                     .collect(),
@@ -4276,17 +4425,19 @@ impl AstVisitor {
                         })
                         .unwrap_or_default(),
                     namespace: Self::attribute_namespace(&option),
-                    value: option
-                        .attribute_value()
-                        .map(|value| {
-                            value
-                                .literal()
-                                .and_then(|literal| Self::resolve_string_literal(&literal))
-                                .unwrap_or_else(|| {
-                                    value.syntax().text().to_string().trim().to_string()
-                                })
-                        })
-                        .unwrap_or_else(|| "true".to_string()),
+                    value: Some(
+                        option
+                            .attribute_value()
+                            .map(|value| {
+                                value
+                                    .literal()
+                                    .and_then(|literal| Self::resolve_string_literal(&literal))
+                                    .unwrap_or_else(|| {
+                                        value.syntax().text().to_string().trim().to_string()
+                                    })
+                            })
+                            .unwrap_or_else(|| "true".to_string()),
+                    ),
                 })
                 .collect()
         })

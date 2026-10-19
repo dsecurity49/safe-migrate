@@ -491,6 +491,10 @@ pub(crate) struct DbCache {
     /// empty catalogue: written collations stay unresolved rather than
     /// equated.
     pub collations: Option<crate::_internal::model::collation::CollationCatalogue>,
+    /// The cluster's implicit casts, from `pg_cast`. `None` when unsynchronized.
+    pub casts: Option<crate::_internal::model::cast::CastCatalogue>,
+    /// The built-in `pg_catalog` aggregate signatures. `None` when unsynchronized.
+    pub aggregates: Option<crate::_internal::model::aggregate::AggregateCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
     /// Dependencies from a view to a routine or type, which the relation
@@ -626,6 +630,8 @@ impl DbCache {
             builtin_types: None,
             opclasses: None,
             collations: None,
+            casts: None,
+            aggregates: None,
             sequences: HashMap::new(),
             dependencies: Vec::new(),
             view_object_dependencies: Vec::new(),

@@ -306,7 +306,7 @@ mod tests {
                 ]),
                 params: vec![crate::_internal::analysis::facts::AttributeFact {
                     name: "publish".into(),
-                    value: "insert, update".into(),
+                    value: Some("insert, update".into()),
                     namespace: None,
                 }],
                 generation: 0,
@@ -321,7 +321,7 @@ mod tests {
                 publications: vec!["app_changes".into()],
                 params: Some(vec![crate::_internal::analysis::facts::AttributeFact {
                     name: "streaming".into(),
-                    value: "parallel".into(),
+                    value: Some("parallel".into()),
                     namespace: None,
                 }]),
                 enabled: false,

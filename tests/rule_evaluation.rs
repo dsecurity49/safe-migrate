@@ -1728,6 +1728,291 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn a_shadowing_routine_decides_whether_an_aggregate_name_conflicts() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // Before the shadowing routine exists, `sum(b)` is the built-in
+        // aggregate. After `SET search_path = public, pg_catalog`, `public.sum`
+        // precedes `pg_catalog`, so the same call is scalar and PostgreSQL
+        // accepts the check option.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_shadow (a int, b int);
+                 CREATE VIEW aggregated AS SELECT a, sum(b) AS s FROM base_shadow WITH CHECK OPTION;
+                 CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+                 SET search_path = public, pg_catalog;
+                 CREATE VIEW shadowed AS SELECT a, sum(b) AS s FROM base_shadow WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        let reasons: Vec<&str> = v
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the unshadowed aggregate view conflicts: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("aggregate functions"),
+            "the conflict is the aggregate refusal: {reasons:?}"
+        );
+
+        let shadowed = state
+            .get_relation(&object_id("public", "shadowed"))
+            .expect("view must exist");
+        assert!(
+            matches!(shadowed, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+            "the shadowed call is scalar, so the view is updatable: {shadowed:?}"
+        );
+    }
+
+    #[test]
+    fn the_built_in_aggregate_beats_a_same_signature_routine_searched_after_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // The default path searches `pg_catalog` first, so `public.sum(bigint)`
+        // does not shadow the built-in aggregate: `sum(b)` is an aggregate and
+        // the check option is refused. Naming `public` first reverses it.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_builtin (a int, b bigint);
+                 CREATE FUNCTION public.sum(bigint) RETURNS bigint LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+                 CREATE VIEW built_in AS SELECT a, sum(b) AS s FROM base_builtin WITH CHECK OPTION;
+                 SET search_path = public, pg_catalog;
+                 CREATE VIEW shadowed_builtin AS SELECT a, sum(b) AS s FROM base_builtin WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        let reasons: Vec<&str> = v
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the catalog-first call is the built-in aggregate: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("aggregate functions"),
+            "the conflict is the aggregate refusal: {reasons:?}"
+        );
+
+        let shadowed = state
+            .get_relation(&object_id("public", "shadowed_builtin"))
+            .expect("the routine-first view must exist");
+        assert!(
+            matches!(shadowed, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+            "naming public first makes the call scalar: {shadowed:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_path_entry_ahead_taints_a_shadowing_aggregate() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // `$user` names a schema the model cannot see, so it could hold a `sum`
+        // that shadows the user aggregate in `public`; the call is unsettled.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_unresolved (a int, b int);
+                 CREATE AGGREGATE public.sum(integer) (SFUNC = int4pl, STYPE = integer, INITCOND = '0');
+                 SET search_path = \"$user\", public, pg_catalog;
+                 CREATE VIEW haunted AS SELECT a, sum(b) AS s FROM base_unresolved WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unresolved schema ahead must not yield a definite conflict: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "the shadowed call leaves the verdict unsettled"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_path_entry_ahead_taints_the_built_in_aggregate() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // `public.sum(text)` does not match `b`, so the built-in aggregate is the
+        // fallback; an unresolved entry ahead of `pg_catalog` could shadow it.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_unresolved_builtin (a int, b int);
+                 CREATE FUNCTION public.sum(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+                 SET search_path = \"$user\", public, pg_catalog;
+                 CREATE VIEW haunted_builtin AS SELECT a, sum(b) AS s FROM base_unresolved_builtin WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unresolved schema ahead of the catalog taints the call: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "the built-in aggregate cannot be claimed"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_path_entry_behind_the_shadow_keeps_the_verdict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // The matching scalar is searched before the unresolved entry, so
+        // nothing it cannot see can shadow the call and the verdict stays firm.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_behind (a int, b int);
+                 CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+                 SET search_path = public, \"$user\", pg_catalog;
+                 CREATE VIEW settled AS SELECT a, sum(b) AS s FROM base_behind WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        let settled = state
+            .get_relation(&object_id("public", "settled"))
+            .expect("view must exist");
+        assert!(
+            matches!(settled, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+            "the scalar shadow precedes the unresolved entry: {settled:?}"
+        );
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "the settled scalar view conflicts with nothing: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrowing_overload_is_not_an_implicit_cast() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // `int -> smallint` narrows and is not implicit, so `public.sum(smallint)`
+        // cannot take `sum(b)` and the built-in aggregate is refused.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_narrow (a int, b int);
+                 CREATE FUNCTION public.sum(smallint) RETURNS smallint LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+                 SET search_path = public, pg_catalog;
+                 CREATE VIEW narrowed AS SELECT a, sum(b) AS s FROM base_narrow WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        let reasons: Vec<&str> = v
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "the narrowing overload cannot shadow the aggregate: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("aggregate functions"),
+            "the conflict is the aggregate refusal: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_cross_category_implicit_cast_shadows_the_built_in_aggregate() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // `text -> regclass` is implicit even though the categories differ, so
+        // `public.sum(regclass)` can take `sum(c)` and the call is not a
+        // definite aggregate.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_cross (a int, c text);
+                 CREATE FUNCTION public.sum(regclass) RETURNS regclass LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+                 SET search_path = public, pg_catalog;
+                 CREATE VIEW crossed AS SELECT a, sum(c) AS s FROM base_cross WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a cross-category implicit cast must not be refused: {v:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn only_a_matching_overload_shadows_a_built_in_aggregate() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // `public.sum(text)` is searched before `pg_catalog`, but `b` is `int`,
+        // so the overload does not match and `sum(b)` is still the built-in
+        // aggregate. An identical-signature overload does match, so there the
+        // call is scalar and PostgreSQL accepts the view.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_overload (a int, b int);
+                 CREATE FUNCTION public.sum(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+                 SET search_path = public, pg_catalog;
+                 CREATE VIEW mismatched AS SELECT a, sum(b) AS s FROM base_overload WITH CHECK OPTION;
+                 CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+                 CREATE VIEW matched AS SELECT a, sum(b) AS s FROM base_overload WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        let reasons: Vec<&str> = v
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the mismatched overload leaves the aggregate in place: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("aggregate functions"),
+            "the conflict is the aggregate refusal: {reasons:?}"
+        );
+
+        let matched = state
+            .get_relation(&object_id("public", "matched"))
+            .expect("view must exist");
+        assert!(
+            matches!(matched, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+            "the matching overload is scalar, so the view is updatable: {matched:?}"
+        );
+        let mismatched_view = object_id("public", "mismatched");
+        assert!(
+            state.get_relation(&mismatched_view).is_none(),
+            "the rejected CREATE VIEW leaves no relation behind"
+        );
+    }
+
+    #[test]
     fn altering_a_view_check_option_requires_an_auto_updatable_query() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -2074,6 +2359,56 @@ mod rule_evaluation_tests {
                 version
             ),
             ReloptionOutcome::Unplaced
+        );
+    }
+
+    #[test]
+    fn an_empty_option_value_is_not_an_absent_one() {
+        let analyze = |sql: &str| {
+            let engine = setup_engine();
+            let mut cache = crate::common::synced_cache();
+            cache.pg_version_num = Some(180_000);
+            let mut state = AnalysisState::new(cache);
+            state.baseline_available = true;
+            engine.analyze(sql, &mut state).unwrap()
+        };
+
+        // A bare option reads as `true` and is accepted; an explicitly empty
+        // value is a value the boolean domain refuses, shown without its quotes.
+        let bare = analyze(
+            "CREATE TABLE base (id int);
+             ALTER TABLE base SET (autovacuum_enabled);",
+        );
+        assert!(
+            !bare.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a bare option reads as true: {bare:?}"
+        );
+
+        let empty = analyze(
+            "CREATE TABLE base (id int);
+             ALTER TABLE base SET (autovacuum_enabled = '');",
+        );
+        let reasons: Vec<&str> = empty
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(reasons.len(), 1, "the empty value is refused: {reasons:?}");
+        assert!(
+            reasons[0].contains("invalid value for parameter \"autovacuum_enabled\":")
+                && !reasons[0].contains("''"),
+            "the empty value is shown as empty, not as its quotes: {reasons:?}"
+        );
+
+        let reset = analyze(
+            "CREATE TABLE base (id int);
+             ALTER TABLE base RESET (fillfactor = '');",
+        );
+        assert!(
+            reset
+                .iter()
+                .any(|v| v.reason.contains("RESET must not include values")),
+            "a RESET carrying the empty value is refused: {reset:?}"
         );
     }
 
@@ -2552,6 +2887,52 @@ mod rule_evaluation_tests {
             matches!(mat, RelationOverlay::Present(r)
                 if r.table_options.get("fillfactor") == Some(&"70".to_string())),
             "a materialized view stores a heap option: {mat:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_reloptions_read_the_value_as_the_server_does() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // An option name folds like any identifier and a string literal is the
+        // value it spells, so these are the statements PostgreSQL accepts.
+        let v = engine
+            .analyze(
+                "CREATE TABLE opt_target (id int);
+                 ALTER TABLE opt_target SET (FILLFACTOR = 70, autovacuum_enabled = 'on');",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a folded name and a quoted value are valid: {v:?}"
+        );
+        let relation = state
+            .get_relation(&object_id("public", "opt_target"))
+            .expect("table must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.table_options.get("fillfactor") == Some(&"70".to_string())
+                    && r.table_options.get("autovacuum_enabled") == Some(&"on".to_string())),
+            "the options must be stored under their folded names: {relation:?}"
+        );
+
+        // `RESET` refuses an option that carries a value, empty or not.
+        let v = engine
+            .analyze(
+                "ALTER TABLE opt_target RESET (fillfactor = '');",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id == "chain-conflict"
+                    && v.reason.contains("must not include values")),
+            "a RESET carrying a value is refused: {v:?}"
         );
     }
 

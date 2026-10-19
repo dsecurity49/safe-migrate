@@ -45,11 +45,20 @@ notes are available on the
   refused any storage parameter and a foreign table the action, and the `toast.`
   namespace checked against the TOAST table's own set, dropped when none exists,
   with any other namespace refused. A name written without a value means `true`,
-  and `RESET` refuses an option that carries a value. A `check_option` option is
-  refused unless the view query is automatically updatable, and an `ALTER TABLE`
-  action is permitted only on the relation kinds PostgreSQL allows.
+  kept apart from an explicitly empty string, which stays empty rather than its
+  quotes; an option name folds like any identifier and a string literal is the
+  value it spells, and `RESET` refuses an option that carries a value. A
+  `check_option`
+  option is refused unless the view query is automatically updatable, an
+  unqualified call is placed against the search path by name and argument types,
+  matched through the server's own implicit casts (`pg_cast`) and built-in
+  aggregate signatures (`pg_proc`),
+  before it counts as an aggregate, and an `ALTER TABLE` action is permitted only
+  on the relation kinds PostgreSQL allows.
 - Built-in types are read from `pg_catalog.pg_type` with their own identities;
-  type declarations the server would refuse are reported. `ALTER TABLE`/`VIEW`
+  type declarations the server would refuse are reported, and a `character(n)`
+  length change is a rewrite because `bpchar` has no length-coercion support
+  function. `ALTER TABLE`/`VIEW`
   `SET`/`RESET` options are modeled, rejected by version, or tainted, not dropped.
 - A scoped baseline records cross-schema dependents and the schemas that existed
   at synchronization, so search-path resolution no longer taints on a schema that

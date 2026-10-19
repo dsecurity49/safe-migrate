@@ -3215,6 +3215,106 @@ fn load_collations(
     )
 }
 
+fn load_casts(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::cast::CastCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                pg_catalog.format_type(c.castsource, NULL) AS source,
+                pg_catalog.format_type(c.casttarget, NULL) AS target
+            FROM pg_catalog.pg_cast c
+            JOIN pg_catalog.pg_type s ON s.oid = c.castsource
+            JOIN pg_catalog.pg_namespace sn ON sn.oid = s.typnamespace
+            JOIN pg_catalog.pg_type t ON t.oid = c.casttarget
+            JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace
+            WHERE c.castcontext = 'i'
+              AND sn.nspname = 'pg_catalog'
+              AND tn.nspname = 'pg_catalog'
+            ",
+            &[],
+        )
+        .context("Failed to load implicit casts")?;
+    Ok(crate::_internal::model::cast::CastCatalogue::new(
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("source").context("implicit cast source")?,
+                    row.try_get("target").context("implicit cast target")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn load_aggregates(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::aggregate::AggregateCatalogue> {
+    use crate::_internal::model::aggregate::{AggregateArg, AggregateCatalogue};
+
+    let rows = client
+        .query(
+            "
+            SELECT
+                p.oid AS oid,
+                p.proname AS name,
+                a.ord AS ord,
+                pg_catalog.format_type(a.argtype, NULL) AS arg,
+                (t.typcategory = 'P') AS polymorphic
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            JOIN pg_catalog.pg_aggregate g ON g.aggfnoid = p.oid
+            LEFT JOIN LATERAL unnest(p.proargtypes) WITH ORDINALITY AS a(argtype, ord) ON true
+            LEFT JOIN pg_catalog.pg_type t ON t.oid = a.argtype
+            WHERE n.nspname = 'pg_catalog' AND g.aggkind = 'n'
+            ORDER BY p.oid, a.ord
+            ",
+            &[],
+        )
+        .context("Failed to load built-in aggregates")?;
+
+    let mut entries: Vec<(String, Vec<AggregateArg>)> = Vec::new();
+    let mut current: Option<(u32, String, Vec<AggregateArg>)> = None;
+    for row in rows {
+        let oid: u32 = row.try_get("oid").context("aggregate oid")?;
+        let name: String = row.try_get("name").context("aggregate name")?;
+        let argument = match row
+            .try_get::<_, Option<String>>("arg")
+            .context("aggregate argument")?
+        {
+            None => None,
+            Some(_)
+                if row
+                    .try_get::<_, Option<bool>>("polymorphic")
+                    .context("aggregate polymorphism")?
+                    .unwrap_or(false) =>
+            {
+                Some(AggregateArg::Any)
+            }
+            Some(spelling) => Some(AggregateArg::Type(spelling)),
+        };
+        if let Some((current_oid, _, arguments)) = current.as_mut()
+            && *current_oid == oid
+        {
+            if let Some(argument) = argument {
+                arguments.push(argument);
+            }
+            continue;
+        }
+        if let Some((_, finished, arguments)) =
+            current.replace((oid, name, argument.into_iter().collect()))
+        {
+            entries.push((finished, arguments));
+        }
+    }
+    if let Some((_, name, arguments)) = current {
+        entries.push((name, arguments));
+    }
+
+    Ok(AggregateCatalogue::new(entries))
+}
+
 fn load_builtin_types(
     client: &mut impl GenericClient,
 ) -> Result<crate::_internal::model::builtin_type::BuiltinTypeCatalogue> {
@@ -3458,15 +3558,16 @@ fn load_publications(
         let mut params = vec![
             crate::_internal::analysis::facts::AttributeFact {
                 name: "publish".to_string(),
-                value: operations.join(", "),
+                value: Some(operations.join(", ")),
                 namespace: None,
             },
             crate::_internal::analysis::facts::AttributeFact {
                 name: "publish_via_partition_root".to_string(),
-                value: row
-                    .try_get::<_, bool>("pubviaroot")
-                    .context("publication partition-root mode")?
-                    .to_string(),
+                value: Some(
+                    row.try_get::<_, bool>("pubviaroot")
+                        .context("publication partition-root mode")?
+                        .to_string(),
+                ),
                 namespace: None,
             },
         ];
@@ -3483,7 +3584,7 @@ fn load_publications(
             };
             params.push(crate::_internal::analysis::facts::AttributeFact {
                 name: "publish_generated_columns".to_string(),
-                value: value.to_string(),
+                value: Some(value.to_string()),
                 namespace: None,
             });
         }
@@ -3718,22 +3819,24 @@ fn load_subscriptions(
             let mut params = vec![
                 crate::_internal::analysis::facts::AttributeFact {
                     name: "binary".to_string(),
-                    value: row
-                        .try_get::<_, bool>("subbinary")
-                        .with_context(|| format!("subscription '{name}' binary mode"))?
-                        .to_string(),
+                    value: Some(
+                        row.try_get::<_, bool>("subbinary")
+                            .with_context(|| format!("subscription '{name}' binary mode"))?
+                            .to_string(),
+                    ),
                     namespace: None,
                 },
                 crate::_internal::analysis::facts::AttributeFact {
                     name: "streaming".to_string(),
-                    value: streaming.to_string(),
+                    value: Some(streaming.to_string()),
                     namespace: None,
                 },
                 crate::_internal::analysis::facts::AttributeFact {
                     name: "synchronous_commit".to_string(),
-                    value: row
-                        .try_get("subsynccommit")
-                        .with_context(|| format!("subscription '{name}' synchronous_commit"))?,
+                    value: Some(
+                        row.try_get("subsynccommit")
+                            .with_context(|| format!("subscription '{name}' synchronous_commit"))?,
+                    ),
                     namespace: None,
                 },
             ];
@@ -3746,7 +3849,7 @@ fn load_subscriptions(
                 if let Some(value) = value {
                     params.push(crate::_internal::analysis::facts::AttributeFact {
                         name: param_name.to_string(),
-                        value,
+                        value: Some(value),
                         namespace: None,
                     });
                 }
@@ -3863,6 +3966,8 @@ fn populate_cache_from_client(
     cache.builtin_types = Some(load_builtin_types(client)?);
     cache.opclasses = Some(load_opclasses(client)?);
     cache.collations = Some(load_collations(client)?);
+    cache.casts = Some(load_casts(client)?);
+    cache.aggregates = Some(load_aggregates(client)?);
     let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's

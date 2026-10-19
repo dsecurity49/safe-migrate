@@ -684,13 +684,14 @@ impl TypeChangeRewriteRule {
             return true;
         }
 
-        // A fixed-length `character` is blank-padded and `varchar` is not, so
-        // converting between them re-encodes every value. Only a widening
-        // inside one family is metadata-only.
+        // Only a variable-length target can lengthen without a rewrite. `char`
+        // is blank-padded and its length coercion has no support function, so
+        // every `character(n)` change re-encodes each value.
         let fixed_char = |parsed: &ParsedDataType| parsed.is_named("bpchar");
         if old_dt.is_text_like()
             && new_dt.is_text_like()
-            && fixed_char(&old_dt) == fixed_char(&new_dt)
+            && !fixed_char(&old_dt)
+            && !fixed_char(&new_dt)
         {
             if new_dt.is_named("text") || !new_dt.has_typmod() {
                 return true;

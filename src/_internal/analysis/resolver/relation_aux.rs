@@ -2,8 +2,9 @@ use super::Resolver;
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::ViewUpdatabilityFact;
 use crate::_internal::analysis::facts::{
-    AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
-    ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
+    AggregateArgumentFact, AggregateCandidateFact, AlterIndexActionFact,
+    AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact,
+    SelectOutputFact, StatisticsTarget,
 };
 use crate::_internal::analysis::mutations::{
     AlterIndexActionMutation, AlterIndexMutation, AlterViewFamily, CreateIndex,
@@ -61,6 +62,8 @@ impl Resolver {
         column_list: &[String],
         options: &[crate::_internal::analysis::facts::AttributeFact],
         updatability: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+        updatability_without_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+        aggregate_candidates: &[AggregateCandidateFact],
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
@@ -71,19 +74,27 @@ impl Resolver {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
         let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
         // A view over a materialized view is not auto-updatable, which is the
-        // one catalog fact the syntactic analysis cannot see.
-        let updatability = match updatability {
-            ViewUpdatabilityFact::Updatable
-                if matches!(
-                    source.as_ref().and_then(|id| state.local.relations.get(id)),
-                    Some(RelationOverlay::Present(relation))
-                        if relation.kind == RelationKind::MaterializedView
-                ) =>
-            {
+        // one catalog fact the syntactic analysis cannot see. It disqualifies
+        // both readings of the query, so it applies before the aggregates.
+        let over_matview = matches!(
+            source.as_ref().and_then(|id| state.local.relations.get(id)),
+            Some(RelationOverlay::Present(relation))
+                if relation.kind == RelationKind::MaterializedView
+        );
+        let downgrade = |verdict| {
+            if over_matview && matches!(verdict, ViewUpdatabilityFact::Updatable) {
                 ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::SingleRelation)
+            } else {
+                verdict
             }
-            other => other,
         };
+        let updatability = Self::resolve_view_aggregates(
+            downgrade(updatability),
+            downgrade(updatability_without_aggregates),
+            aggregate_candidates,
+            source.as_ref(),
+            state,
+        );
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -99,6 +110,63 @@ impl Resolver {
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
         })
+    }
+
+    /// Settle each unqualified aggregate-named call against the routine
+    /// search path: a settled aggregate keeps the reading that counts them, a
+    /// settled shadow is ignored, and anything unplaceable taints the verdict.
+    fn resolve_view_aggregates(
+        with_aggregates: ViewUpdatabilityFact,
+        without_aggregates: ViewUpdatabilityFact,
+        candidates: &[AggregateCandidateFact],
+        source: Option<&ObjectId>,
+        state: &AnalysisState,
+    ) -> ViewUpdatabilityFact {
+        use crate::_internal::analysis::state::AggregateCandidateResolution as Resolution;
+        let mut uncertain = false;
+        for candidate in candidates {
+            let arguments = candidate
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    AggregateArgumentFact::Column(column) => {
+                        Self::source_column_type(source, column, state)
+                    }
+                    AggregateArgumentFact::Typed(typed) => Some(typed.clone()),
+                    AggregateArgumentFact::Unknown => None,
+                })
+                .collect::<Vec<_>>();
+            match state.resolve_aggregate_candidate(&candidate.name, &arguments) {
+                Resolution::Aggregate => return with_aggregates,
+                Resolution::Scalar => {}
+                Resolution::Uncertain => uncertain = true,
+            }
+        }
+        if uncertain {
+            match without_aggregates {
+                ViewUpdatabilityFact::Updatable
+                | ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::NoUpdatableColumns) => {
+                    ViewUpdatabilityFact::Unknown
+                }
+                other => other,
+            }
+        } else {
+            without_aggregates
+        }
+    }
+
+    /// The type a column-reference argument has on the view's single base
+    /// relation; an argument from anywhere else stays untyped.
+    fn source_column_type(
+        source: Option<&ObjectId>,
+        column: &str,
+        state: &AnalysisState,
+    ) -> Option<String> {
+        let columns = state.relation_column_types(source?)?;
+        columns
+            .into_iter()
+            .find(|entry| entry.0 == column)
+            .and_then(|entry| entry.1)
     }
 
     /// Project a view's output list, taking types from the source relation

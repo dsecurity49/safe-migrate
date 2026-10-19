@@ -2,11 +2,12 @@
 mod tests {
     use crate::_internal::analysis::expr_ir::ExprIr;
     use crate::_internal::analysis::facts::{
-        AlterDatabaseAction, AlterPublicationActionFact, AlterSubscriptionActionFact,
-        AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact, PublicationScope,
-        ResetSettingTarget, RetTypeFact, SearchPathTarget, StatementFact,
-        SubscriptionPublicationMode, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-        TypeCreationKind, ViewUpdatabilityFact,
+        AggregateArgumentFact, AggregateCandidateFact, AlterDatabaseAction,
+        AlterPublicationActionFact, AlterSubscriptionActionFact, AlterTableActionFact,
+        AlterTypeActionFact, PublicationObjectFact, PublicationScope, ResetSettingTarget,
+        RetTypeFact, SearchPathTarget, StatementFact, SubscriptionPublicationMode,
+        TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+        ViewUpdatabilityFact,
     };
     use crate::_internal::ast::identifiers::{Ident, QualifiedName};
     use crate::_internal::ast::visitor::AstVisitor;
@@ -1355,8 +1356,59 @@ mod tests {
             fact,
             StatementFact::AlterTable { actions, .. }
                 if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
-                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value == "70")
-                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value == "false"))
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.as_deref() == Some("70"))
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value.as_deref() == Some("false")))
+        ));
+    }
+
+    #[test]
+    fn alter_table_options_fold_names_and_read_literal_values() {
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE entries SET (FILLFACTOR = 70, autovacuum_enabled = 'on');",
+        )
+        .expect("table options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.as_deref() == Some("70"))
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value.as_deref() == Some("on")))
+        ));
+
+        // A `RESET` that carries a value keeps it, even the empty string, so the
+        // server's refusal is reproduced; the empty string is stored as itself,
+        // not as its quotes.
+        let fact = parse_and_extract_statement("ALTER TABLE entries RESET (fillfactor = '');")
+            .expect("reset options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::ResetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.as_deref() == Some("")))
+        ));
+
+        // A `RESET` with no value carries none, which is what makes it valid.
+        let fact = parse_and_extract_statement("ALTER TABLE entries RESET (fillfactor);")
+            .expect("reset options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::ResetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.is_none()))
+        ));
+
+        // A bare `SET` option reads as `true`, as the server reads it, while an
+        // explicitly empty value stays empty.
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE entries SET (autovacuum_enabled, autovacuum_analyze_threshold = '');",
+        )
+        .expect("table options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value.as_deref() == Some("true"))
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_analyze_threshold" && attribute.value.as_deref() == Some("")))
         ));
     }
 
@@ -1784,7 +1836,7 @@ mod tests {
                     AlterPublicationActionFact::SetOptions(options)
                         if options == &[crate::_internal::analysis::facts::AttributeFact {
                             name: "publish".into(),
-                            value: "insert, update".into(),
+                            value: Some("insert, update".into()),
                             namespace: None,
                         }]
                 )
@@ -1806,7 +1858,7 @@ mod tests {
                                 publications,
                                 params,
                             } if publications == &["mixedpub", "AuditPub"]
-                                && params.iter().any(|param| param.name == "refresh" && param.value == "false")
+                                && params.iter().any(|param| param.name == "refresh" && param.value.as_deref() == Some("false"))
                         )
             ),
             "extracted subscription publication action: {:?}",
@@ -1818,8 +1870,8 @@ mod tests {
                 if matches!(
                     &fact.action,
                     AlterSubscriptionActionFact::SetOptions(options)
-                        if options.iter().any(|option| option.name == "streaming" && option.value == "parallel")
-                            && options.iter().any(|option| option.name == "slot_name" && option.value.eq_ignore_ascii_case("none"))
+                        if options.iter().any(|option| option.name == "streaming" && option.value.as_deref() == Some("parallel"))
+                            && options.iter().any(|option| option.name == "slot_name" && option.value.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("none")))
                 )
         ));
         assert!(matches!(
@@ -1828,7 +1880,7 @@ mod tests {
                 if matches!(
                     &fact.action,
                     AlterSubscriptionActionFact::Skip(options)
-                        if options.iter().any(|option| option.name == "lsn" && option.value == "0/16B6C50")
+                        if options.iter().any(|option| option.name == "lsn" && option.value.as_deref() == Some("0/16B6C50"))
                 )
         ));
         assert!(matches!(
@@ -2966,7 +3018,7 @@ mod tests {
                     if column == "payload"
                         && attributes.len() == 1
                         && attributes[0].name == "n_distinct"
-                        && attributes[0].value == "-0.5")
+                        && attributes[0].value.as_deref() == Some("-0.5"))
         ));
         assert!(matches!(
             &facts[5],
@@ -2975,7 +3027,7 @@ mod tests {
                     if column == "payload"
                         && attributes.len() == 1
                         && attributes[0].name == "n_distinct"
-                        && attributes[0].value.is_empty())
+                        && attributes[0].value.is_none())
         ));
         assert!(matches!(
             &facts[6],
@@ -3105,7 +3157,7 @@ mod tests {
         };
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].name, "check_option");
-        assert_eq!(options[0].value, "cascaded");
+        assert_eq!(options[0].value.as_deref(), Some("cascaded"));
         assert_eq!(updatability, ViewUpdatabilityFact::Updatable);
 
         let StatementFact::CreateView {
@@ -3119,8 +3171,85 @@ mod tests {
         else {
             panic!("expected CreateView");
         };
-        assert_eq!(options[0].value, "local");
+        assert_eq!(options[0].value.as_deref(), Some("local"));
         assert_eq!(updatability, ViewUpdatabilityFact::Updatable);
+    }
+
+    #[test]
+    fn create_view_records_unqualified_aggregate_candidates() {
+        let StatementFact::CreateView {
+            updatability,
+            updatability_without_aggregates,
+            aggregate_candidates,
+            ..
+        } = parse_and_extract_statement(
+            "CREATE VIEW v AS SELECT a, sum(b) AS s FROM t WITH CHECK OPTION;",
+        )
+        .expect("view fact")
+        else {
+            panic!("expected CreateView");
+        };
+        assert_eq!(
+            aggregate_candidates,
+            vec![AggregateCandidateFact {
+                name: "sum".to_string(),
+                arguments: vec![AggregateArgumentFact::Column("b".to_string())],
+            }]
+        );
+        assert_eq!(
+            updatability,
+            ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+        );
+        assert_eq!(
+            updatability_without_aggregates,
+            ViewUpdatabilityFact::Updatable
+        );
+
+        // An explicit `pg_catalog` aggregate is settled, not a candidate.
+        let StatementFact::CreateView {
+            updatability,
+            aggregate_candidates,
+            ..
+        } = parse_and_extract_statement(
+            "CREATE VIEW v AS SELECT pg_catalog.sum(b) AS s FROM t WITH CHECK OPTION;",
+        )
+        .expect("view fact")
+        else {
+            panic!("expected CreateView");
+        };
+        assert!(aggregate_candidates.is_empty());
+        assert_eq!(
+            updatability,
+            ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+        );
+    }
+
+    #[test]
+    fn create_view_ignores_calls_inside_nested_queries() {
+        // A nested query's calls belong to that query, not the view, so an
+        // aggregate, a window function or an unplaceable call inside one never
+        // disqualifies the outer view. Verified accepted on PostgreSQL 18.6.
+        let facts = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+            StatementFact::CreateView {
+                updatability,
+                aggregate_candidates,
+                ..
+            } => (updatability, aggregate_candidates),
+            other => panic!("expected CreateView, got {other:?}"),
+        };
+        for sql in [
+            "CREATE VIEW v AS SELECT a, (SELECT sum(o.amount) FROM o WHERE o.id = t.id) AS total FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, (SELECT row_number() OVER () FROM o) AS r FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, (SELECT upper(o.x) FROM o) AS u FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, EXISTS (SELECT sum(o.amount) FROM o) AS e FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, a = ANY (SELECT sum(o.amount) FROM o) AS m FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, ARRAY(SELECT sum(o.amount) FROM o) AS y FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, a IN (SELECT sum(o.amount) FROM o) AS i FROM t WITH CHECK OPTION;",
+        ] {
+            let (updatability, candidates) = facts(sql);
+            assert_eq!(updatability, ViewUpdatabilityFact::Updatable, "{sql}");
+            assert!(candidates.is_empty(), "{sql}");
+        }
     }
 
     #[test]

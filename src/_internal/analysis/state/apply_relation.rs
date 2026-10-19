@@ -5055,7 +5055,15 @@ impl AnalysisState {
                         name: column.clone(),
                         options: attributes
                             .iter()
-                            .map(|attribute| (attribute.key(), attribute.value.clone()))
+                            .map(|attribute| {
+                                (
+                                    attribute.key(),
+                                    attribute
+                                        .value
+                                        .clone()
+                                        .unwrap_or_else(|| "true".to_string()),
+                                )
+                            })
                             .collect(),
                     });
                 }
@@ -5656,8 +5664,13 @@ impl AnalysisState {
                 }
                 AlterTableActionMutation::SetTableOptions { attributes } => {
                     for attribute in attributes {
-                        rel.table_options
-                            .insert(attribute.key(), attribute.value.clone());
+                        rel.table_options.insert(
+                            attribute.key(),
+                            attribute
+                                .value
+                                .clone()
+                                .unwrap_or_else(|| "true".to_string()),
+                        );
                     }
                 }
                 AlterTableActionMutation::ResetTableOptions { attributes } => {

@@ -1340,12 +1340,12 @@ fn publication_option_normalization_ignores_catalog_order() {
     let first = vec![
         safe_migrate::_internal::analysis::facts::AttributeFact {
             name: "publish".into(),
-            value: "insert".into(),
+            value: Some("insert".into()),
             namespace: None,
         },
         safe_migrate::_internal::analysis::facts::AttributeFact {
             name: "publish_via_partition_root".into(),
-            value: "false".into(),
+            value: Some("false".into()),
             namespace: None,
         },
     ];

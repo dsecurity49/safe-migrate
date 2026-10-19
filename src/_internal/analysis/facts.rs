@@ -219,9 +219,14 @@ pub(crate) enum StatementFact {
         /// `WITH (...)` options plus a `WITH [LOCAL] CHECK OPTION` clause,
         /// which PostgreSQL folds into a `check_option` option.
         options: Vec<AttributeFact>,
-        /// Whether the query is automatically updatable, which a
-        /// `check_option` option requires.
+        /// Whether the query is automatically updatable, reading every
+        /// unqualified aggregate-named call as its built-in aggregate.
         updatability: ViewUpdatabilityFact,
+        /// The same verdict when none of those calls is an aggregate.
+        updatability_without_aggregates: ViewUpdatabilityFact,
+        /// The unqualified aggregate-named calls the resolver must place
+        /// against the routine search path to choose between the two verdicts.
+        aggregate_candidates: Vec<AggregateCandidateFact>,
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
@@ -1075,7 +1080,10 @@ pub(crate) struct DropDatabaseFact {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AttributeFact {
     pub name: String,
-    pub value: String,
+    /// The value as written and decoded, or `None` when the SQL wrote no value
+    /// at all (a bare option, which PostgreSQL reads as `true`). An explicitly
+    /// empty string is `Some("")`, kept apart from a missing value.
+    pub value: Option<String>,
     /// The option's `namespace.name` namespace, when the SQL spelled one.
     /// Only relation options accept a namespace (`toast.`); PostgreSQL keeps it
     /// separate from the name, so the analyzer does too.
@@ -1141,6 +1149,24 @@ pub(crate) enum SelectOutputFact {
         source_name: String,
         output_name: String,
     },
+}
+
+/// An argument of an unqualified aggregate-named call, typed as far as the
+/// visitor can see. `Unknown` matches any overload, like a bare literal.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AggregateArgumentFact {
+    Column(String),
+    Typed(String),
+    Unknown,
+}
+
+/// An unqualified call whose written name is a built-in aggregate. A
+/// same-named overload of matching argument types keeps it from being that
+/// aggregate, so the resolver places it against the routine search path.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateCandidateFact {
+    pub name: String,
+    pub arguments: Vec<AggregateArgumentFact>,
 }
 
 /// Whether PostgreSQL's `view_query_is_auto_updatable(query, true)` would

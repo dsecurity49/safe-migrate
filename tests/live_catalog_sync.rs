@@ -272,7 +272,12 @@ fn attributes(
 ) -> std::collections::BTreeMap<&str, &str> {
     values
         .iter()
-        .map(|attribute| (attribute.name.as_str(), attribute.value.as_str()))
+        .map(|attribute| {
+            (
+                attribute.name.as_str(),
+                attribute.value.as_deref().unwrap_or(""),
+            )
+        })
         .collect()
 }
 
