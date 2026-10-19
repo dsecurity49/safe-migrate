@@ -1,6 +1,6 @@
 [package]
 name = "safe-migrate"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 autotests = false
 rust-version = "1.94"
@@ -52,3 +52,7 @@ serde_json = "1.0"
 [[test]]
 name = "api_facade"
 path = "tests/api_facade.rs"
+
+[[test]]
+name = "grammar_action_lists"
+path = "tests/grammar_action_lists.rs"

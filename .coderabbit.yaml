@@ -1,3 +1,5 @@
 reviews:
   path_filters:
     - "!live_tests/**"
+    - "!scripts/**"
+    - "!tests/golden/**"

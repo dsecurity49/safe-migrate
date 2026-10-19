@@ -1,7 +1,9 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::DbCache;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 
 #[cfg(test)]
 mod tests {
@@ -199,6 +201,7 @@ mod tests {
         cache.metadata.source_role = Some("app_user".into());
         cache.metadata.source_session_role = Some("login_user".into());
         cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
+        cache.metadata.source_existing_schemas = Some(vec!["accounting".into(), "public".into()]);
         cache.metadata.source_lock_timeout_ms = 750;
         cache.metadata.source_statement_timeout_ms = 30_000;
         cache.metadata.schemas = Some(vec!["app".into(), "public".into()]);
@@ -250,21 +253,22 @@ mod tests {
         cache.indexes.push(crate::_internal::db::cache::IndexCache {
             index_id: ObjectId::new("public", "idx_test"),
             table_id: ObjectId::new("public", "test_table"),
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
         let type_id = ObjectId::new("app", "status");
         cache.types.insert(
@@ -302,7 +306,8 @@ mod tests {
                 ]),
                 params: vec![crate::_internal::analysis::facts::AttributeFact {
                     name: "publish".into(),
-                    value: "insert, update".into(),
+                    value: Some("insert, update".into()),
+                    namespace: None,
                 }],
                 generation: 0,
             },
@@ -316,7 +321,8 @@ mod tests {
                 publications: vec!["app_changes".into()],
                 params: Some(vec![crate::_internal::analysis::facts::AttributeFact {
                     name: "streaming".into(),
-                    value: "parallel".into(),
+                    value: Some("parallel".into()),
+                    namespace: None,
                 }]),
                 enabled: false,
                 slot_name: None,
@@ -325,7 +331,7 @@ mod tests {
         );
 
         // The current cache format uses bincode.
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V9(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::current(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -333,7 +339,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V9(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V10(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
@@ -356,6 +362,10 @@ mod tests {
         assert_eq!(
             deserialized.metadata.source_search_path.as_deref(),
             Some(["$user".to_string(), "public".to_string()].as_slice())
+        );
+        assert_eq!(
+            deserialized.metadata.source_existing_schemas.as_deref(),
+            Some(["accounting".to_string(), "public".to_string()].as_slice())
         );
         assert_eq!(deserialized.metadata.source_lock_timeout_ms, 750);
         assert_eq!(deserialized.metadata.source_statement_timeout_ms, 30_000);
@@ -418,7 +428,8 @@ mod tests {
             default: None,
             avg_width: Some(10),
             default_expr_text: Some("now()".into()),
-            type_modifier: ParsedDataType::parse("varchar(255)").atttypmod_offset(),
+            type_modifier: ParsedDataType::parse("varchar(255)", &BuiltinTypeCatalogue::fallback())
+                .atttypmod(),
             storage: None,
             compression: None,
             statistics_target: None,
@@ -427,14 +438,14 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V9(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::current(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::_internal::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V9(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V10(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         let rel = deserialized.relations.get(&id).unwrap();
@@ -486,16 +497,14 @@ mod tests {
             crate::_internal::model::function::RoutineKind::Window,
         ] {
             let current = crate::_internal::model::function::FunctionState {
-                id: id.clone(),
-                internal_type_owner: None,
-                routine_kind,
-                arg_types: vec!["mood".into()],
-                arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
                 return_type: "mood".into(),
                 return_type_id: Some(ObjectId::new("public", "mood")),
-                volatility: crate::_internal::model::function::Volatility::Volatile,
-                language: "sql".into(),
-                security: crate::_internal::model::function::SecurityMode::Invoker,
+                arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
+                ..crate::_internal::model::function::FunctionState::with_inputs(
+                    id.clone(),
+                    routine_kind,
+                    vec!["mood".into()],
+                )
             };
             let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
             assert_ne!(current_bytes, legacy_bytes);

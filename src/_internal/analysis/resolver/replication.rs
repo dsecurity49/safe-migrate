@@ -8,6 +8,7 @@ use crate::_internal::analysis::mutations::{
     AlterPublicationMutation, AlterSubscriptionMutation, CreatePublicationMutation,
     CreateSubscriptionMutation, DropPublicationMutation, DropSubscriptionMutation, Mutation,
 };
+use crate::_internal::analysis::namespace::SearchPathEntry;
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 
@@ -41,7 +42,8 @@ impl Resolver {
                     .local
                     .search_path
                     .first()
-                    .cloned()
+                    .and_then(SearchPathEntry::name)
+                    .map(str::to_string)
                     .unwrap_or_else(|| "public".to_string()),
                 row_filter: None,
             },

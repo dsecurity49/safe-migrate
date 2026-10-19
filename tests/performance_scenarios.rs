@@ -234,7 +234,7 @@ mod performance_scenarios {
         let cache = large_baseline();
         let started = Instant::now();
         let config = bincode::config::standard().with_variable_int_encoding();
-        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::new(cache)), config)
+        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::current(cache), config)
             .expect("cache should encode");
         let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)
             .expect("cache payload should compress");
@@ -382,10 +382,12 @@ mod performance_scenarios {
         let json = crate::_internal::report::reporter::Reporter::json_report_with_locations(
             &findings,
             &state.local.confidence,
+            state.not_evaluated(),
         );
         let markdown = crate::_internal::report::reporter::Reporter::markdown_report(
             &findings,
             &state.local.confidence,
+            &[],
         );
         let elapsed = started.elapsed();
 

@@ -1,5 +1,5 @@
 use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct ConflictRule;
@@ -10,19 +10,7 @@ impl ConflictRule {
     const RECIPE: &'static str = "Correct the migration so this statement can execute against the schema state produced by earlier statements. Use an idempotency guard only when a no-op is intended.";
 
     fn extract_conflict_reason(result: &MutationResult) -> Option<&str> {
-        match result {
-            MutationResult::Conflict { reason } => Some(reason.as_str()),
-            _ => None,
-        }
-    }
-
-    fn is_dedicated_transaction_conflict(reason: &str) -> bool {
-        matches!(
-            reason,
-            "CREATE INDEX CONCURRENTLY cannot run inside a transaction"
-                | "DROP INDEX CONCURRENTLY cannot run inside a transaction"
-                | "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot run inside a transaction"
-        )
+        result.conflict_reason()
     }
 }
 
@@ -41,11 +29,11 @@ impl Rule for ConflictRule {
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         match Self::extract_conflict_reason(context.result()) {
-            Some(reason) if Self::is_dedicated_transaction_conflict(reason) => Vec::new(),
+            Some(_reason) if context.result().is_concurrent_transaction_conflict() => Vec::new(),
             Some(reason) => vec![Violation {
                 source_range: None,
                 rule_id: Self::ID,
-                operation_kind: OperationKind::Conflict,
+
                 object_kind: ObjectKind::Unknown,
                 object_name: "migration state".to_string(),
                 tier: Self::DEFAULT_TIER,
@@ -53,7 +41,6 @@ impl Rule for ConflictRule {
                 recipe: Self::RECIPE,
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             }],
             None => Vec::new(),
         }
@@ -71,11 +58,10 @@ mod tests {
     #[test]
     fn test_conflict_rule_emits_tier1_on_conflict() {
         let rule = ConflictRule;
-        let result = MutationResult::Conflict {
-            reason:
-                "column 'x' already added with type int, this file adds it again with type text"
-                    .to_string(),
-        };
+        let result = MutationResult::conflict(
+            "column 'x' already added with type int, this file adds it again with type text"
+                .to_string(),
+        );
         let mutation =
             Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DoBlock);
         let pre_state = crate::_internal::analysis::state::PreState {

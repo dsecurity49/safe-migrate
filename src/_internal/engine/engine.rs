@@ -6,7 +6,7 @@ use crate::_internal::analysis::state::{AnalysisState, PreState};
 use crate::_internal::ast::visitor::AstVisitor;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::_internal::rules::registry;
-use crate::_internal::rules::{Rule, RuleContext};
+use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
 use crate::api::config::Config;
 use squawk_syntax::{
     Parse, SyntaxKind,
@@ -163,6 +163,7 @@ impl SafeMigrateEngine {
                                 &file_order,
                                 file_index,
                                 statement_index,
+                                state.pg_version().is_asserted(),
                             );
                         ReportFinding {
                             location: Self::source_location(
@@ -267,6 +268,11 @@ impl SafeMigrateEngine {
         parsed: &Parse<SourceFile>,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
+        // The state machine needs the deployment's identity to judge statements
+        // about it, and the configuration is where that is stated. Every
+        // analysis path funnels through here, so the fact is applied once
+        // rather than by each caller.
+        state.set_target_database(self.config.target_database().map(str::to_owned));
         let errors: Vec<String> = parsed.errors().iter().map(|e| e.to_string()).collect();
         if !errors.is_empty() {
             return Err(errors);
@@ -381,7 +387,7 @@ impl SafeMigrateEngine {
 
                 statement_failed = matches!(
                     result,
-                    crate::_internal::analysis::state::MutationResult::Conflict { .. }
+                    crate::_internal::analysis::state::MutationResult::Conflict(_)
                 );
                 if statement_failed {
                     let transaction_aborted = state.transaction_is_aborted();
@@ -409,7 +415,6 @@ impl SafeMigrateEngine {
                         statement_violations.push(crate::_internal::report::violations::Violation {
                             source_range: None,
                             rule_id: "inline-suppression-disabled",
-                            operation_kind: crate::_internal::report::violations::OperationKind::Other("config".to_string()),
                             object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
                             object_name: "".to_string(),
                             tier: crate::_internal::report::violations::ViolationTier::Tier1,
@@ -417,7 +422,7 @@ impl SafeMigrateEngine {
                             recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
                             dedup_key: Some(format!("inline-suppression-disabled:{}", rule.id())),
                             sql: None,
-                            fk_dependency_related: false,
+
                         });
                         // Skip evaluating the rule since it was requested to be ignored,
                         // but the build will fail anyway due to the Tier1 config violation.
@@ -425,6 +430,28 @@ impl SafeMigrateEngine {
                     }
 
                     if self.config.is_rule_disabled(rule.id()) || is_inline_ignored {
+                        continue;
+                    }
+
+                    let transition =
+                        TransitionRecord::new(&mutation, &result, &pre_state, pre_cascade.as_ref());
+                    if let Some(cause) = result.unresolved_cause()
+                        && !rule.evaluates_when_unresolved(&transition)
+                    {
+                        state.record_not_evaluated(
+                            crate::_internal::report::violations::NotEvaluated {
+                                rule_id: rule.id(),
+                                tier: rule.default_tier(),
+                                cause,
+                                sql: Some(stmt_text.trim().to_string()),
+                                recipe:
+                                    crate::_internal::report::violations::NotEvaluated::recipe_for(
+                                        cause,
+                                        &state.external_referenced_schemas(),
+                                    ),
+                                missing_schemas: state.external_referenced_schemas(),
+                            },
+                        );
                         continue;
                     }
 

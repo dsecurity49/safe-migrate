@@ -16,7 +16,12 @@ impl Resolver {
             TypeCreationKind::Enum { variants } => TypeKind::Enum {
                 variants: variants.clone(),
             },
-            TypeCreationKind::Range => TypeKind::Range,
+            TypeCreationKind::Range { subtype } => TypeKind::Range {
+                subtype: subtype.clone(),
+                subtype_id: subtype
+                    .as_deref()
+                    .and_then(|subtype| state.resolve_type_reference(subtype)),
+            },
             TypeCreationKind::Composite { fields } => TypeKind::Composite {
                 fields: fields
                     .iter()
@@ -24,11 +29,14 @@ impl Resolver {
                         |field| crate::_internal::model::types::CompositeFieldState {
                             name: field.name.clone(),
                             data_type: field.data_type.clone(),
+                            data_type_id: state.resolve_type_reference(&field.data_type),
                         },
                     )
                     .collect(),
             },
-            TypeCreationKind::Base => TypeKind::Base,
+            TypeCreationKind::Base { element } => TypeKind::Base {
+                element: element.clone(),
+            },
         };
         Mutation::CreateType(CreateTypeMutation {
             id: Self::resolve_creation_name(&fact.name, state),

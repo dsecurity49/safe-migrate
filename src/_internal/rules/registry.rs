@@ -318,6 +318,51 @@ pub(crate) fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
     PRIMARY_RULES.iter().find(|rule| rule.id == id)
 }
 
+/// A finding a primary rule emits under its own id.
+///
+/// These are not independently configurable, so they are not primary entries,
+/// but a report still has to name them: a consumer reads `rules` to label a
+/// finding, and one of these ids would otherwise appear with no title at all.
+pub(crate) struct SecondaryRule {
+    pub id: &'static str,
+    pub title: &'static str,
+}
+
+/// Every auxiliary id a primary rule can report, in evaluation order.
+const SECONDARY_RULES: &[SecondaryRule] = &[
+    SecondaryRule {
+        id: "blocking-index-constraint",
+        title: "Blocking index constraint",
+    },
+    SecondaryRule {
+        id: "table-rewrite-storage",
+        title: "Table rewrite for storage",
+    },
+    SecondaryRule {
+        id: "table-rewrite-access-method",
+        title: "Table rewrite for access method",
+    },
+    SecondaryRule {
+        id: "require-concurrent-drop-index",
+        title: "Require concurrent drop index",
+    },
+];
+
+/// The user-facing title of any rule id a report may carry.
+pub(crate) fn rule_title(id: &str) -> Option<&'static str> {
+    find_primary_rule(id)
+        .map(|descriptor| descriptor.title)
+        .or_else(|| {
+            SECONDARY_RULES
+                .iter()
+                .find(|rule| rule.id == id)
+                .map(|rule| rule.title)
+        })
+}
+
+#[cfg(test)]
+pub(crate) const ALL_SECONDARY_RULES: &[SecondaryRule] = SECONDARY_RULES;
+
 pub(crate) fn validate_rule_configuration(
     config: &crate::api::config::Config,
 ) -> Result<(), String> {

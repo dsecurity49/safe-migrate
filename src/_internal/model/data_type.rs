@@ -1,138 +1,117 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum DataTypeFamily {
-    Boolean,
-    SmallInt,
-    Integer,
-    BigInt,
-    Numeric,
-    Real,
-    DoublePrecision,
-    Date,
-    Time,
-    TimeTz,
-    Timestamp,
-    TimestampTz,
-    Interval,
-    Uuid,
-    Text,
-    Name,
-    CiText,
-    CharacterVarying,
-    Character,
-    BpChar,
-    // Unrecognised type — callers must taint or diagnose rather than assume safe.
-    Unknown,
+use super::builtin_type::{BuiltinType, BuiltinTypeCatalogue, TypeCategory};
+
+/// A built-in type as the analyzer resolved it.
+///
+/// Owned rather than borrowed so a parsed type stays valid without the
+/// catalogue it came from, which matters because parsing happens deep inside
+/// rule evaluation where the catalogue is not in scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResolvedBuiltinType {
+    pub typname: String,
+    /// `format_type(oid, NULL)`, the spelling `TypeIdentity` renders.
+    pub canonical: String,
+    pub category: TypeCategory,
+    pub fixed_bits: Option<i32>,
+    pub accepts_typmod: bool,
 }
 
-impl DataTypeFamily {
-    // Single alias table. All PostgreSQL spellings for a built-in type map here.
-    pub(crate) fn from_base_name(name: &str) -> Self {
-        match name {
-            "bool" | "boolean" => Self::Boolean,
-            "int2" | "smallint" => Self::SmallInt,
-            "int" | "int4" | "integer" => Self::Integer,
-            "int8" | "bigint" => Self::BigInt,
-            "decimal" | "numeric" => Self::Numeric,
-            "float4" | "real" => Self::Real,
-            "float8" | "double precision" => Self::DoublePrecision,
-            "date" => Self::Date,
-            "time" | "time without time zone" => Self::Time,
-            "timetz" | "time with time zone" => Self::TimeTz,
-            "timestamp" | "timestamp without time zone" => Self::Timestamp,
-            "timestamptz" | "timestamp with time zone" => Self::TimestampTz,
-            "interval" => Self::Interval,
-            "uuid" => Self::Uuid,
-            "text" => Self::Text,
-            "name" => Self::Name,
-            "citext" => Self::CiText,
-            "varchar" | "character varying" => Self::CharacterVarying,
-            "char" | "character" => Self::Character,
-            "bpchar" => Self::BpChar,
-            _ => Self::Unknown,
+impl ResolvedBuiltinType {
+    fn from(entry: &BuiltinType) -> Self {
+        Self {
+            typname: entry.typname.clone(),
+            canonical: entry.canonical.clone(),
+            category: entry.category,
+            fixed_bits: entry.fixed_bits,
+            accepts_typmod: entry.accepts_typmod,
         }
     }
 
-    // Returns the canonical catalog spelling; Unknown round-trips through original_fallback.
-    pub(crate) fn to_canonical_string(self, original_fallback: &str) -> String {
-        match self {
-            Self::Boolean => "boolean".to_string(),
-            Self::SmallInt => "smallint".to_string(),
-            Self::Integer => "integer".to_string(),
-            Self::BigInt => "bigint".to_string(),
-            Self::Numeric => "numeric".to_string(),
-            Self::Real => "real".to_string(),
-            Self::DoublePrecision => "double precision".to_string(),
-            Self::Date => "date".to_string(),
-            Self::Time => "time without time zone".to_string(),
-            Self::TimeTz => "time with time zone".to_string(),
-            Self::Timestamp => "timestamp without time zone".to_string(),
-            Self::TimestampTz => "timestamp with time zone".to_string(),
-            Self::Interval => "interval".to_string(),
-            Self::Uuid => "uuid".to_string(),
-            Self::Text => "text".to_string(),
-            Self::Name => "name".to_string(),
-            Self::CiText => "citext".to_string(),
-            Self::CharacterVarying => "character varying".to_string(),
-            Self::Character => "character".to_string(),
-            Self::BpChar => "character".to_string(),
-            Self::Unknown => original_fallback.to_string(),
-        }
+    pub(crate) fn is_named(&self, typname: &str) -> bool {
+        self.typname == typname
     }
 
-    /// Canonical name split so a modifier renders before any timezone suffix:
-    /// `TimestampTz` gives `("timestamp", " with time zone")`.
-    pub(crate) fn canonical_base_and_tz_suffix(
-        self,
-        original_fallback: &str,
-    ) -> (String, &'static str) {
-        match self {
-            Self::Time => ("time".to_string(), " without time zone"),
-            Self::TimeTz => ("time".to_string(), " with time zone"),
-            Self::Timestamp => ("timestamp".to_string(), " without time zone"),
-            Self::TimestampTz => ("timestamp".to_string(), " with time zone"),
-            _ => (self.to_canonical_string(original_fallback), ""),
-        }
+    /// Types whose length limits compare the same way, so a widening between
+    /// two of them is metadata-only. `typcategory` cannot answer this: it also
+    /// admits `name`, which takes no length at all.
+    pub(crate) fn is_text_like(&self) -> bool {
+        self.category == TypeCategory::String && self.typname != "name"
     }
 
-    // Fixed storage size in bits for integer families; None for everything else.
-    pub(crate) fn size_bits(self) -> Option<i32> {
-        match self {
-            Self::SmallInt => Some(16),
-            Self::Integer => Some(32),
-            Self::BigInt => Some(64),
-            _ => None,
-        }
+    /// The `numeric` type specifically, not PostgreSQL's wider numeric
+    /// category: the precision/scale widening rules are about it alone, since
+    /// integers and floats widen by an entirely different route.
+    pub(crate) fn is_exact_numeric(&self) -> bool {
+        self.typname == "numeric"
     }
 
-    pub(crate) fn is_text_like(self) -> bool {
-        matches!(
-            self,
-            Self::CharacterVarying | Self::Character | Self::BpChar | Self::Text
-        )
+    /// The one type whose values need an explicit `::text` cast to compare
+    /// byte-for-byte when a partition key is synthesized.
+    pub(crate) fn requires_text_cast_for_comparison(&self) -> bool {
+        self.typname == "varchar"
     }
+}
 
-    pub(crate) fn is_numeric(self) -> bool {
-        matches!(self, Self::Numeric)
-    }
+/// What a modifier on a built-in type means.
+///
+/// This is *not* in the catalog: PostgreSQL encodes each type's modifier in a
+/// `typmodout` function, and the accepted ranges live in `typtmod.c`. The
+/// catalogue says which types accept a modifier at all; this says what it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypmodKind {
+    None,
+    CharacterLength,
+    BitLength,
+    Numeric,
+    FractionalSeconds,
+    IntervalFields,
+}
 
-    // Partition synthesiser must cast varchar keys through ::text for byte-identical comparison.
-    pub(crate) fn requires_text_cast_for_comparison(self) -> bool {
-        matches!(self, Self::CharacterVarying)
-    }
+/// The ten PostgreSQL types that accept a modifier, matching `pg_type.typmodout`.
+const TYPMOD_RULES: &[(&str, TypmodKind)] = &[
+    ("bit", TypmodKind::BitLength),
+    ("bpchar", TypmodKind::CharacterLength),
+    ("interval", TypmodKind::IntervalFields),
+    ("numeric", TypmodKind::Numeric),
+    ("time", TypmodKind::FractionalSeconds),
+    ("timestamp", TypmodKind::FractionalSeconds),
+    ("timestamptz", TypmodKind::FractionalSeconds),
+    ("timetz", TypmodKind::FractionalSeconds),
+    ("varbit", TypmodKind::BitLength),
+    ("varchar", TypmodKind::CharacterLength),
+];
+
+/// Spellings whose grammar production defaults the length to one.
+///
+/// `CharacterWithoutLength` sets typmod 1 only when it reduced to `bpchar`, and
+/// `BitWithoutLength` only when it did not take `VARYING`. So bare `char`,
+/// `character` and `bit` are `(1)`, while `character varying`, `varchar`,
+/// `varbit` and the catalog's own `bpchar` establish no limit.
+const IMPLICIT_LENGTH_ONE: &[&str] = &["char", "character", "bit"];
+
+fn typmod_kind(typname: &str) -> TypmodKind {
+    TYPMOD_RULES
+        .iter()
+        .find(|(name, _)| *name == typname)
+        .map_or(TypmodKind::None, |(_, kind)| *kind)
 }
 
 // PostgreSQL's accepted ranges for built-in type modifiers, verified against
 // PostgreSQL 18.2 and stable across 14-18. A declaration outside them is SQL
 // the database rejects.
-mod pg_typmod {
+pub(crate) mod pg_typmod {
     // "length for type varchar must be at least 1" / "cannot exceed 10485760"
     pub(crate) const CHAR_LENGTH: std::ops::RangeInclusive<i32> = 1..=10_485_760;
     // A bounded character column stores its length in atttypmod as length + VARHDRSZ.
     pub(crate) const VARHDRSZ: i32 = 4;
     pub(crate) const NUMERIC_PRECISION: std::ops::RangeInclusive<i32> = 1..=1_000;
     pub(crate) const NUMERIC_SCALE: std::ops::RangeInclusive<i32> = -1_000..=1_000;
+    /// PostgreSQL packs a numeric precision and scale into one integer.
+    pub(crate) const NUMERIC_SHIFT: i32 = 16;
+    /// The scale occupies 11 two's-complement bits, so a negative scale is
+    /// stored as `scale & MASK` rather than by setting sign bits.
+    pub(crate) const NUMERIC_SCALE_MASK: i32 = 0x7ff;
 }
 
 /// A character length PostgreSQL has accepted. Holding the bound here is what
@@ -217,7 +196,9 @@ pub(crate) enum TypeTypmod {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedDataType {
-    pub family: DataTypeFamily,
+    /// `None` when the written name is not a built-in; a user-defined type is
+    /// resolved by OID elsewhere and keeps only its written name here.
+    pub builtin: Option<ResolvedBuiltinType>,
     pub original_base: String,
     // Kept verbatim so rendering and signature identity reproduce the exact
     // declaration, including ones the server would reject. Private so it cannot
@@ -231,7 +212,7 @@ pub(crate) struct ParsedDataType {
 pub(crate) const WIDENED_NUMERIC_SCALE_VERSION: u32 = 150_000;
 
 impl ParsedDataType {
-    pub(crate) fn parse(raw: &str) -> Self {
+    pub(crate) fn parse(raw: &str, catalogue: &BuiltinTypeCatalogue) -> Self {
         let mut text = Self::fold_unquoted_identifier_case(raw.trim());
 
         let mut array_dimensions = 0;
@@ -267,14 +248,99 @@ impl ParsedDataType {
         let text = Self::strip_pg_catalog_qualifier(&text).to_string();
         let original_base = Self::strip_pg_catalog_qualifier(&original_base).to_string();
 
-        let family = DataTypeFamily::from_base_name(&text);
-        let typmod = Self::classify_typmod(family, typmods.as_deref());
+        // `float(p)` is grammar over the two real types: the precision picks
+        // one, and neither stores a modifier (atttypmod -1). A precision the
+        // server rejects keeps its written form so classification fails closed.
+        let (text, typmods) = match (text.as_str(), typmods.as_deref()) {
+            ("float", Some(raw)) => match Self::float_precision(raw) {
+                Some(width) => (width.to_string(), None),
+                None => (text, typmods),
+            },
+            _ => (text, typmods),
+        };
+
+        // `serial` is grammar, not a type: the server expands it to an integer
+        // type and a sequence before the column exists.
+        let text = match text.as_str() {
+            "serial" | "serial4" => "integer".to_string(),
+            "bigserial" | "serial8" => "bigint".to_string(),
+            "smallserial" | "serial2" => "smallint".to_string(),
+            _ => text,
+        };
+        let original_base = match original_base.as_str() {
+            "serial" | "serial4" => "integer".to_string(),
+            "bigserial" | "serial8" => "bigint".to_string(),
+            "smallserial" | "serial2" => "smallint".to_string(),
+            _ => original_base,
+        };
+
+        let builtin = catalogue.resolve(&text).map(ResolvedBuiltinType::from);
+        let typmod = Self::classify_typmod(builtin.as_ref(), &text, typmods.as_deref());
         Self {
-            family,
+            builtin,
             original_base,
             raw_typmods: typmods,
             array_dimensions,
             typmod,
+        }
+    }
+
+    /// Whether the written name named a built-in type.
+    pub(crate) fn is_builtin(&self) -> bool {
+        self.builtin.is_some()
+    }
+
+    pub(crate) fn builtin(&self) -> Option<&ResolvedBuiltinType> {
+        self.builtin.as_ref()
+    }
+
+    /// The canonical SQL spelling, or the written name when unresolved.
+    pub(crate) fn canonical_name(&self) -> &str {
+        self.builtin
+            .as_ref()
+            .map_or(self.original_base.as_str(), |b| b.canonical.as_str())
+    }
+
+    /// The canonical spelling split so a modifier renders before any timezone
+    /// qualifier: `timestamptz` gives `("timestamp", " with time zone")`.
+    fn canonical_and_tz_suffix(&self) -> (&str, &str) {
+        let canonical = self.canonical_name();
+        for suffix in [" without time zone", " with time zone"] {
+            if let Some(base) = canonical.strip_suffix(suffix) {
+                return (base, suffix);
+            }
+        }
+        (canonical, "")
+    }
+
+    pub(crate) fn is_named(&self, typname: &str) -> bool {
+        self.builtin.as_ref().is_some_and(|b| b.is_named(typname))
+    }
+
+    pub(crate) fn is_text_like(&self) -> bool {
+        self.builtin.as_ref().is_some_and(|b| b.is_text_like())
+    }
+
+    pub(crate) fn is_exact_numeric(&self) -> bool {
+        self.builtin.as_ref().is_some_and(|b| b.is_exact_numeric())
+    }
+
+    pub(crate) fn fixed_bits(&self) -> Option<i32> {
+        self.builtin.as_ref().and_then(|b| b.fixed_bits)
+    }
+
+    pub(crate) fn requires_text_cast_for_comparison(&self) -> bool {
+        self.builtin
+            .as_ref()
+            .is_some_and(|b| b.requires_text_cast_for_comparison())
+    }
+
+    /// The real type `float(p)` selects. PostgreSQL accepts 1..=53 bits.
+    fn float_precision(raw: &str) -> Option<&'static str> {
+        match raw.trim().parse::<u32>() {
+            Ok(1..=24) => Some("real"),
+            Ok(25..=53) => Some("double precision"),
+            _ => None,
         }
     }
 
@@ -285,15 +351,33 @@ impl ParsedDataType {
     }
 
     // Anything the server would reject becomes OutOfRange rather than a value.
-    fn classify_typmod(family: DataTypeFamily, raw: Option<&str>) -> TypeTypmod {
-        match family {
-            DataTypeFamily::Character | DataTypeFamily::CharacterVarying => {
+    fn classify_typmod(
+        builtin: Option<&ResolvedBuiltinType>,
+        written: &str,
+        raw: Option<&str>,
+    ) -> TypeTypmod {
+        let Some(builtin) = builtin else {
+            // Nothing is known about the type, so a modifier cannot be called
+            // acceptable; failing closed keeps an unverified declaration visible.
+            return match raw {
+                None => TypeTypmod::NotApplicable,
+                Some(_) => TypeTypmod::OutOfRange,
+            };
+        };
+
+        match typmod_kind(&builtin.typname) {
+            TypmodKind::CharacterLength | TypmodKind::BitLength => {
+                let implicit = if matches!(builtin.typname.as_str(), "bpchar" | "bit")
+                    && IMPLICIT_LENGTH_ONE.contains(&written)
+                {
+                    TypeTypmod::CharacterLength(CharLength::IMPLICIT)
+                } else {
+                    // `bpchar` is only ever the catalog's spelling, so an absent
+                    // modifier there means no length was carried.
+                    TypeTypmod::Unbounded
+                };
                 let Some(raw) = raw else {
-                    return if family == DataTypeFamily::Character {
-                        TypeTypmod::CharacterLength(CharLength::IMPLICIT)
-                    } else {
-                        TypeTypmod::Unbounded
-                    };
+                    return implicit;
                 };
                 raw.trim()
                     .parse::<i32>()
@@ -301,18 +385,7 @@ impl ParsedDataType {
                     .and_then(CharLength::new)
                     .map_or(TypeTypmod::OutOfRange, TypeTypmod::CharacterLength)
             }
-            // `bpchar` is only ever the catalog's internal spelling, never a DDL
-            // declaration, so an absent modifier means the length was not carried.
-            DataTypeFamily::BpChar => match raw {
-                None => TypeTypmod::Unbounded,
-                Some(raw) => raw
-                    .trim()
-                    .parse::<i32>()
-                    .ok()
-                    .and_then(CharLength::new)
-                    .map_or(TypeTypmod::OutOfRange, TypeTypmod::CharacterLength),
-            },
-            DataTypeFamily::Numeric => {
+            TypmodKind::Numeric => {
                 let Some(raw) = raw else {
                     return TypeTypmod::Unbounded;
                 };
@@ -334,9 +407,21 @@ impl ParsedDataType {
                 };
                 TypeTypmod::Numeric { precision, scale }
             }
-            _ => match raw {
+            // Fractional-second precision and interval fields take a bare
+            // integer or a field list, neither of which narrows a value.
+            // Fractional-second precision and interval fields take a bare
+            // integer or a field list; neither constrains a stored value, so the
+            // modifier is recorded without being interpreted.
+            TypmodKind::FractionalSeconds | TypmodKind::IntervalFields => match raw {
                 None => TypeTypmod::NotApplicable,
-                // The server rejects a modifier on a family that takes none.
+                Some(_) => TypeTypmod::Unbounded,
+            },
+            // The server rejects a modifier on a type that takes none. A type
+            // the catalog reports as accepting one but this table has no rule
+            // for is a modelling gap, and fails closed rather than claiming the
+            // modifier was accepted.
+            TypmodKind::None => match raw {
+                None => TypeTypmod::NotApplicable,
                 Some(_) => TypeTypmod::OutOfRange,
             },
         }
@@ -374,6 +459,12 @@ impl ParsedDataType {
         self.raw_typmods.is_some()
     }
 
+    /// Whether the server would accept this declaration. A length, precision
+    /// or scale outside the server's range is refused outright.
+    pub(crate) fn is_valid_declaration(&self) -> bool {
+        self.typmod != TypeTypmod::OutOfRange
+    }
+
     /// Character limit, or None when no limit is established: an unbounded
     /// column, another family, or a declaration the server rejects.
     pub(crate) fn character_limit(&self) -> Option<i32> {
@@ -383,11 +474,22 @@ impl ParsedDataType {
         }
     }
 
-    /// atttypmod as PostgreSQL stores it for a bounded character column.
-    pub(crate) fn atttypmod_offset(&self) -> Option<i32> {
+    /// The `atttypmod` PostgreSQL stores for this declaration, or `None` when
+    /// the type carries no modifier or the declared one was rejected.
+    ///
+    /// This is the whole encoding, not just the character-length part, so a
+    /// column derived from DDL compares equal to the same column synchronized
+    /// from `pg_attribute.atttypmod`.
+    pub(crate) fn atttypmod(&self) -> Option<i32> {
         match self.typmod {
             TypeTypmod::CharacterLength(length) => Some(length.atttypmod()),
-            _ => None,
+            // `numeric(p)` is stored as `numeric(p, 0)`.
+            TypeTypmod::Numeric { precision, scale } => Some(
+                ((precision.get() << pg_typmod::NUMERIC_SHIFT)
+                    | (scale.map_or(0, NumericScale::get) & pg_typmod::NUMERIC_SCALE_MASK))
+                    .checked_add(pg_typmod::VARHDRSZ)?,
+            ),
+            TypeTypmod::NotApplicable | TypeTypmod::Unbounded | TypeTypmod::OutOfRange => None,
         }
     }
 
@@ -425,7 +527,11 @@ impl ParsedDataType {
     }
 
     pub(crate) fn is_lossy_narrowing_to(&self, new_type: &ParsedDataType) -> bool {
-        if self.family == new_type.family
+        // Two spellings of one built-in (`int` and `integer`) are the same
+        // type; two unresolved names are never assumed to be.
+        if self.is_builtin()
+            && new_type.is_builtin()
+            && self.canonical_name() == new_type.canonical_name()
             && self.raw_typmods == new_type.raw_typmods
             && self.array_dimensions == new_type.array_dimensions
         {
@@ -437,14 +543,25 @@ impl ParsedDataType {
             return true;
         }
 
-        if let (Some(old_bits), Some(new_bits)) =
-            (self.family.size_bits(), new_type.family.size_bits())
-        {
+        // A numeric keeps a value only when the target holds every digit the
+        // source can hold: a smaller precision overflows, a smaller scale
+        // rounds. A larger scale only pads.
+        if self.is_exact_numeric() && new_type.is_exact_numeric() {
+            return match (self.numeric_params(), new_type.numeric_params()) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some((old_p, old_s)), Some((new_p, new_s))) => new_p < old_p || new_s < old_s,
+            };
+        }
+
+        // A narrower fixed-width representation cannot hold every value of a
+        // wider one, whatever the type.
+        if let (Some(old_bits), Some(new_bits)) = (self.fixed_bits(), new_type.fixed_bits()) {
             return new_bits < old_bits;
         }
 
-        let old_is_string = self.family.is_text_like();
-        let new_is_string = new_type.family.is_text_like();
+        let old_is_string = self.is_text_like();
+        let new_is_string = new_type.is_text_like();
 
         if old_is_string && new_is_string {
             return match (self.character_limit(), new_type.character_limit()) {
@@ -466,34 +583,39 @@ impl ParsedDataType {
 
 /// A type's catalog identity, as PostgreSQL compares it. `ParsedDataType` records
 /// what the user wrote; this discards parenthesized modifiers, so it has no typmod.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TypeIdentity {
-    family: DataTypeFamily,
+    /// `format_type(oid, NULL)` for a built-in, or the written name for a type
+    /// PostgreSQL did not resolve to one.
+    canonical: String,
     array_dimensions: usize,
+    /// Whether `canonical` came from the catalog rather than from the written
+    /// name. Two unresolved types that share a spelling are still distinct, so
+    /// this cannot be inferred from the string.
+    resolved: bool,
 }
 
 impl TypeIdentity {
     pub(crate) fn from_syntax(syntax: &ParsedDataType) -> Self {
         Self {
-            family: syntax.family,
-            array_dimensions: syntax.array_dimensions,
+            canonical: syntax.canonical_name().to_string(),
+            // PostgreSQL has one array type per element however many `[]` a
+            // declaration carried, so the identity cannot keep the count.
+            array_dimensions: usize::from(syntax.array_dimensions > 0),
+            resolved: syntax.is_builtin(),
         }
     }
 
-    /// A type PostgreSQL did not resolve to a catalog family, such as a
-    /// user-defined type. Its written name is all that distinguishes it.
+    /// A type PostgreSQL did not resolve to a built-in, such as a user-defined
+    /// type. Its written name is all that distinguishes it.
     pub(crate) fn is_unknown(&self) -> bool {
-        self.family == DataTypeFamily::Unknown
+        !self.resolved
     }
 
-    /// Renders as `pg_catalog.format_type(oid, NULL)`, so bare `character` is
-    /// not expanded to `character(1)`.
+    /// Renders exactly as `pg_catalog.format_type(oid, NULL)` does, so bare
+    /// `character` is not expanded to `character(1)`.
     pub(crate) fn render(&self) -> String {
-        let (base, tz_suffix) = self
-            .family
-            .canonical_base_and_tz_suffix(&self.family.to_canonical_string(""));
-        let mut out = base;
-        out.push_str(tz_suffix);
+        let mut out = self.canonical.clone();
         for _ in 0..self.array_dimensions {
             out.push_str("[]");
         }
@@ -503,38 +625,45 @@ impl TypeIdentity {
 
 impl fmt::Display for ParsedDataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (base, tz_suffix) = if self.family == DataTypeFamily::BpChar && !self.has_typmod() {
-            ("bpchar".to_string(), "")
+        // The catalog's own spelling renders as itself; a DDL declaration
+        // renders as the canonical SQL spelling it was written with.
+        // `bpchar` keeps its catalog spelling: `character` on its own means
+        // character(1), so rendering it canonically would change the
+        // declaration. PostgreSQL draws the same line in format_type.c.
+        let (base, tz_suffix) = if self.is_named("bpchar") && self.typmod == TypeTypmod::Unbounded {
+            ("bpchar", "")
         } else {
-            self.family
-                .canonical_base_and_tz_suffix(&self.original_base)
+            self.canonical_and_tz_suffix()
         };
+        let mut out = base.to_string();
 
-        let mut out = base;
-
-        // Bare char/character in DDL means character(1) per the SQL standard.
-        if !self.has_typmod() && self.family == DataTypeFamily::Character {
+        if let Some(mods) = self.raw_typmods() {
+            out.push_str(&format!("({mods})"));
+        } else if matches!(self.typmod, TypeTypmod::CharacterLength(length) if length == CharLength::IMPLICIT)
+        {
             out.push_str("(1)");
-        } else if let Some(mods) = self.raw_typmods() {
-            out.push_str(&format!("({})", mods));
         }
 
-        // Re-attach the timezone suffix after any precision modifier so that
-        // `timestamp(6) with time zone` renders correctly rather than as
-        // `timestamp with time zone(6)`.
+        // The qualifier trails the modifier, as PostgreSQL renders it.
         out.push_str(tz_suffix);
 
         for _ in 0..self.array_dimensions {
             out.push_str("[]");
         }
 
-        write!(f, "{}", out)
+        write!(f, "{out}")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The offline snapshot; a synced baseline supersedes it.
+    fn catalogue() -> &'static BuiltinTypeCatalogue {
+        static CATALOGUE: std::sync::OnceLock<BuiltinTypeCatalogue> = std::sync::OnceLock::new();
+        CATALOGUE.get_or_init(BuiltinTypeCatalogue::fallback)
+    }
 
     #[test]
     fn canonical_alias_round_trip() {
@@ -571,7 +700,7 @@ mod tests {
             ("time(0) without time zone", "time(0) without time zone"),
         ];
         for (input, expected) in cases {
-            let parsed = ParsedDataType::parse(input);
+            let parsed = ParsedDataType::parse(input, catalogue());
             assert_eq!(parsed.to_string(), expected, "failed for '{input}'");
         }
     }
@@ -579,7 +708,7 @@ mod tests {
     #[test]
     fn type_identity_discards_typmods_like_postgres() {
         let identity = |raw: &str| {
-            TypeIdentity::from_syntax(&ParsedDataType::parse(raw))
+            TypeIdentity::from_syntax(&ParsedDataType::parse(raw, catalogue()))
                 .render()
                 .to_string()
         };
@@ -605,9 +734,9 @@ mod tests {
 
     #[test]
     fn lossy_narrowing_integer() {
-        let s = ParsedDataType::parse("smallint");
-        let i = ParsedDataType::parse("integer");
-        let b = ParsedDataType::parse("bigint");
+        let s = ParsedDataType::parse("smallint", catalogue());
+        let i = ParsedDataType::parse("integer", catalogue());
+        let b = ParsedDataType::parse("bigint", catalogue());
         assert!(!s.is_lossy_narrowing_to(&i));
         assert!(!i.is_lossy_narrowing_to(&b));
         assert!(b.is_lossy_narrowing_to(&i));
@@ -616,10 +745,10 @@ mod tests {
 
     #[test]
     fn lossy_narrowing_character() {
-        let text = ParsedDataType::parse("text");
-        let vc_unb = ParsedDataType::parse("character varying");
-        let vc255 = ParsedDataType::parse("varchar(255)");
-        let vc50 = ParsedDataType::parse("varchar(50)");
+        let text = ParsedDataType::parse("text", catalogue());
+        let vc_unb = ParsedDataType::parse("character varying", catalogue());
+        let vc255 = ParsedDataType::parse("varchar(255)", catalogue());
+        let vc50 = ParsedDataType::parse("varchar(50)", catalogue());
         assert!(!vc50.is_lossy_narrowing_to(&vc255));
         assert!(!vc50.is_lossy_narrowing_to(&text));
         assert!(vc255.is_lossy_narrowing_to(&vc50));
@@ -629,52 +758,58 @@ mod tests {
 
     #[test]
     fn lossy_narrowing_array_dimension_change() {
-        let i = ParsedDataType::parse("integer");
-        let ia = ParsedDataType::parse("integer[]");
+        let i = ParsedDataType::parse("integer", catalogue());
+        let ia = ParsedDataType::parse("integer[]", catalogue());
         assert!(i.is_lossy_narrowing_to(&ia));
         assert!(ia.is_lossy_narrowing_to(&i));
     }
 
     #[test]
     fn numeric_params_extraction() {
-        assert_eq!(ParsedDataType::parse("numeric").numeric_params(), None);
         assert_eq!(
-            ParsedDataType::parse("numeric(10)").numeric_params(),
+            ParsedDataType::parse("numeric", catalogue()).numeric_params(),
+            None
+        );
+        assert_eq!(
+            ParsedDataType::parse("numeric(10)", catalogue()).numeric_params(),
             Some((10, 0))
         );
         assert_eq!(
-            ParsedDataType::parse("numeric(10, 2)").numeric_params(),
+            ParsedDataType::parse("numeric(10, 2)", catalogue()).numeric_params(),
             Some((10, 2))
         );
         assert_eq!(
-            ParsedDataType::parse("decimal(5,3)").numeric_params(),
+            ParsedDataType::parse("decimal(5,3)", catalogue()).numeric_params(),
             Some((5, 3))
         );
-        assert_eq!(ParsedDataType::parse("integer").numeric_params(), None);
+        assert_eq!(
+            ParsedDataType::parse("integer", catalogue()).numeric_params(),
+            None
+        );
     }
 
     #[test]
     fn numeric_scale_extraction() {
         assert_eq!(
-            ParsedDataType::parse("numeric")
+            ParsedDataType::parse("numeric", catalogue())
                 .numeric_scale()
                 .map(NumericScale::get),
             None
         );
         assert_eq!(
-            ParsedDataType::parse("numeric(10)")
+            ParsedDataType::parse("numeric(10)", catalogue())
                 .numeric_scale()
                 .map(NumericScale::get),
             None
         );
         assert_eq!(
-            ParsedDataType::parse("numeric(10,2)")
+            ParsedDataType::parse("numeric(10,2)", catalogue())
                 .numeric_scale()
                 .map(NumericScale::get),
             Some(2)
         );
         assert_eq!(
-            ParsedDataType::parse("numeric(10,-3)")
+            ParsedDataType::parse("numeric(10,-3)", catalogue())
                 .numeric_scale()
                 .map(NumericScale::get),
             Some(-3)
@@ -682,21 +817,77 @@ mod tests {
     }
 
     #[test]
+    fn atttypmod_covers_numeric_as_well_as_character_lengths() {
+        // Verified against PostgreSQL 18.6 `pg_attribute.atttypmod`:
+        // numeric(5,2) is 327686, numeric(7) is 458756, numeric(10,-3) is
+        // 657409 (the scale is masked into 11 bits), varchar(10) is 14,
+        // text is -1.
+        for (declaration, expected) in [
+            ("numeric(5,2)", Some(327_686)),
+            ("numeric(7)", Some(458_756)),
+            ("numeric(10,-3)", Some(657_409)),
+            ("numeric(1000,1000)", Some(((1000_i32 << 16) | 1000) + 4)),
+            ("varchar(10)", Some(14)),
+            ("numeric", None),
+            ("text", None),
+            ("integer", None),
+        ] {
+            assert_eq!(
+                ParsedDataType::parse(declaration, catalogue()).atttypmod(),
+                expected,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn float_precision_selects_a_real_type_without_a_stored_modifier() {
+        // Verified live on PostgreSQL 18.6: float(1..24) is real, float(25..53)
+        // is double precision, and `pg_attribute.atttypmod` is -1 for every
+        // spelling, the bare type included.
+        for (declaration, canonical) in [
+            ("float", "double precision"),
+            ("float(1)", "real"),
+            ("float(24)", "real"),
+            ("float(25)", "double precision"),
+            ("float(53)", "double precision"),
+        ] {
+            let parsed = ParsedDataType::parse(declaration, catalogue());
+            assert_eq!(parsed.canonical_name(), canonical, "{declaration}");
+            assert_eq!(parsed.atttypmod(), None, "{declaration}");
+        }
+        let array = ParsedDataType::parse("float(24)[]", catalogue());
+        assert_eq!(array.canonical_name(), "real");
+        assert_eq!(array.array_dimensions, 1);
+        for declaration in ["float(0)", "float(54)", "float(10,2)", "float(x)"] {
+            let parsed = ParsedDataType::parse(declaration, catalogue());
+            assert_eq!(parsed.typmod, TypeTypmod::OutOfRange, "{declaration}");
+            assert_eq!(parsed.atttypmod(), None, "{declaration}");
+        }
+    }
+
+    #[test]
     fn character_limit_and_atttypmod() {
-        let v50 = ParsedDataType::parse("varchar(50)");
+        let v50 = ParsedDataType::parse("varchar(50)", catalogue());
         assert_eq!(v50.character_limit(), Some(50));
-        assert_eq!(v50.atttypmod_offset(), Some(54));
-        assert_eq!(ParsedDataType::parse("text").character_limit(), None);
+        assert_eq!(v50.atttypmod(), Some(54));
+        assert_eq!(
+            ParsedDataType::parse("text", catalogue()).character_limit(),
+            None
+        );
 
         // PostgreSQL records these exact atttypmod values; see the 18.2 probe in
         // temp/ and docs. char(7) is 11, bare char is 5.
         assert_eq!(
-            ParsedDataType::parse("char(7)").atttypmod_offset(),
+            ParsedDataType::parse("char(7)", catalogue()).atttypmod(),
             Some(11)
         );
-        assert_eq!(ParsedDataType::parse("char").atttypmod_offset(), Some(5));
         assert_eq!(
-            ParsedDataType::parse("character").character_limit(),
+            ParsedDataType::parse("char", catalogue()).atttypmod(),
+            Some(5)
+        );
+        assert_eq!(
+            ParsedDataType::parse("character", catalogue()).character_limit(),
             Some(1)
         );
     }
@@ -706,27 +897,27 @@ mod tests {
     #[test]
     fn character_length_bounds_match_postgres() {
         assert_eq!(
-            ParsedDataType::parse("varchar(0)").typmod,
+            ParsedDataType::parse("varchar(0)", catalogue()).typmod,
             TypeTypmod::OutOfRange
         );
         assert_eq!(
-            ParsedDataType::parse("char(0)").typmod,
+            ParsedDataType::parse("char(0)", catalogue()).typmod,
             TypeTypmod::OutOfRange
         );
         assert_eq!(
-            ParsedDataType::parse("varchar(-1)").typmod,
+            ParsedDataType::parse("varchar(-1)", catalogue()).typmod,
             TypeTypmod::OutOfRange
         );
         assert_eq!(
-            ParsedDataType::parse("varchar(10485760)").character_limit(),
+            ParsedDataType::parse("varchar(10485760)", catalogue()).character_limit(),
             Some(10485760)
         );
         assert_eq!(
-            ParsedDataType::parse("varchar(10485761)").typmod,
+            ParsedDataType::parse("varchar(10485761)", catalogue()).typmod,
             TypeTypmod::OutOfRange
         );
         assert_eq!(
-            ParsedDataType::parse("varchar(10485760)").atttypmod_offset(),
+            ParsedDataType::parse("varchar(10485760)", catalogue()).atttypmod(),
             Some(10485764)
         );
     }
@@ -742,10 +933,10 @@ mod tests {
             "varchar(2147483647)",
             "varchar(99999999999999)",
         ] {
-            let parsed = ParsedDataType::parse(decl);
+            let parsed = ParsedDataType::parse(decl, catalogue());
             assert_eq!(parsed.typmod, TypeTypmod::OutOfRange, "{decl}");
             assert_eq!(parsed.character_limit(), None, "{decl}");
-            assert_eq!(parsed.atttypmod_offset(), None, "{decl}");
+            assert_eq!(parsed.atttypmod(), None, "{decl}");
         }
     }
 
@@ -755,7 +946,7 @@ mod tests {
     #[test]
     fn hostile_numeric_scale_never_reaches_repeat() {
         for decl in ["numeric(10,4000000000)", "numeric(4000000000,0)"] {
-            let parsed = ParsedDataType::parse(decl);
+            let parsed = ParsedDataType::parse(decl, catalogue());
             assert_eq!(parsed.typmod, TypeTypmod::OutOfRange, "{decl}");
             assert_eq!(parsed.numeric_scale(), None, "{decl}");
             assert_eq!(parsed.numeric_params(), None, "{decl}");
@@ -771,17 +962,17 @@ mod tests {
             "numeric(10,1001)",
         ] {
             assert_eq!(
-                ParsedDataType::parse(bad).typmod,
+                ParsedDataType::parse(bad, catalogue()).typmod,
                 TypeTypmod::OutOfRange,
                 "{bad}"
             );
         }
         assert_eq!(
-            ParsedDataType::parse("numeric(1000,1000)").numeric_params(),
+            ParsedDataType::parse("numeric(1000,1000)", catalogue()).numeric_params(),
             Some((1000, 1000))
         );
         assert_eq!(
-            ParsedDataType::parse("numeric(10,-1000)").numeric_params(),
+            ParsedDataType::parse("numeric(10,-1000)", catalogue()).numeric_params(),
             Some((10, -1000))
         );
     }
@@ -815,17 +1006,17 @@ mod tests {
             "varchar()",
         ] {
             assert_eq!(
-                ParsedDataType::parse(decl).typmod,
+                ParsedDataType::parse(decl, catalogue()).typmod,
                 TypeTypmod::OutOfRange,
                 "{decl}"
             );
         }
         assert_eq!(
-            ParsedDataType::parse("text").typmod,
+            ParsedDataType::parse("text", catalogue()).typmod,
             TypeTypmod::NotApplicable
         );
         assert_eq!(
-            ParsedDataType::parse("integer").typmod,
+            ParsedDataType::parse("integer", catalogue()).typmod,
             TypeTypmod::NotApplicable
         );
     }
@@ -833,15 +1024,15 @@ mod tests {
     #[test]
     fn not_applicable_and_unbounded_are_distinct() {
         assert_eq!(
-            ParsedDataType::parse("varchar").typmod,
+            ParsedDataType::parse("varchar", catalogue()).typmod,
             TypeTypmod::Unbounded
         );
         assert_eq!(
-            ParsedDataType::parse("numeric").typmod,
+            ParsedDataType::parse("numeric", catalogue()).typmod,
             TypeTypmod::Unbounded
         );
         assert_eq!(
-            ParsedDataType::parse("text").typmod,
+            ParsedDataType::parse("text", catalogue()).typmod,
             TypeTypmod::NotApplicable
         );
     }
@@ -852,11 +1043,17 @@ mod tests {
     #[test]
     fn bare_bpchar_establishes_no_limit() {
         assert_eq!(
-            ParsedDataType::parse("bpchar").typmod,
+            ParsedDataType::parse("bpchar", catalogue()).typmod,
             TypeTypmod::Unbounded
         );
-        assert_eq!(ParsedDataType::parse("bpchar").character_limit(), None);
-        assert_eq!(ParsedDataType::parse("bpchar").to_string(), "bpchar");
+        assert_eq!(
+            ParsedDataType::parse("bpchar", catalogue()).character_limit(),
+            None
+        );
+        assert_eq!(
+            ParsedDataType::parse("bpchar", catalogue()).to_string(),
+            "bpchar"
+        );
     }
 
     // A bare `char` is exactly character(1), so widening it to varchar(50) is
@@ -864,19 +1061,19 @@ mod tests {
     // as a lossy narrowing.
     #[test]
     fn bare_char_widening_is_not_reported_as_lossy() {
-        let bare = ParsedDataType::parse("char");
-        assert!(!bare.is_lossy_narrowing_to(&ParsedDataType::parse("varchar(50)")));
-        assert!(!bare.is_lossy_narrowing_to(&ParsedDataType::parse("text")));
-        assert!(!ParsedDataType::parse("char(1)").is_lossy_narrowing_to(&bare));
+        let bare = ParsedDataType::parse("char", catalogue());
+        assert!(!bare.is_lossy_narrowing_to(&ParsedDataType::parse("varchar(50)", catalogue())));
+        assert!(!bare.is_lossy_narrowing_to(&ParsedDataType::parse("text", catalogue())));
+        assert!(!ParsedDataType::parse("char(1)", catalogue()).is_lossy_narrowing_to(&bare));
         // Narrowing it really is lossy.
-        assert!(ParsedDataType::parse("char(10)").is_lossy_narrowing_to(&bare));
+        assert!(ParsedDataType::parse("char(10)", catalogue()).is_lossy_narrowing_to(&bare));
     }
 
     // An unknown length must still fail closed.
     #[test]
     fn unknown_bpchar_length_still_fails_closed() {
-        let unknown = ParsedDataType::parse("bpchar");
-        assert!(unknown.is_lossy_narrowing_to(&ParsedDataType::parse("char(5)")));
+        let unknown = ParsedDataType::parse("bpchar", catalogue());
+        assert!(unknown.is_lossy_narrowing_to(&ParsedDataType::parse("char(5)", catalogue())));
     }
 
     // Rendering must reproduce the declaration verbatim, including one the server
@@ -884,28 +1081,35 @@ mod tests {
     #[test]
     fn rejected_declarations_render_verbatim() {
         assert_eq!(
-            ParsedDataType::parse("numeric(10,4000000000)").to_string(),
+            ParsedDataType::parse("numeric(10,4000000000)", catalogue()).to_string(),
             "numeric(10,4000000000)"
         );
         assert_eq!(
-            ParsedDataType::parse("varchar(2147483647)").to_string(),
+            ParsedDataType::parse("varchar(2147483647)", catalogue()).to_string(),
             "character varying(2147483647)"
         );
-        assert_eq!(ParsedDataType::parse("text(50)").to_string(), "text(50)");
         assert_eq!(
-            TypeIdentity::from_syntax(&ParsedDataType::parse("numeric(10,4000000000)")).render(),
+            ParsedDataType::parse("text(50)", catalogue()).to_string(),
+            "text(50)"
+        );
+        assert_eq!(
+            TypeIdentity::from_syntax(&ParsedDataType::parse(
+                "numeric(10,4000000000)",
+                catalogue()
+            ))
+            .render(),
             "numeric"
         );
     }
 
     #[test]
     fn has_typmod_distinguishes_declared_from_established() {
-        assert!(ParsedDataType::parse("varchar(50)").has_typmod());
-        assert!(!ParsedDataType::parse("varchar").has_typmod());
+        assert!(ParsedDataType::parse("varchar(50)", catalogue()).has_typmod());
+        assert!(!ParsedDataType::parse("varchar", catalogue()).has_typmod());
         // A rejected declaration is still a declaration.
-        assert!(ParsedDataType::parse("varchar(2147483647)").has_typmod());
+        assert!(ParsedDataType::parse("varchar(2147483647)", catalogue()).has_typmod());
         assert!(
-            ParsedDataType::parse("varchar(2147483647)")
+            ParsedDataType::parse("varchar(2147483647)", catalogue())
                 .raw_typmods()
                 .is_some()
         );
@@ -923,8 +1127,8 @@ mod tests {
             ("\"pg_catalog\".numeric", "numeric"),
         ] {
             assert_eq!(
-                TypeIdentity::from_syntax(&ParsedDataType::parse(qualified)),
-                TypeIdentity::from_syntax(&ParsedDataType::parse(bare)),
+                TypeIdentity::from_syntax(&ParsedDataType::parse(qualified, catalogue())),
+                TypeIdentity::from_syntax(&ParsedDataType::parse(bare, catalogue())),
                 "{qualified} must be the same identity as {bare}"
             );
         }
@@ -934,7 +1138,8 @@ mod tests {
     fn a_custom_type_has_no_catalog_rendering_of_its_own() {
         // Callers must key an unresolved custom type on its written name;
         // `render` alone cannot tell two of them apart.
-        let identity = |raw: &str| TypeIdentity::from_syntax(&ParsedDataType::parse(raw));
+        let identity =
+            |raw: &str| TypeIdentity::from_syntax(&ParsedDataType::parse(raw, catalogue()));
         assert!(identity("sm_core.text").is_unknown());
         assert!(identity("sm_core.text[]").is_unknown());
         assert!(!identity("text").is_unknown());
@@ -945,7 +1150,7 @@ mod tests {
         assert_eq!(identity("pg_catalog.int").render(), "integer");
 
         // Distinct custom types keep distinct written forms.
-        let written = |raw: &str| ParsedDataType::parse(raw).to_string();
+        let written = |raw: &str| ParsedDataType::parse(raw, catalogue()).to_string();
         assert_ne!(written("sm_core.text"), written("other.text"));
         assert_ne!(written("sm_core.text"), written("text"));
         assert_ne!(written("sm_core.mood"), written("sm_core.mood[]"));

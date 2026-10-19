@@ -1,9 +1,9 @@
 use crate::_internal::analysis::mutations::{Mutation, ReindexTargetMutation};
-use crate::_internal::analysis::state::MutationResult;
+
 use crate::_internal::model::relation::Persistence;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
-    BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
+    BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext, TransitionRecord,
 };
 
 pub(crate) struct ConcurrentIndexRule;
@@ -23,20 +23,19 @@ impl Rule for ConcurrentIndexRule {
         BASELINE_STATS_DEPENDENCY_CAPABILITIES
     }
 
-    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if *context.result() == MutationResult::Skipped {
-            // An index that is present in the pre-state still incurs the
-            // synchronous DROP INDEX risk even when catalog metadata is too
-            // incomplete to mutate it exactly (for example, eligibility for
-            // a backing constraint is not serialized).  A truly absent,
-            // guarded drop remains a no-op and is correctly suppressed.
-            let known_drop_target = matches!(context.mutation(), Mutation::DropIndex(drop)
-                if drop.ids.iter().any(|id| context.pre_state().indexes.iter().any(|edge| edge.dependent == *id)));
-            if !known_drop_target {
-                return vec![];
-            }
-        }
+    fn evaluates_when_unresolved(&self, transition: &TransitionRecord<'_>) -> bool {
+        // A DROP INDEX on a target present in the pre-state blocks writes even
+        // when catalog metadata is incomplete. Every other transition needs the
+        // post-state to size the lock, so the engine records those.
+        matches!(transition.mutation(), Mutation::DropIndex(drop)
+            if drop.ids.iter().any(|id| transition.pre_state().indexes.iter().any(|edge| edge.dependent == *id)))
+    }
 
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        // The statement was skipped, so no index was built or dropped.
+        if context.result().is_noop() {
+            return vec![];
+        }
         let mut violations = Vec::new();
 
         match context.mutation() {
@@ -64,7 +63,7 @@ impl Rule for ConcurrentIndexRule {
                     let key = format!("{}_stale_{}", self.id(), create.table);
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::CreateIndex,
+
                         object_kind: ObjectKind::Index,
                         object_name: create.id.to_string(),
                         tier: ViolationTier::Tier2,
@@ -72,7 +71,7 @@ impl Rule for ConcurrentIndexRule {
                         recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                         dedup_key: Some(key),
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
 
@@ -95,7 +94,7 @@ impl Rule for ConcurrentIndexRule {
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::CreateIndex,
+
                     object_kind: ObjectKind::Index,
                     object_name: create.id.to_string(),
                     tier,
@@ -103,7 +102,6 @@ impl Rule for ConcurrentIndexRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
-                    fk_dependency_related: false,
                 });
             }
             Mutation::DropIndex(drop) if !drop.concurrently => {
@@ -127,7 +125,7 @@ impl Rule for ConcurrentIndexRule {
                         violations.push(Violation {
                             source_range: None,
                             rule_id,
-                            operation_kind: OperationKind::DropIndex,
+
                             object_kind: ObjectKind::Index,
                             object_name: id.to_string(),
                             tier,
@@ -135,7 +133,6 @@ impl Rule for ConcurrentIndexRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
                         });
                     } else {
                         let target_relations = context
@@ -160,7 +157,7 @@ impl Rule for ConcurrentIndexRule {
                             violations.push(Violation {
                                 source_range: None,
                                 rule_id,
-                                operation_kind: OperationKind::DropIndex,
+
                                 object_kind: ObjectKind::Index,
                                 object_name: id.to_string(),
                                 tier,
@@ -168,7 +165,6 @@ impl Rule for ConcurrentIndexRule {
                                 recipe: self.recipe(),
                                 dedup_key: None,
                                 sql: None,
-                                fk_dependency_related: false,
                             });
                         }
                         for rel in target_relations {
@@ -190,7 +186,7 @@ impl Rule for ConcurrentIndexRule {
                             violations.push(Violation {
                                 source_range: None,
                                 rule_id,
-                                operation_kind: OperationKind::DropIndex,
+
                                 object_kind: ObjectKind::Index,
                                 object_name: id.to_string(),
                                 tier,
@@ -198,7 +194,6 @@ impl Rule for ConcurrentIndexRule {
                                 recipe: self.recipe(),
                                 dedup_key: None,
                                 sql: None,
-                                fk_dependency_related: false,
                             });
                         }
                     }
@@ -256,7 +251,7 @@ impl RequireConcurrentReindexRule {
             return vec![Violation {
                 source_range: None,
                 rule_id: RequireConcurrentReindexRule.id(),
-                operation_kind: OperationKind::Reindex,
+
                 object_kind: ObjectKind::Unknown,
                 object_name: "unknown".to_string(),
                 tier: ViolationTier::Tier1,
@@ -264,7 +259,6 @@ impl RequireConcurrentReindexRule {
                 recipe: RequireConcurrentReindexRule.recipe(),
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             }];
         };
 
@@ -275,10 +269,7 @@ impl RequireConcurrentReindexRule {
 
         // A temporary relation cannot be reindexed concurrently; the synchronous
         // form is the only legal statement, so there is nothing to report.
-        if let ReindexTargetMutation::Table(id) | ReindexTargetMutation::Index(id) = target
-            && let Some(rel) = context.pre_state().relations.get(id)
-            && rel.persistence == Persistence::Temporary
-        {
+        if context.state().reindex_target_is_temporary(target) {
             return vec![];
         }
 
@@ -301,7 +292,7 @@ impl RequireConcurrentReindexRule {
         vec![Violation {
             source_range: None,
             rule_id: RequireConcurrentReindexRule.id(),
-            operation_kind: OperationKind::Reindex,
+
             object_kind,
             object_name: target_name.clone(),
             tier: ViolationTier::Tier1,
@@ -313,7 +304,6 @@ impl RequireConcurrentReindexRule {
                 target_name
             )),
             sql: None,
-            fk_dependency_related: false,
         }]
     }
 }

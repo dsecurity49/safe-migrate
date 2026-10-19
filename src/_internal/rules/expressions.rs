@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct VolatileDefaultRule;
@@ -17,10 +17,10 @@ impl Rule for VolatileDefaultRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if *context.result() == MutationResult::Skipped {
+        // The statement was skipped, so no default was created.
+        if context.result().is_noop() {
             return vec![];
         }
-
         let mut violations = Vec::new();
 
         if let Mutation::CreateTable(c) = context.mutation() {
@@ -31,7 +31,7 @@ impl Rule for VolatileDefaultRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::CreateTable,
+
                         object_kind: ObjectKind::Table,
                         object_name: c.id.to_string(),
                         tier: self.default_tier(),
@@ -39,7 +39,6 @@ impl Rule for VolatileDefaultRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
             }
@@ -55,7 +54,7 @@ impl Rule for VolatileDefaultRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::AddColumn,
+
                         object_kind: ObjectKind::Table,
                         object_name: a.id.to_string(),
                         tier: self.default_tier(),
@@ -63,7 +62,6 @@ impl Rule for VolatileDefaultRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
                 crate::_internal::analysis::mutations::AlterTableActionMutation::SetDefault {
@@ -73,7 +71,7 @@ impl Rule for VolatileDefaultRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::SetDefault,
+
                         object_kind: ObjectKind::Table,
                         object_name: a.id.to_string(),
                         tier: self.default_tier(),
@@ -81,7 +79,6 @@ impl Rule for VolatileDefaultRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
                 _ => {}

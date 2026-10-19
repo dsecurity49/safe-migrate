@@ -1,4 +1,5 @@
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::index::IndexDefinition;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -21,23 +22,27 @@ pub(crate) enum DependencyKind {
         /// expression-column dependencies are not modeled yet.
         referenced_column: Option<String>,
     },
+    /// A routine a view calls, which a drop of that routine must clear.
+    ///
+    /// `unresolved_name` is `Some` when the call could not be pinned to a
+    /// signature. The edge endpoint is then the written name, and every
+    /// overload of that name is a dependent. A move of only some overloads
+    /// cannot be expressed that way and taints the chain instead. `None` means
+    /// the endpoint is the resolved routine identity itself.
+    ViewUsesRoutine {
+        unresolved_name: Option<ObjectId>,
+    },
+    /// A type a view body casts to, which a drop of that type must clear.
+    ///
+    /// PostgreSQL records this from the cast alone: a view that selects a
+    /// column of a type creates no such dependency. The endpoint is the type.
+    ViewUsesType,
     IndexOnRelation {
-        using_method: Option<String>,
-        key_columns: Vec<String>,
-        included_columns: Vec<String>,
+        definition: IndexDefinition,
         dependency_columns: Vec<String>,
         dependency_columns_known: bool,
-        has_expression_keys: bool,
-        has_predicate: bool,
         is_concurrent: bool,
-        is_unique: bool,
         is_immediate: bool,
-        is_valid: bool,
-        is_ready: bool,
-        is_live: bool,
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
         eligibility_known: bool,
     },
     /// A primary-key/unique constraint whose ordered key columns are known.
@@ -384,7 +389,35 @@ impl DependencyGraph {
             .collect()
     }
 
-    #[cfg(test)]
+    /// The table an index is defined on, if the graph records one.
+    pub(crate) fn index_table_of(&self, index: &ObjectId) -> Option<&ObjectId> {
+        self.edges
+            .iter()
+            .find(|edge| {
+                edge.dependent == *index
+                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+            })
+            .map(|edge| &edge.referenced)
+    }
+
+    /// Rewrite a recorded index definition in place.
+    pub(crate) fn update_index_definition(
+        &mut self,
+        index: &ObjectId,
+        apply: impl FnOnce(&mut crate::_internal::model::index::IndexDefinition),
+    ) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                if edge.dependent == *index
+                    && let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind
+                {
+                    apply(definition);
+                    return;
+                }
+            }
+        });
+    }
+
     pub(crate) fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -505,6 +538,15 @@ impl DependencyGraph {
                     remap(trigger_id);
                     remap(function_id);
                 }
+                // The written name is schema-qualified too, so a rename that
+                // leaves it stale makes a later drop miss this view.
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: Some(name),
+                } => {
+                    remap(&mut edge.dependent);
+                    remap(&mut edge.referenced);
+                    remap(name);
+                }
                 _ => {
                     remap(&mut edge.dependent);
                     remap(&mut edge.referenced);
@@ -540,6 +582,13 @@ impl DependencyGraph {
                     }
                     if edge.referenced == *old_id {
                         edge.referenced = new_id.clone();
+                    }
+                }
+                // A view reference follows only on the dependent side: the
+                // referenced routine or type may share the relation's name.
+                DependencyKind::ViewUsesRoutine { .. } | DependencyKind::ViewUsesType => {
+                    if edge.dependent == *old_id {
+                        edge.dependent = new_id.clone();
                     }
                 }
                 DependencyKind::ColumnDefaultOnSequence { .. } => {
@@ -622,13 +671,66 @@ impl DependencyGraph {
         self.invalidate_indexes();
     }
 
-    /// Propagate a function rename through trigger dependency payloads.
+    /// Propagate a routine rename through its typed endpoints: trigger
+    /// dependencies and resolved view references. A name-only view reference
+    /// is the caller's decision, because only it can see the remaining
+    /// overloads of the written name.
     pub(crate) fn propagate_function_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
-            if let DependencyKind::TriggerOnTable { function_id, .. } = &mut edge.kind
-                && *function_id == *old_id
+            match &mut edge.kind {
+                DependencyKind::TriggerOnTable { function_id, .. } if *function_id == *old_id => {
+                    *function_id = new_id.clone();
+                }
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: None,
+                } if edge.referenced == *old_id => {
+                    edge.referenced = new_id.clone();
+                }
+                _ => {}
+            }
+        }
+        self.deduplicate_edges();
+        self.invalidate_indexes();
+    }
+
+    /// Propagate a type rename through view cast references.
+    pub(crate) fn propagate_type_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        for edge in &mut self.edges {
+            if matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *old_id {
+                edge.referenced = new_id.clone();
+            }
+        }
+        self.deduplicate_edges();
+        self.invalidate_indexes();
+    }
+
+    /// Whether any view references `name` without a resolved signature.
+    pub(crate) fn has_view_reference_to_name(&self, name: &ObjectId) -> bool {
+        self.edges.iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: Some(reference),
+                } if reference == name
+            )
+        })
+    }
+
+    /// Follow a name-only view reference to a moved name; the caller has
+    /// established that every overload of the old name moved with it.
+    pub(crate) fn propagate_view_reference_rename(
+        &mut self,
+        old_name: &ObjectId,
+        new_name: &ObjectId,
+    ) {
+        for edge in &mut self.edges {
+            if let DependencyKind::ViewUsesRoutine {
+                unresolved_name: Some(reference),
+            } = &mut edge.kind
+                && reference == old_name
             {
-                *function_id = new_id.clone();
+                *reference = new_name.clone();
+                edge.referenced = new_name.clone();
             }
         }
         self.deduplicate_edges();
@@ -754,19 +856,23 @@ impl DependencyGraph {
                     continue;
                 }
                 let DependencyKind::IndexOnRelation {
-                    key_columns,
-                    included_columns,
+                    definition,
                     dependency_columns,
                     ..
                 } = &mut edge.kind
                 else {
                     continue;
                 };
-                for column in key_columns
+                let index_keys = definition
+                    .keys
                     .iter_mut()
-                    .chain(included_columns)
-                    .chain(dependency_columns)
-                {
+                    .chain(&mut definition.included)
+                    .filter_map(|key| match &mut key.kind {
+                        crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
+                        crate::_internal::model::index::IndexKeyKind::Expression(_) => None,
+                    })
+                    .collect::<Vec<&mut String>>();
+                for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {
                     if column == old_name {
                         *column = new_name.to_string();
                     }
@@ -818,6 +924,43 @@ impl DependencyGraph {
         self.propagate_relation_rename(old_id, new_id);
     }
 
+    /// Views that depend on a routine.
+    ///
+    /// A reference that resolved to an exact signature matches only that
+    /// routine. One that could not be resolved matches every routine of that
+    /// name, because the call may be any of its overloads.
+    pub(crate) fn views_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
+        let (schema, signature) = Self::split_routine_signature(function_id);
+        self.edges
+            .iter()
+            .filter(|edge| match &edge.kind {
+                DependencyKind::ViewUsesRoutine { unresolved_name } => match unresolved_name {
+                    None => &edge.referenced == function_id,
+                    Some(name) => name.schema == schema && name.name == signature,
+                },
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The schema and bare name of a routine whose identity is `name(arguments)`.
+    pub(crate) fn split_routine_signature(routine: &ObjectId) -> (&str, &str) {
+        match routine.name.split_once('(') {
+            Some((name, _)) => (routine.schema.as_str(), name),
+            None => (routine.schema.as_str(), routine.name.as_str()),
+        }
+    }
+
+    /// Views whose body casts to a type.
+    pub(crate) fn views_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        self.edges
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *ty
+            })
+            .collect()
+    }
+
     pub(crate) fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
         self.edges
             .iter()
@@ -838,6 +981,7 @@ impl DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::_internal::model::index::{IndexPredicate, index_keys};
 
     fn id(name: &str) -> ObjectId {
         ObjectId::new("public", name)
@@ -852,6 +996,66 @@ mod tests {
                 referenced_column: None,
             },
         )
+    }
+
+    #[test]
+    fn a_definition_update_keeps_the_edge_set_in_step() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(relation_edge(
+            "index",
+            "table",
+            DependencyKind::IndexOnRelation {
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: false,
+                    ready: false,
+                    live: true,
+                },
+                dependency_columns: Vec::new(),
+                dependency_columns_known: true,
+                is_concurrent: false,
+                is_immediate: true,
+                eligibility_known: true,
+            },
+        ));
+        graph.update_index_definition(&id("index"), |definition| {
+            definition.valid = true;
+            definition.ready = true;
+        });
+
+        // The updated edge is the one now in the graph, so re-adding it must be
+        // rejected as a duplicate rather than inserted beside itself.
+        let updated = graph.edges()[0].clone();
+        graph.add_edge(updated);
+        assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn a_schema_rename_remaps_a_name_only_view_routine_reference() {
+        let mut graph = DependencyGraph::new();
+        let written = ObjectId::new("s", "f");
+        graph.add_edge(DependencyEdge::new(
+            ObjectId::new("s", "v"),
+            written.clone(),
+            DependencyKind::ViewUsesRoutine {
+                unresolved_name: Some(written.clone()),
+            },
+        ));
+
+        graph.remap_schema_namespace("s", "t");
+
+        // A later `DROP FUNCTION t.f(...)` must find the view the rename moved.
+        let renamed = ObjectId::new("t", "f");
+        assert_eq!(graph.views_for_function(&renamed).len(), 1);
+        assert!(graph.has_view_reference_to_name(&renamed));
+        assert!(!graph.has_view_reference_to_name(&written));
     }
 
     #[test]
@@ -1070,22 +1274,23 @@ mod tests {
             "index",
             "target",
             DependencyKind::IndexOnRelation {
-                using_method: Some("btree".into()),
-                key_columns: vec!["id".into()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: Vec::new(),
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
                 is_concurrent: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
                 eligibility_known: true,
             },
         ));

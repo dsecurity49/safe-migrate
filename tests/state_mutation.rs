@@ -6,19 +6,22 @@ mod state_mutation_tests {
         DependencyEdge, DependencyGraph, DependencyKind,
     };
     use safe_migrate::_internal::analysis::mutations::{
-        DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
+        AlterTable, AlterTableActionMutation, DropAggregateMutation, DropFunctionMutation,
+        DropProcedureMutation, DropTable, Mutation,
     };
-    use safe_migrate::_internal::analysis::state::{Confidence, MutationResult};
+    use safe_migrate::_internal::analysis::namespace::SearchPathEntry;
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::_internal::db::cache::{
-        CatalogFamily, ConstraintDependencyCache, GeneratedColumnDependencyCache,
-        ViewDependencyCache,
+        CatalogCoverage, CatalogFamily, ConstraintDependencyCache, GeneratedColumnDependencyCache,
+        SchemaCoverage, ViewDependencyCache,
     };
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::constraint::ConstraintKind;
     use safe_migrate::_internal::model::function::{
-        FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
+        FunctionOverlay, FunctionState, ParameterMode, RoutineKind, RoutineParameter, Volatility,
     };
+    use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
     use safe_migrate::_internal::model::relation::{
         ColumnAction, Persistence, Privilege, RelationKind, RelationOverlay, RelationState,
     };
@@ -26,6 +29,7 @@ mod state_mutation_tests {
     use safe_migrate::_internal::model::schema::SchemaState;
     use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
     use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
+    use safe_migrate::_internal::report::violations::Violation;
 
     #[test]
     fn partition_key_rename_updates_keys_for_synthesis() {
@@ -329,7 +333,7 @@ mod state_mutation_tests {
                         && matches!(
                             edge.kind,
                             DependencyKind::IndexOnRelation {
-                                is_unique: true,
+                                definition: IndexDefinition { unique: true, .. },
                                 ..
                             }
                         ))
@@ -573,7 +577,10 @@ mod state_mutation_tests {
         assert!(matches!(
             edge.kind,
             DependencyKind::IndexOnRelation {
-                has_expression_keys: true,
+                definition: IndexDefinition {
+                    expression_keys: 1,
+                    ..
+                },
                 dependency_columns_known: false,
                 eligibility_known: true,
                 ..
@@ -1029,21 +1036,22 @@ mod state_mutation_tests {
             .push(safe_migrate::_internal::db::cache::IndexCache {
                 index_id: index_id.clone(),
                 table_id: table_id.clone(),
-                using_method: "btree".to_string(),
-                key_columns: Vec::new(),
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(Vec::new()),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 1,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: vec!["note".to_string()],
                 dependency_columns_known: true,
-                has_expression_keys: true,
-                has_predicate: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
 
         let engine = setup_engine();
@@ -1144,7 +1152,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn scoped_drop_with_incomplete_dependency_coverage_stays_unchanged() {
+    fn scoped_drop_with_incomplete_dependency_coverage_applies_and_taints() {
         let in_scope_table = object_id("app", "base");
         let omitted_view = object_id("tenant", "v");
         let mut cache = synced_cache();
@@ -1179,8 +1187,10 @@ mod state_mutation_tests {
                 .any(|violation| violation.rule_id == "chain-conflict"),
             "coverage uncertainty should skip without inventing a conflict: {violations:?}"
         );
+        // PostgreSQL drops the table even when the baseline could not enumerate
+        // every dependent; only the chain's exactness is lost.
         assert_eq!(state.local.confidence, Confidence::Tainted);
-        assert!(state.relation_is_present(&in_scope_table));
+        assert!(!state.relation_is_present(&in_scope_table));
     }
 
     #[test]
@@ -1941,7 +1951,7 @@ mod state_mutation_tests {
                     .is_some_and(|definition| definition.contains("renamed")))
         );
         assert!(state.local.graph.edges().iter().any(|edge| edge.dependent == object_id("public", "child_id_idx")
-            && matches!(&edge.kind, DependencyKind::IndexOnRelation { key_columns, .. } if key_columns == &["renamed".to_string()])));
+            && matches!(&edge.kind, DependencyKind::IndexOnRelation { definition, .. } if definition.key_column_names() == ["renamed"])));
         engine.analyze("ROLLBACK;", &mut state).unwrap();
         for name in ["parent", "child"] {
             let RelationOverlay::Present(relation) =
@@ -4151,6 +4161,979 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn alter_sequence_applies_every_option_regardless_of_order() {
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let parameters = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("ALTER SEQUENCE should analyze");
+            let Some(SequenceOverlay::Present(sequence)) =
+                state.local.sequences.get(&object_id("public", "s"))
+            else {
+                panic!("sequence 's' should remain present");
+            };
+            (sequence.parameters.clone(), sequence.owned_by.clone())
+        };
+        let setup = "CREATE TABLE t (id int); CREATE SEQUENCE s INCREMENT BY 1;";
+
+        // PostgreSQL merges every option into one parameter set, so the
+        // outcome cannot depend on which clause was written first.
+        let increment_first = parameters(&format!(
+            "{setup} ALTER SEQUENCE s INCREMENT BY 2 OWNED BY t.id;"
+        ));
+        let owned_by_first = parameters(&format!(
+            "{setup} ALTER SEQUENCE s OWNED BY t.id INCREMENT BY 2;"
+        ));
+        assert_eq!(
+            increment_first.0.increment, 2,
+            "an option written after OWNED BY must still apply"
+        );
+        assert!(increment_first.1.is_some(), "OWNED BY must still apply");
+        assert_eq!(
+            increment_first, owned_by_first,
+            "clause order must not change the resulting sequence"
+        );
+
+        let (merged, _) = parameters(&format!(
+            "{setup} ALTER SEQUENCE s CACHE 7 CYCLE START 3 INCREMENT BY 4;"
+        ));
+        assert_eq!(merged.cache_size, 7);
+        assert!(merged.cycle);
+        assert_eq!(merged.start_value, 3);
+        assert_eq!(merged.increment, 4);
+
+        let (descending, _) = parameters(&format!(
+            "{setup} ALTER SEQUENCE s INCREMENT BY -1 NO MINVALUE;"
+        ));
+        assert_eq!(descending.min_value, i64::MIN);
+    }
+
+    #[test]
+    fn alter_sequence_rejects_conflicting_and_out_of_range_options() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("ALTER SEQUENCE should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+        let setup = "CREATE TABLE t (id int); CREATE SEQUENCE s INCREMENT BY 1;";
+
+        // PostgreSQL rejects a repeated option before applying anything.
+        let repeated = reason(&format!(
+            "{setup} ALTER SEQUENCE s INCREMENT BY 2 INCREMENT BY 3;"
+        ));
+        assert!(
+            repeated.contains("specified more than once"),
+            "a repeated option must be rejected: {repeated}"
+        );
+        let zero = reason(&format!("{setup} ALTER SEQUENCE s INCREMENT BY 0;"));
+        assert!(
+            zero.contains("INCREMENT") && zero.contains("must not be zero"),
+            "a zero increment must be rejected: {zero}"
+        );
+        let cache = reason(&format!("{setup} ALTER SEQUENCE s CACHE 0;"));
+        assert!(
+            cache.contains("CACHE"),
+            "a non-positive cache must be rejected: {cache}"
+        );
+        let start = reason(&format!("{setup} ALTER SEQUENCE s MAXVALUE 5 START 10;"));
+        assert!(
+            start.contains("cannot be greater than MAXVALUE"),
+            "START is cross-checked against the merged bounds: {start}"
+        );
+        let bounds = reason(&format!("{setup} ALTER SEQUENCE s MINVALUE 50 MAXVALUE 5;"));
+        assert!(
+            bounds.contains("must be less than MAXVALUE"),
+            "the merged bounds must themselves be ordered: {bounds}"
+        );
+        let range = reason(&format!(
+            "{setup} ALTER SEQUENCE s AS smallint MAXVALUE 100000;"
+        ));
+        assert!(
+            range.contains("out of range"),
+            "a bound outside the data type must be rejected: {range}"
+        );
+        let invalid_type = reason(&format!("{setup} ALTER SEQUENCE s AS numeric;"));
+        assert!(
+            invalid_type.contains("sequence type must be smallint, integer, or bigint"),
+            "an unusable sequence data type must be rejected: {invalid_type}"
+        );
+        // RESTART is cross-checked against the final bounds in either clause
+        // order, and alone it derives the value from START.
+        let restart = reason(&format!(
+            "{setup} ALTER SEQUENCE s RESTART WITH 100 MAXVALUE 50;"
+        ));
+        assert!(
+            restart.contains("RESTART value (100) cannot be greater than MAXVALUE (50)"),
+            "RESTART is cross-checked after the bounds merge: {restart}"
+        );
+        assert_eq!(
+            reason(&format!(
+                "{setup} ALTER SEQUENCE s MAXVALUE 50 RESTART WITH 40;"
+            )),
+            "",
+            "a RESTART inside the merged bounds must be accepted"
+        );
+        // The create path reports the same precise reasons.
+        assert!(
+            reason("CREATE SEQUENCE s CACHE 0;").contains("CACHE (0) must be greater than zero"),
+            "a create-time cache must be validated with its value"
+        );
+        assert!(
+            reason("CREATE SEQUENCE s START WITH -1;")
+                .contains("START value (-1) cannot be less than MINVALUE (1)"),
+            "an omitted bound must be derived before START is checked"
+        );
+        assert!(
+            reason("CREATE SEQUENCE s AS numeric;")
+                .contains("sequence type must be smallint, integer, or bigint"),
+            "a create-time data type must be validated by name"
+        );
+        assert!(
+            reason("CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (CACHE 0));")
+                .contains("CACHE (0) must be greater than zero"),
+            "identity sequence options must report the same reason"
+        );
+    }
+
+    #[test]
+    fn sequence_parameter_merge_mirrors_postgresql_init_params() {
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let parameters = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("sequence statements should analyze");
+            let Some(SequenceOverlay::Present(sequence)) =
+                state.local.sequences.get(&object_id("public", "s"))
+            else {
+                panic!("sequence 's' should remain present");
+            };
+            sequence.parameters.clone()
+        };
+
+        // A bare type change re-derives a bound that sat at the old type's
+        // limit; an explicitly chosen bound is left alone.
+        let narrowed = parameters("CREATE SEQUENCE s; ALTER SEQUENCE s AS smallint;");
+        assert_eq!(narrowed.data_type, "smallint");
+        assert_eq!(narrowed.max_value, i16::MAX as i64);
+        assert_eq!(narrowed.min_value, 1);
+        assert_eq!(narrowed.start_value, 1);
+
+        let explicit = parameters("CREATE SEQUENCE s MAXVALUE 100; ALTER SEQUENCE s AS smallint;");
+        assert_eq!(explicit.data_type, "smallint");
+        assert_eq!(explicit.max_value, 100);
+
+        let overridden =
+            parameters("CREATE SEQUENCE s; ALTER SEQUENCE s AS smallint MAXVALUE 100;");
+        assert_eq!(overridden.max_value, 100);
+
+        // The reset is per bound: only the bound at the old type's limit moves.
+        let per_bound = parameters(
+            "CREATE SEQUENCE s MINVALUE -9223372036854775808 START WITH -32768;
+             ALTER SEQUENCE s AS smallint;",
+        );
+        assert_eq!(per_bound.min_value, i16::MIN as i64);
+        assert_eq!(per_bound.max_value, i16::MAX as i64);
+
+        // NO MINVALUE / NO MAXVALUE derive from the final increment, so the
+        // clause order cannot change the outcome.
+        let bounds_early = parameters(
+            "CREATE SEQUENCE s MINVALUE -10 START WITH -1;
+             ALTER SEQUENCE s NO MAXVALUE NO MINVALUE INCREMENT BY -1;",
+        );
+        let bounds_late = parameters(
+            "CREATE SEQUENCE s MINVALUE -10 START WITH -1;
+             ALTER SEQUENCE s INCREMENT BY -1 NO MINVALUE NO MAXVALUE;",
+        );
+        assert_eq!(bounds_early, bounds_late);
+        assert_eq!(bounds_late.increment, -1);
+        assert_eq!(bounds_late.max_value, -1);
+        assert_eq!(bounds_late.min_value, i64::MIN);
+
+        // The create path derives the start from the final bounds and the
+        // increment from the data type.
+        let created = parameters("CREATE SEQUENCE s MINVALUE 10;");
+        assert_eq!(created.start_value, 10);
+        assert_eq!(created.min_value, 10);
+        let descending = parameters("CREATE SEQUENCE s AS smallint INCREMENT BY -1;");
+        assert_eq!(descending.min_value, i16::MIN as i64);
+        assert_eq!(descending.max_value, -1);
+        assert_eq!(descending.start_value, -1);
+    }
+
+    #[test]
+    fn identity_sequence_parameters_mirror_postgresql() {
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("identity statements should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+        let parameters = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("identity statements should analyze");
+            let Some(SequenceOverlay::Present(identity)) =
+                state.local.sequences.get(&object_id("public", "t_id_seq"))
+            else {
+                panic!("identity sequence 't_id_seq' should be present");
+            };
+            identity.parameters.clone()
+        };
+
+        // The column type drives the bounds; the column type is the synthetic
+        // `AS`, so only these three integer types can back an identity column.
+        let ascending = parameters(
+            "CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (INCREMENT 2 START 5));",
+        );
+        assert_eq!(ascending.data_type, "smallint");
+        assert_eq!(ascending.increment, 2);
+        assert_eq!(ascending.start_value, 5);
+        assert_eq!(ascending.min_value, 1);
+        assert_eq!(ascending.max_value, i16::MAX as i64);
+
+        let bounded = parameters(
+            "CREATE TABLE t (id integer GENERATED BY DEFAULT AS IDENTITY (MINVALUE 3 MAXVALUE 900 START 10));",
+        );
+        assert_eq!(bounded.data_type, "integer");
+        assert_eq!(bounded.min_value, 3);
+        assert_eq!(bounded.max_value, 900);
+        assert_eq!(bounded.start_value, 10);
+
+        let descending =
+            parameters("CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (INCREMENT -1));");
+        assert_eq!(descending.increment, -1);
+        assert_eq!(descending.min_value, i16::MIN as i64);
+        assert_eq!(descending.max_value, -1);
+        assert_eq!(descending.start_value, -1);
+
+        let duplicate_as =
+            reason("CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY (AS smallint));");
+        assert!(
+            duplicate_as.contains("conflicting or redundant options")
+                && duplicate_as.contains("\"as\""),
+            "a written AS duplicates the column type: {duplicate_as}"
+        );
+        let bad_type = reason("CREATE TABLE t (id numeric GENERATED ALWAYS AS IDENTITY);");
+        assert!(
+            bad_type.contains("identity column type must be smallint, integer, or bigint"),
+            "only integer types can back an identity column: {bad_type}"
+        );
+    }
+
+    #[test]
+    fn create_index_validates_key_and_include_columns() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // PostgreSQL looks every key and INCLUDE column up by name.
+        assert!(
+            reason("CREATE TABLE t (a int); CREATE INDEX i ON t (nosuch);")
+                .contains("column \"nosuch\" does not exist"),
+            "an unknown key column must be rejected"
+        );
+        assert!(
+            reason("CREATE TABLE t (a int); CREATE INDEX i ON t (a) INCLUDE (nosuch);")
+                .contains("column \"nosuch\" does not exist"),
+            "an unknown INCLUDE column must be rejected"
+        );
+        // An expression key is typed rather than looked up, so it is not a
+        // column-existence question.
+        assert_eq!(
+            reason("CREATE TABLE t (a int); CREATE INDEX i ON t ((a + 1));"),
+            ""
+        );
+        assert_eq!(
+            reason("CREATE TABLE t (a int, b int); CREATE INDEX i ON t (a) INCLUDE (b);"),
+            ""
+        );
+    }
+
+    #[test]
+    fn create_index_skips_column_checks_when_the_relation_columns_are_unknown() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // PostgreSQL accepted this index; an unresolved projection leaves the
+        // columns unknown.
+        assert_eq!(
+            reason(
+                "CREATE MATERIALIZED VIEW mv AS SELECT * FROM generate_series(1,10) AS g(id);
+                 CREATE INDEX i ON mv (id);"
+            ),
+            ""
+        );
+        // A `CREATE TABLE AS` keeps only the columns it could resolve.
+        assert_eq!(
+            reason(
+                "CREATE TABLE t AS SELECT 1 AS id, 'x'::text AS label; CREATE INDEX i ON t (label);"
+            ),
+            ""
+        );
+        assert_eq!(
+            reason(
+                "CREATE TABLE t AS SELECT * FROM generate_series(1,5) AS g(id);
+                 CREATE INDEX i ON t (id);"
+            ),
+            ""
+        );
+        // Incompleteness propagates through inheritance.
+        assert_eq!(
+            reason(
+                "CREATE TABLE t AS SELECT 1 AS id;
+                 CREATE TABLE c () INHERITS (t);
+                 CREATE INDEX i ON c (id);"
+            ),
+            ""
+        );
+        // A known-complete column list still rejects an impossible column.
+        assert!(
+            reason("CREATE TABLE t (); CREATE INDEX i ON t (nosuch);")
+                .contains("column \"nosuch\" does not exist"),
+            "a complete column list cannot excuse an unknown column"
+        );
+    }
+
+    #[test]
+    fn create_index_if_not_exists_skips_a_name_held_by_another_relation() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // The guard covers the whole name, not only an index of that name.
+        assert_eq!(
+            reason(
+                "CREATE TABLE t (a int);
+                 CREATE TABLE dup (a int);
+                 CREATE INDEX IF NOT EXISTS dup ON t (a);"
+            ),
+            ""
+        );
+        assert!(
+            reason(
+                "CREATE TABLE t (a int);
+                 CREATE TABLE dup (a int);
+                 CREATE INDEX dup ON t (a);"
+            )
+            .contains("relation 'public.dup' already exists"),
+            "without the guard a same-name relation is a conflict"
+        );
+    }
+
+    #[test]
+    fn replacing_a_function_may_not_change_its_return_type() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+        let setup = "CREATE FUNCTION work(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;";
+
+        assert!(
+            reason(&format!(
+                "{setup}
+                 CREATE OR REPLACE FUNCTION work(integer) RETURNS text
+                     LANGUAGE sql AS $$ SELECT $1::text $$;"
+            ))
+            .contains("cannot change return type of existing function"),
+            "a replacement may not change the return type"
+        );
+        // The same signature with the same return type is the ordinary case.
+        assert_eq!(
+            reason(&format!(
+                "{setup}
+                 CREATE OR REPLACE FUNCTION work(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 + 1 $$;"
+            )),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_not_change_the_setof_flag() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION rows_out(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;
+                 CREATE OR REPLACE FUNCTION rows_out(integer) RETURNS SETOF integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .expect("the statements should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION rows_out(integer) RETURNS SETOF integer
+                 LANGUAGE sql AS $$ SELECT $1 $$;",
+        );
+        assert!(
+            reason.contains("cannot change return type of existing function"),
+            "`proretset` is its own catalog column, so a set change is a return \
+             type change: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_not_change_the_record_row_descriptor() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION named_row(integer, OUT total integer)
+                     RETURNS record LANGUAGE sql AS $$ SELECT $1, $1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION named_row(integer, OUT total text)
+                 RETURNS record LANGUAGE sql AS $$ SELECT $1, $1::text $$;",
+        );
+        assert!(
+            reason.contains("row type defined by OUT parameters is different"),
+            "the OUT parameters are the row descriptor: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_not_rename_an_input_parameter() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION named_input(amount integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT amount $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION named_input(total integer) RETURNS integer
+                 LANGUAGE sql AS $$ SELECT total $$;",
+        );
+        assert!(
+            reason.contains("cannot change name of input parameter \"amount\""),
+            "a named argument is part of the call syntax: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_give_an_unnamed_input_a_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION namable(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        engine
+            .analyze(
+                "CREATE OR REPLACE FUNCTION namable(amount integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT amount $$;",
+                &mut state,
+            )
+            .expect("naming a formerly unnamed parameter is allowed");
+        assert!(!state.evidence().iter().any(|record| record.code
+            == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnmodeledState));
+    }
+
+    #[test]
+    fn a_replacement_may_not_remove_a_parameter_default() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION defaulted(a integer DEFAULT 5) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION defaulted(a integer) RETURNS integer
+                 LANGUAGE sql AS $$ SELECT a $$;",
+        );
+        assert!(
+            reason.contains("cannot remove parameter defaults from existing function"),
+            "a call that relied on the default would stop resolving: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_procedure_replacement_may_not_gain_output_parameters() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE PROCEDURE reports(OUT total integer)
+                 LANGUAGE sql AS $$ SELECT 1 $$;",
+        );
+        assert!(
+            reason.contains("cannot change whether a procedure has output parameters"),
+            "a procedure's `prorettype` is `void` unless it declares output \
+             parameters: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_baseline_replacement_compares_canonical_type_spellings() {
+        // The catalog reports `format_type`'s spelling while a migration may
+        // write the alias, and `int` is not the same text as `integer`.
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        let id = object_id("public", "spelled(integer)");
+        cache.functions.insert(
+            id.clone(),
+            FunctionState {
+                return_type: "integer".into(),
+                ..FunctionState::with_inputs(
+                    id.clone(),
+                    RoutineKind::Function,
+                    vec!["integer".into()],
+                )
+            },
+        );
+        let mut state = AnalysisState::new(cache);
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION spelled(int) RETURNS int
+                     LANGUAGE sql AS $$ SELECT $1 + 1 $$;",
+            ),
+            "",
+            "a body-only replacement must not depend on how the type is spelled"
+        );
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION spelled(int) RETURNS text
+                     LANGUAGE sql AS $$ SELECT $1::text $$;",
+            )
+            .contains("cannot change return type"),
+            "a genuinely different type must still be refused"
+        );
+    }
+
+    /// A synchronized `RETURNS TABLE` routine, whose catalog spelling is the
+    /// `TABLE(...)` form `pg_get_function_result` renders.
+    fn synced_table_routine(columns: &[(&str, &str)]) -> AnalysisState {
+        let id = object_id("public", "rows()");
+        let mut function =
+            FunctionState::with_inputs(id.clone(), RoutineKind::Function, Vec::new());
+        function.return_type = format!(
+            "TABLE({})",
+            columns
+                .iter()
+                .map(|(name, ty)| format!("{name} {ty}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        function.returns_set = true;
+        function.parameters = columns
+            .iter()
+            .map(|(name, ty)| RoutineParameter {
+                name: Some((*name).to_string()),
+                mode: ParameterMode::Table,
+                ty: (*ty).to_string(),
+            })
+            .collect();
+        let mut cache = synced_cache();
+        cache.functions.insert(id, function);
+        AnalysisState::new(cache)
+    }
+
+    #[test]
+    fn a_returns_table_routine_can_be_replaced_when_its_row_descriptor_holds() {
+        let engine = setup_engine();
+        let mut state = synced_table_routine(&[("id", "integer"), ("name", "text")]);
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION rows() RETURNS TABLE(id int, name text)
+                     LANGUAGE sql AS $$ SELECT 1, ''::text $$;",
+            ),
+            "",
+            "the descriptor holds however the migration spells its types"
+        );
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION rows() RETURNS TABLE(id integer, name varchar)
+                     LANGUAGE sql AS $$ SELECT 1, ''::varchar $$;",
+            )
+            .contains("row type defined by OUT parameters is different"),
+            "the output types are the row descriptor, which cannot change"
+        );
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION rows() RETURNS TABLE(id integer, label text)
+                     LANGUAGE sql AS $$ SELECT 1, ''::text $$;",
+            )
+            .contains("row type defined by OUT parameters is different"),
+            "the output names are part of a multi-column row descriptor"
+        );
+    }
+
+    #[test]
+    fn a_single_output_parameter_is_the_return_type_rather_than_a_descriptor() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION one_out(OUT total integer) LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION one_out(OUT amount int) LANGUAGE sql AS $$ SELECT 1 $$;",
+            ),
+            "",
+            "a single OUT parameter is `prorettype`, so its name is free"
+        );
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION one_out(OUT amount bigint) LANGUAGE sql AS $$ SELECT 1 $$;",
+            )
+            .contains("cannot change return type of existing function"),
+            "changing the single output type changes `prorettype`"
+        );
+    }
+
+    #[test]
+    fn a_procedure_without_output_parameters_can_be_replaced_unchanged() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 2 $$;",
+            ),
+            "",
+            "a procedure's `pg_get_function_result` is NULL, so `prorettype` is \
+             `void` on both sides"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_state_type_that_names_nothing_is_refused() {
+        // `pg_aggregate.c` resolves the state type against the catalog before it
+        // records anything, and the built-in type catalogue is complete, so an
+        // unscoped baseline proves the absence.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE AGGREGATE total(integer)
+                     (sfunc = my_transition, stype = no_such_type);",
+            )
+            .contains("type \"no_such_type\" does not exist"),
+            "a state type nobody has is refused the way PostgreSQL refuses it"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_support_function_is_not_declared_missing_from_the_catalog() {
+        // Synchronization never reads `pg_catalog`, so a built-in transition
+        // function such as `int4pl` is not in the modeled universe. Its absence
+        // there is not proof, so the statement must not be refused for it.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE AGGREGATE total(integer) (sfunc = int4pl, stype = integer);",
+            ),
+            "",
+            "a routine outside the synchronized scope cannot be proven missing"
+        );
+    }
+
+    #[test]
+    fn a_transition_function_the_chain_dropped_is_not_a_name_in_use() {
+        // A tombstone is not a routine the aggregate can name, so the reference
+        // stays unverifiable instead of counting as resolved.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION public.gone_transition(integer, integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .expect("the transition function should be created");
+        engine
+            .analyze(
+                "DROP FUNCTION public.gone_transition(integer, integer);",
+                &mut state,
+            )
+            .expect("the transition function should be dropped");
+        engine
+            .analyze(
+                "CREATE AGGREGATE public.total(integer)
+                     (sfunc = gone_transition, stype = integer);",
+                &mut state,
+            )
+            .expect("the aggregate should analyze");
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn a_name_only_view_reference_blocks_a_drop_only_when_one_overload_can_fill_it() {
+        for (extra_overload, expect_conflict) in [(false, true), (true, false)] {
+            let engine = setup_engine();
+            let mut cache = synced_cache();
+            let view = object_id("public", "v");
+            cache.insert_baseline(
+                view.clone(),
+                RelationState::new(
+                    view.clone(),
+                    object_id("", "postgres"),
+                    0,
+                    Some(0),
+                    RelationKind::View,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+            let target = object_id("public", "f(integer)");
+            cache.functions.insert(
+                target.clone(),
+                FunctionState {
+                    return_type: "integer".into(),
+                    ..FunctionState::with_inputs(
+                        target.clone(),
+                        RoutineKind::Function,
+                        vec!["integer".into()],
+                    )
+                },
+            );
+            if extra_overload {
+                let other = object_id("public", "f(text)");
+                cache.functions.insert(
+                    other.clone(),
+                    FunctionState {
+                        return_type: "text".into(),
+                        ..FunctionState::with_inputs(
+                            other.clone(),
+                            RoutineKind::Function,
+                            vec!["text".into()],
+                        )
+                    },
+                );
+            }
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+            // A call the body could not pin to a signature names the routine
+            // only, which is what `views_for_function` matches by name.
+            let written = object_id("public", "f");
+            state.local.graph.add_edge(DependencyEdge::new(
+                view.clone(),
+                written.clone(),
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: Some(written.clone()),
+                },
+            ));
+
+            let violations = engine
+                .analyze("DROP FUNCTION public.f(integer);", &mut state)
+                .expect("the drop should analyze");
+            let blocked = violations
+                .iter()
+                .any(|violation| violation.reason.contains("is required by view"));
+            if expect_conflict {
+                assert!(blocked, "one overload makes the view reference definite");
+            } else {
+                assert!(!blocked, "a second overload leaves the reference open");
+                assert_eq!(state.local.confidence, Confidence::Tainted);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_defaults_make_their_expression_types_unverifiable() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION keeps_default(a integer DEFAULT 5) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        engine
+            .analyze(
+                "CREATE OR REPLACE FUNCTION keeps_default(a integer DEFAULT 6) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+                &mut state,
+            )
+            .expect("retaining a default is allowed");
+        assert!(
+            state.evidence().iter().any(|record| record.code
+                == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics),
+            "PostgreSQL compares the type of each retained default, and only the \
+             server can type a default expression"
+        );
+    }
+
+    #[test]
+    fn alter_procedure_options_are_applied_rather_than_dropped() {
+        use safe_migrate::_internal::model::function::{FunctionOverlay, SecurityMode};
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE PROCEDURE do_work() LANGUAGE sql SECURITY INVOKER AS $$ SELECT 1 $$;
+                 ALTER PROCEDURE do_work() SECURITY DEFINER;",
+                &mut state,
+            )
+            .expect("the statements should analyze");
+        assert!(
+            matches!(
+                state.local.functions.get(&object_id("public", "do_work()")),
+                Some(FunctionOverlay::Present(function)) if function.security == SecurityMode::Definer
+            ),
+            "ALTER PROCEDURE must apply the option it carries"
+        );
+    }
+
+    #[test]
+    fn a_statement_the_build_claims_keeps_every_action() {
+        use safe_migrate::_internal::model::relation::RelationOverlay;
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a int, b int);
+                 CREATE SEQUENCE s INCREMENT BY 1;
+                 ALTER TABLE t ADD COLUMN c int, ALTER COLUMN a SET DEFAULT 1;
+                 ALTER SEQUENCE s INCREMENT BY 2 CACHE 5;",
+                &mut state,
+            )
+            .expect("the statements should analyze");
+
+        assert!(
+            state
+                .local
+                .relations
+                .get(&object_id("public", "t"))
+                .is_some_and(|overlay| matches!(
+                    overlay,
+                    RelationOverlay::Present(relation)
+                        if relation.has_column("c") && relation.has_column("a")
+                )),
+            "ALTER TABLE must apply every action it carries"
+        );
+        assert!(
+            state
+                .local
+                .sequences
+                .get(&object_id("public", "s"))
+                .is_some_and(|overlay| matches!(
+                    overlay,
+                    SequenceOverlay::Present(sequence)
+                        if sequence.parameters.increment == 2
+                            && sequence.parameters.cache_size == 5
+                )),
+            "ALTER SEQUENCE must apply every option it carries"
+        );
+    }
+
+    #[test]
     fn sequence_rename_preserves_default_dependency() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -4449,6 +5432,78 @@ mod state_mutation_tests {
         ));
     }
 
+    /// PostgreSQL has one array type per element, so `name[]` and `name[][]` are
+    /// one argument type, and an array argument is not its element.
+    #[test]
+    fn an_array_argument_names_the_element_array_type() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('sad');
+                 CREATE FUNCTION arr_arg(value mood[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION dim_arg(value integer[][]) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+
+        for drop in [
+            "DROP FUNCTION arr_arg(mood[]);",
+            "DROP FUNCTION arr_arg(mood[][]);",
+            "DROP FUNCTION dim_arg(integer[]);",
+            "DROP FUNCTION dim_arg(integer[][]);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(
+                    &format!(
+                        "CREATE TYPE mood AS ENUM ('sad');
+                         CREATE FUNCTION arr_arg(value mood[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION dim_arg(value integer[][]) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;
+                         {drop}"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{drop}"
+            );
+        }
+
+        // The element and its array remain distinct functions.
+        for drop in [
+            "DROP FUNCTION arr_arg(mood);",
+            "DROP FUNCTION dim_arg(integer);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(
+                    &format!(
+                        "CREATE TYPE mood AS ENUM ('sad');
+                         CREATE FUNCTION arr_arg(value mood[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION dim_arg(value integer[][]) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;
+                         {drop}"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{drop}"
+            );
+        }
+    }
+
     #[test]
     fn rename_type_remaps_modeled_dependent_references() {
         let engine = setup_engine();
@@ -4502,6 +5557,1267 @@ mod state_mutation_tests {
         };
         assert_eq!(function.arg_types, vec!["emotion"]);
         assert_eq!(function.return_type, "emotion");
+    }
+
+    /// A declaration the server refuses: a modifier outside its range, or a
+    /// type nothing resolves to.
+    #[test]
+    fn a_type_declaration_the_server_refuses_is_a_conflict() {
+        let engine = setup_engine();
+        for sql in [
+            "CREATE TABLE bad (c varchar(10485761));",
+            "CREATE TABLE bad (c numeric(0));",
+            "CREATE TABLE bad (c numeric(1001));",
+            "CREATE TABLE bad (c no_such_type);",
+            "CREATE DOMAIN bad AS no_such_type;",
+            "CREATE TYPE bad AS (a no_such_type);",
+            "CREATE TYPE bad AS RANGE (subtype = no_such_type);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn if_exists_guards_only_the_relation_lookup() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // PostgreSQL notices and skips; neither statement is an error.
+        assert!(
+            conflicts("ALTER VIEW IF EXISTS missing RENAME TO other;").is_empty(),
+            "ALTER VIEW IF EXISTS must skip a missing view"
+        );
+        assert!(
+            conflicts("ALTER MATERIALIZED VIEW IF EXISTS missing RENAME TO other;").is_empty(),
+            "ALTER MATERIALIZED VIEW IF EXISTS must skip a missing view"
+        );
+
+        // The guard does not cover a relation of the wrong kind.
+        assert!(
+            conflicts("CREATE TABLE t (a int); ALTER VIEW IF EXISTS t RENAME TO other;")
+                .iter()
+                .any(|message| message.contains("is not a view")),
+            "IF EXISTS must not suppress the wrong-kind error"
+        );
+
+        // Without the guard the same statement conflicts.
+        assert!(
+            conflicts("ALTER VIEW missing RENAME TO other;")
+                .iter()
+                .any(|message| message.contains("does not exist")),
+            "an unguarded ALTER of a missing view must conflict"
+        );
+    }
+
+    #[test]
+    fn create_materialized_view_if_not_exists_skips_an_existing_relation() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count()
+        };
+        assert_eq!(
+            conflicts(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 2 AS a;"
+            ),
+            0,
+            "IF NOT EXISTS must skip the existing relation"
+        );
+        assert_eq!(
+            conflicts(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE MATERIALIZED VIEW mv AS SELECT 2 AS a;"
+            ),
+            1,
+            "an unguarded duplicate materialized view must conflict"
+        );
+    }
+
+    #[test]
+    fn refresh_without_data_leaves_the_view_unpopulated() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // `WITH NO DATA` is a modeled state change, not an opaque statement.
+        let unpopulated = conflicts(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+        );
+        assert!(
+            unpopulated
+                .iter()
+                .any(|message| message.contains("is not populated")),
+            "a concurrent refresh of an unpopulated view must conflict: {unpopulated:?}"
+        );
+
+        // PostgreSQL rejects the option pair before looking for a unique index.
+        let pair = conflicts(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA;",
+        );
+        assert!(
+            pair.iter()
+                .any(|message| message.contains("cannot be used together")),
+            "CONCURRENTLY with WITH NO DATA must conflict: {pair:?}"
+        );
+
+        // A plain refresh repopulates, so the populated-state conflict goes away.
+        let repopulated = conflicts(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;
+             REFRESH MATERIALIZED VIEW mv;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+        );
+        assert!(
+            !repopulated
+                .iter()
+                .any(|message| message.contains("is not populated")),
+            "a populated view must not report the populated-state conflict: {repopulated:?}"
+        );
+    }
+
+    #[test]
+    fn a_view_depends_on_the_types_its_body_casts_to() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count()
+        };
+        assert_eq!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1::ct AS r;
+                 DROP TYPE ct;"
+            ),
+            1,
+            "a cast to a user type must block dropping it"
+        );
+        assert_eq!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1::ct AS r;
+                 DROP TYPE ct CASCADE;"
+            ),
+            0,
+            "CASCADE applies the drop; the view fallout is reported as unmodeled"
+        );
+        assert_eq!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1 AS r;
+                 DROP TYPE ct;"
+            ),
+            0,
+            "a view that never names the type must not block it"
+        );
+    }
+
+    #[test]
+    fn a_view_depends_on_every_routine_its_query_calls() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        let blocked = |sql: &str| {
+            conflicts(sql)
+                .iter()
+                .any(|reason| reason.contains("is required by view"))
+        };
+
+        // The call is in the target list.
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 DROP FUNCTION f(integer);"
+            ),
+            "a view's target list is a routine dependency"
+        );
+        // The call is in the WHERE clause, which the old scan never reached.
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT a FROM t WHERE f(a) > 0;
+                 DROP FUNCTION f(integer);"
+            ),
+            "a view's WHERE clause is a routine dependency"
+        );
+        // CASCADE clears the dependent view.
+        assert!(
+            !blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT a FROM t WHERE f(a) > 0;
+                 DROP FUNCTION f(integer) CASCADE;
+                 DROP VIEW v;"
+            ),
+            "CASCADE must drop the dependent view"
+        );
+        // An exact reference must not block a different overload.
+        assert!(
+            !blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE FUNCTION f(text) RETURNS text AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 DROP FUNCTION f(text);"
+            ),
+            "an exact signature must not block another overload"
+        );
+        // A call whose arguments do not resolve names no overload, so the
+        // drop is reported unresolved rather than as a conflict.
+        let undecided = conflicts(
+            "CREATE TABLE t (a int);
+             CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+             CREATE FUNCTION f(text) RETURNS text AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+             CREATE VIEW v AS SELECT f(a + 1) AS fa FROM t;
+             DROP FUNCTION f(text);",
+        );
+        assert!(
+            !undecided
+                .iter()
+                .any(|reason| reason.contains("is required by view")),
+            "an unresolved reference must not report a conflict: {undecided:?}"
+        );
+    }
+
+    #[test]
+    fn a_view_reference_follows_a_rename_of_its_target() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        let blocked = |sql: &str| {
+            conflicts(sql)
+                .iter()
+                .any(|reason| reason.contains("is required by view"))
+        };
+
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 ALTER FUNCTION f(integer) RENAME TO g;
+                 DROP FUNCTION g(integer);"
+            ),
+            "a resolved call must follow the renamed routine"
+        );
+        assert!(
+            blocked(
+                "CREATE SCHEMA other;
+                 CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 ALTER FUNCTION f(integer) SET SCHEMA other;
+                 DROP FUNCTION other.f(integer);"
+            ),
+            "a resolved call must follow the moved routine"
+        );
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a + 1) AS fa FROM t;
+                 ALTER FUNCTION f(integer) RENAME TO g;
+                 DROP FUNCTION g(integer);"
+            ),
+            "a name-only reference must follow a fully moved name"
+        );
+        assert!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT a FROM t WHERE a::ct IS NOT NULL;
+                 ALTER TYPE ct RENAME TO renamed_ct;
+                 DROP TYPE renamed_ct;"
+            )
+            .iter()
+            .any(|reason| reason.contains("dependent objects")),
+            "a view cast must follow the renamed type"
+        );
+    }
+
+    #[test]
+    fn cascading_a_function_drop_covers_only_the_moved_name() {
+        let engine = setup_engine();
+        let state_after = |functions: &[&str], sql: &str| {
+            let mut cache = synced_cache();
+            cache.metadata.source_search_path = Some(vec!["public".to_string()]);
+            for ty in functions {
+                let id = object_id("public", &format!("f({ty})"));
+                cache.functions.insert(
+                    id.clone(),
+                    FunctionState {
+                        return_type: ty.to_string(),
+                        ..FunctionState::with_inputs(
+                            id.clone(),
+                            RoutineKind::Function,
+                            vec![ty.to_string()],
+                        )
+                    },
+                );
+            }
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+            engine.analyze(sql, &mut state).unwrap();
+            state
+        };
+        let view = object_id("public", "v");
+        let prefix = "CREATE TABLE t (a int);
+                      CREATE VIEW v AS SELECT a FROM t WHERE f(a + 1) > 0;";
+
+        // One overload survives, so the name-only reference may call it: the
+        // view is kept and the chain stops being exact.
+        let state = state_after(
+            &["integer", "text"],
+            &format!("{prefix} DROP FUNCTION f(integer) CASCADE;"),
+        );
+        assert!(
+            state.relation_is_present(&view),
+            "the view may call the surviving overload"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+
+        // The statement covers every overload, so the view is definitely gone.
+        let state = state_after(
+            &["integer", "text"],
+            &format!("{prefix} DROP FUNCTION f(integer), f(text) CASCADE;"),
+        );
+        assert!(!state.relation_is_present(&view));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+
+        // A lone overload resolves, so the view is dropped as before.
+        let state = state_after(
+            &["integer"],
+            &format!("{prefix} DROP FUNCTION f(integer) CASCADE;"),
+        );
+        assert!(!state.relation_is_present(&view));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn cascading_a_type_drop_removes_a_dependent_view_and_frees_the_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let ct = object_id("public", "ct");
+        let view = object_id("public", "v");
+        engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1::ct AS r;
+                 DROP TYPE ct CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            matches!(state.local.types.get(&ct), Some(TypeOverlay::Dropped)),
+            "the cascade must not refuse to mark the type dropped"
+        );
+        assert!(
+            !state.relation_is_present(&view),
+            "the view casting to the type goes with it"
+        );
+        let violations = engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1 AS r;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0,
+            "both names must be free again: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn cascading_a_domain_drop_removes_dependent_columns() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let domain = object_id("public", "d");
+        let table = object_id("public", "t");
+        let violations = engine
+            .analyze(
+                "CREATE DOMAIN d AS int;
+                 CREATE TABLE t (a d);
+                 DROP DOMAIN d CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&domain),
+            Some(TypeOverlay::Dropped)
+        ));
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("the table survives a column cascade");
+        };
+        assert!(
+            !relation.has_column("a"),
+            "the column of the dropped domain goes with it"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_type_dependent_the_gate_must_see_blocks_a_plain_drop() {
+        let engine = setup_engine();
+        let conflicts = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        for sql in [
+            // A composite field typed by the type.
+            "CREATE TYPE inner_t AS ENUM ('a');
+             CREATE TYPE outer_t AS (f inner_t);
+             DROP TYPE inner_t;",
+            // A range built on the type.
+            "CREATE TYPE sub_t AS ENUM ('a');
+             CREATE TYPE span_t AS RANGE (subtype = sub_t);
+             DROP TYPE sub_t;",
+            // An array column collapsed onto the element's array identity.
+            "CREATE TYPE tag_t AS ENUM ('a');
+             CREATE TABLE t (tags tag_t[]);
+             DROP TYPE tag_t;",
+            // A routine whose signature names the type.
+            "CREATE TYPE mood AS ENUM ('a');
+             CREATE FUNCTION m(mood) RETURNS mood AS 'SELECT $1' LANGUAGE sql;
+             DROP TYPE mood;",
+        ] {
+            assert!(
+                conflicts(sql)
+                    .iter()
+                    .any(|reason| reason.contains("dependent objects")),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn cascading_a_type_drop_removes_dependent_columns_and_fields() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE inner_t AS ENUM ('a');
+                 CREATE TYPE outer_t AS (f inner_t);
+                 CREATE TABLE t1 (a inner_t);
+                 CREATE TABLE t2 (tags inner_t[]);",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze("DROP TYPE inner_t CASCADE;", &mut state)
+            .unwrap();
+        let inner = object_id("public", "inner_t");
+        assert!(matches!(
+            state.local.types.get(&inner),
+            Some(TypeOverlay::Dropped)
+        ));
+        let Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Composite { fields },
+            ..
+        })) = state.local.types.get(&object_id("public", "outer_t"))
+        else {
+            panic!("the composite survives a field cascade");
+        };
+        assert!(
+            fields.iter().all(|field| field.name != "f"),
+            "the field of the dropped type goes with it"
+        );
+        for (table, column) in [("t1", "a"), ("t2", "tags")] {
+            let RelationOverlay::Present(relation) = state
+                .local
+                .relations
+                .get(&object_id("public", table))
+                .unwrap()
+            else {
+                panic!("{table} survives a column cascade");
+            };
+            assert!(
+                !relation.has_column(column),
+                "column {column} of {table} goes with the type"
+            );
+        }
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cascading_a_type_drop_takes_the_ranges_built_on_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE sub_t AS ENUM ('a');
+                 CREATE TYPE span_t AS RANGE (subtype = sub_t);
+                 DROP TYPE sub_t CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                state.local.types.get(&object_id("public", "span_t")),
+                Some(TypeOverlay::Dropped)
+            ),
+            "the range built on the type goes with it"
+        );
+    }
+
+    #[test]
+    fn cascading_a_type_drop_removes_typed_tables_and_routines() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let tof = object_id("public", "tof");
+        engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;
+                 CREATE FUNCTION uses_ct(ct) RETURNS ct AS 'SELECT $1' LANGUAGE sql;
+                 DROP TYPE ct CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&tof),
+            "a typed table is dropped whole by the cascade"
+        );
+        assert!(
+            !state.local.functions.iter().any(|(id, overlay)| {
+                matches!(overlay, FunctionOverlay::Present(_))
+                    && DependencyGraph::split_routine_signature(id).1 == "uses_ct"
+            }),
+            "the routine naming the type in its signature goes with it"
+        );
+        let violations = engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0,
+            "both names must be free again: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_type_drop_is_refused_when_a_typed_table_depends_on_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let ct = object_id("public", "ct");
+        let tof = object_id("public", "tof");
+        engine
+            .analyze(
+                "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;
+                 DROP TYPE ct;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.relation_is_present(&tof));
+        assert!(matches!(
+            state.local.types.get(&ct),
+            Some(TypeOverlay::Present(_))
+        ));
+        let violations = engine.analyze("DROP TYPE ct CASCADE;", &mut state).unwrap();
+        assert!(!state.relation_is_present(&tof));
+        assert!(matches!(
+            state.local.types.get(&ct),
+            Some(TypeOverlay::Dropped)
+        ));
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0,
+            "typed table must be free to recreate: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn cascading_a_schema_drop_removes_type_dependents_outside_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SCHEMA s;
+                 CREATE TYPE s.ct AS (z int);
+                 CREATE TABLE t (a s.ct);
+                 DROP SCHEMA s CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&object_id("s", "ct")),
+            Some(TypeOverlay::Dropped)
+        ));
+        let RelationOverlay::Present(relation) = state
+            .local
+            .relations
+            .get(&object_id("public", "t"))
+            .unwrap()
+        else {
+            panic!("the table outside the schema survives");
+        };
+        assert!(
+            !relation.has_column("a"),
+            "the column typing itself with the dropped schema's type goes"
+        );
+    }
+
+    #[test]
+    fn a_routine_cascade_drops_triggers_of_cascaded_views() {
+        use safe_migrate::_internal::model::trigger::TriggerOverlay;
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f() RETURNS trigger AS 'BEGIN RETURN NULL; END' LANGUAGE plpgsql;
+                 CREATE FUNCTION g(int) RETURNS int AS 'SELECT $1' LANGUAGE sql;
+                 CREATE VIEW v AS SELECT g(a) AS ga FROM t;
+                 CREATE TRIGGER trg INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f();
+                 DROP FUNCTION g(integer) CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&object_id("public", "v")),
+            "the view calling the routine goes with it"
+        );
+        assert!(
+            !state.local.triggers.values().any(|overlay| matches!(
+                overlay,
+                TriggerOverlay::Present(trigger) if trigger.name == "trg"
+            )),
+            "the trigger on the cascaded view goes with it"
+        );
+    }
+
+    #[test]
+    fn a_ranges_multirange_companion_blocks_and_cascades_with_it() {
+        let engine = setup_engine();
+        let sub = object_id("public", "sub_t");
+        let range = object_id("public", "span_t");
+        let companion = object_id("public", "span_t_multirange");
+        let table_id = object_id("public", "t");
+        let build = || {
+            let mut cache = synced_cache();
+            for (id, kind) in [
+                (
+                    sub.clone(),
+                    TypeKind::Enum {
+                        variants: vec!["a".to_string()],
+                    },
+                ),
+                (
+                    range.clone(),
+                    TypeKind::Range {
+                        subtype: Some("sub_t".to_string()),
+                        subtype_id: Some(sub.clone()),
+                    },
+                ),
+                (companion.clone(), TypeKind::Multirange),
+            ] {
+                cache.types.insert(
+                    id.clone(),
+                    TypeState {
+                        id: id.clone(),
+                        generation: 0,
+                        kind,
+                    },
+                );
+            }
+            let mut table = RelationState::new(
+                table_id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            );
+            let mut column = Column::migration_created(
+                "c".to_string(),
+                Some("span_t_multirange".to_string()),
+                true,
+                None,
+            );
+            column.type_id = Some(companion.clone());
+            table.columns.push(column);
+            cache.insert_baseline(table_id.clone(), table);
+            AnalysisState::new(cache)
+        };
+
+        // A column of the companion blocks the plain drop, as PostgreSQL
+        // reports it as a dependent of the range.
+        let mut state = build();
+        let violations = engine.analyze("DROP TYPE span_t;", &mut state).unwrap();
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict"
+                    && violation.reason.contains("dependent objects")
+            }),
+            "{violations:?}"
+        );
+
+        // The cascade removes the companion and the column, not the table.
+        let mut state = build();
+        engine
+            .analyze("DROP TYPE span_t CASCADE;", &mut state)
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&range),
+            Some(TypeOverlay::Dropped)
+        ));
+        assert!(matches!(
+            state.local.types.get(&companion),
+            Some(TypeOverlay::Dropped)
+        ));
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table_id).unwrap()
+        else {
+            panic!("the table survives");
+        };
+        assert!(!relation.has_column("c"));
+    }
+
+    #[test]
+    fn cascading_a_procedure_drop_applies_like_a_plain_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
+                 DROP PROCEDURE p() CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "p()")),
+            Some(FunctionOverlay::Dropped)
+        ));
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn dropping_an_aggregate_a_view_calls_requires_cascade() {
+        let engine = setup_engine();
+        let setup = "CREATE TABLE t (a int);
+                     CREATE FUNCTION af(int, int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+                     CREATE AGGREGATE ag(int) (SFUNC = af, STYPE = int);
+                     CREATE VIEW v AS SELECT ag(a) AS x FROM t;";
+
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(&format!("{setup} DROP AGGREGATE ag(int);"), &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"
+                    && violation.reason.contains("required by view")),
+            "a view call must block dropping the aggregate: {violations:?}"
+        );
+
+        let mut state = setup_state();
+        engine
+            .analyze(
+                &format!("{setup} DROP AGGREGATE ag(int) CASCADE;"),
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.relation_is_present(&object_id("public", "v")));
+        assert!(matches!(
+            state
+                .local
+                .functions
+                .get(&object_id("public", "ag(integer)")),
+            Some(FunctionOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn cascading_a_function_drop_removes_transitive_view_dependents() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+                 CREATE VIEW v AS SELECT f() AS x;
+                 CREATE VIEW w AS SELECT * FROM v;
+                 CREATE MATERIALIZED VIEW m AS SELECT * FROM v;
+                 DROP FUNCTION f() CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.relation_is_present(&object_id("public", "v")));
+        assert!(!state.relation_is_present(&object_id("public", "w")));
+        assert!(!state.relation_is_present(&object_id("public", "m")));
+    }
+
+    #[test]
+    fn view_column_lists_rename_the_projection_prefix() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v (x) AS SELECT a, b FROM t;
+                 CREATE MATERIALIZED VIEW m (y) AS SELECT a, b FROM t;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .relation_column_types(&object_id("public", "v"))
+                .unwrap(),
+            vec![
+                ("x".to_string(), Some("integer".to_string())),
+                ("b".to_string(), Some("integer".to_string())),
+            ]
+        );
+        assert_eq!(
+            state
+                .relation_column_types(&object_id("public", "m"))
+                .unwrap(),
+            vec![
+                ("y".to_string(), Some("integer".to_string())),
+                ("b".to_string(), Some("integer".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_column_list_longer_than_the_projection_is_a_conflict() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v (x, y, z) AS SELECT a, b FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("CREATE VIEW specifies more column names than columns")),
+            "a view column list may not exceed the projection"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE MATERIALIZED VIEW m (x, y, z) AS SELECT a, b FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("too many column names were specified")),
+            "a materialized view column list may not exceed the projection"
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_requires_a_usable_unique_index() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let missing = conflicts(
+            "CREATE TABLE t (id int);
+             CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY m;",
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|reason| reason.contains("cannot refresh materialized view 'public.m")),
+            "a concurrent refresh without a unique index must conflict: {missing:?}"
+        );
+
+        let usable = conflicts(
+            "CREATE TABLE t (id int);
+             CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+             CREATE UNIQUE INDEX m_id_idx ON m (id);
+             REFRESH MATERIALIZED VIEW CONCURRENTLY m;",
+        );
+        assert!(
+            usable.is_empty(),
+            "a usable unique index must allow the concurrent refresh: {usable:?}"
+        );
+
+        for keys in ["(id) WHERE id > 0", "((id + 1))"] {
+            let partial = conflicts(&format!(
+                "CREATE TABLE t (id int);
+                 CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+                 CREATE UNIQUE INDEX m_id_idx ON m {keys};
+                 REFRESH MATERIALIZED VIEW CONCURRENTLY m;"
+            ));
+            assert!(
+                partial
+                    .iter()
+                    .any(|reason| reason.contains("cannot refresh materialized view 'public.m")),
+                "a partial or expression index is not usable: {partial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_view_creation_validates_its_options() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let bad_value =
+            conflicts("CREATE MATERIALIZED VIEW m WITH (fillfactor = 5) AS SELECT 1 AS id;");
+        assert!(
+            bad_value
+                .iter()
+                .any(|reason| reason.contains("invalid value for parameter \"fillfactor\"")),
+            "a value outside the option's domain must conflict: {bad_value:?}"
+        );
+
+        let view_only = conflicts(
+            "CREATE MATERIALIZED VIEW m WITH (check_option = 'cascaded') AS SELECT 1 AS id;",
+        );
+        assert!(
+            view_only
+                .iter()
+                .any(|reason| reason.contains("unrecognized parameter \"check_option\"")),
+            "a view-only option must not reach a materialized view: {view_only:?}"
+        );
+
+        let accepted =
+            conflicts("CREATE MATERIALIZED VIEW m WITH (fillfactor = 70) AS SELECT 1 AS id;");
+        assert!(
+            accepted.is_empty(),
+            "a valid option must not conflict: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_a_materialized_views_populated_state() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The rollback must undo the refresh, or the concurrent refresh below
+        // would reach the unique-index check instead of the populated one.
+        let after_rollback = conflicts(
+            "CREATE MATERIALIZED VIEW m AS SELECT 1 AS id WITH NO DATA;
+             BEGIN;
+             REFRESH MATERIALIZED VIEW m;
+             ROLLBACK;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY m;",
+        );
+        assert!(
+            after_rollback
+                .iter()
+                .any(|reason| reason.contains("is not populated")),
+            "a rolled-back refresh must restore the unpopulated state: {after_rollback:?}"
+        );
+    }
+
+    #[test]
+    fn create_or_replace_view_only_appends_columns() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT b AS renamed FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("cannot change name of view column \"a\" to \"renamed\"")),
+            "a leading column may not be renamed"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT a, b FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT a FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("cannot drop columns from view")),
+            "columns may not be dropped"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, c text);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT c AS a FROM t;"
+            )
+            .iter()
+            .any(|reason| reason
+                .contains("cannot change data type of view column \"a\" from integer to text")),
+            "a leading column may not change type"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a varchar(10), c varchar(20));
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT c AS a FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("from character varying(10) to character varying(20)")),
+            "a typmod change is a type change"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT a, b FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT a, b, 1 AS c FROM t;"
+            )
+            .is_empty(),
+            "appending columns is allowed"
+        );
+    }
+
+    #[test]
+    fn a_materialized_view_carries_its_columns_and_storage() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // A view expanding `*` over a materialized view must see its columns,
+        // and an explicit column list renames them.
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t (id int, nm text);
+                 CREATE MATERIALIZED VIEW mv (xx, yy) USING heap AS SELECT id, nm FROM t;
+                 CREATE VIEW v AS SELECT * FROM mv;
+                 ALTER VIEW v ALTER COLUMN yy SET DEFAULT 1;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "a materialized view must expose the renamed columns: {violations:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact,
+            "modeled storage and column state must not taint"
+        );
+    }
+
+    #[test]
+    fn a_rejected_declaration_does_not_block_the_valid_ones() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE ok_a (c text, d text[], e serial, f bigserial);
+                 CREATE DOMAIN ok_dom AS text;
+                 CREATE TYPE ok_enum AS ENUM ('a', 'b');
+                 CREATE TYPE ok_comp AS (a int, b text);
+                 CREATE TYPE ok_range AS RANGE (subtype = int4);
+                 CREATE TYPE ok_range2 AS RANGE (subtype = text);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "valid declarations must still apply"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_enum_label_is_a_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze("CREATE TYPE dup AS ENUM ('a', 'a');", &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    /// PostgreSQL rewrites unless the catalog type and its modifier are
+    /// unchanged, so only these changes are metadata-only. Measured against a
+    /// live server by watching `relfilenode` change.
+    #[test]
+    fn type_change_rewrite_matches_postgres_rewrite_behaviour() {
+        let engine = setup_engine();
+        for (column, declared, rewrites) in [
+            ("numeric(5,2)", "numeric(6,2)", false),
+            ("numeric(5,2)", "numeric(7,2)", false),
+            ("numeric(5,2)", "numeric", false),
+            ("numeric(5,2)", "numeric(5,3)", true),
+            ("numeric(5,2)", "numeric(4,2)", true),
+            ("numeric(5,2)", "numeric(5,1)", true),
+            ("varchar(50)", "varchar(100)", false),
+            ("varchar(50)", "text", false),
+            ("varchar(50)", "varchar(10)", true),
+            ("int", "integer", false),
+            ("int", "bigint", true),
+            ("character(5)", "character(10)", true),
+            ("character(5)", "varchar(5)", true),
+            ("character(5)", "text", true),
+        ] {
+            let sql = format!(
+                "CREATE TABLE probe (c {column});\
+                 ALTER TABLE probe ALTER COLUMN c TYPE {declared};"
+            );
+            let mut state = setup_state();
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            let reported = violations
+                .iter()
+                .any(|violation| violation.rule_id == "type-change-rewrite");
+            assert_eq!(reported, rewrites, "{column} -> {declared}");
+        }
+    }
+
+    #[test]
+    fn a_canonical_alias_is_not_a_rewrite() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE alias_probe (a int, b integer, c int4);
+                 ALTER TABLE alias_probe ALTER COLUMN a TYPE integer;
+                 ALTER TABLE alias_probe ALTER COLUMN b TYPE int4;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "type-change-rewrite"),
+            "two spellings of one type are one type"
+        );
     }
 
     #[test]
@@ -4672,16 +6988,12 @@ mod state_mutation_tests {
         cache.functions.insert(
             function_id.clone(),
             FunctionState {
-                id: function_id.clone(),
-                internal_type_owner: None,
-                routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
-                arg_types: vec!["mood".into()],
-                arg_type_ids: Vec::new(),
                 return_type: "mood".into(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".into(),
-                security: SecurityMode::Invoker,
+                ..FunctionState::with_inputs(
+                    function_id.clone(),
+                    safe_migrate::_internal::model::function::RoutineKind::Function,
+                    vec!["mood".into()],
+                )
             },
         );
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -4860,7 +7172,7 @@ mod state_mutation_tests {
         };
         assert_eq!(variants("sm_core"), ["core_final", "sm_core_only"]);
         assert_eq!(variants("public"), ["public_new", "public_only"]);
-        assert_eq!(state.local.search_path, ["sm_core", "public"]);
+        assert_eq!(state.search_path_names(), ["sm_core", "public"]);
     }
 
     #[test]
@@ -4869,6 +7181,14 @@ mod state_mutation_tests {
         let mut cache = synced_cache();
         cache.metadata.source_role = Some("app_user".into());
         for schema in ["app_user", "public"] {
+            cache.schemas.insert(
+                schema.to_string(),
+                SchemaState {
+                    name: schema.to_string(),
+                    owner: object_id("", "postgres"),
+                    generation: 0,
+                },
+            );
             let id = object_id(schema, "mood");
             cache.types.insert(
                 id.clone(),
@@ -4893,7 +7213,7 @@ mod state_mutation_tests {
 
         assert_eq!(state.local.current_role, "app_user");
         assert!(state.local.current_role_known);
-        assert_eq!(state.local.search_path, ["app_user", "public"]);
+        assert_eq!(state.search_path_names(), ["app_user", "public"]);
         assert_eq!(state.local.confidence, Confidence::Exact);
         let Some(TypeOverlay::Present(type_state)) =
             state.local.types.get(&object_id("app_user", "mood"))
@@ -4909,7 +7229,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn cache_without_role_provenance_taints_explicit_user_search_path() {
+    fn an_unknown_user_schema_taints_only_the_lookup_that_resolves_past_it() {
         let engine = setup_engine();
         let mut cache = synced_cache();
         let id = object_id("public", "mood");
@@ -4926,16 +7246,269 @@ mod state_mutation_tests {
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
-            .analyze(
-                "SET search_path TO \"$user\", public;
-                 ALTER TYPE mood RENAME VALUE 'old' TO 'new';",
-                &mut state,
-            )
+            .analyze("SET search_path TO \"$user\", public;", &mut state)
             .unwrap();
 
         assert!(!state.local.current_role_known);
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(
+            state.local.search_path,
+            [
+                SearchPathEntry::Unresolved(None),
+                SearchPathEntry::Schema("public".to_string())
+            ]
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Exact,
+            "an unresolved entry is only uncertain once a lookup resolves past it"
+        );
+
+        engine
+            .analyze("ALTER TYPE mood RENAME VALUE 'old' TO 'new';", &mut state)
+            .unwrap();
+
         assert_eq!(state.local.confidence, Confidence::Tainted);
+        let Some(TypeOverlay::Present(type_state)) = state.local.types.get(&id) else {
+            panic!("public.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["old".into()]
+            },
+            "a target behind the unresolved $user schema is reported, not mutated"
+        );
+    }
+
+    #[test]
+    fn a_scoped_baseline_does_not_make_its_scope_searchable() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(Some(&["app".to_string()])),
+            CatalogFamily::ALL,
+        );
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "app".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        // The sync session searched a schema the scope omits, so its contents
+        // are unknown; the scope itself must not become reachable instead.
+        cache.metadata.source_search_path = Some(vec!["public".to_string()]);
+        cache.search_path = Vec::new();
+        let id = object_id("app", "mood");
+        cache.types.insert(
+            id.clone(),
+            TypeState {
+                id,
+                generation: 0,
+                kind: TypeKind::Enum {
+                    variants: vec!["old".into()],
+                },
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("ALTER TYPE mood RENAME VALUE 'old' TO 'new';", &mut state)
+            .unwrap();
+
+        assert_eq!(state.search_path_names(), Vec::<String>::new());
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("app", "mood"))
+        else {
+            panic!("app.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["old".into()]
+            },
+            "the out-of-scope search path entry must not be replaced by the sync scope"
+        );
+    }
+
+    #[test]
+    fn a_creation_behind_an_unresolved_path_entry_is_reported_not_placed() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(Some(&["public".to_string()])),
+            CatalogFamily::ALL,
+        );
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.schemas.insert(
+            "public".to_string(),
+            SchemaState {
+                name: "public".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        cache.metadata.source_search_path = Some(vec!["app".to_string(), "public".to_string()]);
+        cache.search_path = vec!["public".to_string()];
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        assert_eq!(
+            state.local.search_path,
+            [
+                SearchPathEntry::Unresolved(Some("app".to_string())),
+                SearchPathEntry::Schema("public".to_string())
+            ]
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(
+            !state.relation_is_present(&object_id("public", "t")),
+            "PostgreSQL might have created the table in the unresolved schema"
+        );
+    }
+
+    #[test]
+    fn a_scoped_baseline_drops_template_entries_absent_at_sync() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(Some(&["public".to_string()])),
+            CatalogFamily::ALL,
+        );
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.metadata.source_role = Some("app_role".into());
+        cache.metadata.source_session_role = Some("app_role".into());
+        cache.metadata.source_search_path =
+            Some(vec!["gone".into(), "$user".into(), "public".into()]);
+        // The synchronizing session recorded no `gone` and no role schema, so
+        // neither entry resolved then and PostgreSQL would skip both.
+        cache.metadata.source_existing_schemas = Some(vec!["public".to_string()]);
+        cache.search_path = vec!["public".to_string()];
+        cache.schemas.insert(
+            "public".to_string(),
+            SchemaState {
+                name: "public".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        assert_eq!(
+            state.local.search_path,
+            [SearchPathEntry::Schema("public".to_string())]
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(state.relation_is_present(&object_id("public", "t")));
+    }
+
+    #[test]
+    fn a_scoped_baseline_keeps_template_entries_that_existed_at_sync() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(Some(&["public".to_string()])),
+            CatalogFamily::ALL,
+        );
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.metadata.source_role = Some("app_role".into());
+        cache.metadata.source_session_role = Some("app_role".into());
+        cache.metadata.source_search_path =
+            Some(vec!["gone".into(), "$user".into(), "public".into()]);
+        // Both out-of-scope schemas existed at sync, so either can still shadow
+        // `public` even though the cache carries none of their objects.
+        cache.metadata.source_existing_schemas =
+            Some(vec!["gone".into(), "app_role".into(), "public".into()]);
+        cache.search_path = vec!["public".to_string()];
+        cache.schemas.insert(
+            "public".to_string(),
+            SchemaState {
+                name: "public".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        assert_eq!(
+            state.local.search_path,
+            [
+                SearchPathEntry::Unresolved(Some("gone".to_string())),
+                SearchPathEntry::Unresolved(Some("app_role".to_string())),
+                SearchPathEntry::Schema("public".to_string())
+            ]
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(
+            !state.relation_is_present(&object_id("public", "t")),
+            "PostgreSQL might have created the table in an earlier schema"
+        );
+    }
+
+    #[test]
+    fn a_view_call_resolves_in_the_routine_namespace_not_the_relation_one() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        for schema in ["public", "other"] {
+            cache.schemas.insert(
+                schema.to_string(),
+                SchemaState {
+                    name: schema.to_string(),
+                    owner: object_id("", "postgres"),
+                    generation: 0,
+                },
+            );
+        }
+        let table = object_id("public", "f");
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("", "postgres"),
+                0,
+                Some(0),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let function = object_id("other", "f()");
+        cache.functions.insert(
+            function.clone(),
+            FunctionState {
+                return_type: "integer".into(),
+                ..FunctionState::with_inputs(function.clone(), RoutineKind::Function, Vec::new())
+            },
+        );
+        cache.metadata.source_search_path = Some(vec!["public".to_string(), "other".to_string()]);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE VIEW public.v AS SELECT f();", &mut state)
+            .unwrap();
+
+        assert!(
+            state.local.graph.edges().iter().any(|edge| {
+                edge.dependent == object_id("public", "v")
+                    && edge.referenced == function
+                    && matches!(edge.kind, DependencyKind::ViewUsesRoutine { .. })
+            }),
+            "the call must follow the routine namespace, not resolve to public.f the table"
+        );
     }
 
     #[test]
@@ -5405,7 +7978,7 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "t")));
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.search_path_names(), ["public"]);
     }
 
     #[test]
@@ -5421,7 +7994,7 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "t")));
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.search_path_names(), ["public"]);
     }
 
     #[test]
@@ -5443,7 +8016,7 @@ mod state_mutation_tests {
 
         assert!(state.relation_is_present(&object_id("tenant_app", "first")));
         assert!(state.relation_is_present(&object_id("tenant_app", "second")));
-        assert_eq!(state.local.search_path, ["tenant_app", "shared"]);
+        assert_eq!(state.search_path_names(), ["tenant_app", "shared"]);
     }
 
     #[test]
@@ -5672,16 +8245,10 @@ mod state_mutation_tests {
             cache.functions.insert(
                 id.clone(),
                 FunctionState {
-                    id,
-                    routine_kind,
-                    arg_types: vec!["integer".into()],
-                    arg_type_ids: Vec::new(),
                     return_type: "integer".into(),
-                    return_type_id: None,
                     volatility: Volatility::Immutable,
                     language: "internal".into(),
-                    security: SecurityMode::Invoker,
-                    internal_type_owner: None,
+                    ..FunctionState::with_inputs(id.clone(), routine_kind, vec!["integer".into()])
                 },
             );
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -5773,7 +8340,8 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert!(window_conflict.iter().any(|violation| {
-            violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("cannot change routine kind")
         }));
 
         let aggregate_conflict = engine
@@ -5786,7 +8354,8 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert!(aggregate_conflict.iter().any(|violation| {
-            violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("cannot change routine kind")
         }));
     }
 
@@ -5802,20 +8371,17 @@ mod state_mutation_tests {
             cache.functions.insert(
                 id.clone(),
                 FunctionState {
-                    id,
-                    routine_kind,
-                    arg_types: if routine_kind == RoutineKind::Aggregate {
-                        vec!["integer".into()]
-                    } else {
-                        Vec::new()
-                    },
-                    arg_type_ids: Vec::new(),
                     return_type: "integer".into(),
-                    return_type_id: None,
-                    volatility: Volatility::Volatile,
                     language: "internal".into(),
-                    security: SecurityMode::Invoker,
-                    internal_type_owner: None,
+                    ..FunctionState::with_inputs(
+                        id.clone(),
+                        routine_kind,
+                        if routine_kind == RoutineKind::Aggregate {
+                            vec!["integer".into()]
+                        } else {
+                            Vec::new()
+                        },
+                    )
                 },
             );
         }
@@ -5876,16 +8442,12 @@ mod state_mutation_tests {
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
-                    id: routine_id.clone(),
-                    internal_type_owner: None,
-                    routine_kind,
-                    arg_types: vec!["integer".into()],
-                    arg_type_ids: Vec::new(),
                     return_type: "void".into(),
-                    return_type_id: None,
-                    volatility: Volatility::Volatile,
-                    language: "sql".into(),
-                    security: SecurityMode::Invoker,
+                    ..FunctionState::with_inputs(
+                        routine_id.clone(),
+                        routine_kind,
+                        vec!["integer".into()],
+                    )
                 },
             );
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -5915,16 +8477,8 @@ mod state_mutation_tests {
         fn routine(kind: RoutineKind) -> FunctionState {
             let id = object_id("public", "work(integer)");
             FunctionState {
-                id,
-                routine_kind: kind,
-                arg_types: vec!["integer".into()],
-                arg_type_ids: Vec::new(),
                 return_type: "void".into(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".into(),
-                security: SecurityMode::Invoker,
-                internal_type_owner: None,
+                ..FunctionState::with_inputs(id, kind, vec!["integer".into()])
             }
         }
 
@@ -5985,7 +8539,7 @@ mod state_mutation_tests {
             aggregate_drop("public", true),
         ] {
             let mut state = setup_state();
-            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(state.apply(&drop, None), MutationResult::NoOp);
             assert_eq!(state.local.confidence, Confidence::Exact);
         }
 
@@ -5997,7 +8551,10 @@ mod state_mutation_tests {
             let mut cache = synced_cache();
             cache.metadata.schemas = Some(vec!["public".into()]);
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
-            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(
+                state.apply(&drop, None),
+                MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+            );
             assert_eq!(state.local.confidence, Confidence::Tainted);
         }
 
@@ -6006,12 +8563,12 @@ mod state_mutation_tests {
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert_eq!(
             state.apply(&function_drop("tenant", true), None),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
         );
         assert_eq!(state.local.confidence, Confidence::Tainted);
         assert_eq!(
             state.apply(&aggregate_drop("tenant", true), None),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
         );
         assert_eq!(state.local.confidence, Confidence::Tainted);
     }
@@ -6148,6 +8705,7 @@ mod state_mutation_tests {
     fn cached_publication_and_subscription_actions_update_exact_state() {
         let engine = setup_engine();
         let mut cache = cache_with_table("public", "first", None);
+        cache.pg_version_num = Some(180_006);
         let second = object_id("public", "second");
         cache.insert_baseline(
             second.clone(),
@@ -6244,9 +8802,9 @@ mod state_mutation_tests {
         };
         assert_eq!(subscription.publications, ["renamed_changes"]);
         assert!(subscription.params.as_ref().is_some_and(|params| {
-            params
-                .iter()
-                .any(|param| param.name == "streaming" && param.value == "parallel")
+            params.iter().any(|param| {
+                param.name == "streaming" && param.value.as_deref() == Some("parallel")
+            })
         }));
 
         engine.analyze("DROP TABLE second;", &mut state).unwrap();
@@ -6500,6 +9058,88 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn subscription_options_are_gated_on_the_server_version() {
+        let engine = setup_engine();
+        // The release that introduced each gated parameter, checked against a
+        // server one major version below it.
+        for (since, parameter) in [
+            (140_000, "binary = true"),
+            (140_000, "streaming = parallel"),
+            (150_000, "two_phase = true"),
+            (150_000, "disable_on_error = true"),
+            (160_000, "password_required = true"),
+            (160_000, "run_as_owner = true"),
+            (160_000, "origin = 'any'"),
+            (170_000, "failover = true"),
+        ] {
+            let sql = format!(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH ({parameter});"
+            );
+
+            let mut state = setup_state();
+            state.pg_version_num = Some(since - 10_000);
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{parameter} must be rejected below {since}"
+            );
+
+            let mut state = setup_state();
+            state.pg_version_num = Some(since);
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{parameter} must be accepted from {since}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_server_version_taints_rather_than_conflicting() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.pg_version_num = None;
+        let violations = engine
+            .analyze(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH (failover = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "an unanswerable version question cannot prove a conflict"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn an_unknown_subscription_parameter_is_rejected() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.pg_version_num = Some(180_006);
+        let violations = engine
+            .analyze(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH (not_a_parameter = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
     fn subscription_options_enforce_postgresql_slot_and_publication_invariants() {
         let engine = setup_engine();
 
@@ -6526,6 +9166,8 @@ mod state_mutation_tests {
         }
 
         let mut boolean_state = setup_state();
+        // `binary` is PostgreSQL 14, so this baseline must know its server.
+        boolean_state.pg_version_num = Some(180_006);
         let violations = engine
             .analyze(
                 "CREATE SUBSCRIPTION boolean_options
@@ -7641,21 +10283,22 @@ mod state_mutation_tests {
             .push(safe_migrate::_internal::db::cache::IndexCache {
                 index_id: derived_index.clone(),
                 table_id: table.clone(),
-                using_method: "btree".to_string(),
-                key_columns: vec!["derived".to_string()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["derived".to_string()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: vec!["derived".to_string()],
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
 
@@ -8073,9 +10716,7 @@ mod state_mutation_tests {
 
     #[test]
     fn test_variadic_function_drop_normalizes_array_alias() {
-        use safe_migrate::_internal::model::function::{
-            FunctionOverlay, FunctionState, SecurityMode, Volatility,
-        };
+        use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState};
 
         let engine = setup_engine();
         let function_id = object_id("public", "f_safe(integer[])");
@@ -8083,16 +10724,13 @@ mod state_mutation_tests {
         cache.functions.insert(
             function_id.clone(),
             FunctionState {
-                id: function_id.clone(),
-                internal_type_owner: None,
-                routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
-                arg_types: vec!["integer[]".to_string()],
-                arg_type_ids: vec![None],
                 return_type: "integer".to_string(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".to_string(),
-                security: SecurityMode::Invoker,
+                arg_type_ids: vec![None],
+                ..FunctionState::with_inputs(
+                    function_id.clone(),
+                    safe_migrate::_internal::model::function::RoutineKind::Function,
+                    vec!["integer[]".to_string()],
+                )
             },
         );
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -8851,7 +11489,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.search_path_names(), ["public"]);
         let RelationOverlay::Present(relation) = state.get_relation(&table).unwrap() else {
             panic!("table missing");
         };
@@ -9051,6 +11689,8 @@ mod state_mutation_tests {
     fn grant_set_option_authorizes_set_role_and_revoke_removes_it() {
         let engine = setup_engine();
         let mut cache = synced_cache();
+        // Per-membership SET/INHERIT options exist from PostgreSQL 16 onward.
+        cache.pg_version_num = Some(180_002);
         cache.metadata.source_role = Some("member".into());
         cache.metadata.source_session_role = Some("member".into());
         for name in ["member", "parent"] {
@@ -9113,6 +11753,8 @@ mod state_mutation_tests {
     fn role_membership_admin_and_inherit_options_round_trip() {
         let engine = setup_engine();
         let mut cache = synced_cache();
+        // Per-membership SET/INHERIT options exist from PostgreSQL 16 onward.
+        cache.pg_version_num = Some(180_002);
         for name in ["member", "parent"] {
             let id = object_id("", name);
             cache.roles.insert(
@@ -9159,6 +11801,62 @@ mod state_mutation_tests {
         };
         assert!(role.can_administer_membership.is_empty());
         assert_eq!(role.member_of, vec![object_id("", "parent")]);
+    }
+
+    fn membership_state(pg_version_num: Option<u32>) -> AnalysisState {
+        let mut cache = synced_cache();
+        cache.pg_version_num = pg_version_num;
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        AnalysisState::new(cache)
+    }
+
+    #[test]
+    fn per_membership_options_need_a_known_pre_16_version_to_conflict() {
+        let engine = setup_engine();
+        for sql in [
+            "GRANT parent TO member WITH INHERIT FALSE;",
+            "REVOKE INHERIT OPTION FOR parent FROM member;",
+        ] {
+            let mut state = membership_state(None);
+            assert_eq!(conflict_reason(&engine, &mut state, sql), "", "{sql}");
+            assert!(
+                state
+                    .evidence()
+                    .iter()
+                    .any(|record| record.code == EvidenceCode::UnsupportedSemantics),
+                "an unknown server version cannot place {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_membership_options_conflict_on_a_known_pre_16_version() {
+        let engine = setup_engine();
+        for sql in [
+            "GRANT parent TO member WITH INHERIT FALSE;",
+            "REVOKE INHERIT OPTION FOR parent FROM member;",
+        ] {
+            let mut state = membership_state(Some(150_000));
+            assert!(
+                conflict_reason(&engine, &mut state, sql).contains("require PostgreSQL 16+"),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -9622,6 +12320,1345 @@ mod state_mutation_tests {
                 .iter()
                 .any(|finding| finding.rule_id == "chain-conflict"),
             "an unrelated index must survive its neighbour's drop: {findings:?}"
+        );
+    }
+
+    // The expected outcomes below were confirmed against a live PostgreSQL
+    // 18.6 server before being encoded here. Fixtures that exercise the manual
+    // `ALTER INDEX ... ATTACH PARTITION` comparison build the parent `ON ONLY`:
+    // a plain `CREATE INDEX` on the partitioned parent first attaches a child
+    // for every partition, which turns a later manual attach into
+    // PostgreSQL's "another index is already attached" refusal.
+    fn attach_fixture(sql: &str) -> (AnalysisState, Vec<Violation>) {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine.analyze(sql, &mut state).unwrap();
+        (state, violations)
+    }
+
+    #[test]
+    fn attaching_a_mismatched_index_partition_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text, d text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text, d text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_d ON ONLY p (d);
+             ALTER INDEX p_d ATTACH PARTITION c_b;",
+        );
+        // PostgreSQL: "cannot attach index ... the index definitions do not match"
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("index definitions do not match")),
+            "expected a definition mismatch, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_an_index_from_a_non_partition_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             CREATE TABLE elsewhere (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX elsewhere_a ON elsewhere (a);
+             CREATE INDEX p_a ON ONLY p (a);
+             ALTER INDEX p_a ATTACH PARTITION elsewhere_a;",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("not an index on any partition")),
+            "expected a non-partition refusal, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_a_matching_index_partition_is_accepted() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_b ON p (b);
+             ALTER INDEX p_b ATTACH PARTITION c_b;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_b")
+                && edge.referenced == object_id("public", "p_b")),
+            "expected the attachment to be recorded, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_an_index_with_a_different_opclass_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (b varchar_pattern_ops);
+             CREATE INDEX p_ops ON p (b varchar_pattern_ops);
+             ALTER INDEX p_ops ATTACH PARTITION c_ops;
+             CREATE INDEX c_plain ON c (b);
+             CREATE INDEX p_plain ON p (b);",
+        );
+        // Sanity: the matching pair attaches.
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_ops")
+                && edge.referenced == object_id("public", "p_ops")),
+            "matching opclasses must attach, got {violations:?}"
+        );
+        // A default opclass against an explicit one must not.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (b varchar_pattern_ops);
+             CREATE INDEX p_plain ON ONLY p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_ops;",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "a differing opclass must not attach, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_written_default_opclass_matches_an_omitted_one() {
+        // Verified live: PostgreSQL records opclass OID 3126 for both
+        // `CREATE INDEX ... (note)` and `CREATE INDEX ... (note text_ops)`,
+        // and attaches one to the other. The simulator must agree, or it
+        // rejects an attachment PostgreSQL accepts.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, note text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, note text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_note ON c (note text_ops);
+             CREATE INDEX p_note ON p (note);
+             ALTER INDEX p_note ATTACH PARTITION c_note;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_note")
+                && edge.referenced == object_id("public", "p_note")),
+            "an explicit default opclass must attach like an omitted one, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_indexes_that_differ_only_in_sort_order_is_accepted() {
+        // Verified live: `CompareIndexInfo` never reads `indoption`, so a
+        // child whose key is written with the opposite direction attaches.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_desc ON c (b DESC);
+             CREATE INDEX p_plain ON p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_desc;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_desc")
+                && edge.referenced == object_id("public", "p_plain")),
+            "a differing sort order must attach, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_indexes_with_different_nulls_not_distinct_is_refused() {
+        // Verified live: `CompareIndexInfo` compares `indnullsnotdistinct`;
+        // equal settings attach and a mismatch is refused.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_nnd ON c (b) NULLS NOT DISTINCT;
+             CREATE INDEX p_nnd ON p (b) NULLS NOT DISTINCT;
+             ALTER INDEX p_nnd ATTACH PARTITION c_nnd;
+             CREATE INDEX c_mix ON c (b) NULLS NOT DISTINCT;
+             CREATE INDEX p_lenient ON ONLY p (b);
+             ALTER INDEX p_lenient ATTACH PARTITION c_mix;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_nnd")
+                && edge.referenced == object_id("public", "p_nnd")),
+            "matching NULLS NOT DISTINCT must attach, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_mix")),
+            "a differing NULLS NOT DISTINCT must not attach"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("index definitions do not match")),
+            "expected a definition mismatch, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_an_index_with_a_non_default_collation_is_undecidable() {
+        // Live PostgreSQL refuses this pair — the child's key carries
+        // collation OID 950 and the parent's the database default 100. The
+        // simulator does not record a column's declared collation, so it
+        // cannot prove the pair differs (a column declared `COLLATE "C"`
+        // would make it one collation) and stays undecidable.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_c ON c (b COLLATE \"C\");
+             CREATE INDEX p_plain ON ONLY p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_c;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_c")),
+            "a child with an unresolvable-relative collation must not attach"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn writing_the_default_collation_leaves_attachment_undecidable() {
+        // Live PostgreSQL attaches: both spellings land on collation OID 100
+        // when the column carries no collation of its own. The simulator does
+        // not record column collations, so it cannot prove the written
+        // `default` is the same choice and refuses to equate them silently.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_def ON c (b COLLATE \"default\");
+             CREATE INDEX p_plain ON ONLY p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_def;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_def")),
+            "a written default collation must not be silently equated"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_expression_indexes_matches_expression_identity() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_lower ON c (lower(b));
+             CREATE INDEX p_lower ON ONLY p (lower(b));
+             ALTER INDEX p_lower ATTACH PARTITION c_lower;
+             CREATE INDEX c_upper ON c (upper(b));
+             CREATE INDEX p_upper ON ONLY p (lower(b));
+             ALTER INDEX p_upper ATTACH PARTITION c_upper;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_lower")
+                && edge.referenced == object_id("public", "p_lower")),
+            "equal expressions must attach, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_upper")),
+            "different expressions must not attach"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("index definitions do not match")),
+            "expected a definition mismatch, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_opclass_on_an_expression_leaves_attachment_undecidable() {
+        // Live PostgreSQL attaches: `lower(b)` on a text column is `text_ops`
+        // (OID 3126) whether written or not. The simulator does not infer an
+        // expression's result type, so it cannot prove the written class is
+        // the expression's default and refuses to guess.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (lower(b) text_ops);
+             CREATE INDEX p_lower ON ONLY p (lower(b));
+             ALTER INDEX p_lower ATTACH PARTITION c_ops;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_ops")),
+            "a written class on an expression must not be silently equated"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn opclasses_in_the_same_family_attach_despite_different_names() {
+        // Verified live: `varchar_pattern_ops` and `text_pattern_ops` both
+        // belong to family `text_pattern_ops`, and `CompareIndexInfo`
+        // compares family OIDs, so the attachment succeeds.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (b text_pattern_ops);
+             CREATE INDEX p_ops ON p (b varchar_pattern_ops);
+             ALTER INDEX p_ops ATTACH PARTITION c_ops;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_ops")
+                && edge.referenced == object_id("public", "p_ops")),
+            "same-family classes must attach, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_backed_child_index_leaves_attachment_undecidable() {
+        // Live PostgreSQL refuses this pair because the child's backing index
+        // carries exclusion operators the parent's does not. The constraint
+        // marker records the key columns but not the operators, so the
+        // simulator stays undecidable instead of claiming a mismatch it has
+        // not established.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_b ON ONLY p (b);
+             ALTER TABLE c ADD CONSTRAINT c_excl EXCLUDE USING btree (b WITH =);
+             ALTER INDEX p_b ATTACH PARTITION c_excl;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_excl")),
+            "an exclusion-backed child must not attach to a plain parent"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_backed_parent_index_leaves_attachment_undecidable() {
+        // Live PostgreSQL refuses this pair because the parent's backing
+        // constraint has no counterpart on the child. The simulator cannot
+        // model the constraint rule on a shape it has not established, so the
+        // outcome stays undecidable on both sides of the comparison.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             ALTER TABLE p ADD CONSTRAINT p_excl EXCLUDE USING btree (a WITH =);
+             ALTER INDEX p_excl ATTACH PARTITION c_a;",
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_a")),
+            "a plain child must not attach to an exclusion-backed parent"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_synced_index_attaches_to_a_statement_created_parent() {
+        // The catalog records the resolved opfamily (`text_ops`), and the
+        // statement normalizes the omitted default to the same family, so a
+        // synced child attaches to a statement-created parent.
+        use safe_migrate::_internal::db::cache::{IndexCache, InheritanceCache};
+        use safe_migrate::_internal::model::index::{
+            IndexKey, IndexKeyKind, IndexOrder, KeyCollation, KeyOpclass, ResolvedName,
+        };
+
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        let parent_id = object_id("public", "p");
+        let child_id = object_id("public", "c");
+        let owner = object_id("public", "postgres");
+        let synced_table = |id: &ObjectId| {
+            let mut table = RelationState::new(
+                id.clone(),
+                owner.clone(),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            );
+            table.columns.push(Column {
+                name: "b".to_string(),
+                data_type: Some("text".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: None,
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
+            });
+            table
+        };
+        let mut parent = synced_table(&parent_id);
+        parent.partition_type = Some("RANGE".to_string());
+        parent.partition_by = Some("PARTITION BY RANGE (b)".to_string());
+        cache.insert_baseline(parent_id.clone(), parent);
+        cache.insert_baseline(child_id.clone(), synced_table(&child_id));
+        cache.inheritances.push(InheritanceCache {
+            child: child_id.clone(),
+            parent: parent_id.clone(),
+            sequence: 0,
+            is_partition: true,
+            detach_pending: false,
+        });
+        cache.indexes.push(IndexCache {
+            index_id: object_id("public", "c_b"),
+            table_id: child_id,
+            definition: IndexDefinition {
+                method: Some("btree".to_string()),
+                keys: vec![IndexKey {
+                    kind: IndexKeyKind::Column("b".to_string()),
+                    opclass: KeyOpclass::Default(Some(ResolvedName {
+                        schema: "pg_catalog".to_string(),
+                        name: "text_ops".to_string(),
+                    })),
+                    collation: KeyCollation::Derived,
+                    order: IndexOrder::Default,
+                }],
+                included: Vec::new(),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
+            dependency_columns: vec!["b".to_string()],
+            dependency_columns_known: true,
+            is_immediate: true,
+        });
+        let mut state = AnalysisState::new(cache);
+        let violations = engine
+            .analyze(
+                "CREATE INDEX p_b ON p (b);
+                 ALTER INDEX p_b ATTACH PARTITION c_b;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_b")
+                && edge.referenced == object_id("public", "p_b")),
+            "a synced default opclass must attach to a statement parent, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_attached_child_index_cannot_be_dropped_on_its_own() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER INDEX p_a ATTACH PARTITION c_a;
+             DROP INDEX c_a;",
+        );
+        // PostgreSQL refuses this as 2BP01 even with CASCADE.
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("requires it")),
+            "expected a dependent-index refusal, got {violations:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| matches!(
+            edge.kind,
+            DependencyKind::IndexOnRelation { .. }
+        ) && edge.dependent
+            == object_id("public", "c_a")));
+    }
+
+    #[test]
+    fn creating_a_partition_attaches_its_indexes_to_the_parent() {
+        // PostgreSQL creates and attaches the partition's index as part of
+        // CREATE TABLE ... PARTITION OF, so the child cannot be dropped alone.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE INDEX p_b ON p (b);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.referenced
+                == object_id("public", "p_b")),
+            "the partition's index must be attached to the parent's, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_an_attached_child_with_its_parent_in_one_statement_is_allowed() {
+        // PostgreSQL applies a statement's DROP INDEX targets as a batch, so
+        // the parent and its attached child may be named together.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE INDEX p_a ON p (a);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);
+             DROP INDEX p_a, c_a_idx;",
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.reason.contains("requires it")),
+            "a parent dropped in the same statement does not require its child, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexOnRelation { .. }
+            ) && (edge.dependent
+                == object_id("public", "p_a")
+                || edge.dependent == object_id("public", "c_a_idx"))),
+            "both indexes must be gone, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_partitioned_index_removes_attached_grandchildren() {
+        // PostgreSQL drops the whole attached index tree with its parent, so a
+        // grandchild index on a sub-partition must not survive.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE INDEX p_a ON p (a);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (a);
+             CREATE TABLE d PARTITION OF c FOR VALUES FROM (0) TO (5);
+             DROP INDEX p_a;",
+        );
+        for name in ["p_a", "c_a_idx", "d_a_idx"] {
+            assert!(
+                !state.local.graph.edges().iter().any(|edge| matches!(
+                    edge.kind,
+                    DependencyKind::IndexOnRelation { .. }
+                ) && edge.dependent
+                    == object_id("public", name)),
+                "the attached index tree must go with its parent, {name} survived: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attaching_a_partition_attaches_reused_child_indexes_to_the_parent() {
+        // The pre-existing child index is reused rather than recreated, and is
+        // still attached, so DROP INDEX on it must be refused. PostgreSQL
+        // creates no parent index when the parent has none, so the parent index
+        // has to exist here for an attachment to happen at all.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_b ON p (b);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_b")
+                && edge.referenced == object_id("public", "p_b")),
+            "a reused partition index must be attached to the parent's, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_a_partition_creates_the_missing_child_index_and_attaches_it() {
+        // Verified live: PostgreSQL creates the partition's index when it is
+        // missing and attaches it to the parent's, so it cannot be dropped
+        // alone afterwards.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE INDEX p_b ON p (b);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+        );
+        let attachment = state
+            .local
+            .graph
+            .edges()
+            .iter()
+            .find(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf));
+        let child = attachment.map(|edge| edge.dependent.clone());
+        assert!(
+            attachment.is_some() && child.as_ref() == Some(&object_id("public", "c_b_idx")),
+            "expected a generated child index attached to p_b, got {child:?} in {violations:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| matches!(
+            edge.kind,
+            DependencyKind::IndexOnRelation { .. }
+        ) && edge.dependent
+            == object_id("public", "c_b_idx")
+            && edge.referenced == object_id("public", "c")));
+    }
+
+    #[test]
+    fn attaching_a_partition_without_a_parent_index_creates_no_attachment() {
+        // Verified live: PostgreSQL does not invent a parent index here, so the
+        // child index stays independent and remains droppable.
+        let (state, _violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             CREATE INDEX c_b ON c (b);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "no parent index means no attachment"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_detach_also_releases_index_attachments() {
+        // PostgreSQL detaches the indexes on the first phase, before FINALIZE,
+        // so a later DROP INDEX must already be allowed.
+        let (state, _violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER TABLE p DETACH PARTITION c CONCURRENTLY;",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "DETACH PARTITION CONCURRENTLY must release index attachments"
+        );
+    }
+
+    #[test]
+    fn detaching_a_partition_releases_its_index_attachments() {
+        let (state, _violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER INDEX p_a ATTACH PARTITION c_a;
+             ALTER TABLE p DETACH PARTITION c;",
+        );
+        // PostgreSQL detaches the indexes with the partition, so leaving the
+        // edge behind would make a later DROP INDEX fail spuriously.
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "detach must not leave a stale index attachment"
+        );
+    }
+    #[test]
+    fn dropping_a_column_removes_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (id integer, doomed text, keep text);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.relation_is_present(&object_id("public", "t")));
+        engine
+            .analyze("ALTER TABLE t DROP COLUMN doomed;", &mut state)
+            .unwrap();
+        let columns = state
+            .local
+            .relations
+            .get(&object_id("public", "t"))
+            .and_then(|o| match o {
+                RelationOverlay::Present(r) => {
+                    Some(r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(columns, ["id", "keep"], "dropped column must be gone");
+    }
+
+    // The differential harness applies a fixture to a baseline hydrated from the
+    // catalog, not to a table the same run created, so both paths must drop.
+    #[test]
+    fn dropping_a_column_from_a_baseline_relation_removes_it() {
+        let mut cache = crate::common::cache_with_table("public", "t", None);
+        let tid = object_id("public", "t");
+        if let Some(rel) = cache.relations.get_mut(&tid) {
+            rel.columns = vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: false,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: None,
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
+                },
+                Column {
+                    name: "doomed".to_string(),
+                    data_type: Some("text".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: None,
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
+                },
+            ];
+        }
+        let mut state = AnalysisState::with_baseline(cache, true);
+        setup_engine()
+            .analyze("ALTER TABLE t DROP COLUMN doomed;", &mut state)
+            .unwrap();
+        let columns = state
+            .local
+            .relations
+            .get(&tid)
+            .and_then(|overlay| match overlay {
+                RelationOverlay::Present(rel) => Some(
+                    rel.columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(columns, ["id"], "baseline column must be gone");
+    }
+
+    // PostgreSQL 18 materialises NOT NULL columns as `pg_constraint` rows, so a
+    // table carrying one exercises a path the unit fixtures otherwise skip.
+    #[test]
+    fn dropping_a_column_works_alongside_a_pg18_not_null_constraint() {
+        let tid = object_id("public", "t");
+        let mut state = setup_state();
+        state.pg_version_num = Some(180_006);
+        setup_engine()
+            .analyze(
+                "CREATE TABLE t (id integer NOT NULL, doomed text);
+                 ALTER TABLE t DROP COLUMN doomed;",
+                &mut state,
+            )
+            .unwrap();
+        let columns = state
+            .local
+            .relations
+            .get(&tid)
+            .and_then(|overlay| match overlay {
+                RelationOverlay::Present(rel) => Some(
+                    rel.columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(columns, ["id"], "dropped column must be gone");
+    }
+
+    // PostgreSQL accepts ALTER TABLE, GRANT and TRUNCATE on a foreign table,
+    // and rejects DROP TABLE, LOCK and a foreign-key reference. Each is
+    // verified against a live server; the baseline must know the kind.
+    #[test]
+    fn foreign_table_accepts_the_statements_postgres_accepts() {
+        let id = object_id("public", "remote_t");
+        let mut cache = synced_cache();
+        cache.insert_baseline(
+            id.clone(),
+            RelationState::new(
+                id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::ForeignTable,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        let alter = Mutation::AlterTable(AlterTable {
+            id: id.clone(),
+            only: false,
+            action: AlterTableActionMutation::AddColumn {
+                name: "extra".to_string(),
+                ty: Some("integer".to_string()),
+                if_not_exists: false,
+                not_null: false,
+                default: None,
+                depends_on: None,
+                generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
+                identity_sequence: None,
+                generated_expr: None,
+                generated_expr_sql: None,
+            },
+        });
+        assert!(
+            matches!(state.apply(&alter, None), MutationResult::Applied),
+            "ALTER TABLE is accepted on a foreign table"
+        );
+    }
+
+    #[test]
+    fn drop_table_still_rejects_a_foreign_table() {
+        let id = object_id("public", "remote_t");
+        let mut cache = synced_cache();
+        cache.insert_baseline(
+            id.clone(),
+            RelationState::new(
+                id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::ForeignTable,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        let drop = Mutation::DropTable(DropTable {
+            ids: vec![id],
+            if_exists: false,
+            cascade: false,
+        });
+        assert!(
+            matches!(state.apply(&drop, None), MutationResult::Conflict { .. }),
+            "the server answers DROP TABLE with 'is not a table'"
+        );
+    }
+
+    /// PostgreSQL attaches to a parent index that is invalid precisely because
+    /// partitions are missing, and marks it valid once the last one arrives.
+    #[test]
+    fn attaching_to_an_incomplete_partitioned_index_is_allowed() {
+        let engine = setup_engine();
+        for extra in ["", "ALTER INDEX pt_idx ATTACH PARTITION p1_idx;"] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(
+                    &format!(
+                        "CREATE TABLE pt (a int) PARTITION BY RANGE (a);
+                         CREATE TABLE p1 PARTITION OF pt FOR VALUES FROM (0) TO (10);
+                         CREATE TABLE p2 PARTITION OF pt FOR VALUES FROM (10) TO (20);
+                         CREATE INDEX pt_idx ON ONLY pt (a);
+                         CREATE INDEX p1_idx ON ONLY p1 (a);
+                         CREATE INDEX p2_idx ON ONLY p2 (a);
+                         ALTER INDEX pt_idx ATTACH PARTITION p1_idx;
+                         {extra}"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "attaching an incomplete parent must succeed"
+            );
+        }
+    }
+
+    /// `ON ONLY` declines the recursion into partitions, so the parent stays
+    /// invalid while partitions exist and is valid with none to cover — the
+    /// same rule as any other index on an uncovered table.
+    #[test]
+    fn creating_an_index_on_only_leaves_covered_partitioned_parents_invalid() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE c (a integer, b text);
+                 ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX p_only ON ONLY p (b);
+                 CREATE TABLE q (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE INDEX q_only ON ONLY q (b);
+                 CREATE TABLE r (a integer, b text);
+                 CREATE INDEX r_only ON ONLY r (b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "ON ONLY is legal everywhere the server accepts it: {violations:?}"
+        );
+        let valid = |name: &str| {
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .find_map(|edge| match &edge.kind {
+                    DependencyKind::IndexOnRelation { definition, .. }
+                        if edge.dependent == object_id("public", name) =>
+                    {
+                        Some(definition.valid)
+                    }
+                    _ => None,
+                })
+        };
+        assert_eq!(valid("p_only"), Some(false));
+        assert_eq!(valid("q_only"), Some(true));
+        assert_eq!(valid("r_only"), Some(true));
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "ON ONLY must not create or attach partition indexes"
+        );
+    }
+
+    /// A plain `CREATE INDEX` on a partitioned table creates and attaches a
+    /// child index for each partition, recursing when a partition is itself
+    /// partitioned; the whole chain is valid.
+    #[test]
+    fn creating_an_index_on_a_partitioned_table_clones_children_recursively() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE c (a integer, b text) PARTITION BY RANGE (a);
+                 ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+                 CREATE TABLE d (a integer, b text);
+                 ALTER TABLE c ATTACH PARTITION d FOR VALUES FROM (0) TO (5);
+                 CREATE INDEX p_idx ON p (b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "creating a partitioned index must be clean: {violations:?}"
+        );
+        let attached = |child: &str, parent: &str| {
+            state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", child)
+                    && edge.referenced == object_id("public", parent)
+            })
+        };
+        assert!(attached("c_b_idx", "p_idx"));
+        assert!(attached("d_b_idx", "c_b_idx"));
+        for name in ["p_idx", "c_b_idx", "d_b_idx"] {
+            assert!(
+                state.local.graph.edges().iter().any(|edge| {
+                    edge.dependent == object_id("public", name)
+                        && matches!(
+                            &edge.kind,
+                            DependencyKind::IndexOnRelation { definition, .. }
+                                if definition.valid
+                        )
+                }),
+                "{name} must be valid: {violations:?}"
+            );
+        }
+    }
+
+    /// A plain `CREATE INDEX` on a partitioned table adopts an existing
+    /// equivalent unattached child index instead of creating a second one.
+    #[test]
+    fn creating_an_index_on_a_partitioned_table_reuses_an_equivalent_child() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE c (a integer, b text);
+                 ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX c_existing ON c (b);
+                 CREATE INDEX p_idx ON p (b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "reusing an equivalent child must be clean: {violations:?}"
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c_existing")
+                    && edge.referenced == object_id("public", "p_idx")
+            }),
+            "the existing index must be attached"
+        );
+        assert!(
+            !state.index_is_present(&object_id("public", "c_b_idx")),
+            "no second index may be created on the partition"
+        );
+    }
+
+    /// Attaching a table does not revalidate an invalid parent index: the
+    /// parent flips valid only when the last partition's index is attached.
+    #[test]
+    fn attaching_a_table_does_not_revalidate_the_parent_index() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+                 CREATE TABLE c1 (a integer);
+                 ALTER TABLE p ATTACH PARTITION c1 FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX p_idx ON ONLY p (a);
+                 CREATE TABLE c2 (a integer);
+                 CREATE INDEX c2_idx ON c2 (a);
+                 ALTER TABLE p ATTACH PARTITION c2 FOR VALUES FROM (10) TO (20);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "the server accepts the whole sequence: {violations:?}"
+        );
+        fn parent_valid(state: &AnalysisState) -> Option<bool> {
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .find_map(|edge| match &edge.kind {
+                    DependencyKind::IndexOnRelation { definition, .. }
+                        if edge.dependent == object_id("public", "p_idx") =>
+                    {
+                        Some(definition.valid)
+                    }
+                    _ => None,
+                })
+        }
+        assert!(
+            state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c2_idx")
+                    && edge.referenced == object_id("public", "p_idx")
+            }),
+            "attaching the table adopts the partition's existing index"
+        );
+        assert_eq!(
+            parent_valid(&state),
+            Some(false),
+            "attaching a table must not revalidate the parent"
+        );
+        let violations = engine
+            .analyze(
+                "CREATE INDEX c1_idx ON c1 (a);
+                 ALTER INDEX p_idx ATTACH PARTITION c1_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "the last attachment is accepted: {violations:?}"
+        );
+        assert_eq!(
+            parent_valid(&state),
+            Some(true),
+            "the last attachment must validate the parent"
+        );
+    }
+
+    /// A partition's table cannot feed a second attached index to the same
+    /// parent: the server refuses with its own wording.
+    #[test]
+    fn attaching_a_second_index_for_the_same_partition_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text, d text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text, d text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_d ON p (d);
+             ALTER INDEX p_d ATTACH PARTITION c_b;",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("already attached")),
+            "expected the duplicate-attachment refusal, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c_b")
+            }),
+            "the manually named index must not be attached"
+        );
+    }
+
+    /// `verifyPartitionIndexNotNull`: a primary-key partition index cannot
+    /// cover a column the partition's table leaves nullable.
+    ///
+    /// Reaching this through the parser requires dropping the column's NOT
+    /// NULL after the key exists, which the server itself blocks; the check is
+    /// modeled for catalog states and for the simulator's own move set, which
+    /// does not yet recurse `ADD CONSTRAINT` into partitions.
+    #[test]
+    fn attaching_a_partition_index_over_a_nullable_key_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer NOT NULL);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             ALTER TABLE c ALTER COLUMN a DROP NOT NULL;
+             ALTER TABLE p ADD PRIMARY KEY (a);
+             ALTER TABLE c ADD CONSTRAINT c_u UNIQUE (a);
+             ALTER INDEX p_pkey ATTACH PARTITION c_u;",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("is not marked NOT NULL")),
+            "expected the primary-key nullability refusal, got {violations:?}"
+        );
+        assert!(
+            !state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && edge.dependent == object_id("public", "c_u")
+            }),
+            "a nullable key must not attach to a primary key"
+        );
+    }
+
+    /// REINDEX rebuilds a broken index, so the index is usable afterwards.
+    #[test]
+    fn reindex_makes_a_broken_index_usable() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        let broken = object_id("public", "broken_idx");
+        let table = object_id("public", "t");
+        let definition = safe_migrate::_internal::model::index::IndexDefinition {
+            method: Some("btree".to_string()),
+            keys: index_keys(vec!["a".to_string()]),
+            included: Vec::new(),
+            expression_keys: 0,
+            unique: true,
+            nulls_not_distinct: Some(false),
+            predicate: IndexPredicate::None,
+            unestablished: false,
+            valid: false,
+            ready: false,
+            live: true,
+        };
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("public", "owner"),
+                0,
+                Some(1000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache
+            .indexes
+            .push(safe_migrate::_internal::db::cache::IndexCache {
+                index_id: broken.clone(),
+                table_id: table.clone(),
+                definition,
+                dependency_columns: vec!["a".to_string()],
+                dependency_columns_known: true,
+                is_immediate: true,
+            });
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        let violations = engine
+            .analyze(
+                "REINDEX INDEX broken_idx;
+                 ALTER TABLE t ADD CONSTRAINT t_u UNIQUE USING INDEX broken_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "a rebuilt index is usable"
+        );
+    }
+
+    #[test]
+    fn a_foreign_table_can_hold_a_partition() {
+        let parent = object_id("public", "parent");
+        let child = object_id("public", "child");
+        let mut cache = synced_cache();
+        for (id, kind) in [
+            (parent.clone(), RelationKind::Table),
+            (child.clone(), RelationKind::ForeignTable),
+        ] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id.clone(),
+                    object_id("public", "owner"),
+                    0,
+                    None,
+                    kind,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        if let Some(RelationOverlay::Present(parent_state)) = state.local.relations.get_mut(&parent)
+        {
+            parent_state.partition_type = Some("RANGE".to_string());
+            parent_state.partition_by = Some("id".to_string());
+        }
+        let attach = Mutation::AlterTable(AlterTable {
+            id: parent,
+            only: false,
+            action: AlterTableActionMutation::AttachPartition {
+                child,
+                strategy: None,
+                bound: None,
+            },
+        });
+        assert!(
+            !matches!(state.apply(&attach, None), MutationResult::Conflict { .. }),
+            "ATTACH PARTITION accepts a foreign table"
         );
     }
 }

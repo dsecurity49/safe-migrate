@@ -1,4 +1,5 @@
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionState;
 use crate::_internal::model::relation::{RelationKind, RelationState};
@@ -9,6 +10,8 @@ use crate::_internal::model::sequence::{SequenceKind, SequenceState};
 use crate::_internal::model::trigger::TriggerEnableMode;
 use crate::_internal::model::types::{TypeKind, TypeState};
 use serde::{Deserialize, Serialize};
+
+use crate::_internal::model::index::IndexDefinition;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Catalog families whose completeness is independently meaningful to the
@@ -168,6 +171,69 @@ impl Default for CatalogCoverage {
     }
 }
 
+/// A cross-scope dependency, keeping both endpoints.
+///
+/// Direction matters: `scoped` is the object inside the synced schemas and
+/// `external` depends on it from outside. Storing only the external endpoint
+/// cannot answer "does this object have dependents out of scope?".
+///
+/// `family` is the catalog family of `scoped`. Identity is `(schema, name)`,
+/// which a table and a type in one schema may share, so the family keeps
+/// cross-scope exposure attributable to the object that actually has it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct ScopedDependencyEdge {
+    pub family: CatalogFamily,
+    pub scoped: ObjectId,
+    /// The out-of-scope dependent, absent when its catalog class could not be
+    /// resolved. That is exposure we can neither model nor name, and it still
+    /// forces the scoped endpoint to stay unevaluated.
+    pub external: Option<ObjectId>,
+}
+
+impl ScopedDependencyEdge {
+    pub(crate) fn new(family: CatalogFamily, scoped: ObjectId, external: ObjectId) -> Self {
+        Self {
+            family,
+            scoped,
+            external: Some(external),
+        }
+    }
+
+    pub(crate) fn unresolved_external(family: CatalogFamily, scoped: ObjectId) -> Self {
+        Self {
+            family,
+            scoped,
+            external: None,
+        }
+    }
+
+    /// True when this edge makes `scoped` unevaluatable: a modeled external
+    /// dependent, or an external dependent we could not resolve at all.
+    pub(crate) fn exposes(&self, family: CatalogFamily, id: &ObjectId) -> bool {
+        self.family == family && self.scoped == *id
+    }
+}
+
+impl Ord for ScopedDependencyEdge {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.family
+            .cmp(&other.family)
+            .then_with(|| self.scoped.cmp_identity(&other.scoped))
+            .then_with(|| match (&self.external, &other.external) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(a), Some(b)) => a.cmp_identity(b),
+            })
+    }
+}
+
+impl PartialOrd for ScopedDependencyEdge {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ForeignKeyCache {
     pub constraint_name: String,
@@ -253,12 +319,8 @@ pub(crate) struct DefaultSequenceDependencyCache {
 pub(crate) struct IndexCache {
     pub index_id: ObjectId,
     pub table_id: ObjectId,
-    pub using_method: String,
-    /// Ordered simple key columns. An expression key is omitted, so this is
-    /// complete only when `has_expression_keys` is false.
-    pub key_columns: Vec<String>,
-    /// Columns stored with `INCLUDE`; they remain dependencies of the index.
-    pub included_columns: Vec<String>,
+    /// The index's shape, exactly as the catalog states it.
+    pub definition: IndexDefinition,
     /// Every table column named by PostgreSQL's `pg_depend` rows for this
     /// index, including expression keys and predicates. This is unordered
     /// dependency evidence, not an index definition.
@@ -266,17 +328,8 @@ pub(crate) struct IndexCache {
     /// Whether `dependency_columns` came from complete catalog evidence.
     /// Locally parsed expression/predicate indexes cannot claim this yet.
     pub dependency_columns_known: bool,
-    pub has_expression_keys: bool,
-    pub has_predicate: bool,
-    pub is_unique: bool,
     /// `pg_index.indimmediate`; deferred unique indexes cannot be a replica identity.
     pub is_immediate: bool,
-    pub is_valid: bool,
-    pub is_ready: bool,
-    pub is_live: bool,
-    pub has_default_sort_order: bool,
-    pub has_default_opclasses: bool,
-    pub has_default_collations: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +360,24 @@ pub(crate) struct ViewDependencyCache {
     pub referenced_column: Option<String>,
 }
 
+/// The non-relation object a view depends on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ViewDependencyTarget {
+    Routine { routine: ObjectId },
+    Type { ty: ObjectId },
+}
+
+/// A `pg_depend` row from a view to a routine or a type.
+///
+/// PostgreSQL records these from the rewrite rules of the view, so a synced
+/// view carries the same obligations as one built from the statements in this
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ViewObjectDependencyCache {
+    pub dependent: ObjectId,
+    pub target: ViewDependencyTarget,
+}
+
 /// One direct table or index inheritance relationship from `pg_inherits`.
 ///
 /// The row is retained separately from generic dependencies because PostgreSQL
@@ -322,6 +393,19 @@ pub(crate) struct InheritanceCache {
     /// partitioning from traditional `INHERITS`, which shares `pg_inherits`.
     pub is_partition: bool,
     pub detach_pending: bool,
+}
+
+/// An index that is a partition of a partitioned index.
+///
+/// PostgreSQL stores this in the same `pg_inherits` rows as table partitions,
+/// with the parent's `relkind` `I` and the child's `i`. The row is what makes
+/// `DROP INDEX` on the child fail while the parent exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IndexAttachmentCache {
+    /// The attached (partition) index.
+    pub child: ObjectId,
+    /// The partitioned (parent) index.
+    pub parent: ObjectId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -345,6 +429,10 @@ pub(crate) struct CacheMetadata {
     pub source_session_role: Option<String>,
     /// Parsed `search_path` setting before PostgreSQL expands `$user`.
     pub source_search_path: Option<Vec<String>>,
+    /// Every schema that existed at sync time, before the scope filter. A
+    /// default search-path entry absent here named no schema then, which
+    /// PostgreSQL skips rather than resolving.
+    pub source_existing_schemas: Option<Vec<String>>,
     /// Effective `lock_timeout` observed on the fresh synchronization
     /// connection, normalized to milliseconds. PostgreSQL uses zero to mean
     /// that the timeout is disabled.
@@ -390,17 +478,41 @@ pub(crate) struct DbCache {
     #[serde(default)]
     pub bootstrap_superuser: Option<String>,
     pub schemas: HashMap<String, SchemaState>,
+    /// Built-in types of the synchronized cluster, derived from `pg_type`.
+    ///
+    /// `None` when no baseline was synchronized, which is distinct from an
+    /// empty catalogue: the former means "unknown", the latter cannot occur
+    /// against a real server.
+    pub builtin_types: Option<BuiltinTypeCatalogue>,
+    pub opclasses: Option<crate::_internal::model::opclass::OpclassCatalogue>,
+    /// Collations of the synchronized cluster, as `pg_collation` records them.
+    ///
+    /// `None` when no baseline was synchronized, which is distinct from an
+    /// empty catalogue: written collations stay unresolved rather than
+    /// equated.
+    pub collations: Option<crate::_internal::model::collation::CollationCatalogue>,
+    /// The cluster's implicit casts, from `pg_cast`. `None` when unsynchronized.
+    pub casts: Option<crate::_internal::model::cast::CastCatalogue>,
+    /// The built-in `pg_catalog` aggregate signatures. `None` when unsynchronized.
+    pub aggregates: Option<crate::_internal::model::aggregate::AggregateCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
-    /// Synchronized relations with a known dependent outside an explicit
-    /// schema scope. Scoped destructive transitions stay conservative for
-    /// these identities; an absent entry means no such dependent was observed
-    /// in the catalog families the synchronizer resolves.
-    pub scoped_external_relation_dependencies: Vec<ObjectId>,
-    pub scoped_external_type_dependencies: Vec<ObjectId>,
-    pub scoped_external_routine_dependencies: Vec<ObjectId>,
-    pub scoped_external_index_dependencies: Vec<ObjectId>,
+    /// Dependencies from a view to a routine or type, which the relation
+    /// dependency rows cannot express.
+    pub view_object_dependencies: Vec<ViewObjectDependencyCache>,
+    /// Every observed cross-scope dependency edge, tagged with the catalog
+    /// family of the in-scope endpoint. Scoped destructive transitions stay
+    /// conservative for these identities; an absent entry means no external
+    /// dependent was observed when the boundary query ran.
+    pub scoped_external_dependencies: Vec<ScopedDependencyEdge>,
+    /// Schemas outside the synchronized scope that depend on an in-scope object
+    /// through a catalog class this build does not model as an object, such as
+    /// an operator. They cannot be attributed to a catalog family, but a
+    /// consumer still has to be told that widening the scope would change the
+    /// answer.
+    pub external_referencing_schemas: Vec<String>,
     pub inheritances: Vec<InheritanceCache>,
+    pub index_attachments: Vec<IndexAttachmentCache>,
     pub publications: HashMap<String, PublicationState>,
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
@@ -411,17 +523,18 @@ pub(crate) struct DbCache {
 // this: bincode carries no field names, so bytes are laid out exactly as the
 // current definitions describe. The header encodes the same number, and the
 // magic must stay one digit wide or the fixed-size prefix read breaks.
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 9;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
 
-/// Current durable cache header. V9 records every independently-nameable type,
-/// including ranges and multiranges, so `Types` coverage is honest.
-pub(crate) const CACHE_V9_MAGIC: &[u8] = b"SMCACHE09";
+/// Current durable cache header. V10 is unreleased, so its layout is still
+/// being shaped within the version that introduced it; caches anyone holds are
+/// V9 or older, which this header already rejects with resync guidance.
+pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE10";
 
-// The header width is fixed, so a two-digit version would break the prefix
-// comparison in `api.rs` and read as corruption rather than an old format.
+// The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
+// must stay the same width as the version grows. Two version digits fit.
 const _: () = assert!(
-    CACHE_FORMAT_VERSION < 10,
-    "a two-digit cache version changes the header width; redesign the prefix read first"
+    CACHE_MAGIC.len() == 9,
+    "the cache magic must stay 9 bytes; a wider version needs a new prefix read"
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,9 +551,16 @@ pub(crate) enum DbCacheVersioned {
     V7(Box<DbCache>),
     V8(Box<DbCache>),
     V9(Box<DbCache>),
+    V10(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
+    /// The variant this build writes. Naming it in one place keeps a format
+    /// bump from silently leaving a writer or a fixture on a stale layout.
+    pub(crate) fn current(cache: DbCache) -> Self {
+        DbCacheVersioned::V10(Box::new(cache))
+    }
+
     pub(crate) fn format_version(&self) -> u32 {
         match self {
             DbCacheVersioned::V1 => 1,
@@ -452,6 +572,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V7(_) => 7,
             DbCacheVersioned::V8(_) => 8,
             DbCacheVersioned::V9(_) => 9,
+            DbCacheVersioned::V10(_) => 10,
         }
     }
 
@@ -464,11 +585,12 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V5(_)
             | DbCacheVersioned::V6(_)
             | DbCacheVersioned::V7(_)
-            | DbCacheVersioned::V8(_) => Err(
+            | DbCacheVersioned::V8(_)
+            | DbCacheVersioned::V9(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V9(c) => {
+            DbCacheVersioned::V10(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -505,13 +627,18 @@ impl DbCache {
             role_membership_grantors_complete: false,
             bootstrap_superuser: None,
             schemas: HashMap::new(),
+            builtin_types: None,
+            opclasses: None,
+            collations: None,
+            casts: None,
+            aggregates: None,
             sequences: HashMap::new(),
             dependencies: Vec::new(),
-            scoped_external_relation_dependencies: Vec::new(),
-            scoped_external_type_dependencies: Vec::new(),
-            scoped_external_routine_dependencies: Vec::new(),
-            scoped_external_index_dependencies: Vec::new(),
+            view_object_dependencies: Vec::new(),
+            scoped_external_dependencies: Vec::new(),
+            external_referencing_schemas: Vec::new(),
             inheritances: Vec::new(),
+            index_attachments: Vec::new(),
             publications: HashMap::new(),
             subscriptions: HashMap::new(),
         }
@@ -630,6 +757,14 @@ impl DbCache {
                 "cache metadata source search path contains an empty schema identity".to_string(),
             );
         }
+        if let Some(existing) = &self.metadata.source_existing_schemas
+            && existing.iter().any(String::is_empty)
+        {
+            return Err(
+                "cache metadata source existing schemas contain an empty schema identity"
+                    .to_string(),
+            );
+        }
         let mut search_path = HashSet::new();
         for schema in &self.search_path {
             if schema.is_empty() {
@@ -650,60 +785,36 @@ impl DbCache {
                 ));
             }
         }
-        let mut scoped_external_relations = HashSet::new();
-        for id in &self.scoped_external_relation_dependencies {
-            validate_id("scoped external relation dependency identity", id, true)?;
-            if !scoped_external_relations.insert(id) {
+        let mut seen_edges = HashSet::new();
+        for edge in &self.scoped_external_dependencies {
+            validate_id("scoped dependency endpoint", &edge.scoped, true)?;
+            if !seen_edges.insert(edge.clone()) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' appears more than once",
-                    id
+                    "scoped external dependency '{}' appears more than once",
+                    edge.scoped
                 ));
             }
             if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' requires an explicit schema scope",
-                    id
+                    "scoped external dependency '{}' requires an explicit schema scope",
+                    edge.scoped
                 ));
             }
-            if !self.coverage.schema_scope.covers(&id.schema) {
+            if !self.coverage.schema_scope.covers(&edge.scoped.schema) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' is outside the cache schema scope",
-                    id
+                    "scoped external dependency '{}' is outside the cache schema scope",
+                    edge.scoped
                 ));
             }
-        }
-        for (label, ids) in [
-            (
-                "scoped external type dependency",
-                &self.scoped_external_type_dependencies,
-            ),
-            (
-                "scoped external routine dependency",
-                &self.scoped_external_routine_dependencies,
-            ),
-            (
-                "scoped external index dependency",
-                &self.scoped_external_index_dependencies,
-            ),
-        ] {
-            let mut seen = HashSet::new();
-            for id in ids {
-                validate_id(label, id, true)?;
-                if !seen.insert(id) {
-                    return Err(format!("{label} '{}' appears more than once", id));
-                }
-                if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
-                    return Err(format!(
-                        "{label} '{}' requires an explicit schema scope",
-                        id
-                    ));
-                }
-                if !self.coverage.schema_scope.covers(&id.schema) {
-                    return Err(format!(
-                        "{label} '{}' is outside the cache schema scope",
-                        id
-                    ));
-                }
+            let Some(external) = &edge.external else {
+                continue;
+            };
+            validate_id("scoped dependency endpoint", external, true)?;
+            if self.coverage.schema_scope.covers(&external.schema) {
+                return Err(format!(
+                    "scoped external dependency '{}' -> '{}' must not be in the cache schema scope",
+                    edge.scoped, external
+                ));
             }
         }
         let coverage_scope = self
@@ -1488,7 +1599,7 @@ impl DbCache {
                         constraint.table_id, constraint.name, backing_index
                     ));
                 };
-                if !index.is_valid || !index.is_ready || !index.is_live {
+                if !index.definition.is_usable() {
                     return Err(format!(
                         "constraint '{}.{}' references an unusable backing index '{}'",
                         constraint.table_id, constraint.name, backing_index
@@ -1497,7 +1608,7 @@ impl DbCache {
                 if matches!(
                     constraint.kind,
                     ConstraintKind::PrimaryKey | ConstraintKind::Unique
-                ) && !index.is_unique
+                ) && !index.definition.unique
                 {
                     return Err(format!(
                         "constraint '{}.{}' references non-unique backing index '{}'",
@@ -1592,7 +1703,7 @@ impl DbCache {
                     index.index_id
                 ));
             }
-            if index.using_method.is_empty() {
+            if index.definition.method.as_deref().is_none_or(str::is_empty) {
                 return Err(format!(
                     "index '{}' has an empty access method",
                     index.index_id
@@ -1616,7 +1727,9 @@ impl DbCache {
             if !index_ids.insert(index.index_id.clone()) {
                 return Err(format!("index '{}' appears more than once", index.index_id));
             }
-            if !index.has_expression_keys && index.key_columns.is_empty() {
+            // `keys` counts expression keys too, so this cannot be satisfied by an
+            // index that merely recorded expression positions as absent columns.
+            if index.definition.keys.is_empty() {
                 return Err(format!(
                     "index '{}' has no key column identities",
                     index.index_id
@@ -1629,9 +1742,10 @@ impl DbCache {
                 ));
             }
             for column in index
-                .key_columns
+                .definition
+                .key_column_names()
                 .iter()
-                .chain(&index.included_columns)
+                .chain(&index.definition.included_column_names())
                 .chain(&index.dependency_columns)
             {
                 if !relation.has_column(column) {
@@ -1692,18 +1806,16 @@ impl DbCache {
                     relation.id, index_name
                 ));
             };
-            let all_keys_not_null = index.key_columns.iter().all(|column| {
+            let all_keys_not_null = index.definition.key_column_names().iter().all(|column| {
                 relation
                     .get_column(column)
                     .is_some_and(|column| !column.is_nullable)
             });
-            if !index.is_unique
-                || index.has_predicate
-                || index.has_expression_keys
-                || !index.is_valid
+            if !index.definition.is_usable()
+                || !index.definition.unique
+                || index.definition.has_predicate()
+                || index.definition.has_expression_keys()
                 || !index.is_immediate
-                || !index.is_ready
-                || !index.is_live
                 || !all_keys_not_null
             {
                 return Err(format!(
@@ -1730,7 +1842,10 @@ impl DbCache {
                     trigger.trigger_id, trigger.table_id
                 ));
             };
-            if !matches!(relation.kind, RelationKind::Table | RelationKind::View) {
+            if !matches!(
+                relation.kind,
+                RelationKind::Table | RelationKind::View | RelationKind::ForeignTable
+            ) {
                 return Err(format!(
                     "trigger '{}' targets a relation kind that cannot have triggers",
                     trigger.trigger_id
@@ -1936,7 +2051,7 @@ impl DbCache {
             };
             for id in [&inheritance.child, &inheritance.parent] {
                 if let Some(relation) = self.relations.get(id) {
-                    if !matches!(relation.kind, RelationKind::Table) {
+                    if !relation.kind.is_table_like() {
                         return Err(format!(
                             "inheritance '{} -> {}' must reference tables",
                             inheritance.child, inheritance.parent
@@ -2196,6 +2311,7 @@ impl DbCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::_internal::model::index::{IndexPredicate, index_keys};
 
     /// Coverage for a hand-built cache that retrieved the whole catalog.
     fn fully_covering(schemas: Option<&[String]>) -> CatalogCoverage {
@@ -2270,10 +2386,16 @@ mod tests {
     }
 
     #[test]
-    fn current_cache_format_is_v9() {
-        assert_eq!(CACHE_FORMAT_VERSION, 9);
-        assert_eq!(DbCacheVersioned::V9(Box::default()).format_version(), 9);
-        assert_eq!(CACHE_V9_MAGIC, b"SMCACHE09");
+    fn current_cache_format_is_v10() {
+        assert_eq!(CACHE_FORMAT_VERSION, 10);
+        assert_eq!(DbCacheVersioned::V10(Box::default()).format_version(), 10);
+        assert_eq!(CACHE_MAGIC, b"SMCACHE10");
+    }
+
+    #[test]
+    fn legacy_cache_versions_are_rejected_before_validation() {
+        assert!(DbCacheVersioned::V9(Box::default()).into_cache().is_err());
+        assert!(DbCacheVersioned::V1.into_cache().is_err());
     }
 
     #[test]
@@ -2352,13 +2474,81 @@ mod tests {
         let mut cache = synced_cache();
         let schemas = vec!["public".to_string()];
         cache.coverage = fully_covering(Some(&schemas));
-        cache.metadata.schemas = Some(schemas);
+        cache.metadata.schemas = Some(schemas.clone());
+        // The scoped endpoint is the one that must lie inside the scope.
         cache
-            .scoped_external_relation_dependencies
-            .push(ObjectId::new("omitted", "table"));
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::new(
+                CatalogFamily::Relations,
+                ObjectId::new("omitted", "scoped"),
+                ObjectId::new("public", "table"),
+            ));
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("outside the cache schema scope"), "{error}");
+
+        // An external endpoint inside the scope is the contradictory case.
+        let mut cache = synced_cache();
+        cache.coverage = fully_covering(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::new(
+                CatalogFamily::Relations,
+                ObjectId::new("public", "scoped"),
+                ObjectId::new("public", "table"),
+            ));
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(
+            error.contains("must not be in the cache schema scope"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn current_cache_accepts_unresolvable_external_endpoint() {
+        let mut cache = synced_cache();
+        let schemas = vec!["public".to_string()];
+        cache.coverage = fully_covering(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::unresolved_external(
+                CatalogFamily::Relations,
+                ObjectId::new("public", "scoped"),
+            ));
+
+        // An unresolvable dependent is exposure we can neither model nor name,
+        // so it is recorded rather than rejected.
+        assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn scoped_external_edges_keep_family_distinct() {
+        let mut cache = synced_cache();
+        let schemas = vec!["public".to_string()];
+        cache.coverage = fully_covering(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        let scoped = ObjectId::new("public", "widget");
+        let external = ObjectId::new("other", "widget");
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::new(
+                CatalogFamily::Indexes,
+                scoped.clone(),
+                external.clone(),
+            ));
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::new(
+                CatalogFamily::Relations,
+                scoped,
+                external,
+            ));
+
+        // A table and an index may share an identity, so the family stays part
+        // of the key and the duplicate check does not fire.
+        assert!(cache.validate_semantics().is_ok());
     }
 
     #[test]
@@ -2373,7 +2563,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
@@ -2384,7 +2574,7 @@ mod tests {
         let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema coverage disagrees"));
@@ -2414,6 +2604,7 @@ mod tests {
                     fields: vec![crate::_internal::model::types::CompositeFieldState {
                         name: "street".to_string(),
                         data_type: "text".to_string(),
+                        data_type_id: None,
                     }],
                 },
             },
@@ -2548,21 +2739,22 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: index_id.clone(),
             table_id: table_id.clone(),
-            using_method: "gist".to_string(),
-            key_columns: vec!["id".to_string()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("gist".into()),
+                keys: index_keys(vec!["id".to_string()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".to_string()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
         cache.constraints.push(ConstraintState {
             table_id,
@@ -2880,6 +3072,11 @@ mod tests {
         cache.metadata.source_search_path = Some(vec![String::new()]);
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("source search path contains an empty"));
+
+        let mut cache = synced_cache();
+        cache.metadata.source_existing_schemas = Some(vec![String::new()]);
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("source existing schemas contain an empty"));
     }
 
     #[test]
@@ -2911,7 +3108,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("empty or duplicate table column"));
@@ -2947,7 +3144,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("owner 'missing_owner' is absent"));
@@ -2971,6 +3168,38 @@ mod tests {
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("appears more than once"));
+    }
+
+    #[test]
+    fn a_synced_cache_carries_view_dependencies_on_routines_and_types() {
+        let view = ObjectId::new("public", "vsync");
+        let mut cache = synced_cache();
+        let mut view_state = table(view.clone(), &["a"]);
+        view_state.kind = RelationKind::View;
+        cache.insert_baseline(view.clone(), view_state);
+        let routine = ObjectId::new("public", "fsync(integer)");
+        let ty = ObjectId::new("public", "tsync_t");
+        cache.view_object_dependencies = vec![
+            ViewObjectDependencyCache {
+                dependent: view.clone(),
+                target: ViewDependencyTarget::Routine {
+                    routine: routine.clone(),
+                },
+            },
+            ViewObjectDependencyCache {
+                dependent: view.clone(),
+                target: ViewDependencyTarget::Type { ty: ty.clone() },
+            },
+        ];
+        cache
+            .validate_semantics()
+            .expect("valid view object dependencies");
+
+        let state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        let edges = state.local.graph.views_for_function(&routine);
+        assert_eq!(edges.len(), 1, "a synced view must block its routine");
+        let edges = state.local.graph.views_for_type(&ty);
+        assert_eq!(edges.len(), 1, "a synced view must block its type");
     }
 
     #[test]
@@ -3224,24 +3453,25 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("public", "items_idx"),
             table_id: ObjectId::new("public", "items"),
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
@@ -3255,24 +3485,25 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("other", "items_idx"),
             table_id,
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as indexed relation"));
@@ -3288,24 +3519,25 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id,
             table_id: ObjectId::new("public", "items"),
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -3330,7 +3562,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -3350,7 +3582,7 @@ mod tests {
             enabled_mode: TriggerEnableMode::Origin,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as trigger table"));
@@ -3364,25 +3596,26 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("public", "items_idx"),
             table_id,
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: false,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
         assert!(
-            DbCacheVersioned::V9(Box::new(cache))
+            DbCacheVersioned::current(cache)
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -3405,13 +3638,13 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V9(Box::new(cache.clone()))
+            DbCacheVersioned::current(cache.clone())
                 .into_cache()
                 .is_ok()
         );
 
         cache.inheritances[0].detach_pending = true;
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("pending detach requires"));
@@ -3436,7 +3669,7 @@ mod tests {
             is_partition: true,
             detach_pending: true,
         });
-        assert!(DbCacheVersioned::V9(Box::new(cache)).into_cache().is_ok());
+        assert!(DbCacheVersioned::current(cache).into_cache().is_ok());
     }
 
     #[test]

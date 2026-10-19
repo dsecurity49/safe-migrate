@@ -1,6 +1,7 @@
 use crate::_internal::analysis::state::Confidence;
-use crate::_internal::report::reporter::{terminal_block, terminal_inline};
-use crate::_internal::report::violations::Violation;
+use crate::_internal::report::reporter::{human_not_evaluated, terminal_block, terminal_inline};
+use crate::_internal::report::violations::{NotEvaluated, ReportFinding};
+use crate::api::Certainty;
 use anyhow::Result;
 use crossterm::{
     cursor,
@@ -40,13 +41,23 @@ fn require_interactive_terminal(stdin_is_terminal: bool, stdout_is_terminal: boo
     Ok(())
 }
 
-pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Result<()> {
-    if violations.is_empty() {
-        println!("No violations found!");
+pub(crate) fn run_interactive(
+    findings: &[ReportFinding],
+    confidence: &Confidence,
+    not_evaluated: &[NotEvaluated],
+) -> Result<()> {
+    if findings.is_empty() {
+        println!("No findings found!");
+        if !not_evaluated.is_empty() {
+            println!();
+            print!("{}", human_not_evaluated(not_evaluated));
+        }
         return Ok(());
     }
 
     require_interactive_terminal(stdin().is_terminal(), stdout().is_terminal())?;
+
+    print!("{}", human_not_evaluated(not_evaluated));
 
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -61,6 +72,11 @@ pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence)
     )?;
 
     let mut selected: usize = 0;
+    let skipped = if not_evaluated.is_empty() {
+        String::new()
+    } else {
+        format!("; {} not evaluated", not_evaluated.len())
+    };
 
     loop {
         queue!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
@@ -68,8 +84,9 @@ pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence)
             stdout,
             SetForegroundColor(Color::Cyan),
             Print(format!(
-                "Safe-Migrate Interactive Viewer ({} violations) [Confidence: {:?}]\r\n\r\n",
-                violations.len(),
+                "Safe-Migrate Interactive Viewer ({} findings{}) [Confidence: {:?}]\r\n\r\n",
+                findings.len(),
+                skipped,
                 confidence
             )),
             ResetColor,
@@ -80,14 +97,15 @@ pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence)
         let window_size = (h.saturating_sub(18) as usize).max(3);
 
         let start = selected.saturating_sub(window_size / 2);
-        let end = std::cmp::min(start + window_size, violations.len());
+        let end = std::cmp::min(start + window_size, findings.len());
 
         if start > 0 {
             queue!(stdout, Print("   ...\r\n"))?;
         }
 
-        for (i, v) in violations.iter().enumerate().take(end).skip(start) {
+        for (i, entry) in findings.iter().enumerate().take(end).skip(start) {
             let prefix = if i == selected { " > " } else { "   " };
+            let v = &entry.violation;
             let color = match v.tier {
                 crate::_internal::report::violations::ViolationTier::Tier1 => Color::Red,
                 crate::_internal::report::violations::ViolationTier::Tier2 => Color::Yellow,
@@ -101,14 +119,18 @@ pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence)
                 Print(format!("[{:?}] ", v.tier)),
                 ResetColor,
                 Print(format!(
-                    "{} (rule: {})\r\n",
-                    terminal_inline(&v.operation_kind.to_string()),
+                    "{} ({})\r\n",
+                    terminal_inline(
+                        crate::_internal::rules::registry::find_primary_rule(v.rule_id)
+                            .map(|descriptor| descriptor.title)
+                            .unwrap_or(v.rule_id)
+                    ),
                     terminal_inline(v.rule_id)
                 ))
             )?;
         }
 
-        if end < violations.len() {
+        if end < findings.len() {
             queue!(stdout, Print("   ...\r\n"))?;
         }
 
@@ -117,20 +139,31 @@ pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence)
             Print("\r\n------------------------------------------------------------\r\n")
         )?;
 
-        let active = &violations[selected];
+        let active = &findings[selected];
+        let violation = &active.violation;
         queue!(
             stdout,
             SetForegroundColor(Color::White),
             Print("Reason: "),
             ResetColor,
-            Print(format!("{}\r\n", terminal_inline(&active.reason))),
+            Print(format!("{}\r\n", terminal_inline(&violation.reason))),
             SetForegroundColor(Color::White),
             Print("Recipe: "),
             ResetColor,
-            Print(format!("{}\r\n", terminal_inline(active.recipe))),
+            Print(format!("{}\r\n", terminal_inline(violation.recipe))),
         )?;
 
-        if let Some(sql) = &active.sql {
+        if active.certainty != Certainty::Exact {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::White),
+                Print("Certainty: "),
+                ResetColor,
+                Print(format!("{}\r\n", active.certainty)),
+            )?;
+        }
+
+        if let Some(sql) = &violation.sql {
             // Bound detail height so navigation remains visible.
             let mut sql_lines: Vec<&str> = sql.lines().collect();
             let mut truncated = false;
@@ -167,7 +200,7 @@ pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence)
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Up if selected > 0 => selected -= 1,
-                KeyCode::Down if selected < violations.len() - 1 => selected += 1,
+                KeyCode::Down if selected < findings.len() - 1 => selected += 1,
                 _ => {}
             }
         }

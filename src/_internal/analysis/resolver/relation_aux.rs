@@ -1,17 +1,24 @@
 use super::Resolver;
+use crate::_internal::analysis::expr_ir::ExprIr;
+use crate::_internal::analysis::facts::ViewUpdatabilityFact;
 use crate::_internal::analysis::facts::{
-    AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
-    ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
+    AggregateArgumentFact, AggregateCandidateFact, AlterIndexActionFact,
+    AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact,
+    SelectOutputFact, StatisticsTarget,
 };
 use crate::_internal::analysis::mutations::{
-    AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
-    CreatePolicyMutation, CreateTriggerMutation, CreateView, DropPolicyMutation,
-    DropTriggerMutation, Mutation, OpaqueMutation, RefreshMaterializedViewMutation,
-    ReindexTargetMutation, ReloptionTarget, Rename, RenameTriggerMutation, ViewColumn,
+    AlterIndexActionMutation, AlterIndexMutation, AlterViewFamily, CreateIndex,
+    CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
+    DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
+    RefreshMaterializedViewMutation, ReindexTargetMutation, ReloptionTarget, Rename,
+    RenameTriggerMutation, ViewColumn, ViewRoutine,
 };
-use crate::_internal::analysis::state::AnalysisState;
+use crate::_internal::analysis::state::{AnalysisState, RelationOverlay};
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
-use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::model::data_type::ParsedDataType;
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
+use crate::_internal::model::relation::RelationKind;
+use crate::_internal::model::relation::ViewUpdatabilityReason;
 
 impl Resolver {
     pub(super) fn resolve_reindex(
@@ -21,9 +28,11 @@ impl Resolver {
         state: &AnalysisState,
     ) -> Mutation {
         let target = match (target_kind, target_name) {
-            (ReindexTargetKindFact::Database, Some(name)) => {
-                Some(ReindexTargetMutation::Database(name.name.resolve()))
-            }
+            // The grammar makes the database name optional for `DATABASE` and
+            // `SYSTEM` alike, so both forms carry the same identity.
+            (ReindexTargetKindFact::Database, name_opt) => Some(ReindexTargetMutation::Database(
+                name_opt.map(|name| name.name.resolve()).unwrap_or_default(),
+            )),
             (ReindexTargetKindFact::Schema, Some(name)) => {
                 Some(ReindexTargetMutation::Schema(name.name.resolve()))
             }
@@ -45,17 +54,47 @@ impl Resolver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_view(
         name: &QualifiedName,
         or_replace: bool,
         depends_on: &[QualifiedName],
+        column_list: &[String],
+        options: &[crate::_internal::analysis::facts::AttributeFact],
+        updatability: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+        updatability_without_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+        aggregate_candidates: &[AggregateCandidateFact],
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
+        routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
+        cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
         let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
+        // A view over a materialized view is not auto-updatable, which is the
+        // one catalog fact the syntactic analysis cannot see. It disqualifies
+        // both readings of the query, so it applies before the aggregates.
+        let over_matview = matches!(
+            source.as_ref().and_then(|id| state.local.relations.get(id)),
+            Some(RelationOverlay::Present(relation))
+                if relation.kind == RelationKind::MaterializedView
+        );
+        let downgrade = |verdict| {
+            if over_matview && matches!(verdict, ViewUpdatabilityFact::Updatable) {
+                ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::SingleRelation)
+            } else {
+                verdict
+            }
+        };
+        let updatability = Self::resolve_view_aggregates(
+            downgrade(updatability),
+            downgrade(updatability_without_aggregates),
+            aggregate_candidates,
+            source.as_ref(),
+            state,
+        );
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -64,8 +103,70 @@ impl Resolver {
                 .map(|dependency| Self::resolve_relation_lookup_name(dependency, state))
                 .collect(),
             columns,
+            column_list: column_list.to_vec(),
             projection_complete,
+            options: options.to_vec(),
+            updatability,
+            routines: Self::resolve_view_routines(routines, source.as_ref(), state),
+            cast_types: Self::resolve_cast_types(cast_types, state),
         })
+    }
+
+    /// Settle each unqualified aggregate-named call against the routine
+    /// search path: a settled aggregate keeps the reading that counts them, a
+    /// settled shadow is ignored, and anything unplaceable taints the verdict.
+    fn resolve_view_aggregates(
+        with_aggregates: ViewUpdatabilityFact,
+        without_aggregates: ViewUpdatabilityFact,
+        candidates: &[AggregateCandidateFact],
+        source: Option<&ObjectId>,
+        state: &AnalysisState,
+    ) -> ViewUpdatabilityFact {
+        use crate::_internal::analysis::state::AggregateCandidateResolution as Resolution;
+        let mut uncertain = false;
+        for candidate in candidates {
+            let arguments = candidate
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    AggregateArgumentFact::Column(column) => {
+                        Self::source_column_type(source, column, state)
+                    }
+                    AggregateArgumentFact::Typed(typed) => Some(typed.clone()),
+                    AggregateArgumentFact::Unknown => None,
+                })
+                .collect::<Vec<_>>();
+            match state.resolve_aggregate_candidate(&candidate.name, &arguments) {
+                Resolution::Aggregate => return with_aggregates,
+                Resolution::Scalar => {}
+                Resolution::Uncertain => uncertain = true,
+            }
+        }
+        if uncertain {
+            match without_aggregates {
+                ViewUpdatabilityFact::Updatable
+                | ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::NoUpdatableColumns) => {
+                    ViewUpdatabilityFact::Unknown
+                }
+                other => other,
+            }
+        } else {
+            without_aggregates
+        }
+    }
+
+    /// The type a column-reference argument has on the view's single base
+    /// relation; an argument from anywhere else stays untyped.
+    fn source_column_type(
+        source: Option<&ObjectId>,
+        column: &str,
+        state: &AnalysisState,
+    ) -> Option<String> {
+        let columns = state.relation_column_types(source?)?;
+        columns
+            .into_iter()
+            .find(|entry| entry.0 == column)
+            .and_then(|entry| entry.1)
     }
 
     /// Project a view's output list, taking types from the source relation
@@ -89,11 +190,13 @@ impl Resolver {
         };
         let view_column = |output_name: String, declared: Option<&str>| ViewColumn {
             name: output_name,
-            data_type: declared.map(|declared| {
-                TypeIdentity::from_syntax(&ParsedDataType::parse(declared)).render()
+            // `format_type` spelling, typmod included, so a view built from
+            // DDL carries the same string the catalog reports.
+            data_type: declared
+                .map(|declared| ParsedDataType::parse(declared, state.builtin_types()).to_string()),
+            type_modifier: declared.and_then(|declared| {
+                ParsedDataType::parse(declared, state.builtin_types()).atttypmod()
             }),
-            type_modifier: declared
-                .and_then(|declared| ParsedDataType::parse(declared).atttypmod_offset()),
         };
 
         let mut columns = Vec::new();
@@ -113,12 +216,93 @@ impl Resolver {
         columns
     }
 
+    /// The routines a view calls, as identities the drop path can match.
+    ///
+    /// A call whose arguments are all plain column references of the source
+    /// resolves to the exact routine identity. Any other call falls back to the
+    /// lone routine of that name when the modeled universe holds one; only a
+    /// call that is still ambiguous keeps just the qualified name.
+    fn resolve_view_routines(
+        routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
+        source: Option<&ObjectId>,
+        state: &AnalysisState,
+    ) -> Vec<ViewRoutine> {
+        let source_columns = source
+            .and_then(|id| state.relation_column_types(id))
+            .unwrap_or_default();
+        routines
+            .iter()
+            .map(|reference| {
+                let name = Self::resolve_routine_namespace_name(&reference.name, state);
+                let signature = reference.argument_types.as_ref().and_then(|arguments| {
+                    arguments
+                        .iter()
+                        .map(|argument| {
+                            source_columns
+                                .iter()
+                                .find(|(column, _)| column == argument)
+                                .and_then(|(_, data_type)| data_type.clone())
+                        })
+                        .collect::<Option<Vec<String>>>()
+                });
+                ViewRoutine {
+                    name: name.clone(),
+                    signature: signature
+                        .map(|arguments| {
+                            ObjectId::new(
+                                name.schema.clone(),
+                                format!(
+                                    "{}({})",
+                                    name.name,
+                                    arguments
+                                        .iter()
+                                        .map(|argument| {
+                                            Resolver::normalize_function_arg_type(
+                                                argument,
+                                                state.builtin_types(),
+                                            )
+                                            .render()
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ),
+                            )
+                        })
+                        .or_else(|| {
+                            // The argument types did not resolve, but a lone routine
+                            // of this name is still the one PostgreSQL picked.
+                            state.unique_routine_named(&ObjectId::new(
+                                name.schema.clone(),
+                                name.name.clone(),
+                            ))
+                        }),
+                }
+            })
+            .collect()
+    }
+
+    /// The types a view body casts to, as identities the drop path can match.
+    fn resolve_cast_types(
+        cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
+        state: &AnalysisState,
+    ) -> Vec<ObjectId> {
+        let mut resolved: Vec<ObjectId> = Vec::new();
+        for reference in cast_types {
+            let id = Self::resolve_type_lookup_name(&reference.name, state);
+            if !resolved.contains(&id) {
+                resolved.push(id);
+            }
+        }
+        resolved
+    }
+
     pub(super) fn resolve_alter_view(
         name: &QualifiedName,
         action: &AlterViewAction,
+        if_exists: bool,
         state: &AnalysisState,
     ) -> Mutation {
-        match action {
+        let action = match action {
             AlterViewAction::RenameTo { new_name } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
@@ -155,26 +339,74 @@ impl Resolver {
             AlterViewAction::ResetOptions { options } => Mutation::ResetReloptions {
                 id: Self::resolve_relation_lookup_name(name, state),
                 kind: ReloptionTarget::View,
-                names: options.iter().map(|option| option.name.clone()).collect(),
+                attributes: options.clone(),
             },
-        }
+        };
+        Mutation::AlterViewFamily(AlterViewFamily {
+            id: Self::resolve_relation_lookup_name(name, state),
+            kind: RelationKind::View,
+            if_exists,
+            actions: vec![action],
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_materialized_view(
         name: &QualifiedName,
         depends_on: &[QualifiedName],
+        if_not_exists: bool,
+        with_no_data: bool,
+        column_list: &[String],
+        access_method: &Option<String>,
+        tablespace: &Option<String>,
+        options: &[crate::_internal::analysis::facts::AttributeFact],
+        select_outputs: &[SelectOutputFact],
+        projection_complete: bool,
+        select_source: Option<&QualifiedName>,
+        view_routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
+        cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
+        let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
+        let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
         Mutation::CreateMaterializedView(CreateMaterializedView {
             id: Self::resolve_creation_name(name, state),
             depends_on: depends_on
                 .iter()
                 .map(|dependency| Self::resolve_relation_lookup_name(dependency, state))
                 .collect(),
+            if_not_exists,
+            with_no_data,
+            columns,
+            column_list: column_list.to_vec(),
+            projection_complete,
+            routines: Self::resolve_view_routines(view_routines, source.as_ref(), state),
+            cast_types: Self::resolve_cast_types(cast_types, state),
+            access_method: access_method.clone(),
+            tablespace: tablespace.clone(),
+            options: options.to_vec(),
         })
     }
 
     pub(super) fn resolve_alter_materialized_view(
+        name: &QualifiedName,
+        actions: &[AlterMaterializedViewActionFact],
+        if_exists: bool,
+        state: &AnalysisState,
+    ) -> Mutation {
+        let actions = actions
+            .iter()
+            .map(|action| Self::resolve_alter_materialized_view_action(name, action, state))
+            .collect();
+        Mutation::AlterViewFamily(AlterViewFamily {
+            id: Self::resolve_relation_lookup_name(name, state),
+            kind: RelationKind::MaterializedView,
+            if_exists,
+            actions,
+        })
+    }
+
+    fn resolve_alter_materialized_view_action(
         name: &QualifiedName,
         action: &AlterMaterializedViewActionFact,
         state: &AnalysisState,
@@ -217,7 +449,7 @@ impl Resolver {
                 Mutation::ResetReloptions {
                     id: Self::resolve_relation_lookup_name(name, state),
                     kind: ReloptionTarget::MaterializedView,
-                    names: options.iter().map(|option| option.name.clone()).collect(),
+                    attributes: options.clone(),
                 }
             }
         }
@@ -226,11 +458,13 @@ impl Resolver {
     pub(super) fn resolve_refresh_materialized_view(
         name: &QualifiedName,
         concurrently: bool,
+        with_no_data: bool,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::RefreshMaterializedView(RefreshMaterializedViewMutation {
             id: Self::resolve_relation_lookup_name(name, state),
             concurrently,
+            with_no_data,
         })
     }
 
@@ -240,15 +474,17 @@ impl Resolver {
         relation: &QualifiedName,
         if_not_exists: bool,
         concurrently: bool,
+        only: bool,
         using_method: &Option<String>,
-        has_predicate: bool,
+        predicate: &IndexPredicate,
         unique: bool,
+        nulls_not_distinct: bool,
         key_columns: &[String],
+        key_expressions: &[Option<ExprIr>],
+        key_orders: &[IndexOrder],
+        key_opclasses: &[Option<WrittenName>],
+        key_collations: &[Option<WrittenName>],
         included_columns: &[String],
-        has_expression_keys: bool,
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
         state: &AnalysisState,
     ) -> Mutation {
         let table = Self::resolve_relation_lookup_name(relation, state);
@@ -264,15 +500,17 @@ impl Resolver {
             table,
             if_not_exists,
             concurrently,
+            only,
             using_method: using_method.clone(),
-            has_predicate,
+            predicate: predicate.clone(),
             unique,
+            nulls_not_distinct,
             key_columns: key_columns.to_vec(),
+            key_expressions: key_expressions.to_vec(),
+            key_orders: key_orders.to_vec(),
+            key_opclasses: key_opclasses.to_vec(),
+            key_collations: key_collations.to_vec(),
             included_columns: included_columns.to_vec(),
-            has_expression_keys,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
         })
     }
 

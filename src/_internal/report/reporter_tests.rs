@@ -6,17 +6,19 @@ mod tests {
     use crate::_internal::analysis::outcome::AnalysisOutcome;
     use crate::_internal::analysis::state::Confidence;
     use crate::_internal::report::reporter::{
-        Reporter, Verdict, compute_verdict, terminal_block, terminal_inline, tier_label_with_color,
+        Reporter, Verdict, color_enabled, compute_verdict, human_not_evaluated, terminal_block,
+        terminal_inline, tier_label_with_color,
     };
     use crate::_internal::report::violations::{
-        ObjectKind, OperationKind, ReportFinding, SourceLocation, Violation, ViolationTier,
+        ObjectKind, ReportFinding, SourceLocation, Violation, ViolationTier,
     };
+    use crate::api::Certainty;
 
     fn make_violation(rule_id: &'static str, tier: ViolationTier, reason: &str) -> Violation {
         Violation {
             source_range: None,
             rule_id,
-            operation_kind: OperationKind::Other("test".to_string()),
+
             object_kind: ObjectKind::Unknown,
             object_name: "test.object".to_string(),
             tier,
@@ -24,7 +26,6 @@ mod tests {
             recipe: "test recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         }
     }
 
@@ -32,7 +33,7 @@ mod tests {
     fn test_reporter_print_empty() {
         let violations: Vec<Violation> = vec![];
         let confidence = Confidence::Exact;
-        let has_failures = Reporter::print_report(&violations, &confidence);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[], false);
         assert!(!has_failures);
     }
 
@@ -49,10 +50,10 @@ mod tests {
         ];
 
         let confidence = Confidence::Tainted;
-        let has_failures = Reporter::print_report(&violations, &confidence);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[], false);
         assert!(has_failures);
 
-        let report = Reporter::json_report(&violations, &confidence);
+        let report = Reporter::json_report(&violations, &confidence, &[]);
         assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
         assert_eq!(report["confidence"], "Tainted");
         assert_eq!(report["verdict"], "HALT");
@@ -73,17 +74,37 @@ mod tests {
                 column: 5,
             }),
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
         let markdown =
-            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact, &[]);
         assert!(markdown.starts_with("# safe-migrate report\n"));
         assert!(markdown.contains("**Verdict:** CAUTIOUS"));
         assert!(markdown.contains("### WARN — test-rule (`test-rule`)"));
         assert!(markdown.contains("`migrations/001.sql:3:5`"));
         assert!(markdown.contains("**Statement:** 1"));
         assert!(markdown.contains("needs review"));
+        assert!(
+            !markdown.contains("**Certainty:**"),
+            "an exact finding needs no certainty line: {markdown}"
+        );
+
+        for certainty in [Certainty::Assumed, Certainty::Tainted] {
+            let uncertain = ReportFinding {
+                certainty,
+                ..finding.clone()
+            };
+            let markdown = Reporter::markdown_report(
+                std::slice::from_ref(&uncertain),
+                &Confidence::Exact,
+                &[],
+            );
+            assert!(
+                markdown.contains(&format!("**Certainty:** {certainty}")),
+                "reduced certainty must be visible in the report: {markdown}"
+            );
+        }
     }
 
     #[test]
@@ -96,18 +117,19 @@ mod tests {
             ),
             location: None,
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
-        let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact);
+        let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact, &[]);
         assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
+        assert_eq!(report["violations"][0]["statement_index"], 1);
+        // The rule title is catalogued once instead of repeated per occurrence.
         assert_eq!(
-            report["violations"][0]["rule_title"],
+            report["rules"]["require-concurrent-index"],
             "Require concurrent index"
         );
-        assert_eq!(report["violations"][0]["impact"], "locking");
-        assert_eq!(report["violations"][0]["statement_index"], 1);
-        assert!(report["violations"][0]["rule_summary"].is_string());
+        assert!(report["violations"][0].get("rule_title").is_none());
+        assert!(report["violations"][0].get("impact").is_none());
     }
 
     #[test]
@@ -116,7 +138,7 @@ mod tests {
             violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
             location: None,
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
         let outcome = AnalysisOutcome::new(
             vec![finding],
@@ -131,12 +153,12 @@ mod tests {
             ],
         );
 
-        let json = Reporter::json_outcome_with_locations(&outcome);
-        assert_eq!(json["schema_version"], 2);
+        let json = Reporter::json_outcome_with_locations(&outcome, &[]);
+        assert_eq!(json["schema_version"], Reporter::JSON_SCHEMA_VERSION);
         assert_eq!(json["evidence"][0]["code"], "unsupported_statement");
         assert_eq!(json["evidence"][0]["location"]["statement_index"], 1);
 
-        let markdown = Reporter::markdown_outcome(&outcome);
+        let markdown = Reporter::markdown_outcome(&outcome, &[]);
         assert!(markdown.contains("## Analysis evidence"));
         assert!(markdown.contains("`unsupported_statement`"));
         assert!(markdown.contains("migrations/001.sql"));
@@ -152,12 +174,13 @@ mod tests {
                 column: 5,
             }),
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
         let json = Reporter::json_report_with_locations(
             std::slice::from_ref(&finding),
             &Confidence::Exact,
+            &[],
         );
         let expected_json: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/golden/representative-report.json"
@@ -166,7 +189,7 @@ mod tests {
         assert_eq!(json, expected_json);
 
         let markdown =
-            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact, &[]);
         assert_eq!(
             markdown,
             include_str!("../../../tests/golden/representative-report.md")
@@ -178,13 +201,14 @@ mod tests {
                 serde_json::to_string_pretty(&Reporter::json_report_with_locations(
                     std::slice::from_ref(&finding),
                     &Confidence::Exact,
+                    &[],
                 ))
                 .expect("serialize repeated report"),
                 canonical_json,
                 "JSON output must be byte-stable across repeated runs"
             );
             assert_eq!(
-                Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact),
+                Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact, &[]),
                 markdown,
                 "Markdown output must be byte-stable across repeated runs"
             );
@@ -196,11 +220,11 @@ mod tests {
         let finding = ReportFinding {
             location: None,
             statement_index: None,
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
-                operation_kind: OperationKind::Other("test".to_string()),
+
                 object_kind: ObjectKind::Table,
                 object_name: "example".to_string(),
                 tier: ViolationTier::Tier2,
@@ -208,11 +232,10 @@ mod tests {
                 recipe: "review it",
                 dedup_key: None,
                 sql: Some("SELECT '```';".to_string()),
-                fk_dependency_related: false,
             },
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(markdown.contains("\n````sql\nSELECT '```';\n````\n"));
     }
 
@@ -224,10 +247,10 @@ mod tests {
             violation,
             location: None,
             statement_index: None,
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(!markdown.contains('\x1b'));
         assert!(markdown.contains("SELECT '\\u{1b}[2J';\n\tSELECT 1;"));
     }
@@ -241,11 +264,11 @@ mod tests {
                 column: 1,
             }),
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
-                operation_kind: OperationKind::Other("test".to_string()),
+
                 object_kind: ObjectKind::Table,
                 object_name: "entry\n## forged <details>".to_string(),
                 tier: ViolationTier::Tier2,
@@ -253,11 +276,10 @@ mod tests {
                 recipe: "escape | inline <markup>",
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             },
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(!markdown.contains("\n## forged"));
         assert!(markdown.contains("entry ## forged \\<details\\>"));
         assert!(markdown.contains("escape \\| inline \\<markup\\>"));
@@ -272,11 +294,11 @@ mod tests {
                 column: 1,
             }),
             statement_index: None,
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
-                operation_kind: OperationKind::Other("test".to_string()),
+
                 object_kind: ObjectKind::Table,
                 object_name: "entry\x1b[2J".to_string(),
                 tier: ViolationTier::Tier2,
@@ -284,11 +306,10 @@ mod tests {
                 recipe: "review",
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             },
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(!markdown.contains('\x1b'));
         assert!(markdown.contains("entry\\\\u{1b}[2J"));
         assert!(markdown.contains("migrations/\\u{1b}[2J.sql"));
@@ -302,6 +323,93 @@ mod tests {
             terminal_block("SELECT\n'\u{1b}[31m';"),
             "SELECT\n'\\u{1b}[31m';"
         );
+    }
+
+    #[test]
+    fn verdict_may_not_read_safer_than_cautious_while_a_blocking_rule_was_not_evaluated() {
+        let violations = vec![make_violation("test-rule", ViolationTier::Tier3, "safe")];
+        assert_eq!(compute_verdict(&violations), Verdict::Safe);
+
+        let blocked = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "destructive-cascade",
+            tier: ViolationTier::Tier1,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
+            sql: None,
+            recipe: "Re-sync without `--schemas`.".to_string(),
+            missing_schemas: Vec::new(),
+        }];
+        assert_eq!(
+            crate::_internal::report::reporter::compute_verdict_with(&violations, &blocked),
+            Verdict::Cautious,
+            "SAFE must mean every blocking check actually ran"
+        );
+
+        let irreversible = vec![Violation {
+            source_range: None,
+            rule_id: "irreversible-migration",
+            object_kind: ObjectKind::Table,
+            object_name: "public.test".to_string(),
+            tier: ViolationTier::Tier3,
+            reason: "irreversible operation on empty table".to_string(),
+            recipe: "ensure backups exist before deploying",
+            dedup_key: None,
+            sql: None,
+        }];
+        assert_eq!(compute_verdict(&irreversible), Verdict::SafeWithRisk);
+        assert_eq!(
+            crate::_internal::report::reporter::compute_verdict_with(&irreversible, &blocked),
+            Verdict::Cautious,
+            "an uncheckable blocking rule must cap SAFE WITH RISK as well"
+        );
+
+        let low_tier = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "prefer-timestamptz",
+            tier: ViolationTier::Tier2,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::UnmodeledState,
+            sql: None,
+            recipe: "Outside the model.".to_string(),
+            missing_schemas: Vec::new(),
+        }];
+        assert_eq!(
+            crate::_internal::report::reporter::compute_verdict_with(&violations, &low_tier),
+            Verdict::Safe,
+            "a skipped non-blocking rule does not block a SAFE verdict"
+        );
+    }
+
+    #[test]
+    fn human_report_renders_skipped_checks_with_their_remedy() {
+        let skipped = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "destructive-cascade",
+            tier: ViolationTier::Tier1,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
+            sql: None,
+            recipe: "Re-sync without `--schemas`.".to_string(),
+            missing_schemas: Vec::new(),
+        }];
+
+        let rendered = human_not_evaluated(&skipped);
+        assert!(rendered.contains("Checks not evaluated:"));
+        assert!(rendered.contains("destructive-cascade [Tier1]"));
+        assert!(rendered.contains("cause  : catalog_coverage_incomplete"));
+        assert!(rendered.contains("remedy : Re-sync without `--schemas`."));
+        assert_eq!(human_not_evaluated(&[]), "");
+    }
+
+    #[test]
+    fn human_skipped_checks_render_controls_inertly() {
+        let skipped = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "destructive-cascade",
+            tier: ViolationTier::Tier1,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::UnmodeledState,
+            sql: None,
+            recipe: "run \u{1b}[2J sync".to_string(),
+            missing_schemas: Vec::new(),
+        }];
+
+        let rendered = human_not_evaluated(&skipped);
+        assert!(!rendered.contains('\x1b'));
+        assert!(rendered.contains("run \\u{1b}[2J sync"));
     }
 
     #[test]
@@ -324,7 +432,6 @@ mod tests {
         let violations = vec![Violation {
             source_range: None,
             rule_id: "irreversible-migration",
-            operation_kind: OperationKind::DropColumn,
             object_kind: ObjectKind::Table,
             object_name: "public.test".to_string(),
             tier: ViolationTier::Tier3,
@@ -332,7 +439,6 @@ mod tests {
             recipe: "ensure backups exist before deploying",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         }];
         assert_eq!(compute_verdict(&violations), Verdict::SafeWithRisk);
     }
@@ -387,6 +493,15 @@ mod tests {
     }
 
     #[test]
+    fn color_requires_a_terminal_and_the_absence_of_no_color() {
+        // Piped or redirected output must never carry escape codes.
+        assert!(!color_enabled(false, false));
+        assert!(!color_enabled(true, true));
+        assert!(!color_enabled(true, false));
+        assert!(color_enabled(false, true));
+    }
+
+    #[test]
     fn test_inferred_schema_label() {
         use crate::_internal::analysis::state::AnalysisState;
         use crate::_internal::ast::identifiers::{Ident, QualifiedName};
@@ -415,7 +530,7 @@ mod tests {
             Violation {
                 source_range: None,
                 rule_id: "test-rule",
-                operation_kind: OperationKind::Other("test".to_string()),
+
                 object_kind: ObjectKind::Database,
                 object_name: "public.production_db (inferred)".to_string(),
                 tier: ViolationTier::Tier3,
@@ -423,12 +538,11 @@ mod tests {
                 recipe: "recipe",
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             },
             Violation {
                 source_range: None,
                 rule_id: "test-rule-unknown",
-                operation_kind: OperationKind::Other("test".to_string()),
+
                 object_kind: ObjectKind::Unknown,
                 object_name: "<dynamic>".to_string(),
                 tier: ViolationTier::Tier3,
@@ -436,11 +550,36 @@ mod tests {
                 recipe: "recipe",
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             },
         ];
         let confidence = Confidence::Exact;
-        let has_failures = Reporter::print_report(&violations, &confidence);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[], false);
         assert!(!has_failures);
+    }
+
+    #[test]
+    fn every_reported_rule_id_carries_a_title() {
+        // A finding whose id has no descriptor reaches a consumer as a bare
+        // slug, because `rules` is where titles are cited once.
+        for rule in crate::_internal::rules::registry::ALL_SECONDARY_RULES {
+            assert!(
+                crate::_internal::rules::registry::rule_title(rule.id).is_some(),
+                "secondary rule '{}' has no title",
+                rule.id
+            );
+            assert_ne!(rule.title, rule.id, "a title must not be the id");
+        }
+
+        let findings = vec![ReportFinding {
+            violation: make_violation("require-concurrent-drop-index", ViolationTier::Tier2, "x"),
+            location: None,
+            certainty: Certainty::Exact,
+            statement_index: None,
+        }];
+        let report = Reporter::json_report_with_locations(&findings, &Confidence::Exact, &[]);
+        assert_eq!(
+            report["rules"]["require-concurrent-drop-index"],
+            "Require concurrent drop index"
+        );
     }
 }

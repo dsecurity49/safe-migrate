@@ -20,11 +20,23 @@ pub(crate) enum TypeKind {
         #[serde(skip)]
         base_type_id: Option<ObjectId>,
     },
-    Base,
+    /// A user-defined base type. `element` is `pg_type.typelem`, set when the
+    /// type stores fixed-length elements; it is what `ALTER TYPE ... ADD
+    /// ATTRIBUTE` and the shell-type protocol are written against.
+    Base {
+        element: Option<String>,
+    },
     Composite {
         fields: Vec<CompositeFieldState>,
     },
-    Range,
+    /// A range type. Its subtype (`pg_range.rngsubtype`) is what defines it.
+    Range {
+        subtype: Option<String>,
+        /// Derived from `subtype` when a cache enters analysis. Keeping it
+        /// out of the cache preserves the stable binary representation.
+        #[serde(skip)]
+        subtype_id: Option<ObjectId>,
+    },
     /// PostgreSQL's automatically created companion of a [`TypeKind::Range`]
     /// (`typtype = 'm'`). Renameable independently, so it needs its own row.
     Multirange,
@@ -34,6 +46,10 @@ pub(crate) enum TypeKind {
 pub(crate) struct CompositeFieldState {
     pub name: String,
     pub data_type: String,
+    /// Derived from `data_type` when a cache enters analysis. Keeping it out
+    /// of the cache preserves the stable binary representation.
+    #[serde(skip)]
+    pub data_type_id: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

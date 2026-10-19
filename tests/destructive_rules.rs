@@ -287,6 +287,49 @@ mod destructive_rule_tests {
         );
     }
 
+    /// `character(n)` -> `character(m)` is not metadata-only: `bpchar`'s length
+    /// coercion has no support function, so PostgreSQL rewrites the table even
+    /// when the length grows (verified live on 18.6).
+    #[test]
+    fn test_rule_bpchar_length_change_rewrites() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        let mut rel = safe_migrate::_internal::model::relation::RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.columns.push(Column {
+            name: "data".into(),
+            data_type: Some("character(5)".into()),
+            type_id: None,
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: Some(9),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
+        });
+        cache.insert_baseline(object_id("public", "t"), rel);
+        let mut state = AnalysisState::new(cache);
+
+        let v = engine
+            .analyze("ALTER TABLE t ALTER COLUMN data TYPE char(10);", &mut state)
+            .unwrap();
+        assert!(
+            v.iter().any(|v| v.rule_id == "type-change-rewrite"),
+            "char(5) -> char(10) rewrites the table: {v:?}"
+        );
+    }
+
     /// DriftDetectionRule: DROP TABLE that doesn't exist in baseline → Tier 1
     #[test]
     fn test_rule_drift_detection_drop_missing_table() {

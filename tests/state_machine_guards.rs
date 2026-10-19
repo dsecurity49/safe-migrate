@@ -342,7 +342,11 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
+            .analyze(
+                "CREATE TABLE t (id int);
+                 CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+                &mut state,
+            )
             .expect("matview setup should analyze");
 
         for sql in [
@@ -364,7 +368,11 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
+            .analyze(
+                "CREATE TABLE t (id int);
+                 CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+                &mut state,
+            )
             .expect("matview setup should analyze");
 
         // This unsupported action produces OpaqueMutation::UnsupportedStatement and taints
@@ -378,6 +386,43 @@ mod state_machine_guards_tests {
         assert_eq!(
             state.local.confidence,
             safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn an_unmodeled_alter_materialized_view_action_keeps_its_own_transparency_signal() {
+        let confidence = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(
+                    "CREATE TABLE t (id int);
+                     CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+                    &mut state,
+                )
+                .expect("matview setup should analyze");
+            engine.analyze(sql, &mut state).unwrap();
+            state.local.confidence
+        };
+
+        use safe_migrate::_internal::analysis::state::Confidence;
+        // The first action alone is modeled and must not taint.
+        assert_eq!(
+            confidence("ALTER MATERIALIZED VIEW mv SET (fillfactor=70);"),
+            Confidence::Exact
+        );
+        // The unmodeled action must taint when it is the only action.
+        assert_eq!(
+            confidence("ALTER MATERIALIZED VIEW mv RENAME COLUMN id TO new_id;"),
+            Confidence::Tainted
+        );
+        // PostgreSQL applies every action, so a modeled action in front of an
+        // unmodeled one must not hide the transparency signal.
+        assert_eq!(
+            confidence(
+                "ALTER MATERIALIZED VIEW mv SET (fillfactor=70), RENAME COLUMN id TO new_id;"
+            ),
+            Confidence::Tainted
         );
     }
 

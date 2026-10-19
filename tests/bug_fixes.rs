@@ -1,12 +1,11 @@
 mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
-    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 
-    use safe_migrate::_internal::model::relation::{Persistence, RelationKind};
-    use safe_migrate::_internal::report::violations::{
-        ObjectKind, OperationKind, Violation, ViolationTier,
-    };
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 
     fn baseline_index(
         index_id: ObjectId,
@@ -15,21 +14,22 @@ mod phase10_bug_fixes_and_sorting_tests {
         safe_migrate::_internal::db::cache::IndexCache {
             index_id,
             table_id,
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         }
     }
 
@@ -304,7 +304,6 @@ mod phase10_bug_fixes_and_sorting_tests {
         let v_tier3 = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_a",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "a".to_string(),
             tier: ViolationTier::Tier3,
@@ -312,12 +311,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
         let v_tier1 = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_b",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "b".to_string(),
             tier: ViolationTier::Tier1,
@@ -325,12 +322,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
         let v_range_later = Violation {
             source_range: Some(rowan::TextRange::new(20.into(), 30.into())),
             rule_id: "rule_c",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "c".to_string(),
             tier: ViolationTier::Tier1,
@@ -338,12 +333,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
         let v_name_later = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_b",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "z".to_string(),
             tier: ViolationTier::Tier1,
@@ -351,7 +344,6 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
 
         let mut violations = vec![
@@ -535,6 +527,209 @@ mod phase10_bug_fixes_and_sorting_tests {
             v.iter().any(|violation| violation.tier
                 == safe_migrate::_internal::report::violations::ViolationTier::Tier1),
             "Expected Tier1 because confidence should be restored to Exact after rollback"
+        );
+    }
+
+    #[test]
+    fn scoped_drop_separates_a_blocking_dependent_from_an_unproven_cascade() {
+        use safe_migrate::_internal::db::cache::{
+            CatalogFamily, ForeignKeyCache, ScopedDependencyEdge,
+        };
+
+        let scoped = vec!["app".to_string()];
+        let build = |external_present: bool, edge_present: bool| {
+            let mut cache = crate::common::synced_cache();
+            cache.metadata.schemas = Some(scoped.clone());
+            cache.metadata.boundary_queries_complete = true;
+
+            let parent = object_id("app", "parent");
+            let child = object_id("other", "child");
+            for id in [parent.clone(), child.clone()] {
+                if id.schema == "other" && !external_present {
+                    continue;
+                }
+                cache.insert_baseline(
+                    id.clone(),
+                    RelationState::new(
+                        id.clone(),
+                        object_id("public", "postgres"),
+                        0,
+                        Some(10),
+                        RelationKind::Table,
+                        Persistence::Permanent,
+                        0,
+                    ),
+                );
+            }
+            if edge_present {
+                cache
+                    .scoped_external_dependencies
+                    .push(ScopedDependencyEdge::new(
+                        CatalogFamily::Relations,
+                        parent.clone(),
+                        child.clone(),
+                    ));
+            }
+            cache.foreign_keys.push(ForeignKeyCache {
+                constraint_name: "child_parent_fk".to_string(),
+                from_table: child,
+                to_table: parent.clone(),
+                from_columns: vec!["parent_id".to_string()],
+                to_columns: vec!["id".to_string()],
+                pk_fk_equality_operators: Vec::new(),
+                pk_pk_equality_operators: Vec::new(),
+                fk_fk_equality_operators: Vec::new(),
+            });
+            AnalysisState::new(cache)
+        };
+
+        let drop = |cascade: bool| {
+            safe_migrate::_internal::analysis::mutations::Mutation::DropTable(
+                safe_migrate::_internal::analysis::mutations::DropTable {
+                    ids: vec![object_id("app", "parent")],
+                    if_exists: false,
+                    cascade,
+                },
+            )
+        };
+
+        // Without CASCADE a recorded dependent is exactly what PostgreSQL
+        // refuses on, whether or not it is in scope.
+        let mut state = build(true, true);
+        let result = state.apply(&drop(false), None);
+        assert!(
+            matches!(result, MutationResult::Conflict(_)),
+            "an unproven dependent blocks a non-cascading drop: {result:?}"
+        );
+
+        // With CASCADE the target still drops. The dependent is known only as
+        // an edge, so the cascade's reach is open, but that must widen the
+        // result rather than cancel it.
+        let mut state = build(true, true);
+        let result = state.apply(&drop(true), None);
+        assert!(
+            matches!(result, MutationResult::Applied),
+            "CASCADE still drops the target: {result:?}"
+        );
+        assert!(!state.relation_is_present(&object_id("app", "parent")));
+        assert!(
+            state
+                .evidence()
+                .iter()
+                .any(|record| record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete),
+            "an unproven cascade must taint the chain"
+        );
+
+        // The dependent is modeled but stays inside the scope, so the drop is
+        // fully known and PostgreSQL would reject it outright.
+        let mut state = build(true, false);
+        let result = state.apply(&drop(false), None);
+        assert!(
+            matches!(result, MutationResult::Conflict(_)),
+            "an in-scope dependent makes the drop a known conflict: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_scope_remedy_names_the_missing_schemas() {
+        use safe_migrate::_internal::analysis::evidence::EvidenceCode;
+        use safe_migrate::_internal::db::cache::{CatalogFamily, ScopedDependencyEdge};
+        use safe_migrate::_internal::report::violations::NotEvaluated;
+
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.metadata.boundary_queries_complete = true;
+        let scoped = object_id("app", "parent");
+        for name in ["Billing", "audit_log", "reporting"] {
+            cache
+                .scoped_external_dependencies
+                .push(ScopedDependencyEdge::new(
+                    CatalogFamily::Relations,
+                    scoped.clone(),
+                    object_id(name, "child"),
+                ));
+        }
+        // An unresolved external endpoint has no schema to name.
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::unresolved_external(
+                CatalogFamily::Relations,
+                scoped.clone(),
+            ));
+        let state = AnalysisState::new(cache);
+
+        let missing = state.external_referenced_schemas();
+        assert_eq!(missing, vec!["Billing", "audit_log", "reporting"]);
+
+        let recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &missing);
+        // Quoted because it needs quoting, and named rather than described.
+        assert!(recipe.contains("\"Billing\""), "{recipe}");
+        assert!(recipe.contains("audit_log"), "{recipe}");
+        assert!(recipe.contains("audit_log and reporting"), "{recipe}");
+
+        // With nothing to name, the recipe falls back to describing the fix.
+        let generic_recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &[]);
+        assert!(
+            generic_recipe.contains("the referenced schema"),
+            "{generic_recipe}"
+        );
+    }
+
+    #[test]
+    fn cascade_drop_names_the_out_of_scope_fk_dependency() {
+        use safe_migrate::_internal::db::cache::ForeignKeyCache;
+
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+
+        let parent = object_id("public", "parent");
+        let child = object_id("other", "child");
+        for id in [parent.clone(), child.clone()] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id.clone(),
+                    object_id("public", "postgres"),
+                    0,
+                    Some(10),
+                    RelationKind::Table,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+        // Scoped sync pulls in out-of-scope relations that a foreign key
+        // connects to the scoped set, and marks them as such.
+        cache
+            .relations
+            .get_mut(&child)
+            .expect("child baseline row")
+            .mark_fk_dependency();
+        cache.foreign_keys.push(ForeignKeyCache {
+            constraint_name: "child_parent_fk".to_string(),
+            from_table: child.clone(),
+            to_table: parent.clone(),
+            from_columns: vec!["parent_id".to_string()],
+            to_columns: vec!["id".to_string()],
+            pk_fk_equality_operators: Vec::new(),
+            pk_pk_equality_operators: Vec::new(),
+            fk_fk_equality_operators: Vec::new(),
+        });
+
+        let mut state = AnalysisState::new(cache);
+        let violations = engine
+            .analyze("DROP TABLE parent CASCADE;", &mut state)
+            .unwrap();
+
+        let cascade = violations
+            .iter()
+            .find(|violation| violation.rule_id == "destructive-cascade")
+            .expect("a cascading drop over baseline objects must be reported");
+        assert!(
+            cascade
+                .reason
+                .contains("FK-pulled tables from other schemas"),
+            "the closure pulled an out-of-scope FK relation, so the reason must say so: {cascade:?}"
         );
     }
 
@@ -1129,6 +1324,40 @@ mod phase10_bug_fixes_and_sorting_tests {
     // ─────────────────────────────────────────────
     // Bug 14 — Directive parsing tolerates whitespace
     // ─────────────────────────────────────────────
+    #[test]
+    fn an_assumed_version_drives_maintain_expansion() {
+        use safe_migrate::_internal::model::relation::{Privilege, RelationOverlay};
+
+        let engine = setup_engine();
+        // No observed version: the config asserts one. Before the fix these
+        // sites read `pg_version_num` directly and saw `None`, so an asserted
+        // version was ignored and MAINTAIN silently went missing.
+        for (version, expected) in [(170_000, true), (160_000, false)] {
+            let mut cache = cache_with_table("public", "t_large", None);
+            cache.pg_version_num = None;
+            let mut state = AnalysisState::new(cache).with_asserted_pg_version(Some(version));
+            engine
+                .analyze("GRANT ALL ON TABLE t_large TO app_user;", &mut state)
+                .expect("GRANT ALL should analyze");
+
+            let Some(RelationOverlay::Present(relation)) =
+                state.local.relations.get(&object_id("public", "t_large"))
+            else {
+                panic!("baseline relation should remain present");
+            };
+            let grantee = object_id("", "app_user");
+            assert_eq!(
+                relation
+                    .privileges
+                    .grants
+                    .get(&grantee)
+                    .is_some_and(|privileges| privileges.contains(&Privilege::Maintain)),
+                expected,
+                "asserted PG {version} GRANT ALL MAINTAIN expansion mismatch"
+            );
+        }
+    }
+
     #[test]
     fn test_bug014_directive_ignore_with_spaces() {
         let engine = setup_engine();

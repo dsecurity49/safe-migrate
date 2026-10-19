@@ -1,7 +1,8 @@
+use super::index_topology::AttachRefusal;
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{IndexStatisticsColumn, StatisticsTarget};
-use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
+use crate::_internal::analysis::graph::DependencyKind;
 use crate::_internal::analysis::mutations::{
     AlterDatabaseMutation, AlterIndexActionMutation, AlterIndexAllInTablespaceMutation,
     AlterIndexMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
@@ -14,6 +15,20 @@ use crate::_internal::model::relation::RelationKind;
 const SET_STATISTICS_MIN: i32 = -1;
 /// Largest statistics target PostgreSQL stores without clamping.
 const SET_STATISTICS_MAX: i32 = 10_000;
+
+/// The database a `REINDEX` form names, or `None` when it names none.
+///
+/// Both `DATABASE` and `SYSTEM` carry an optional name that PostgreSQL
+/// resolves against the session's database, so an omitted name is always the
+/// current database and needs no check.
+fn reindex_target_database_name(target: &ReindexTargetMutation) -> Option<&str> {
+    match target {
+        ReindexTargetMutation::Database(name) | ReindexTargetMutation::System(Some(name)) => {
+            (!name.is_empty()).then_some(name.as_str())
+        }
+        _ => None,
+    }
+}
 
 impl AnalysisState {
     pub(super) fn apply_lock_table(&mut self, lock: &LockTableMutation) -> MutationResult {
@@ -37,7 +52,7 @@ impl AnalysisState {
         for target in &truncate.targets {
             if let Err(result) = self.ensure_relation_target(
                 &target.id,
-                |kind| *kind == RelationKind::Table,
+                |kind| kind.is_table_like(),
                 format!("truncated relation '{}' does not exist", target.id),
                 format!("truncated relation '{}' is not a table", target.id),
             ) {
@@ -84,25 +99,103 @@ impl AnalysisState {
     pub(super) fn apply_reindex(
         &mut self,
         target: &Option<ReindexTargetMutation>,
+        concurrently: bool,
     ) -> MutationResult {
+        let reindex_is_concurrent = concurrently;
         if let Some(target) = target {
+            // PostgreSQL gives `REINDEX SCHEMA`, `DATABASE` and `SYSTEM`
+            // separate commit points per relation, so none of them can run
+            // inside a transaction block. `CONCURRENTLY` is checked first and
+            // names the form the user wrote.
+            if matches!(
+                target,
+                ReindexTargetMutation::Database(_)
+                    | ReindexTargetMutation::Schema(_)
+                    | ReindexTargetMutation::System(_)
+            ) {
+                let form = match target {
+                    ReindexTargetMutation::Schema(_) => "REINDEX SCHEMA",
+                    ReindexTargetMutation::System(_) => "REINDEX SYSTEM",
+                    _ => "REINDEX DATABASE",
+                };
+                // `PreventInTransactionBlock` only rejects inside an explicit
+                // block, so a statement outside one is legal whatever its form.
+                if self.in_transaction() {
+                    return MutationResult::conflict(format!(
+                        "{form} cannot run inside a transaction block"
+                    ));
+                }
+                // Outside a block PostgreSQL still refuses a concurrent
+                // system-catalog reindex, which is the form's own rule rather
+                // than a transaction rule.
+                if matches!(target, ReindexTargetMutation::System(_)) && reindex_is_concurrent {
+                    return MutationResult::conflict(
+                        "cannot reindex system catalogs concurrently".to_string(),
+                    );
+                }
+                // `ReindexMultipleTables` resolves both of these forms to
+                // `MyDatabaseId` and refuses a name that is not it. Analysis
+                // has no session, so the name can only be checked against the
+                // configured target; without one it cannot be resolved at all.
+                if let Some(named) = reindex_target_database_name(target) {
+                    match self.target_database() {
+                        // PostgreSQL compares with `strcmp` against the name it
+                        // reads from `pg_database`, so the comparison is exact.
+                        Some(current) if current != named => {
+                            return MutationResult::conflict(format!(
+                                "can only reindex the currently open database, not '{named}'"
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+                        }
+                    }
+                }
+                // The catalog scope of these forms is not modeled, so which
+                // relations they touch remains unknown.
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+            }
+            // A catalog relation named directly cannot be rebuilt concurrently.
+            if matches!(
+                target,
+                ReindexTargetMutation::Table(_) | ReindexTargetMutation::Index(_)
+            ) && reindex_is_concurrent
+                && self.target_is_catalog(target)
+            {
+                return MutationResult::conflict(
+                    "cannot reindex system catalogs concurrently".to_string(),
+                );
+            }
             match target {
                 ReindexTargetMutation::Database(_)
                 | ReindexTargetMutation::Schema(_)
-                | ReindexTargetMutation::System(_) => {
-                    // System/Database/Schema reindexes affect many relations at once.
-                    // Tracking exact concurrent/transaction state for all of them
-                    // is not currently modeled, so we taint the statement.
-                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                }
+                | ReindexTargetMutation::System(_) => {}
                 ReindexTargetMutation::Table(id) => {
                     if let Err(result) = self.ensure_relation_target(
                         id,
-                        |_| true,
+                        // PostgreSQL accepts a table, a materialized view, or a
+                        // partitioned table, and refuses anything else.
+                        |kind| {
+                            // A partitioned table is modeled as a table, so
+                            // the kind predicate is the same as PostgreSQL's.
+                            matches!(
+                                kind,
+                                crate::_internal::model::relation::RelationKind::Table
+                                    | crate::_internal::model::relation::RelationKind::MaterializedView
+                            )
+                        },
                         format!("reindexed relation '{}' does not exist", id),
-                        format!("reindexed relation '{}' is invalid", id),
+                        format!("\"{}\" is not a table or materialized view", id),
                     ) {
                         return result;
+                    }
+                    // A partitioned table has no storage of its own, so its
+                    // partitions are reindexed across commit points.
+                    if self.relation_is_partitioned(id) && self.in_transaction() {
+                        return MutationResult::conflict(
+                            "REINDEX TABLE cannot run inside a transaction block".to_string(),
+                        );
                     }
                 }
                 ReindexTargetMutation::Index(id) => {
@@ -114,12 +207,17 @@ impl AnalysisState {
                             id,
                             crate::_internal::db::cache::CatalogFamily::Indexes,
                         ) {
-                            return MutationResult::Conflict {
-                                reason: format!("reindexed index '{}' does not exist", id),
-                            };
+                            return MutationResult::conflict(format!(
+                                "reindexed index '{}' does not exist",
+                                id
+                            ));
                         }
                         // No baseline coverage — we cannot prove it is absent.
                         self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                    } else {
+                        // REINDEX rebuilds a broken index; a partitioned parent
+                        // only becomes valid once its partitions are attached.
+                        self.mark_index_valid(id);
                     }
                 }
             }
@@ -156,12 +254,12 @@ impl AnalysisState {
                 &alter.index_id,
                 crate::_internal::db::cache::CatalogFamily::Indexes,
             ) {
-                return MutationResult::Conflict {
-                    reason: format!("index '{}' does not exist", alter.index_id),
-                };
+                return MutationResult::conflict(format!(
+                    "index '{}' does not exist",
+                    alter.index_id
+                ));
             }
-            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
 
         for action in &alter.actions {
@@ -175,11 +273,20 @@ impl AnalysisState {
                         return result;
                     }
                 }
-                // Tablespace, storage options and reloptions are physical or
-                // advisory metadata not tracked in the schema model.
-                AlterIndexActionMutation::SetTablespace { .. }
-                | AlterIndexActionMutation::SetOptions { .. }
-                | AlterIndexActionMutation::ResetOptions { .. } => {}
+                // Tablespace and reloptions are physical or advisory metadata
+                // not tracked in the schema model, but SET options are still
+                // validated against the access method's option table.
+                AlterIndexActionMutation::SetTablespace { .. } => {}
+                AlterIndexActionMutation::SetOptions { options } => {
+                    if let Err(result) = self.validate_index_set_options(&alter.index_id, options) {
+                        return result;
+                    }
+                }
+                AlterIndexActionMutation::ResetOptions { options } => {
+                    if let Err(result) = Self::reset_reloption_names(options) {
+                        return result;
+                    }
+                }
                 AlterIndexActionMutation::SetStatistics { column, target } => {
                     let result =
                         self.apply_alter_index_set_statistics(&alter.index_id, column, target);
@@ -194,24 +301,68 @@ impl AnalysisState {
                             partition_id,
                             crate::_internal::db::cache::CatalogFamily::Indexes,
                         ) {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "partition index '{}' does not exist",
-                                    partition_id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "partition index '{}' does not exist",
+                                partition_id
+                            ));
                         }
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
-                    // Record the link so dropping the parent also drops the
-                    // child, which PostgreSQL does.
-                    self.snapshot_graph();
-                    self.local.graph.add_edge(DependencyEdge::new(
-                        partition_id.clone(),
-                        alter.index_id.clone(),
-                        DependencyKind::IndexPartitionOf,
-                    ));
+                    let parent_name = alter.index_id.name.as_str();
+                    let child_name = partition_id.name.as_str();
+                    match self.index_attach_refusal(&alter.index_id, partition_id) {
+                        None => {
+                            // The attach path revalidates the parent, including
+                            // when the child is already attached to it.
+                            self.record_index_partition(&alter.index_id, partition_id);
+                            self.validate_partitioned_index(&alter.index_id);
+                        }
+                        Some(AttachRefusal::AttachedElsewhere) => {
+                            return MutationResult::conflict(format!(
+                                "cannot attach index \"{child_name}\" as partition of index \"{parent_name}\""
+                            ));
+                        }
+                        Some(AttachRefusal::DuplicateAttachment) => {
+                            let partition_table = self
+                                .index_table_of(partition_id)
+                                .map(|table| table.to_string())
+                                .unwrap_or_else(|| child_name.to_string());
+                            return MutationResult::conflict(format!(
+                                "another index is already attached for partition \"{partition_table}\""
+                            ));
+                        }
+                        Some(AttachRefusal::NotAPartition) => {
+                            let parent_table = self
+                                .index_table_of(&alter.index_id)
+                                .map(|table| table.to_string())
+                                .unwrap_or_else(|| alter.index_id.to_string());
+                            return MutationResult::conflict(format!(
+                                "index \"{child_name}\" is not an index on any partition of table \"{parent_table}\""
+                            ));
+                        }
+                        Some(AttachRefusal::MissingConstraint) => {
+                            return MutationResult::conflict(format!(
+                                "parent index \"{parent_name}\" has a constraint but partition index \"{child_name}\" does not"
+                            ));
+                        }
+                        Some(AttachRefusal::PrimaryKeyNotNull { column }) => {
+                            let partition_table = self
+                                .index_table_of(partition_id)
+                                .map(|table| table.to_string())
+                                .unwrap_or_else(|| child_name.to_string());
+                            return MutationResult::conflict(format!(
+                                "invalid primary key definition: column \"{column}\" of relation \"{partition_table}\" is not marked NOT NULL"
+                            ));
+                        }
+                        Some(AttachRefusal::DefinitionsDiffer) => {
+                            return MutationResult::conflict(format!(
+                                "cannot attach index \"{child_name}\" as partition of index \"{parent_name}\": the index definitions do not match"
+                            ));
+                        }
+                        Some(AttachRefusal::EquivalenceUnknown) => {
+                            return self.unresolved(EvidenceCode::UnmodeledState);
+                        }
+                    }
                 }
                 // Extension dependencies are managed by PostgreSQL's extension
                 // machinery, which lives outside the schema catalog model.
@@ -236,19 +387,15 @@ impl AnalysisState {
             return MutationResult::Applied;
         };
         if *value < SET_STATISTICS_MIN {
-            return MutationResult::Conflict {
-                reason: format!("statistics target {value} is too low"),
-            };
+            return MutationResult::conflict(format!("statistics target {value} is too low"));
         }
         if *value > SET_STATISTICS_MAX {
             // Accepted and stored as 10000, so it does not match what was written.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
         } else if self.index_has_expression_keys(index) == Some(false) {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "cannot alter statistics on non-expression column \"{column}\" of index \"{index}\""
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "cannot alter statistics on non-expression column \"{column}\" of index \"{index}\""
+            ));
         }
         MutationResult::Applied
     }
@@ -264,11 +411,16 @@ impl AnalysisState {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                     && edge.dependent == *index
             })
-            .map(|edge| match &edge.kind {
-                DependencyKind::IndexOnRelation {
-                    has_expression_keys,
-                    ..
-                } => *has_expression_keys,
+            .and_then(|edge| match &edge.kind {
+                DependencyKind::IndexOnRelation { definition, .. } => {
+                    // A constraint-backed placeholder records its constraint
+                    // columns but not its expression keys, so its shape cannot
+                    // establish the answer.
+                    if definition.unestablished {
+                        return None;
+                    }
+                    Some(definition.has_expression_keys())
+                }
                 _ => unreachable!("index lookup matched an IndexOnRelation edge"),
             })
     }

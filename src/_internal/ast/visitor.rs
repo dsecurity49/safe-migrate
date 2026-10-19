@@ -1,24 +1,113 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::IndexStatisticsColumn;
 use crate::_internal::analysis::facts::{
-    AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
-    CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
-    ReindexTargetKindFact, RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget,
-    SearchPathTarget, StatementFact, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-    TypeCreationKind,
+    AggregateArgumentFact, AggregateCandidateFact, AlterIndexActionFact, AlterTableActionFact,
+    AlterTypeActionFact, AlterTypeFact, ColumnFact, CreateTypeFact, FkFact, LikePropertiesFact,
+    LikeSourceFact, LockModeFact, PersistenceFact, ReindexTargetKindFact, RelationTargetFact,
+    ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact, TableConstraintFact,
+    TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterTrigger, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
     Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
-    Path, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
-    Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg, TableConstraint, Truncate,
+    DropTable, DropTrigger, DropType, DropView, Grant, HasSelectTail, Lock, NameRef, PartitionBy,
+    PartitionType, Path, PathRef, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint,
+    Revoke, RevokeCommand, Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg,
+    TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
+
+/// The `pg_catalog` aggregate function names. A call to one of these in a view
+/// target list makes the view non-updatable; the analyzer resolves no catalog
+/// functions, so the names are listed rather than looked up. An aggregate in
+/// another schema is not recognised and stays unknown.
+const BUILTIN_AGGREGATES: &[&str] = &[
+    "any_value",
+    "array_agg",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "count",
+    "covar_pop",
+    "covar_samp",
+    "cume_dist",
+    "dense_rank",
+    "every",
+    "json_agg",
+    "json_agg_strict",
+    "json_object_agg",
+    "json_object_agg_strict",
+    "json_object_agg_unique",
+    "json_object_agg_unique_strict",
+    "jsonb_agg",
+    "jsonb_agg_strict",
+    "jsonb_object_agg",
+    "jsonb_object_agg_strict",
+    "jsonb_object_agg_unique",
+    "jsonb_object_agg_unique_strict",
+    "max",
+    "min",
+    "mode",
+    "percent_rank",
+    "percentile_cont",
+    "percentile_disc",
+    "range_agg",
+    "range_intersect_agg",
+    "rank",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "sum",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "xmlagg",
+];
+
+/// A view query's updatability under two readings of its unqualified
+/// aggregate-named calls, plus those calls for the resolver to place.
+///
+/// The visitor cannot know the search path, so it hands both readings and the
+/// calls to the resolver, which can tell a built-in aggregate from a
+/// same-named overload.
+struct ViewUpdatabilityOutcome {
+    /// The verdict when every unqualified aggregate-named call is its built-in
+    /// aggregate.
+    with_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+    /// The verdict when none of them is.
+    without_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+    aggregate_candidates: Vec<AggregateCandidateFact>,
+}
+
+impl ViewUpdatabilityOutcome {
+    /// A verdict no search path can change, carrying nothing to resolve.
+    fn settled(verdict: crate::_internal::analysis::facts::ViewUpdatabilityFact) -> Self {
+        Self {
+            with_aggregates: verdict,
+            without_aggregates: verdict,
+            aggregate_candidates: Vec::new(),
+        }
+    }
+}
 
 pub(crate) struct AstVisitor;
 
@@ -1153,15 +1242,10 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::ResetOptions(options) => {
-                    let names = options.attribute_list().map(|list| {
-                        list.attribute_options()
-                            .filter_map(|option| {
-                                option.name().map(|name| name.syntax().text().to_string())
-                            })
-                            .collect::<Vec<_>>()
-                    });
-                    if let Some(names) = names.filter(|names| !names.is_empty()) {
-                        actions.push(AlterTableActionFact::ResetTableOptions { names });
+                    if let Some(attributes) =
+                        Self::extract_attribute_options_raw(options.attribute_list())
+                    {
+                        actions.push(AlterTableActionFact::ResetTableOptions { attributes });
                     } else {
                         unsupported_action = true;
                     }
@@ -1712,17 +1796,10 @@ impl AstVisitor {
                 column: col_name,
                 attributes: Self::extract_attribute_options(options.attribute_list())?,
             }),
-            AlterColumnOption::ResetOptions(options) => {
-                let names = options
-                    .attribute_list()?
-                    .attribute_options()
-                    .map(|option| option.name().map(|name| name.syntax().text().to_string()))
-                    .collect::<Option<Vec<_>>>()?;
-                (!names.is_empty()).then_some(AlterTableActionFact::ResetOptions {
-                    column: col_name,
-                    names,
-                })
-            }
+            AlterColumnOption::ResetOptions(options) => Some(AlterTableActionFact::ResetOptions {
+                column: col_name,
+                attributes: Self::extract_attribute_options_raw(options.attribute_list())?,
+            }),
             AlterColumnOption::Inherit(i) => Some(AlterTableActionFact::Inherit {
                 column: col_name,
                 parent: i
@@ -1749,15 +1826,50 @@ impl AstVisitor {
         }
     }
 
+    /// The option's namespace, normalized the way PostgreSQL folds an
+    /// unquoted identifier. `None` when the SQL gave a bare name.
+    fn attribute_namespace(option: &ast::AttributeOption) -> Option<String> {
+        option.namespace().map(|namespace| {
+            Self::resolve_identifier_token(namespace.syntax().text().to_string().trim())
+        })
+    }
+
+    /// The options of a `SET (...)` list. A name written without a value means
+    /// `true`, as the server's `transformRelOptions` reads it.
     fn extract_attribute_options(
+        list: Option<ast::AttributeList>,
+    ) -> Option<Vec<crate::_internal::analysis::facts::AttributeFact>> {
+        let mut attributes = Self::extract_attribute_options_raw(list)?;
+        for attribute in &mut attributes {
+            if attribute.value.is_none() {
+                attribute.value = Some("true".to_string());
+            }
+        }
+        Some(attributes)
+    }
+
+    /// The options of a `SET`/`RESET` list with the value exactly as written. A
+    /// missing value stays `None`, which is how a `RESET` tells that PostgreSQL
+    /// would refuse the value it carries.
+    fn extract_attribute_options_raw(
         list: Option<ast::AttributeList>,
     ) -> Option<Vec<crate::_internal::analysis::facts::AttributeFact>> {
         let attributes = list?
             .attribute_options()
             .map(|option| {
                 Some(crate::_internal::analysis::facts::AttributeFact {
-                    name: option.name()?.syntax().text().to_string(),
-                    value: option.attribute_value()?.syntax().text().to_string(),
+                    name: Self::resolve_identifier_token(
+                        option.name()?.syntax().text().to_string().trim(),
+                    ),
+                    // A string literal is read as the value it spells, so an
+                    // explicitly empty one is the empty string, not its quotes.
+                    value: option.attribute_value().map(|value| {
+                        value
+                            .literal()
+                            .and_then(|literal| Self::resolve_string_literal(&literal))
+                            .unwrap_or_else(|| value.syntax().text().to_string().trim().to_string())
+                    }),
+                    namespace: Self::attribute_namespace(&option),
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -2068,8 +2180,56 @@ impl AstVisitor {
             .collect()
     }
 
+    /// PostgreSQL stores both bits absolutely, so `ASC NULLS LAST` and
+    /// `DESC NULLS FIRST` are one order; saying nothing means `ASC NULLS LAST`.
+    fn index_key_order(
+        sort_order: Option<ast::SortOrder>,
+        nulls_order: Option<ast::NullsOrder>,
+    ) -> IndexOrder {
+        let descending = matches!(sort_order, Some(ast::SortOrder::SortDesc(_)));
+        // PostgreSQL defaults to NULLS LAST for ASC and NULLS FIRST for DESC,
+        // so a bare `DESC` is the default order, not a non-default one.
+        let nulls_first = match nulls_order {
+            Some(ast::NullsOrder::NullsFirst(_)) => true,
+            Some(ast::NullsOrder::NullsLast(_)) => false,
+            None => descending,
+        };
+        match (descending, nulls_first) {
+            (false, false) | (true, true) => IndexOrder::Default,
+            (true, false) => IndexOrder::DescNullsLast,
+            (false, true) => IndexOrder::AscNullsFirst,
+        }
+    }
+
+    /// Strip the wrappers PostgreSQL removes before deciding an index key's
+    /// kind, so `(col)`, `col COLLATE c`, and their compositions reduce the
+    /// same way the server reduces them.
+    fn strip_index_key_wrappers(expression: Option<ast::Expr>) -> Option<ast::Expr> {
+        match expression {
+            Some(ast::Expr::ParenExpr(paren)) => Self::strip_index_key_wrappers(paren.expr()),
+            Some(ast::Expr::Collate(collate)) => Self::strip_index_key_wrappers(collate.expr()),
+            other => other,
+        }
+    }
+
+    /// A dotted reference's written name, keeping the schema qualifier: a
+    /// collation or operator class resolved through the path is a different
+    /// identity from the same trailing name in the catalog.
+    fn index_item_written_name<T: AstNode>(
+        reference: Option<T>,
+        child: impl Fn(&T) -> Option<PathRef>,
+    ) -> Option<WrittenName> {
+        let reference = reference?;
+        let qualified = Self::path_ref_to_qualified_name(&child(&reference)?)?;
+        Some(WrittenName {
+            schema: qualified.schema.map(|schema| schema.resolve()),
+            name: qualified.name.resolve(),
+        })
+    }
+
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
-        let relation = node.table_relation_name()?.table_name_ref()?.path_ref()?;
+        let table_relation = node.table_relation_name()?;
+        let relation = table_relation.table_name_ref()?.path_ref()?;
         let relation = Self::path_ref_to_qualified_name(&relation)?;
 
         let index_ident = if let Some(name) = node
@@ -2092,7 +2252,21 @@ impl AstVisitor {
                 .unwrap_or_default()
         });
 
-        let has_predicate = node.where_clause().is_some();
+        let predicate = match node.where_clause() {
+            None => IndexPredicate::None,
+            Some(clause) => match clause.expr() {
+                Some(expr) => IndexPredicate::Parsed(
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+                ),
+                None => IndexPredicate::Opaque,
+            },
+        };
+        // `NULLS NOT DISTINCT` is the `false` case of the catalog's
+        // `indnullsnotdistinct`, which reads "distinct is false".
+        let nulls_not_distinct = matches!(
+            node.nulls_distinct_option(),
+            Some(ast::NullsDistinctOption::NullsNotDistinct(_))
+        );
         let unique = node.unique_token().is_some();
         let included_columns = node
             .index_include_clause()
@@ -2105,30 +2279,46 @@ impl AstVisitor {
             })
             .collect();
         let mut key_columns = Vec::new();
-        let mut has_expression_keys = false;
-        let mut has_default_sort_order = true;
-        let mut has_default_opclasses = true;
-        let mut has_default_collations = true;
+        let mut key_expressions: Vec<Option<ExprIr>> = Vec::new();
+        let mut key_orders: Vec<IndexOrder> = Vec::new();
+        let mut key_opclasses: Vec<Option<WrittenName>> = Vec::new();
+        let mut key_collations: Vec<Option<WrittenName>> = Vec::new();
         for item in node
             .partition_item_list()
             .into_iter()
             .flat_map(|items| items.partition_items())
         {
-            if item.sort_order().is_some() || item.nulls_order().is_some() {
-                has_default_sort_order = false;
-            }
-            if item.op_class_ref().is_some() {
-                has_default_opclasses = false;
-            }
-            if item.collate().is_some() {
-                has_default_collations = false;
-            }
-            match item.expr() {
+            // `DefineIndex` strips top-level `COLLATE` (and parentheses)
+            // before deciding a key is a column or an expression, so a
+            // collated bare column is a column key carrying the collation,
+            // not an expression.
+            let collate = match item.expr() {
+                Some(ast::Expr::Collate(collate)) => Some(collate),
+                _ => item.collate(),
+            };
+            let mut expression = match item.expr() {
+                Some(ast::Expr::Collate(collate)) => collate.expr(),
+                expression => expression,
+            };
+            expression = Self::strip_index_key_wrappers(expression);
+            match expression {
                 Some(ast::Expr::NameRef(name)) => {
                     key_columns.push(Self::resolve_identifier_token(name.text()));
+                    key_expressions.push(None);
                 }
-                _ => has_expression_keys = true,
+                Some(expr) => key_expressions.push(Some(
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+                )),
+                None => key_expressions.push(None),
             }
+            key_orders.push(Self::index_key_order(item.sort_order(), item.nulls_order()));
+            key_opclasses.push(Self::index_item_written_name(item.op_class_ref(), |r| {
+                r.path_ref()
+            }));
+            key_collations.push(Self::index_item_written_name(
+                collate.and_then(|collate| collate.collation_ref()),
+                |r| r.path_ref(),
+            ));
         }
 
         Some(StatementFact::CreateIndex {
@@ -2136,15 +2326,17 @@ impl AstVisitor {
             relation,
             if_not_exists: node.if_not_exists().is_some(),
             concurrently: node.concurrently_token().is_some(),
+            only: table_relation.only_token().is_some(),
             using_method,
-            has_predicate,
+            predicate,
             unique,
+            nulls_not_distinct,
             key_columns,
+            key_expressions,
+            key_orders,
+            key_opclasses,
+            key_collations,
             included_columns,
-            has_expression_keys,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
         })
     }
 
@@ -2238,7 +2430,8 @@ impl AstVisitor {
                 actions.push(AlterIndexActionFact::SetOptions { options });
             }
             squawk_syntax::ast::AlterIndexAction::ResetOptions(ro) => {
-                let options = Self::extract_attribute_list(ro.attribute_list());
+                let options =
+                    Self::extract_attribute_options_raw(ro.attribute_list()).unwrap_or_default();
                 actions.push(AlterIndexActionFact::ResetOptions { options });
             }
         }
@@ -2305,16 +2498,472 @@ impl AstVisitor {
     }
 
     fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
-        // View options and WITH CHECK OPTION alter write/security semantics
-        // that are not represented by the relation state or dependency graph.
-        if node.with_check_option().is_some() || node.with_params().is_some() {
+        let path = node.view()?.path()?;
+        let query = node.query();
+        let (select_source, select_outputs) = Self::extract_single_source_projection(query.clone());
+        let projection_was_complete = select_outputs.is_some();
+        let select_outputs = select_outputs.unwrap_or_default();
+        let mut options = node
+            .with_params()
+            .and_then(|params| params.attribute_list())
+            .map(|attribute_list| Self::extract_attribute_list(Some(attribute_list)))
+            .unwrap_or_default();
+        // `WITH [LOCAL] CHECK OPTION` is a `check_option` reloption, and is
+        // what makes the auto-updatable precondition apply.
+        if let Some(check) = node.with_check_option() {
+            let local = matches!(
+                check.check_option_level(),
+                Some(ast::CheckOptionLevel::LocalCheckOption(_))
+            );
+            options.push(crate::_internal::analysis::facts::AttributeFact {
+                name: "check_option".to_string(),
+                value: Some(if local { "local" } else { "cascaded" }.to_string()),
+                namespace: None,
+            });
+        }
+        let outcome = Self::view_updatability(query);
+        Some(StatementFact::CreateView {
+            name: Self::path_to_qualified_name(&path)?,
+            or_replace: node.or_replace().is_some(),
+            depends_on: Self::extract_view_dependencies(node.syntax()),
+            column_list: node
+                .column_list()
+                .map(|list| {
+                    list.column_names()
+                        .filter_map(|name| {
+                            Some(Self::resolve_identifier_token(name.ident_token()?.text()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            options,
+            updatability: outcome.with_aggregates,
+            updatability_without_aggregates: outcome.without_aggregates,
+            aggregate_candidates: outcome.aggregate_candidates,
+            select_projection_complete: select_source.is_some() && projection_was_complete,
+            select_outputs,
+            select_source,
+            routines: Self::extract_view_routines(node.syntax()),
+            cast_types: Self::extract_view_cast_types(node.syntax()),
+        })
+    }
+
+    /// Whether PostgreSQL would accept `WITH CHECK OPTION` on this view query,
+    /// mirroring `view_query_is_auto_updatable(query, true)`. Only the
+    /// unambiguous syntax is settled here; a query whose verdict depends on
+    /// the search path is read twice, and an unplaceable target stays unknown.
+    fn view_updatability(query: Option<ast::SelectVariant>) -> ViewUpdatabilityOutcome {
+        use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
+        use crate::_internal::model::relation::ViewUpdatabilityReason as R;
+        match query {
+            Some(ast::SelectVariant::Select(select)) => Self::select_updatability(&select),
+            Some(ast::SelectVariant::ParenSelect(paren)) => Self::view_updatability(paren.select()),
+            Some(ast::SelectVariant::CompoundSelect(_)) => {
+                ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::SetOperation))
+            }
+            Some(ast::SelectVariant::Values(_)) => {
+                ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::SingleRelation))
+            }
+            // `TABLE t` and `SELECT ... INTO` are not a plain projection the
+            // rest of the analysis expects, so do not claim a verdict.
+            Some(ast::SelectVariant::Table(_)) | Some(ast::SelectVariant::SelectInto(_)) | None => {
+                ViewUpdatabilityOutcome::settled(V::Unknown)
+            }
+        }
+    }
+
+    fn select_updatability(select: &ast::Select) -> ViewUpdatabilityOutcome {
+        use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
+        use crate::_internal::model::relation::ViewUpdatabilityReason as R;
+        if select
+            .select_clause()
+            .and_then(|clause| clause.select_quantifier())
+            .is_some_and(|quantifier| {
+                matches!(quantifier, ast::SelectQuantifier::DistinctClause(_))
+            })
+        {
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::Distinct));
+        }
+        if select.group_by_clause().is_some() {
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::GroupBy));
+        }
+        if select.having_clause().is_some() {
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::Having));
+        }
+        if select.with_clause().is_some() {
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::With));
+        }
+        if select.limit_clause().is_some()
+            || select.offset_clause().is_some()
+            || select.fetch_clause().is_some()
+        {
+            return ViewUpdatabilityOutcome::settled(V::NotUpdatable(R::Limit));
+        }
+        // An aggregate or window function in the target list makes each row a
+        // summary; a set-returning function multiplies rows. An explicit
+        // `pg_catalog` aggregate is settled here, an unqualified possible
+        // aggregate is settled by the resolver, and a call that is neither
+        // might be a set-returning function the analyzer cannot identify.
+        let targets = select
+            .select_clause()
+            .and_then(|clause| clause.target_list())
+            .map(|list| list.targets().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut aggregate = false;
+        let mut window = false;
+        let mut unknown_call = false;
+        let mut aggregate_candidates: Vec<AggregateCandidateFact> = Vec::new();
+        for target in targets.iter() {
+            for call in Self::target_list_calls(target) {
+                if call.over_clause().is_some() {
+                    window = true;
+                } else if Self::is_pg_catalog_aggregate(&call) {
+                    aggregate = true;
+                } else if let Some(candidate) = Self::unqualified_aggregate_candidate(&call) {
+                    aggregate_candidates.push(candidate);
+                } else if call.expr().is_some() {
+                    // An identifier call the analyzer cannot identify might be
+                    // a set-returning function. A keyword form (`EXISTS`,
+                    // `ANY`, `substring`, ...) has no callee and never is.
+                    unknown_call = true;
+                }
+            }
+        }
+        let structural = match Self::single_source_relation(select) {
+            Ok(whole_row) => {
+                // With `check_cols`, PostgreSQL requires at least one updatable
+                // column: a star, or a reference to a user column of the base
+                // relation.
+                if targets.iter().any(|target| {
+                    target.star_token().is_some() || Self::is_column_reference(target, &whole_row)
+                }) {
+                    V::Updatable
+                } else {
+                    V::NotUpdatable(R::NoUpdatableColumns)
+                }
+            }
+            Err(reason) => V::NotUpdatable(reason),
+        };
+        // The reading that ignores the unqualified calls still honours an
+        // explicit aggregate, which no path can redirect.
+        let without_aggregates = if aggregate {
+            V::NotUpdatable(R::Aggregate)
+        } else if window {
+            V::NotUpdatable(R::Window)
+        } else if unknown_call {
+            V::Unknown
+        } else {
+            structural
+        };
+        // PostgreSQL checks aggregates before window functions and before the
+        // from-shape, so any aggregate-named call decides the reading that
+        // counts them.
+        let with_aggregates = if aggregate || !aggregate_candidates.is_empty() {
+            V::NotUpdatable(R::Aggregate)
+        } else {
+            without_aggregates
+        };
+        ViewUpdatabilityOutcome {
+            with_aggregates,
+            without_aggregates,
+            aggregate_candidates,
+        }
+    }
+
+    fn unwrap_parens(mut expr: ast::Expr) -> ast::Expr {
+        loop {
+            match expr {
+                ast::Expr::ParenExpr(paren) => match paren.expr() {
+                    Some(inner) => expr = inner,
+                    None => return ast::Expr::ParenExpr(paren),
+                },
+                other => return other,
+            }
+        }
+    }
+
+    /// Whether a target is a user column of the single base relation. A
+    /// whole-row or system-column reference is not, and neither is an
+    /// expression.
+    fn is_column_reference(target: &ast::Target, whole_row: &str) -> bool {
+        let Some(expr) = target.expr() else {
+            return false;
+        };
+        let name = match Self::unwrap_parens(expr) {
+            ast::Expr::NameRef(name) => name.syntax().first_token(),
+            // `t.a` and `t.*` address the base relation's columns; PostgreSQL
+            // spells a qualified reference this way.
+            ast::Expr::FieldExpr(field) => {
+                if field.star_token().is_some() {
+                    return true;
+                }
+                field.field().and_then(|field| field.syntax().first_token())
+            }
+            _ => return false,
+        };
+        match name {
+            Some(token) => {
+                let name = Self::resolve_identifier_token(token.text());
+                !Self::is_system_column(&name) && name != whole_row
+            }
+            None => false,
+        }
+    }
+
+    /// The name a bare reference to the single base relation denotes as a
+    /// whole row: the table alias when given, otherwise the relation's own
+    /// name. Also reports the from clauses PostgreSQL refuses.
+    fn single_source_relation(
+        select: &ast::Select,
+    ) -> Result<String, crate::_internal::model::relation::ViewUpdatabilityReason> {
+        use crate::_internal::model::relation::ViewUpdatabilityReason as R;
+        let Some(from) = select.from_clause() else {
+            return Err(R::SingleRelation);
+        };
+        let mut items = from.items();
+        let Some(item) = items.next() else {
+            return Err(R::SingleRelation);
+        };
+        if items.next().is_some() {
+            return Err(R::SingleRelation);
+        }
+        let ast::FromListItem::FromItem(ast::FromItem::RelationFromItem(relation)) = item else {
+            return Err(R::SingleRelation);
+        };
+        if relation.tablesample_clause().is_some() {
+            return Err(R::Tablesample);
+        }
+        if let Some(alias) = relation.alias().and_then(|alias| alias.name()) {
+            return alias
+                .ident_token()
+                .map(|token| Self::resolve_identifier_token(token.text()))
+                .ok_or(R::SingleRelation);
+        }
+        let qualified = relation
+            .relation_name_ref()
+            .and_then(|name| name.path_ref())
+            .and_then(|path| Self::path_ref_to_qualified_name(&path))
+            .ok_or(R::SingleRelation)?;
+        Ok(qualified.name.resolve())
+    }
+
+    /// PostgreSQL's system columns, which a view cannot update.
+    fn is_system_column(name: &str) -> bool {
+        matches!(
+            name,
+            "tableoid" | "ctid" | "xmin" | "cmin" | "xmax" | "cmax"
+        )
+    }
+
+    /// Every call a target's expression makes, but not calls inside a nested
+    /// query: a subquery, `EXISTS`, `ANY`/`ALL` or `ARRAY` carries its own
+    /// `SELECT`, whose aggregates and windows belong to it, not the view.
+    fn target_list_calls(target: &ast::Target) -> Vec<ast::CallExpr> {
+        let boundary = target.syntax();
+        target
+            .syntax()
+            .descendants()
+            .filter_map(ast::CallExpr::cast)
+            .filter(|call| {
+                !call
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|ancestor| ancestor != boundary)
+                    .any(|ancestor| {
+                        matches!(
+                            ancestor.kind(),
+                            SyntaxKind::SELECT
+                                | SyntaxKind::PAREN_SELECT
+                                | SyntaxKind::COMPOUND_SELECT
+                                | SyntaxKind::SELECT_INTO
+                                | SyntaxKind::VALUES
+                                | SyntaxKind::TABLE
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Whether a call spells `pg_catalog.<aggregate>`, which no search path can
+    /// redirect to another schema.
+    fn is_pg_catalog_aggregate(call: &ast::CallExpr) -> bool {
+        let Some(callee) = call.expr() else {
+            return false;
+        };
+        let text = callee.syntax().text().to_string();
+        let Some((schema, name)) = text.rsplit_once('.') else {
+            return false;
+        };
+        Self::resolve_identifier_token(schema) == "pg_catalog"
+            && Self::is_aggregate_name(&Self::resolve_identifier_token(name))
+    }
+
+    /// Candidate facts for an unqualified call that spells a built-in
+    /// aggregate: its name and the argument types the visitor can see.
+    fn unqualified_aggregate_candidate(call: &ast::CallExpr) -> Option<AggregateCandidateFact> {
+        let callee = call.expr()?;
+        let text = callee.syntax().text().to_string();
+        if text.contains('.') {
             return None;
         }
-        let path = node.view()?.path()?;
-        // Only a plain `SELECT` exposes a target list. Compound, parenthesized
-        // and `VALUES` queries still create the view, but its columns are then
-        // unknown, so the projection is left incomplete.
-        let (select_source, select_outputs) = match node.query() {
+        let name = Self::resolve_identifier_token(&text);
+        if !Self::is_aggregate_name(&name) {
+            return None;
+        }
+        // `count(*)` is a star form with no arguments; a named-notation
+        // argument pins a type the visitor cannot see.
+        let arguments = match call.arg_list() {
+            Some(args) if args.star_token().is_none() => args
+                .args()
+                .map(|arg| match arg.func_arg_expr() {
+                    Some(ast::FuncArgExpr::Expr(expr)) => Self::aggregate_argument(expr),
+                    _ => AggregateArgumentFact::Unknown,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(AggregateCandidateFact { name, arguments })
+    }
+
+    /// One argument of a candidate call, typed as far as the visitor can see
+    /// without the schema.
+    fn aggregate_argument(expr: ast::Expr) -> AggregateArgumentFact {
+        use AggregateArgumentFact as A;
+        match Self::unwrap_parens(expr) {
+            // A cast is the type it converts to.
+            ast::Expr::CastExpr(cast) => cast
+                .ty()
+                .map(|ty| A::Typed(ty.syntax().text().to_string()))
+                .unwrap_or(A::Unknown),
+            ast::Expr::NameRef(name) => A::Column(Self::resolve_identifier_token(
+                name.syntax().text().to_string(),
+            )),
+            // `t.amount` addresses the base relation's column; `t.*` does not.
+            ast::Expr::FieldExpr(field) if field.star_token().is_none() => field
+                .field()
+                .map(|name| {
+                    A::Column(Self::resolve_identifier_token(
+                        name.syntax().text().to_string(),
+                    ))
+                })
+                .unwrap_or(A::Unknown),
+            _ => A::Unknown,
+        }
+    }
+
+    fn is_aggregate_name(name: &str) -> bool {
+        BUILTIN_AGGREGATES.contains(&name)
+    }
+
+    /// The qualified name a cast target writes.
+    fn qualified_name_from_type(
+        cast_type: &ast::Type,
+    ) -> Option<crate::_internal::analysis::facts::CastTypeReferenceFact> {
+        let text = cast_type.syntax().text().to_string();
+        let name = Self::routine_name_from_text(text.split('(').next().unwrap_or(&text))?;
+        Some(crate::_internal::analysis::facts::CastTypeReferenceFact { name })
+    }
+
+    /// The routines a view calls, wherever they appear in the query.
+    ///
+    /// The whole query is scanned rather than the target list alone, because
+    /// PostgreSQL records the dependency from anywhere in the definition —
+    /// `WHERE`, `HAVING`, `JOIN ... ON` and the grouping clauses all hold one.
+    /// The types a view body casts to, which a drop of that type must clear.
+    fn extract_view_cast_types(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> {
+        let mut references: Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> =
+            Vec::new();
+        for cast in syntax.descendants().filter_map(ast::CastExpr::cast) {
+            let Some(cast_type) = cast.ty() else { continue };
+            let Some(reference) = Self::qualified_name_from_type(&cast_type) else {
+                continue;
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    /// The routine and cast references a view query makes.
+    fn extract_view_routines(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::RoutineReferenceFact> {
+        let mut references: Vec<crate::_internal::analysis::facts::RoutineReferenceFact> =
+            Vec::new();
+        for call in syntax.descendants().filter_map(ast::CallExpr::cast) {
+            let Some(expr) = call.expr() else {
+                continue;
+            };
+            let Some(qualified) = Self::routine_name_from_text(&expr.syntax().text().to_string())
+            else {
+                continue;
+            };
+            // Argument types are stated only for plain column references,
+            // which are the arguments whose type the source relation fixes.
+            // A qualified column reference is not one of them.
+            let argument_types = call.arg_list().and_then(|args| {
+                args.args()
+                    .map(|argument| match argument.expr() {
+                        Some(ast::Expr::NameRef(column)) => Some(Self::resolve_identifier_token(
+                            column.syntax().first_token()?.text(),
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<String>>>()
+            });
+            let reference = crate::_internal::analysis::facts::RoutineReferenceFact {
+                name: qualified,
+                argument_types,
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    /// The qualified name a function call names, written as `name` or
+    /// `schema.name`.
+    fn routine_name_from_text(text: &str) -> Option<QualifiedName> {
+        let (schema, name) = match text.split_once('.') {
+            Some((schema, name)) => (Some(schema), name),
+            None => (None, text),
+        };
+        let part = |raw: &str| {
+            let is_quoted = raw.len() > 1 && raw.starts_with('"') && raw.ends_with('"');
+            Ident::new(
+                if is_quoted {
+                    &raw[1..raw.len() - 1]
+                } else {
+                    raw
+                }
+                .to_string(),
+                is_quoted,
+            )
+        };
+        Some(QualifiedName::new(
+            schema.map(part),
+            part(name.trim_end_matches('(').trim()),
+        ))
+    }
+
+    /// The source relation and target list of a query that selects from a
+    /// single plain relation.
+    ///
+    /// Only a plain `SELECT` exposes a target list. Compound, parenthesized
+    /// and `VALUES` queries still create the relation, but its columns are
+    /// then unknown, so the projection is left incomplete.
+    fn extract_single_source_projection(
+        query: Option<ast::SelectVariant>,
+    ) -> (
+        Option<QualifiedName>,
+        Option<Vec<crate::_internal::analysis::facts::SelectOutputFact>>,
+    ) {
+        match query {
             Some(ast::SelectVariant::Select(select)) => {
                 let source = select.from_clause().and_then(|from| {
                     let mut items = from.items();
@@ -2341,55 +2990,44 @@ impl AstVisitor {
                 (source, outputs)
             }
             _ => (None, None),
-        };
-        let select_projection_complete = select_source.is_some() && select_outputs.is_some();
-        Some(StatementFact::CreateView {
-            name: Self::path_to_qualified_name(&path)?,
-            or_replace: node.or_replace().is_some(),
-            depends_on: Self::extract_view_dependencies(node.syntax()),
-            select_outputs: select_outputs.unwrap_or_default(),
-            select_projection_complete,
-            select_source,
-        })
+        }
     }
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action_node = node.action()?;
+        Some(StatementFact::AlterView {
+            name: Self::path_ref_to_qualified_name(&path)?,
+            action: Self::extract_alter_view_action(action_node)?,
+            if_exists: node.if_exists().is_some(),
+        })
+    }
 
-        let action = node.action()?;
-        match action {
+    fn extract_alter_view_action(
+        action_node: ast::AlterViewAction,
+    ) -> Option<crate::_internal::analysis::facts::AlterViewAction> {
+        Some(match action_node {
             ast::AlterViewAction::ViewRenameTo(rt) => {
                 let new_name_node = rt.view()?.path()?;
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameTo {
-                        new_name: Self::path_to_qualified_name(&new_name_node)?.name,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::RenameTo {
+                    new_name: Self::path_to_qualified_name(&new_name_node)?.name,
+                }
             }
             ast::AlterViewAction::OwnerTo(ot) => {
-                let new_owner = Self::extract_role(&ot.role_ref()?);
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
-                        new_owner,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
+                    new_owner: Self::extract_role(&ot.role_ref()?),
+                }
             }
             ast::AlterViewAction::SetSchema(ss) => {
                 let token = ss.schema_ref()?.ident_token()?;
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::SetSchema {
-                        new_schema: Self::resolve_identifier_token(token.text()),
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::SetSchema {
+                    new_schema: Self::resolve_identifier_token(token.text()),
+                }
             }
             ast::AlterViewAction::AlterViewColumn(avc) => {
                 let col_token = avc.name()?.ident_token()?;
                 let column = Self::resolve_identifier_token(col_token.text());
-                let action = match avc.alter_view_column_action()? {
+                match avc.alter_view_column_action()? {
                     ast::AlterViewColumnAction::SetDefault(sd) => {
                         crate::_internal::analysis::facts::AlterViewAction::SetDefault {
                             column,
@@ -2401,8 +3039,7 @@ impl AstVisitor {
                     ast::AlterViewColumnAction::DropDefault(_) => {
                         crate::_internal::analysis::facts::AlterViewAction::DropDefault { column }
                     }
-                };
-                Some(StatementFact::AlterView { name, action })
+                }
             }
             ast::AlterViewAction::RenameColumn(rc) => {
                 let from_token = rc.column_name_ref()?.ident_token()?;
@@ -2411,58 +3048,86 @@ impl AstVisitor {
                 let to_token = rc.column_name()?.ident_token()?;
                 let to = Self::identifier_from_token(to_token.text());
 
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameColumn {
-                        from,
-                        to,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::RenameColumn { from, to }
             }
             ast::AlterViewAction::SetOptions(so) => {
-                let options = Self::extract_attribute_list(so.attribute_list());
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::SetOptions {
-                        options,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::SetOptions {
+                    options: Self::extract_attribute_list(so.attribute_list()),
+                }
             }
             ast::AlterViewAction::ResetOptions(ro) => {
-                let options = Self::extract_attribute_list(ro.attribute_list());
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
-                        options,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
+                    options: Self::extract_attribute_options_raw(ro.attribute_list())
+                        .unwrap_or_default(),
+                }
             }
-        }
+        })
     }
 
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
-        // A materialized view created WITH NO DATA cannot be refreshed
-        // concurrently until it has been populated; populated state is not
-        // modeled, so preserve the opaque path for this explicit form.
-        if node
-            .data_option()
-            .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_)))
-        {
-            return None;
-        }
         let path = node.view()?.path()?;
+        let (select_source, select_outputs) = Self::extract_single_source_projection(node.query());
+        let projection_was_complete = select_outputs.is_some();
+        let select_outputs = select_outputs.unwrap_or_default();
         Some(StatementFact::CreateMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             depends_on: Self::extract_view_dependencies(node.syntax()),
+            if_not_exists: node.if_not_exists().is_some(),
+            with_no_data: node
+                .data_option()
+                .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
+            column_list: node
+                .column_list()
+                .map(|list| {
+                    list.column_names()
+                        .filter_map(|name| {
+                            Some(Self::resolve_identifier_token(name.ident_token()?.text()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            access_method: node
+                .using_method()
+                .and_then(|method| method.access_method_ref())
+                .and_then(|reference| reference.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            tablespace: node
+                .tablespace_clause()
+                .and_then(|clause| clause.tablespace_ref())
+                .and_then(|reference| reference.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            options: node
+                .with_params()
+                .and_then(|params| params.attribute_list())
+                .map(|attribute_list| Self::extract_attribute_list(Some(attribute_list)))
+                .unwrap_or_default(),
+            select_projection_complete: select_source.is_some() && projection_was_complete,
+            select_outputs,
+            select_source,
+            routines: Self::extract_view_routines(node.syntax()),
+            cast_types: Self::extract_view_cast_types(node.syntax()),
         })
     }
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let name = Self::path_ref_to_qualified_name(&path)?;
-        let action_node = node.action().next()?;
+        // An action the model does not represent makes the whole statement
+        // opaque, rather than silently applying the remaining actions.
+        let actions: Option<Vec<_>> = node
+            .action()
+            .map(Self::extract_alter_materialized_view_action)
+            .collect();
+        Some(StatementFact::AlterMaterializedView {
+            name: Self::path_ref_to_qualified_name(&path)?,
+            actions: actions?,
+            if_exists: node.if_exists().is_some(),
+        })
+    }
 
-        let action = match action_node {
+    fn extract_alter_materialized_view_action(
+        action_node: ast::AlterMaterializedViewAction,
+    ) -> Option<crate::_internal::analysis::facts::AlterMaterializedViewActionFact> {
+        Some(match action_node {
             ast::AlterMaterializedViewAction::ViewRenameTo(rt) => {
                 let segment = rt.view()?.path()?.segment()?;
                 crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameTo {
@@ -2508,7 +3173,8 @@ impl AstVisitor {
                     }
                     ast::AlterTableAction::ResetOptions(ro) => {
                         crate::_internal::analysis::facts::AlterMaterializedViewActionFact::ResetOptions {
-                            options: Self::extract_attribute_list(ro.attribute_list()),
+                            options: Self::extract_attribute_options_raw(ro.attribute_list())
+                                .unwrap_or_default(),
                         }
                     }
                     ast::AlterTableAction::ClusterOn(co) => {
@@ -2559,9 +3225,7 @@ impl AstVisitor {
                     _ => return None,
                 }
             }
-        };
-
-        Some(StatementFact::AlterMaterializedView { name, action })
+        })
     }
 
     fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {
@@ -2569,6 +3233,9 @@ impl AstVisitor {
         Some(StatementFact::RefreshMaterializedView {
             name: Self::path_ref_to_qualified_name(&path)?,
             concurrently: node.concurrently_token().is_some(),
+            with_no_data: node
+                .data_option()
+                .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
         })
     }
 
@@ -2710,48 +3377,107 @@ impl AstVisitor {
     fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
         let path = node.sequence_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
-        let action = match node.actions().next() {
-            Some(ast::AlterSequenceAction::OwnerTo(owner)) => owner
-                .role_ref()
-                .map(|role| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnerTo(
-                        Self::extract_role(&role),
-                    )
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SequenceRenameTo(rename)) => rename
-                .sequence()
-                .and_then(|sequence| sequence.path())
-                .and_then(|path| Self::path_to_qualified_name(&path))
-                .map(|name| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::RenameTo(name.name)
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SetSchema(set_schema)) => set_schema
-                .schema_ref()
-                .and_then(|schema| schema.ident_token())
-                .map(|token| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::SetSchema(
-                        Self::resolve_identifier_token(token.text()),
-                    )
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SequenceOption(ast::SequenceOption::OptionOwnedBy(
-                option,
-            ))) => match option.owned_by_target() {
-                Some(ast::OwnedByTarget::OwnedByNone(_)) => {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(None)
-                }
-                Some(_) => crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(
-                    Self::extract_owned_by(&option),
-                ),
-                None => crate::_internal::analysis::facts::AlterSequenceActionFact::Other,
-            },
-            _ => crate::_internal::analysis::facts::AlterSequenceActionFact::Other,
+
+        use crate::_internal::analysis::facts::{
+            AlterSequenceActionFact, SequenceOptionFact as OptionFact,
         };
+        let integer = |expr: ast::Expr| expr.syntax().text().to_string().trim().parse::<i64>().ok();
+
+        let mut options = Vec::new();
+        let mut action: Option<AlterSequenceActionFact> = None;
+        for entry in node.actions() {
+            let singular = match entry {
+                ast::AlterSequenceAction::OwnerTo(owner) => Some(AlterSequenceActionFact::OwnerTo(
+                    Self::extract_role(&owner.role_ref()?),
+                )),
+                ast::AlterSequenceAction::SequenceRenameTo(rename) => {
+                    let new_name = Self::path_to_qualified_name(&rename.sequence()?.path()?)?;
+                    Some(AlterSequenceActionFact::RenameTo(new_name.name))
+                }
+                ast::AlterSequenceAction::SetSchema(set_schema) => {
+                    let token = set_schema.schema_ref()?.ident_token()?;
+                    Some(AlterSequenceActionFact::SetSchema(
+                        Self::resolve_identifier_token(token.text()),
+                    ))
+                }
+                ast::AlterSequenceAction::SetLogged(_) => {
+                    options.push(OptionFact::Logged(true));
+                    None
+                }
+                ast::AlterSequenceAction::SetUnlogged(_) => {
+                    options.push(OptionFact::Logged(false));
+                    None
+                }
+                ast::AlterSequenceAction::SequenceOption(option) => {
+                    let option = match option {
+                        ast::SequenceOption::OptionAsType(o) => {
+                            OptionFact::As(o.ty()?.syntax().text().to_string())
+                        }
+                        ast::SequenceOption::OptionCache(o) => {
+                            OptionFact::Cache(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionCycle(_) => OptionFact::Cycle(true),
+                        ast::SequenceOption::OptionNoCycle(_) => OptionFact::Cycle(false),
+                        ast::SequenceOption::OptionIncrement(o) => {
+                            OptionFact::Increment(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionMaxValue(o) => {
+                            OptionFact::MaxValue(Some(integer(o.expr()?)?))
+                        }
+                        ast::SequenceOption::OptionNoMaxValue(_) => OptionFact::MaxValue(None),
+                        ast::SequenceOption::OptionMinValue(o) => {
+                            OptionFact::MinValue(Some(integer(o.expr()?)?))
+                        }
+                        ast::SequenceOption::OptionNoMinValue(_) => OptionFact::MinValue(None),
+                        ast::SequenceOption::OptionStart(o) => {
+                            OptionFact::Start(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionRestart(o) => {
+                            OptionFact::Restart(match o.expr() {
+                                Some(expr) => Some(integer(expr)?),
+                                None => None,
+                            })
+                        }
+                        ast::SequenceOption::OptionLogged(_) => OptionFact::Logged(true),
+                        ast::SequenceOption::OptionUnlogged(_) => OptionFact::Logged(false),
+                        ast::SequenceOption::OptionOwnedBy(o) => match o.owned_by_target() {
+                            Some(ast::OwnedByTarget::OwnedByNone(_)) => OptionFact::OwnedBy(None),
+                            Some(_) => OptionFact::OwnedBy(Some(Self::extract_owned_by(&o)?)),
+                            None => return None,
+                        },
+                        ast::SequenceOption::OptionSequenceName(o) => OptionFact::SequenceName(
+                            Self::path_to_qualified_name(&o.sequence()?.path()?)?
+                                .name
+                                .resolve(),
+                        ),
+                    };
+                    options.push(option);
+                    None
+                }
+            };
+            if let Some(singular) = singular {
+                // PostgreSQL parses ownership, rename, and schema changes as
+                // their own statement kinds, so a statement carrying two of
+                // them is not a form it accepts.
+                if action.is_some() {
+                    return None;
+                }
+                action = Some(singular);
+            }
+        }
+
+        // PostgreSQL gives `OWNER TO`, `RENAME TO`, and `SET SCHEMA` their own
+        // statement kinds, each of which ends at its own name; a parameter
+        // option in the same statement is a syntax error rather than an
+        // ordering choice.
+        if action.is_some() && !options.is_empty() {
+            return None;
+        }
+
         Some(StatementFact::AlterSequence {
             name,
             if_exists: node.if_exists().is_some(),
+            options,
             action,
         })
     }
@@ -2924,13 +3650,34 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // The model records these kinds without their subtype or I/O
-            // metadata, matching what the catalog sync reports for them.
-            ast::CreateTypeKind::RangeType(_) => TypeCreationKind::Range,
-            ast::CreateTypeKind::BaseType(_) => TypeCreationKind::Base,
+            // A range type is defined by its subtype and a base type by its
+            // element; both arrive as attributes on the same list.
+            ast::CreateTypeKind::RangeType(range) => TypeCreationKind::Range {
+                subtype: Self::type_attribute(
+                    Self::extract_attribute_list(range.attribute_list()),
+                    "subtype",
+                ),
+            },
+            ast::CreateTypeKind::BaseType(base) => TypeCreationKind::Base {
+                element: Self::type_attribute(
+                    Self::extract_attribute_list(base.attribute_list()),
+                    "element",
+                ),
+            },
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
+    }
+
+    /// The named type an attribute list declares, if it names one.
+    fn type_attribute(
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
+        name: &str,
+    ) -> Option<String> {
+        attributes
+            .into_iter()
+            .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
+            .and_then(|attribute| attribute.value)
     }
 
     fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
@@ -3154,11 +3901,33 @@ impl AstVisitor {
                 .collect();
             crate::_internal::analysis::facts::RetTypeFact::Table(cols)
         } else {
-            let ty = ret
-                .func_type()
-                .map(|t| t.syntax().text().to_string())
-                .unwrap_or_else(|| "unknown".into());
-            crate::_internal::analysis::facts::RetTypeFact::Scalar(ty)
+            // `FuncType` wraps `Type`, and `SETOF` sits on the inner
+            // `PathType`, so the flag has to be read from the parse tree
+            // rather than recovered from the rendered text. The type is kept
+            // without the keyword, matching `pg_proc.prorettype`.
+            match ret.func_type() {
+                Some(func_type) => {
+                    let setof_token = match &func_type {
+                        ast::FuncType::Type(ast::Type::PathType(path_type)) => {
+                            path_type.setof_token()
+                        }
+                        _ => None,
+                    };
+                    let text = func_type.syntax().text().to_string();
+                    let ty = match &setof_token {
+                        Some(token) => text[token.text().len()..].trim_start().to_string(),
+                        None => text,
+                    };
+                    crate::_internal::analysis::facts::RetTypeFact::Scalar {
+                        ty,
+                        setof: setof_token.is_some(),
+                    }
+                }
+                None => crate::_internal::analysis::facts::RetTypeFact::Scalar {
+                    ty: "unknown".to_string(),
+                    setof: false,
+                },
+            }
         }
     }
 
@@ -3458,6 +4227,16 @@ impl AstVisitor {
                     ),
                 },
             ),
+            // A procedure takes the same option list a function does, so
+            // dropping it here turned `ALTER PROCEDURE ... SECURITY DEFINER`
+            // into an unmodeled statement even though PostgreSQL applies it.
+            ast::AlterProcedureAction::FuncOptionList(ol) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    ol.options()
+                        .map(|option| Self::extract_func_option(&option))
+                        .collect(),
+                ),
+            ),
             _ => None,
         });
 
@@ -3526,23 +4305,32 @@ impl AstVisitor {
 
     fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
         let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
+        let attributes = Self::extract_attribute_list(node.attribute_list());
         let params = if let Some(params) = node.param_list() {
             params
                 .params()
                 .map(|param| Self::extract_param(&param))
                 .collect()
         } else {
-            Self::extract_attribute_list(node.attribute_list())
-                .into_iter()
+            attributes
+                .iter()
                 .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
                 .filter(|attribute| {
-                    !matches!(attribute.value.to_ascii_lowercase().as_str(), "any" | "*")
+                    !matches!(
+                        attribute
+                            .value
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "any" | "*"
+                    )
                 })
                 .map(|attribute| {
                     vec![crate::_internal::analysis::facts::ParamFact {
                         mode: crate::_internal::analysis::facts::ParamModeFact::In,
                         name: None,
-                        ty: attribute.value,
+                        ty: attribute.value.clone().unwrap_or_default(),
                         default: None,
                     }]
                 })
@@ -3553,6 +4341,20 @@ impl AstVisitor {
                 name,
                 or_replace: node.or_replace().is_some(),
                 params,
+                // The parser keeps the transition functions, state type, and
+                // initial condition as attribute options. Recording them keeps
+                // the definition honest about what it knows, so the state's
+                // limits follow from the fact rather than from a blanket
+                // statement that the whole definition was discarded.
+                definition: attributes
+                    .into_iter()
+                    .map(
+                        |attribute| crate::_internal::analysis::facts::AggregateOptionFact {
+                            name: attribute.name,
+                            value: attribute.value.unwrap_or_default(),
+                        },
+                    )
+                    .collect(),
             },
         ))
     }
@@ -3622,17 +4424,20 @@ impl AstVisitor {
                             Self::resolve_identifier_token(name.syntax().text().to_string().trim())
                         })
                         .unwrap_or_default(),
-                    value: option
-                        .attribute_value()
-                        .map(|value| {
-                            value
-                                .literal()
-                                .and_then(|literal| Self::resolve_string_literal(&literal))
-                                .unwrap_or_else(|| {
-                                    value.syntax().text().to_string().trim().to_string()
-                                })
-                        })
-                        .unwrap_or_else(|| "true".to_string()),
+                    namespace: Self::attribute_namespace(&option),
+                    value: Some(
+                        option
+                            .attribute_value()
+                            .map(|value| {
+                                value
+                                    .literal()
+                                    .and_then(|literal| Self::resolve_string_literal(&literal))
+                                    .unwrap_or_else(|| {
+                                        value.syntax().text().to_string().trim().to_string()
+                                    })
+                            })
+                            .unwrap_or_else(|| "true".to_string()),
+                    ),
                 })
                 .collect()
         })

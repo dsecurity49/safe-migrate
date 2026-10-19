@@ -25,9 +25,7 @@ impl AnalysisState {
         let role_id = ObjectId::new("", &role.name);
         match self.role_lookup(&role_id) {
             RoleLookup::Present => {
-                return MutationResult::Conflict {
-                    reason: format!("role '{}' already exists", role.name),
-                };
+                return MutationResult::conflict(format!("role '{}' already exists", role.name));
             }
             RoleLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -60,19 +58,16 @@ impl AnalysisState {
             &self.local.current_role,
             &self.local.session_role,
         ) else {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnresolvedReference);
         };
         self.snapshot_role(&role_id);
         match self.role_lookup(&role_id) {
             RoleLookup::Present => {}
             RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("role '{}' does not exist", role_id.name),
-                };
+                return MutationResult::conflict(format!("role '{}' does not exist", role_id.name));
             }
             RoleLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
@@ -103,13 +98,10 @@ impl AnalysisState {
                         continue;
                     }
                     RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                        return MutationResult::Conflict {
-                            reason: format!("role '{}' does not exist", name),
-                        };
+                        return MutationResult::conflict(format!("role '{}' does not exist", name));
                     }
                     RoleLookup::Unknown => {
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                     RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
                 }
@@ -120,8 +112,7 @@ impl AnalysisState {
         // completely in RoleState, so do not claim an exact drop when a
         // catalog-backed role list is available.
         if self.local.roles_known && !present_roles.is_empty() {
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for role_id in present_roles {
             self.snapshot_role(&role_id);
@@ -140,12 +131,10 @@ impl AnalysisState {
         }
         match (grantor, self.local.current_role_known) {
             (Some(grantor), true) if grantor.name != self.local.current_role => {
-                Err(MutationResult::Conflict {
-                    reason: format!(
-                        "object privilege GRANTED BY '{}' must name current role '{}'",
-                        grantor.name, self.local.current_role
-                    ),
-                })
+                Err(MutationResult::conflict(format!(
+                    "object privilege GRANTED BY '{}' must name current role '{}'",
+                    grantor.name, self.local.current_role
+                )))
             }
             (Some(_), false) | (None, _) => {
                 self.taint(
@@ -265,6 +254,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_grant(&mut self, grant: &GrantMutation) -> MutationResult {
+        let pg_version = self.pg_version().conservative_num();
         if let Err(result) = self.validate_grant_targets(&grant.target) {
             return result;
         }
@@ -315,15 +305,13 @@ impl AnalysisState {
                     match authorization {
                         Some(true) => {}
                         Some(false) => {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "role '{}' lacks grant option on relation '{}'",
-                                    grantor
-                                        .as_ref()
-                                        .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
-                                    id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "role '{}' lacks grant option on relation '{}'",
+                                grantor
+                                    .as_ref()
+                                    .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
+                                id
+                            ));
                         }
                         None if grantor.is_some() => self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
@@ -379,16 +367,24 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if self.pg_version_num.is_some_and(|version| version < 160_000)
-                    && grant
-                        .role_options
-                        .iter()
-                        .any(|option| !matches!(option, RoleMembershipOptionFact::Admin(true)))
+                if grant
+                    .role_options
+                    .iter()
+                    .any(|option| !matches!(option, RoleMembershipOptionFact::Admin(true)))
                 {
-                    return MutationResult::Conflict {
-                        reason: "per-membership TRUE/FALSE options require PostgreSQL 16+"
-                            .to_string(),
-                    };
+                    match self.pg_version().num() {
+                        Some(version) if version < 160_000 => {
+                            return MutationResult::conflict(
+                                "per-membership TRUE/FALSE options require PostgreSQL 16+"
+                                    .to_string(),
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            // An unknown version cannot prove a rejection.
+                            return self.unresolved(EvidenceCode::UnsupportedSemantics);
+                        }
+                    }
                 }
                 // Role memberships attribute implicit superuser grants to
                 // the bootstrap superuser, unlike object privileges.
@@ -413,12 +409,10 @@ impl AnalysisState {
                         match can_administer {
                             Some(true) => {}
                             Some(false) => {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "role '{}' lacks ADMIN OPTION for the granted membership",
-                                        grantor.name
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "role '{}' lacks ADMIN OPTION for the granted membership",
+                                    grantor.name
+                                ));
                             }
                             None => self.taint(
                                 EvidenceCode::CatalogCoverageIncomplete,
@@ -454,17 +448,14 @@ impl AnalysisState {
                         })
                         .is_some()
                     {
-                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnmodeledState);
                     }
                 }
                 if grant.role_options.is_empty() && grant.with_grant_option {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnmodeledState);
                 }
                 if grantees.iter().any(|member| member.name == "public") {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnmodeledState);
                 }
                 // PostgreSQL rejects membership cycles. Validate the whole
                 // batch against a proposed adjacency map before taking any
@@ -485,12 +476,10 @@ impl AnalysisState {
                         let mut visited = HashSet::new();
                         while let Some(role_id) = pending.pop() {
                             if role_id == *member {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "role membership '{}' in '{}' would create a cycle",
-                                        member.name, parent
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "role membership '{}' in '{}' would create a cycle",
+                                    member.name, parent
+                                ));
                             }
                             if !visited.insert(role_id.clone()) {
                                 continue;
@@ -506,6 +495,7 @@ impl AnalysisState {
                     }
                 }
                 let record_mode = grantor.is_some() && self.local.role_membership_grantors_complete;
+                let pg16_or_later = self.pg_version().satisfies(|version| version >= 160_000);
                 let mut touched = HashSet::new();
                 if let Some(grantor) = grantor.as_ref() {
                     self.snapshot_role_membership_grantors();
@@ -528,9 +518,7 @@ impl AnalysisState {
                                             record.admin = admin;
                                         }
                                         if let Some(inherit) = explicit_inherit
-                                            && self
-                                                .pg_version_num
-                                                .is_some_and(|version| version >= 160_000)
+                                            && pg16_or_later
                                         {
                                             record.inherit = inherit;
                                         }
@@ -553,8 +541,8 @@ impl AnalysisState {
                                         // an existing tuple is only updated
                                         // when an option was specified.
                                         let default_inherit = if self
-                                            .pg_version_num
-                                            .is_some_and(|version| version >= 160_000)
+                                            .pg_version()
+                                            .satisfies(|version| version >= 160_000)
                                         {
                                             member_inherits
                                         } else {
@@ -604,8 +592,8 @@ impl AnalysisState {
                                         grantor: grantor.clone(),
                                         admin: explicit_admin.unwrap_or(false),
                                         inherit: self
-                                            .pg_version_num
-                                            .is_some_and(|version| version < 160_000)
+                                            .pg_version()
+                                            .satisfies(|version| version < 160_000)
                                             || explicit_inherit.unwrap_or(true),
                                         set: explicit_set.unwrap_or(true),
                                     },
@@ -651,12 +639,11 @@ impl AnalysisState {
                         // inheritance option: every edge exists and the role's
                         // current INHERIT attribute controls traversal. From
                         // PostgreSQL 16 onward the option belongs to the edge.
-                        let inherit_opt =
-                            if self.pg_version_num.is_some_and(|version| version < 160_000) {
-                                is_new.then_some(true)
-                            } else {
-                                explicit_inherit.or_else(|| is_new.then_some(role.inherits))
-                            };
+                        let inherit_opt = if pg_version < 160_000 {
+                            is_new.then_some(true)
+                        } else {
+                            explicit_inherit.or_else(|| is_new.then_some(role.inherits))
+                        };
                         if inherit_opt == Some(true) {
                             if !role.can_inherit_from.contains(parent) {
                                 role.can_inherit_from.push(parent.clone());
@@ -731,15 +718,13 @@ impl AnalysisState {
                     match authorization {
                         Some(true) => {}
                         Some(false) => {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "role '{}' lacks grant option on relation '{}'",
-                                    grantor
-                                        .as_ref()
-                                        .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
-                                    id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "role '{}' lacks grant option on relation '{}'",
+                                grantor
+                                    .as_ref()
+                                    .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
+                                id
+                            ));
                         }
                         None if grantor.is_some() => self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
@@ -833,17 +818,25 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if self.pg_version_num.is_some_and(|version| version < 160_000)
-                    && matches!(
-                        revoke.role_option,
-                        Some(RoleMembershipOptionFact::Inherit(_))
-                            | Some(RoleMembershipOptionFact::Set(_))
-                    )
-                {
-                    return MutationResult::Conflict {
-                        reason: "per-membership TRUE/FALSE options require PostgreSQL 16+"
-                            .to_string(),
-                    };
+                if matches!(
+                    revoke.role_option,
+                    Some(RoleMembershipOptionFact::Inherit(_))
+                        | Some(RoleMembershipOptionFact::Set(_))
+                ) {
+                    match self.pg_version().num() {
+                        Some(version) if version < 160_000 => {
+                            return MutationResult::conflict(
+                                "per-membership TRUE/FALSE options require PostgreSQL 16+"
+                                    .to_string(),
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            // A conflict claims the server rejects the
+                            // statement; an unknown version cannot prove that.
+                            return self.unresolved(EvidenceCode::UnsupportedSemantics);
+                        }
+                    }
                 }
                 if revoke.cascade && !self.local.role_membership_grantors_complete {
                     self.taint(
@@ -872,12 +865,10 @@ impl AnalysisState {
                         match can_administer {
                             Some(true) => {}
                             Some(false) => {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "role '{}' lacks ADMIN OPTION for the revoked membership",
-                                        grantor.name
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "role '{}' lacks ADMIN OPTION for the revoked membership",
+                                    grantor.name
+                                ));
                             }
                             None => self.taint(
                                 EvidenceCode::CatalogCoverageIncomplete,
@@ -908,8 +899,7 @@ impl AnalysisState {
                         Some(RoleMembershipOptionFact::Set(false))
                     }
                     Some(_) => {
-                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnmodeledState);
                     }
                 };
                 if matches!(revoke_option, Some(RoleMembershipOptionFact::Admin(false)))
@@ -922,8 +912,7 @@ impl AnalysisState {
                     );
                 }
                 if revokees.iter().any(|member| member.name == "public") {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnmodeledState);
                 }
                 let mut cascade_grantors = Vec::new();
                 let record_mode =
@@ -1101,11 +1090,14 @@ impl AnalysisState {
                     self.ensure_relation_target(
                         id,
                         |kind| {
+                            // A foreign table accepts GRANT; only its server
+                            // options are restricted.
                             matches!(
                                 kind,
                                 crate::_internal::model::relation::RelationKind::Table
                                     | crate::_internal::model::relation::RelationKind::View
                                     | crate::_internal::model::relation::RelationKind::MaterializedView
+                                    | crate::_internal::model::relation::RelationKind::ForeignTable
                             )
                         },
                         format!("grant target relation '{}' does not exist", id),
@@ -1123,13 +1115,13 @@ impl AnalysisState {
                     match self.role_lookup(role) {
                         RoleLookup::Present => {}
                         RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                            return Err(MutationResult::Conflict {
-                                reason: format!("role '{}' does not exist", role.name),
-                            });
+                            return Err(MutationResult::conflict(format!(
+                                "role '{}' does not exist",
+                                role.name
+                            )));
                         }
                         RoleLookup::Unknown => {
-                            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                            return Err(MutationResult::Skipped);
+                            return Err(self.unresolved(EvidenceCode::UnknownObjectState));
                         }
                         RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
                     }
@@ -1143,8 +1135,7 @@ impl AnalysisState {
         let mut ids = Vec::with_capacity(facts.len());
         for fact in facts {
             let Some((name, _identity_known)) = self.role_fact_identity(fact) else {
-                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                return Err(MutationResult::Skipped);
+                return Err(self.unresolved(EvidenceCode::UnresolvedReference));
             };
             // PUBLIC is a PostgreSQL pseudo-role, not a row in pg_roles.
             // Unquoted PUBLIC is resolved to "public" by the AST identifier rules.
@@ -1157,9 +1148,10 @@ impl AnalysisState {
             match self.role_lookup(&id) {
                 RoleLookup::Present => ids.push(id),
                 RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                    return Err(MutationResult::Conflict {
-                        reason: format!("role '{}' does not exist", name),
-                    });
+                    return Err(MutationResult::conflict(format!(
+                        "role '{}' does not exist",
+                        name
+                    )));
                 }
                 RoleLookup::Unknown => {
                     self.taint(

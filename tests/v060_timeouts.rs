@@ -224,7 +224,7 @@ fn savepoint_rollback_restores_settings_and_reset_all_is_transactional() {
 }
 
 #[test]
-fn rollback_restores_confidence_tainted_by_reset_search_path() {
+fn rollback_restores_confidence_tainted_by_a_lookup_after_reset_search_path() {
     let engine = SafeMigrateEngine::new(Config::default());
     let mut cache = cache_with_timeouts(500, 5_000);
     cache.metadata.schemas = Some(vec!["public".to_string()]);
@@ -233,9 +233,16 @@ fn rollback_restores_confidence_tainted_by_reset_search_path() {
     state.local.default_search_path_template = vec!["outside_sync_scope".to_string()];
 
     engine
-        .analyze("BEGIN; RESET search_path;", &mut state)
+        .analyze(
+            "BEGIN; RESET search_path; ALTER TABLE shadowed ADD COLUMN x int;",
+            &mut state,
+        )
         .unwrap();
-    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert_eq!(
+        state.local.confidence,
+        Confidence::Tainted,
+        "the reset path cannot prove which schema answered the lookup"
+    );
 
     engine.analyze("ROLLBACK;", &mut state).unwrap();
     assert_eq!(state.local.confidence, Confidence::Exact);

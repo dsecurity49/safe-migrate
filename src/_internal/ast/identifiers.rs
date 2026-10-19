@@ -89,6 +89,15 @@ impl PartialEq for ObjectId {
 
 impl Eq for ObjectId {}
 
+impl ObjectId {
+    /// Total order over identity, for use inside ordered collections.
+    pub(crate) fn cmp_identity(&self, other: &Self) -> std::cmp::Ordering {
+        self.schema
+            .cmp(&other.schema)
+            .then_with(|| self.name.cmp(&other.name))
+    }
+}
+
 impl std::hash::Hash for ObjectId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.schema.hash(state);
@@ -102,6 +111,23 @@ impl ObjectId {
             schema: schema.into(),
             name: name.into(),
             inferred_schema: false,
+        }
+    }
+
+    /// A column of this relation, as `schema.relation.column`.
+    ///
+    /// The inferred-schema annotation belongs to the relation and stays at the
+    /// end, so it never lands inside the qualified name.
+    ///
+    /// TODO: `Violation::object_name` is still a `String`, so callers assemble
+    /// identities by interpolation. Replace it with a structured object
+    /// reference (relation plus optional column) and let the renderers format
+    /// it, which removes this whole class of mis-rendered identifier.
+    pub(crate) fn column_name(&self, column: &str) -> String {
+        if self.inferred_schema {
+            format!("{}.{}.{} (inferred)", self.schema, self.name, column)
+        } else {
+            format!("{}.{}.{}", self.schema, self.name, column)
         }
     }
 }

@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.10.0's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.11.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -53,21 +53,51 @@ are mutually exclusive; conflicts exit `1`. Both lint commands support JSON.
 
 ## JSON report
 
-The report schema is version 2:
+The report schema is version 3:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "confidence": "Exact",
-  "verdict": "HALT",
+  "verdict": "SAFE",
+  "summary": { "total": 0, "tier1": 0, "tier2": 0, "tier3": 0 },
   "evidence": [],
+  "not_evaluated": [],
+  "rules": {},
+  "baseline": {
+    "status": "available",
+    "created_at_unix_secs": 0,
+    "source_database": "app",
+    "schemas": ["public"],
+    "auto_sync": "not_requested",
+    "observed_settings": {
+      "lock_timeout_ms": 5000,
+      "statement_timeout_ms": 900000
+    }
+  },
   "violations": []
 }
 ```
 
-Each violation includes `rule_id`, `operation_kind`, `object_kind`,
-`object_name`, `tier`, `reason`, `recipe`, `dedup_key`, `sql`, and
-`fk_dependency_related`. `rule_id` is the stable identifier.
+Each violation carries only per-occurrence data: `rule_id`, `object_kind`,
+`object_name`, `tier`, `reason`, `recipe`, and — when known — `sql`, `location`,
+and `statement_index`. `certainty` appears only when it is not `Exact`.
+`rule_id` is the stable identifier; rule metadata is not repeated per finding. A
+cascade that pulls an out-of-scope foreign-key dependent says so in `reason`;
+there is no separate flag for it.
+
+Rule titles live once in the top-level `rules` object, keyed by `rule_id`:
+
+```json
+"rules": {
+  "destructive-cascade": "Drop table with cascade",
+  "irreversible-migration": "Irreversible migration"
+}
+```
+
+It covers every `rule_id` the report names, in `violations` and `not_evaluated`
+alike, including the auxiliary ids a primary rule reports. `rules --json`
+remains the authoritative list of configurable primary rules.
 
 Additional top-level objects are:
 
@@ -75,6 +105,7 @@ Additional top-level objects are:
 | --- | --- |
 | `summary` | `total`, `tier1`, `tier2`, and `tier3` counts. |
 | `evidence` | Ordered, deduplicated reasons for conservative analysis. Each has a stable snake-case `code`, `statement` or `chain` scope, summary, and optional file/index. It contains no SQL or credentials. |
+| `not_evaluated` | Checks that did not run for want of evidence. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. |
 | `baseline` | Cache status, provenance, observed settings, and automatic-sync result. |
 
 The `baseline` shape is:
@@ -98,29 +129,36 @@ The `baseline` shape is:
 are `null` when no cache is available. Missing creation provenance makes an
 otherwise readable baseline stale.
 
-Violations may also include a one-based `statement_index`, known-rule metadata
-(`rule_title`, `rule_summary`, and `impact`), and this location object:
+Violations may also include a one-based `statement_index` and this location
+object:
 
 ```json
 "location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
 ```
 
-`rules --json` has its own version 2 schema. Descriptors expose identity,
-guidance, tier, supported settings, and effective values. Every primary rule
-supports `disabled`; other settings are accepted only when advertised.
+`rules --json` has its own version 3 schema, versioned independently of the lint
+report. Descriptors expose identity, guidance, tier, supported settings, and
+effective values. Every primary rule supports `disabled`; other settings are
+accepted only when advertised.
 Unknown rule IDs and unsupported fields are operational errors.
 
 Consumers must branch on `schema_version`. Additive fields are compatible;
 removal, renaming, type changes, and changed enum meanings require a changelog
 entry. Violation ordering is deterministic for identical inputs and version.
 
+Schema 3 is a breaking change from schema 2: `not_evaluated` is new, and
+`operation_kind`, `dedup_key`, `fk_dependency_related`, `rule_title`,
+`rule_summary`, and `impact` are gone from violations. Rule titles moved to
+`rules`. `rules --json` moved to its own version 3 at the same time, renaming
+`remediation` to `recipe`.
+
 ## Verdict and exit status
 
 | Verdict | Condition |
 | --- | --- |
 | `HALT` | At least one Tier 1 finding. |
-| `CAUTIOUS` | Tier 2, but no Tier 1. |
-| `SAFE WITH RISK` | Irreversible Tier 3, but no Tier 1 or Tier 2. |
+| `CAUTIOUS` | No Tier 1 finding, and a Tier 2 finding or an unevaluated Tier 1-capable check. |
+| `SAFE WITH RISK` | An `irreversible-migration` Tier 3 finding, but no Tier 1 or Tier 2 finding and no unevaluated Tier 1-capable check. |
 | `SAFE` | No higher verdict applies. |
 
 | Exit | Meaning |
@@ -129,7 +167,12 @@ entry. Violation ordering is deterministic for identical inputs and version.
 | `1` | Invocation, configuration, I/O, cache, parser, or internal failure. |
 | `2` | Analysis completed with Tier 1. |
 
-Human, JSON, and Markdown modes must use the same exit-status policy.
+Human, JSON, and Markdown modes must use the same exit-status policy. An
+unevaluated Tier 1-capable check caps the verdict at `CAUTIOUS`; it does not
+change the exit status, because degraded analysis (no cache, or a baseline
+scoped away from the target) is a supported mode. The report lists every
+skipped check in `not_evaluated`, with the cause and what would make it
+evaluable, in each output mode.
 
 ## Confidence
 
@@ -151,7 +194,7 @@ PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V9 supplies typed evidence for:
+Cache V10 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
@@ -159,7 +202,9 @@ Cache V9 supplies typed evidence for:
 - indexes, including included and expression/predicate dependency columns;
 - inheritance and partition topology, view dependencies, sequence ownership,
   and standalone sequence references;
-- every `pg_proc.prokind`, publications, and redacted subscriptions;
+- every `pg_proc.prokind` with the columns that make a routine's identity
+  (`proretset`, parameter names and modes, and `pronargdefaults`), plus
+  publications and redacted subscriptions;
 - every `pg_type.typtype` a user can name, including range types and the
   multirange PostgreSQL creates beside them, plus the range constructors it
   records as internally owned by that type.
@@ -178,7 +223,7 @@ The principal precision boundaries are:
 | Partitions | Synchronized predicates retain catalog evidence. Local retained-CHECK synthesis reproduces PostgreSQL-exact constraints for multi-column RANGE (including `MINVALUE`/`MAXVALUE` sentinels), LIST values (including `NULL`), boolean, and mixed-varchar bounds, and for default partitions; HASH partitions form no retained check. Expression keys and missing ancestor predicates remain `Tainted`. |
 | Indexes | Synchronized complex-index dependencies support exact cleanup. Locally parsed complex indexes do not claim that precision. CTAS `WITH NO DATA` and expression indexes remain available to safety rules. |
 | Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized only with a versioned baseline. |
-| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. |
+| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. `CREATE OR REPLACE` is checked against PostgreSQL's identity rules — return type and `SETOF`, the `RETURNS record` row descriptor, an already-named input parameter, and the default count. Comparing the *type* of a retained default needs a parse tree only the server can type, so that case is `Tainted`. An aggregate's definition is retained and its state type is resolved; its support functions are not resolved yet, and the definition is `Tainted`. |
 | Publications | Sync is database-wide. Table edits without `ONLY` are `Tainted` until effective partition scope is proven. |
 | Subscriptions | Only non-secret fields are cached; connection targets are `Redacted`. Connected create, refresh, and drop operations are `Tainted` because they depend on remote state. |
 
@@ -189,7 +234,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V9, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V10, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -206,15 +251,15 @@ These conditions exit `1` instead of producing a clean report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V9 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V10 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V9 carries an explicit header, coverage and scope-completion markers,
+`sync`. V10 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V8 and unheadered caches are rejected with resync guidance.
+V1–V9 and unheadered caches are rejected with resync guidance.
 
 ### GitHub Action
 
@@ -235,3 +280,5 @@ report.
 
 Before v1.0 the CLI may evolve. User-visible changes still require regression
 tests, a changelog and contract update, and a migration note for automation.
+Schema 2 consumers must not assume `recipe`; they must branch on
+`schema_version` before reading any violation field.

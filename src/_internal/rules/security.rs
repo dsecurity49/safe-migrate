@@ -1,7 +1,7 @@
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::_internal::rules::{Rule, RuleContext};
+
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
+use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
 
 pub(crate) struct OverbroadGrantRule;
 
@@ -16,17 +16,16 @@ impl Rule for OverbroadGrantRule {
         "Avoid GRANT ALL to public roles. Use granular privileges."
     }
 
+    fn evaluates_when_unresolved(&self, transition: &TransitionRecord<'_>) -> bool {
+        // A grant's finding comes from the statement text and an
+        // already-resolved target, so it survives an unapplied privilege
+        // matrix. Every other statement is recorded as not evaluated.
+        matches!(transition.mutation(), Mutation::Grant(_))
+    }
+
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        // `WITH GRANT OPTION` is itself the security-sensitive operation. The
-        // state matrix intentionally skips it because grant chains are not
-        // modeled, but that uncertainty must not suppress the syntax-level
-        // warning for a statement PostgreSQL will execute.
-        let skipped_grant_option = *context.result() == MutationResult::Skipped
-            && matches!(
-                context.mutation(),
-                Mutation::Grant(grant) if grant.with_grant_option
-            );
-        if *context.result() == MutationResult::Skipped && !skipped_grant_option {
+        // Nothing was granted, so there is no privilege to report.
+        if context.result().is_noop() {
             return vec![];
         }
         let mut violations = Vec::new();
@@ -65,7 +64,7 @@ impl Rule for OverbroadGrantRule {
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::Grant,
+
                     object_kind: obj_kind.clone(),
                     object_name: obj_name.clone(),
                     tier: ViolationTier::Tier1,
@@ -73,7 +72,6 @@ impl Rule for OverbroadGrantRule {
                     recipe: "GRANT to PUBLIC is almost never intended as it applies to every role.",
                     dedup_key: None,
                     sql: None,
-                    fk_dependency_related: false,
                 });
             }
 
@@ -108,7 +106,7 @@ impl Rule for OverbroadGrantRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::Grant,
+
                         object_kind: obj_kind.clone(),
                         object_name: obj_name.clone(),
                         tier: ViolationTier::Tier2,
@@ -116,7 +114,6 @@ impl Rule for OverbroadGrantRule {
                         recipe: "GRANT ALL PRIVILEGES to a role that is not the owner is risky.",
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
             }
@@ -124,7 +121,7 @@ impl Rule for OverbroadGrantRule {
             if grant.with_grant_option {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::Grant,
+
                     object_kind: obj_kind,
                     object_name: obj_name,
                     tier: ViolationTier::Tier2,
@@ -132,7 +129,7 @@ impl Rule for OverbroadGrantRule {
                     recipe: "WITH GRANT OPTION allows the grantee to re-grant privileges, widening the blast radius.",
                     dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                 });
             }
         }

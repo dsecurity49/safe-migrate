@@ -405,7 +405,9 @@ mod transaction_lifecycle_tests {
 
         assert!(violations.iter().any(|violation| {
             violation.rule_id == "chain-conflict"
-                && violation.reason.contains("relation 'public.conflict_t'")
+                && violation
+                    .reason
+                    .contains("relation 'public.conflict_t (inferred)' already exists")
         }));
         assert!(
             !violations

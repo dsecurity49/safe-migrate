@@ -10,6 +10,10 @@
 # Structural-tooling caches
 /.ast-bro/
 
+# Python bytecode caches from the contract-checker scripts
+__pycache__/
+*.pyc
+
 # Agent and editor configuration that is intentionally not part of the project
 /AGENTS.md
 /.aider*

@@ -2,14 +2,17 @@
 mod tests {
     use crate::_internal::analysis::expr_ir::ExprIr;
     use crate::_internal::analysis::facts::{
-        AlterDatabaseAction, AlterPublicationActionFact, AlterSubscriptionActionFact,
-        AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact, PublicationScope,
-        ResetSettingTarget, RetTypeFact, SearchPathTarget, StatementFact,
-        SubscriptionPublicationMode, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-        TypeCreationKind,
+        AggregateArgumentFact, AggregateCandidateFact, AlterDatabaseAction,
+        AlterPublicationActionFact, AlterSubscriptionActionFact, AlterTableActionFact,
+        AlterTypeActionFact, PublicationObjectFact, PublicationScope, ResetSettingTarget,
+        RetTypeFact, SearchPathTarget, StatementFact, SubscriptionPublicationMode,
+        TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+        ViewUpdatabilityFact,
     };
     use crate::_internal::ast::identifiers::{Ident, QualifiedName};
     use crate::_internal::ast::visitor::AstVisitor;
+    use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
+    use crate::_internal::model::relation::ViewUpdatabilityReason;
     use squawk_syntax::ast::SourceFile;
 
     // ========================================================================
@@ -1002,10 +1005,45 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateIndex { has_predicate, .. } => {
-                assert!(has_predicate);
+            StatementFact::CreateIndex { predicate, .. } => {
+                assert!(predicate.has_predicate());
+                assert!(matches!(predicate, IndexPredicate::Parsed(_)));
             }
             _ => panic!("Expected CreateIndex fact"),
+        }
+    }
+
+    #[test]
+    fn create_index_records_nulls_not_distinct() {
+        for (sql, expected) in [
+            (
+                "CREATE UNIQUE INDEX idx ON users(email) NULLS NOT DISTINCT;",
+                true,
+            ),
+            ("CREATE UNIQUE INDEX idx ON users(email);", false),
+        ] {
+            let facts = parse_and_extract_statement(sql);
+            let Some(StatementFact::CreateIndex {
+                nulls_not_distinct, ..
+            }) = facts
+            else {
+                panic!("Expected CreateIndex fact for: {sql}");
+            };
+            assert_eq!(nulls_not_distinct, expected, "for: {sql}");
+        }
+    }
+
+    #[test]
+    fn create_index_records_only_recursion() {
+        for (sql, expected) in [
+            ("CREATE INDEX idx ON ONLY users(email);", true),
+            ("CREATE INDEX idx ON users(email);", false),
+        ] {
+            let facts = parse_and_extract_statement(sql);
+            let Some(StatementFact::CreateIndex { only, .. }) = facts else {
+                panic!("Expected CreateIndex fact for: {sql}");
+            };
+            assert_eq!(only, expected, "for: {sql}");
         }
     }
 
@@ -1318,8 +1356,59 @@ mod tests {
             fact,
             StatementFact::AlterTable { actions, .. }
                 if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
-                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value == "70")
-                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value == "false"))
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.as_deref() == Some("70"))
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value.as_deref() == Some("false")))
+        ));
+    }
+
+    #[test]
+    fn alter_table_options_fold_names_and_read_literal_values() {
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE entries SET (FILLFACTOR = 70, autovacuum_enabled = 'on');",
+        )
+        .expect("table options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.as_deref() == Some("70"))
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value.as_deref() == Some("on")))
+        ));
+
+        // A `RESET` that carries a value keeps it, even the empty string, so the
+        // server's refusal is reproduced; the empty string is stored as itself,
+        // not as its quotes.
+        let fact = parse_and_extract_statement("ALTER TABLE entries RESET (fillfactor = '');")
+            .expect("reset options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::ResetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.as_deref() == Some("")))
+        ));
+
+        // A `RESET` with no value carries none, which is what makes it valid.
+        let fact = parse_and_extract_statement("ALTER TABLE entries RESET (fillfactor);")
+            .expect("reset options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::ResetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value.is_none()))
+        ));
+
+        // A bare `SET` option reads as `true`, as the server reads it, while an
+        // explicitly empty value stays empty.
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE entries SET (autovacuum_enabled, autovacuum_analyze_threshold = '');",
+        )
+        .expect("table options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value.as_deref() == Some("true"))
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_analyze_threshold" && attribute.value.as_deref() == Some("")))
         ));
     }
 
@@ -1747,7 +1836,8 @@ mod tests {
                     AlterPublicationActionFact::SetOptions(options)
                         if options == &[crate::_internal::analysis::facts::AttributeFact {
                             name: "publish".into(),
-                            value: "insert, update".into(),
+                            value: Some("insert, update".into()),
+                            namespace: None,
                         }]
                 )
         ));
@@ -1768,7 +1858,7 @@ mod tests {
                                 publications,
                                 params,
                             } if publications == &["mixedpub", "AuditPub"]
-                                && params.iter().any(|param| param.name == "refresh" && param.value == "false")
+                                && params.iter().any(|param| param.name == "refresh" && param.value.as_deref() == Some("false"))
                         )
             ),
             "extracted subscription publication action: {:?}",
@@ -1780,8 +1870,8 @@ mod tests {
                 if matches!(
                     &fact.action,
                     AlterSubscriptionActionFact::SetOptions(options)
-                        if options.iter().any(|option| option.name == "streaming" && option.value == "parallel")
-                            && options.iter().any(|option| option.name == "slot_name" && option.value.eq_ignore_ascii_case("none"))
+                        if options.iter().any(|option| option.name == "streaming" && option.value.as_deref() == Some("parallel"))
+                            && options.iter().any(|option| option.name == "slot_name" && option.value.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("none")))
                 )
         ));
         assert!(matches!(
@@ -1790,7 +1880,7 @@ mod tests {
                 if matches!(
                     &fact.action,
                     AlterSubscriptionActionFact::Skip(options)
-                        if options.iter().any(|option| option.name == "lsn" && option.value == "0/16B6C50")
+                        if options.iter().any(|option| option.name == "lsn" && option.value.as_deref() == Some("0/16B6C50"))
                 )
         ));
         assert!(matches!(
@@ -2928,13 +3018,16 @@ mod tests {
                     if column == "payload"
                         && attributes.len() == 1
                         && attributes[0].name == "n_distinct"
-                        && attributes[0].value == "-0.5")
+                        && attributes[0].value.as_deref() == Some("-0.5"))
         ));
         assert!(matches!(
             &facts[5],
             StatementFact::AlterTable { actions, .. }
-                if matches!(actions.as_slice(), [AlterTableActionFact::ResetOptions { column, names }]
-                    if column == "payload" && names == &vec!["n_distinct".to_string()])
+                if matches!(actions.as_slice(), [AlterTableActionFact::ResetOptions { column, attributes }]
+                    if column == "payload"
+                        && attributes.len() == 1
+                        && attributes[0].name == "n_distinct"
+                        && attributes[0].value.is_none())
         ));
         assert!(matches!(
             &facts[6],
@@ -3049,29 +3142,236 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_create_view_semantics_are_not_silent_noops() {
-        for sql in [
+    fn create_view_with_check_option_carries_the_option_and_updatability() {
+        let facts = parse_and_extract_statement(
             "CREATE VIEW writable AS SELECT id FROM source WITH CHECK OPTION;",
-            "CREATE VIEW protected AS SELECT id FROM source WITH (security_barrier = true);",
+        )
+        .expect("a check-option view is modeled");
+        let StatementFact::CreateView {
+            options,
+            updatability,
+            ..
+        } = facts
+        else {
+            panic!("expected CreateView");
+        };
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].name, "check_option");
+        assert_eq!(options[0].value.as_deref(), Some("cascaded"));
+        assert_eq!(updatability, ViewUpdatabilityFact::Updatable);
+
+        let StatementFact::CreateView {
+            options,
+            updatability,
+            ..
+        } = parse_and_extract_statement(
+            "CREATE VIEW writable AS SELECT id FROM source WITH LOCAL CHECK OPTION;",
+        )
+        .expect("view fact")
+        else {
+            panic!("expected CreateView");
+        };
+        assert_eq!(options[0].value.as_deref(), Some("local"));
+        assert_eq!(updatability, ViewUpdatabilityFact::Updatable);
+    }
+
+    #[test]
+    fn create_view_records_unqualified_aggregate_candidates() {
+        let StatementFact::CreateView {
+            updatability,
+            updatability_without_aggregates,
+            aggregate_candidates,
+            ..
+        } = parse_and_extract_statement(
+            "CREATE VIEW v AS SELECT a, sum(b) AS s FROM t WITH CHECK OPTION;",
+        )
+        .expect("view fact")
+        else {
+            panic!("expected CreateView");
+        };
+        assert_eq!(
+            aggregate_candidates,
+            vec![AggregateCandidateFact {
+                name: "sum".to_string(),
+                arguments: vec![AggregateArgumentFact::Column("b".to_string())],
+            }]
+        );
+        assert_eq!(
+            updatability,
+            ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+        );
+        assert_eq!(
+            updatability_without_aggregates,
+            ViewUpdatabilityFact::Updatable
+        );
+
+        // An explicit `pg_catalog` aggregate is settled, not a candidate.
+        let StatementFact::CreateView {
+            updatability,
+            aggregate_candidates,
+            ..
+        } = parse_and_extract_statement(
+            "CREATE VIEW v AS SELECT pg_catalog.sum(b) AS s FROM t WITH CHECK OPTION;",
+        )
+        .expect("view fact")
+        else {
+            panic!("expected CreateView");
+        };
+        assert!(aggregate_candidates.is_empty());
+        assert_eq!(
+            updatability,
+            ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+        );
+    }
+
+    #[test]
+    fn create_view_ignores_calls_inside_nested_queries() {
+        // A nested query's calls belong to that query, not the view, so an
+        // aggregate, a window function or an unplaceable call inside one never
+        // disqualifies the outer view. Verified accepted on PostgreSQL 18.6.
+        let facts = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+            StatementFact::CreateView {
+                updatability,
+                aggregate_candidates,
+                ..
+            } => (updatability, aggregate_candidates),
+            other => panic!("expected CreateView, got {other:?}"),
+        };
+        for sql in [
+            "CREATE VIEW v AS SELECT a, (SELECT sum(o.amount) FROM o WHERE o.id = t.id) AS total FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, (SELECT row_number() OVER () FROM o) AS r FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, (SELECT upper(o.x) FROM o) AS u FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, EXISTS (SELECT sum(o.amount) FROM o) AS e FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, a = ANY (SELECT sum(o.amount) FROM o) AS m FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, ARRAY(SELECT sum(o.amount) FROM o) AS y FROM t WITH CHECK OPTION;",
+            "CREATE VIEW v AS SELECT a, a IN (SELECT sum(o.amount) FROM o) AS i FROM t WITH CHECK OPTION;",
         ] {
-            let parsed = SourceFile::parse(sql);
-            let statement = parsed.tree().stmts().next().expect("statement");
-            assert!(
-                AstVisitor::extract(&statement).is_none(),
-                "unsupported CREATE VIEW semantics must use the opaque engine path: {sql}"
-            );
+            let (updatability, candidates) = facts(sql);
+            assert_eq!(updatability, ViewUpdatabilityFact::Updatable, "{sql}");
+            assert!(candidates.is_empty(), "{sql}");
         }
     }
 
     #[test]
-    fn unsupported_create_materialized_view_population_is_not_silent() {
-        let parsed = SourceFile::parse(
-            "CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;",
+    fn create_view_updatability_matches_postgres_refusals() {
+        let updatability = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+            StatementFact::CreateView { updatability, .. } => updatability,
+            other => panic!("expected CreateView, got {other:?}"),
+        };
+        let refused = |reason| ViewUpdatabilityFact::NotUpdatable(reason);
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT DISTINCT a FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Distinct)
         );
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unpopulated materialized views must use the opaque engine path"
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT count(*) FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Aggregate)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t GROUP BY a WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::GroupBy)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t HAVING count(*) > 0 WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Having)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t LIMIT 1 WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Limit)
+        );
+        assert_eq!(
+            updatability(
+                "CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM t WITH CHECK OPTION;"
+            ),
+            refused(ViewUpdatabilityReason::SetOperation)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t, u WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::SingleRelation)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT t FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::NoUpdatableColumns)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT ctid FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::NoUpdatableColumns)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t WHERE b > 0 WITH CHECK OPTION;"),
+            ViewUpdatabilityFact::Updatable
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT * FROM t WITH CHECK OPTION;"),
+            ViewUpdatabilityFact::Updatable
+        );
+        // A call the analyzer cannot place might be set-returning, so it stays
+        // unknown rather than guessing a refusal.
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT upper('x') FROM t WITH CHECK OPTION;"),
+            ViewUpdatabilityFact::Unknown
+        );
+    }
+
+    #[test]
+    fn create_view_carries_its_explicit_column_list() {
+        let names = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("view fact") {
+                StatementFact::CreateView { column_list, .. } => column_list,
+                other => panic!("expected CreateView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            names("CREATE VIEW renamed (x, y) AS SELECT a, b FROM source;"),
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert!(names("CREATE VIEW plain AS SELECT a FROM source;").is_empty());
+    }
+
+    #[test]
+    fn create_materialized_view_carries_its_explicit_column_list() {
+        let names = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("materialized view fact") {
+                StatementFact::CreateMaterializedView { column_list, .. } => column_list,
+                other => panic!("expected CreateMaterializedView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            names("CREATE MATERIALIZED VIEW renamed (x) AS SELECT a FROM source;"),
+            vec!["x".to_string()]
+        );
+        assert!(names("CREATE MATERIALIZED VIEW plain AS SELECT a FROM source;").is_empty());
+    }
+
+    #[test]
+    fn create_materialized_view_carries_its_population_and_guard() {
+        let population = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("materialized view fact") {
+                StatementFact::CreateMaterializedView {
+                    with_no_data,
+                    if_not_exists,
+                    ..
+                } => (with_no_data, if_not_exists),
+                other => panic!("expected CreateMaterializedView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source;"),
+            (false, false)
+        );
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;"),
+            (true, false)
+        );
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW IF NOT EXISTS snapshot AS SELECT id FROM source;"),
+            (false, true)
         );
     }
 
@@ -3097,11 +3397,21 @@ mod tests {
         for (sql, expected) in [
             (
                 "CREATE TYPE floatrange AS RANGE (subtype = float8);",
-                TypeCreationKind::Range,
+                TypeCreationKind::Range {
+                    subtype: Some("float8".to_string()),
+                },
             ),
             (
                 "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
-                TypeCreationKind::Base,
+                TypeCreationKind::Base { element: None },
+            ),
+            (
+                // PostgreSQL spells the base-type element `ELEMENT`; `typelem`
+                // is only the catalog column name.
+                "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out, ELEMENT = int4);",
+                TypeCreationKind::Base {
+                    element: Some("int4".to_string()),
+                },
             ),
         ] {
             let parsed = SourceFile::parse(sql);
@@ -3139,6 +3449,94 @@ mod tests {
     }
 
     #[test]
+    fn expression_indexes_keep_their_parsed_identity() {
+        let parsed =
+            SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        let Some(StatementFact::CreateIndex {
+            unique,
+            concurrently,
+            predicate,
+            key_columns,
+            key_expressions,
+            ..
+        }) = AstVisitor::extract(&statement)
+        else {
+            panic!("expected create index fact");
+        };
+        assert!(unique);
+        assert!(!concurrently);
+        assert!(!predicate.has_predicate());
+        // An expression key names no column, so the columns list is empty while
+        // the key itself is still present and carries its parsed identity.
+        assert!(key_columns.is_empty());
+        assert_eq!(key_expressions.len(), 1);
+        assert!(key_expressions[0].is_some());
+    }
+
+    #[test]
+    fn a_collated_column_key_stays_a_column() {
+        // PostgreSQL strips top-level COLLATE and parentheses before deciding
+        // a key is a column, so a collated bare column is a column key that
+        // carries the written collation, not an expression.
+        for sql in [
+            "CREATE INDEX ON source (name COLLATE \"C\");",
+            "CREATE INDEX ON source ((name) COLLATE \"C\");",
+        ] {
+            let Some(StatementFact::CreateIndex {
+                key_columns,
+                key_expressions,
+                key_collations,
+                ..
+            }) = parse_and_extract_statement(sql)
+            else {
+                panic!("expected create index fact for: {sql}");
+            };
+            assert_eq!(key_columns, ["name"], "for: {sql}");
+            assert_eq!(key_expressions, [None], "for: {sql}");
+            assert_eq!(
+                key_collations,
+                [Some(WrittenName {
+                    schema: None,
+                    name: "C".to_string(),
+                })],
+                "for: {sql}"
+            );
+        }
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            key_expressions,
+            key_collations,
+            ..
+        }) = parse_and_extract_statement("CREATE INDEX ON source ((name));")
+        else {
+            panic!("expected create index fact");
+        };
+        assert_eq!(key_columns, ["name"]);
+        assert_eq!(key_expressions, [None]);
+        assert_eq!(key_collations, [None]);
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            key_expressions,
+            key_collations,
+            ..
+        }) = parse_and_extract_statement("CREATE INDEX ON source (lower(name) COLLATE \"C\");")
+        else {
+            panic!("expected create index fact");
+        };
+        assert!(key_columns.is_empty());
+        assert_eq!(key_expressions.len(), 1);
+        assert!(key_expressions[0].is_some());
+        assert_eq!(
+            key_collations,
+            [Some(WrittenName {
+                schema: None,
+                name: "C".to_string(),
+            })]
+        );
+    }
+
+    #[test]
     fn expression_indexes_preserve_index_rule_metadata() {
         let parsed =
             SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
@@ -3148,8 +3546,7 @@ mod tests {
             Some(StatementFact::CreateIndex {
                 unique: true,
                 concurrently: false,
-                has_predicate: false,
-                has_expression_keys: true,
+                predicate: IndexPredicate::None,
                 ..
             })
         ));
@@ -3162,22 +3559,25 @@ mod tests {
         let statement = parsed.tree().stmts().next().expect("statement");
         let Some(StatementFact::CreateIndex {
             key_columns,
-            has_expression_keys,
+            key_expressions,
             included_columns,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
+            key_orders,
+            key_opclasses,
+            key_collations,
+            nulls_not_distinct,
             ..
         }) = AstVisitor::extract(&statement)
         else {
             panic!("expected create index fact");
         };
         assert_eq!(key_columns, ["name"]);
-        assert!(!has_expression_keys);
+        // Key positions stay aligned: one plain column, no expressions.
+        assert_eq!(key_expressions, [None]);
         assert_eq!(included_columns, ["id"]);
-        assert!(has_default_sort_order);
-        assert!(has_default_opclasses);
-        assert!(has_default_collations);
+        assert_eq!(key_orders, [IndexOrder::Default]);
+        assert_eq!(key_opclasses, [None]);
+        assert_eq!(key_collations, [None]);
+        assert!(!nulls_not_distinct);
     }
 
     #[test]
@@ -3203,7 +3603,9 @@ mod tests {
             let parsed = SourceFile::parse(sql);
             let stmt = parsed.tree().stmts().next().expect("statement");
             match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
-                StatementFact::AlterMaterializedView { action, .. } => action,
+                StatementFact::AlterMaterializedView { actions, .. } => {
+                    actions.into_iter().next().expect("at least one action")
+                }
                 other => panic!("expected AlterMaterializedView fact, got {other:?} for: {sql}"),
             }
         };
@@ -3257,6 +3659,23 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_owned_by_target_is_not_read_as_owned_by_none() {
+        // PostgreSQL refuses `OWNED BY column` with "invalid OWNED BY option",
+        // so the statement must stay unmodeled rather than become OWNED BY NONE.
+        assert!(parse_and_extract_statement("ALTER SEQUENCE public.s OWNED BY id").is_none());
+        let fact = parse_and_extract_statement("ALTER SEQUENCE public.s OWNED BY public.t.id")
+            .expect("a qualified target still extracts");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterSequence { options, .. }
+                if matches!(
+                    options.as_slice(),
+                    [crate::_internal::analysis::facts::SequenceOptionFact::OwnedBy(Some(_))]
+                )
+        ));
+    }
+
+    #[test]
     fn squawk_264_typed_view_sequence_policy_and_function_children_preserve_facts() {
         let facts = parse_and_extract(
             "CREATE SEQUENCE event_ids OWNED BY public.events.id;
@@ -3278,9 +3697,12 @@ mod tests {
         assert!(matches!(
             &facts[1],
             StatementFact::AlterSequence {
-                action: crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(None),
+                options,
                 ..
-            }
+            } if matches!(
+                options.as_slice(),
+                [crate::_internal::analysis::facts::SequenceOptionFact::OwnedBy(None)]
+            )
         ));
         assert!(matches!(
             &facts[2],
