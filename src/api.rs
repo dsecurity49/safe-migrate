@@ -682,11 +682,10 @@ impl Migration {
     }
 }
 
-/// Immutable analysis result with API-owned snapshots and built-in renderers.
-#[derive(Clone)]
 /// A rule that could not state a finding for want of evidence. Nothing is
 /// wrong with the migration; these are the checks that did not run.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct NotEvaluated {
     /// Rule that could not be evaluated.
     pub rule_id: String,
@@ -718,6 +717,7 @@ impl From<&crate::_internal::report::violations::NotEvaluated> for NotEvaluated 
 }
 
 /// Verdict, findings, evidence, and the checks that did not run.
+#[derive(Clone)]
 pub struct AnalysisOutcome {
     findings: Vec<Finding>,
     confidence: Confidence,

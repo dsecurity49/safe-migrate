@@ -367,15 +367,24 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if self.pg_version().conservative_num() < 160_000
-                    && grant
-                        .role_options
-                        .iter()
-                        .any(|option| !matches!(option, RoleMembershipOptionFact::Admin(true)))
+                if grant
+                    .role_options
+                    .iter()
+                    .any(|option| !matches!(option, RoleMembershipOptionFact::Admin(true)))
                 {
-                    return MutationResult::conflict(
-                        "per-membership TRUE/FALSE options require PostgreSQL 16+".to_string(),
-                    );
+                    match self.pg_version().num() {
+                        Some(version) if version < 160_000 => {
+                            return MutationResult::conflict(
+                                "per-membership TRUE/FALSE options require PostgreSQL 16+"
+                                    .to_string(),
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            // An unknown version cannot prove a rejection.
+                            return self.unresolved(EvidenceCode::UnsupportedSemantics);
+                        }
+                    }
                 }
                 // Role memberships attribute implicit superuser grants to
                 // the bootstrap superuser, unlike object privileges.
@@ -809,16 +818,25 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if self.pg_version().conservative_num() < 160_000
-                    && matches!(
-                        revoke.role_option,
-                        Some(RoleMembershipOptionFact::Inherit(_))
-                            | Some(RoleMembershipOptionFact::Set(_))
-                    )
-                {
-                    return MutationResult::conflict(
-                        "per-membership TRUE/FALSE options require PostgreSQL 16+".to_string(),
-                    );
+                if matches!(
+                    revoke.role_option,
+                    Some(RoleMembershipOptionFact::Inherit(_))
+                        | Some(RoleMembershipOptionFact::Set(_))
+                ) {
+                    match self.pg_version().num() {
+                        Some(version) if version < 160_000 => {
+                            return MutationResult::conflict(
+                                "per-membership TRUE/FALSE options require PostgreSQL 16+"
+                                    .to_string(),
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            // A conflict claims the server rejects the
+                            // statement; an unknown version cannot prove that.
+                            return self.unresolved(EvidenceCode::UnsupportedSemantics);
+                        }
+                    }
                 }
                 if revoke.cascade && !self.local.role_membership_grantors_complete {
                     self.taint(

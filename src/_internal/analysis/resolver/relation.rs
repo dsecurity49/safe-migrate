@@ -125,6 +125,10 @@ impl Resolver {
                 for output in select_outputs {
                     match output {
                         SelectOutputFact::AllColumns => {
+                            if !source.columns_complete {
+                                complete = false;
+                                break;
+                            }
                             projected.extend(source.columns.iter().map(|column| ColumnMutation {
                                 name: column.name.clone(),
                                 ty: column.data_type.clone(),
@@ -568,10 +572,10 @@ impl Resolver {
                         attributes: attributes.clone(),
                     }
                 }
-                AlterTableActionFact::ResetOptions { column, names } => {
+                AlterTableActionFact::ResetOptions { column, attributes } => {
                     AlterTableActionMutation::ResetColumnOptions {
                         column: column.clone(),
-                        names: names.clone(),
+                        attributes: attributes.clone(),
                     }
                 }
                 AlterTableActionFact::SetTableOptions { attributes } => {
@@ -579,9 +583,9 @@ impl Resolver {
                         attributes: attributes.clone(),
                     }
                 }
-                AlterTableActionFact::ResetTableOptions { names } => {
+                AlterTableActionFact::ResetTableOptions { attributes } => {
                     AlterTableActionMutation::ResetTableOptions {
-                        names: names.clone(),
+                        attributes: attributes.clone(),
                     }
                 }
                 AlterTableActionFact::Inherit { .. } | AlterTableActionFact::NoInherit { .. } => {

@@ -17,6 +17,10 @@ impl Rule for VolatileDefaultRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        // The statement was skipped, so no default was created.
+        if context.result().is_noop() {
+            return vec![];
+        }
         let mut violations = Vec::new();
 
         if let Mutation::CreateTable(c) = context.mutation() {

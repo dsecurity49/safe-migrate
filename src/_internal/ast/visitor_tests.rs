@@ -6,11 +6,12 @@ mod tests {
         AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact, PublicationScope,
         ResetSettingTarget, RetTypeFact, SearchPathTarget, StatementFact,
         SubscriptionPublicationMode, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-        TypeCreationKind,
+        TypeCreationKind, ViewUpdatabilityFact,
     };
     use crate::_internal::ast::identifiers::{Ident, QualifiedName};
     use crate::_internal::ast::visitor::AstVisitor;
     use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
+    use crate::_internal::model::relation::ViewUpdatabilityReason;
     use squawk_syntax::ast::SourceFile;
 
     // ========================================================================
@@ -1784,6 +1785,7 @@ mod tests {
                         if options == &[crate::_internal::analysis::facts::AttributeFact {
                             name: "publish".into(),
                             value: "insert, update".into(),
+                            namespace: None,
                         }]
                 )
         ));
@@ -2969,8 +2971,11 @@ mod tests {
         assert!(matches!(
             &facts[5],
             StatementFact::AlterTable { actions, .. }
-                if matches!(actions.as_slice(), [AlterTableActionFact::ResetOptions { column, names }]
-                    if column == "payload" && names == &vec!["n_distinct".to_string()])
+                if matches!(actions.as_slice(), [AlterTableActionFact::ResetOptions { column, attributes }]
+                    if column == "payload"
+                        && attributes.len() == 1
+                        && attributes[0].name == "n_distinct"
+                        && attributes[0].value.is_empty())
         ));
         assert!(matches!(
             &facts[6],
@@ -3085,18 +3090,98 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_create_view_semantics_are_not_silent_noops() {
-        for sql in [
+    fn create_view_with_check_option_carries_the_option_and_updatability() {
+        let facts = parse_and_extract_statement(
             "CREATE VIEW writable AS SELECT id FROM source WITH CHECK OPTION;",
-            "CREATE VIEW protected AS SELECT id FROM source WITH (security_barrier = true);",
-        ] {
-            let parsed = SourceFile::parse(sql);
-            let statement = parsed.tree().stmts().next().expect("statement");
-            assert!(
-                AstVisitor::extract(&statement).is_none(),
-                "unsupported CREATE VIEW semantics must use the opaque engine path: {sql}"
-            );
-        }
+        )
+        .expect("a check-option view is modeled");
+        let StatementFact::CreateView {
+            options,
+            updatability,
+            ..
+        } = facts
+        else {
+            panic!("expected CreateView");
+        };
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].name, "check_option");
+        assert_eq!(options[0].value, "cascaded");
+        assert_eq!(updatability, ViewUpdatabilityFact::Updatable);
+
+        let StatementFact::CreateView {
+            options,
+            updatability,
+            ..
+        } = parse_and_extract_statement(
+            "CREATE VIEW writable AS SELECT id FROM source WITH LOCAL CHECK OPTION;",
+        )
+        .expect("view fact")
+        else {
+            panic!("expected CreateView");
+        };
+        assert_eq!(options[0].value, "local");
+        assert_eq!(updatability, ViewUpdatabilityFact::Updatable);
+    }
+
+    #[test]
+    fn create_view_updatability_matches_postgres_refusals() {
+        let updatability = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+            StatementFact::CreateView { updatability, .. } => updatability,
+            other => panic!("expected CreateView, got {other:?}"),
+        };
+        let refused = |reason| ViewUpdatabilityFact::NotUpdatable(reason);
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT DISTINCT a FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Distinct)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT count(*) FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Aggregate)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t GROUP BY a WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::GroupBy)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t HAVING count(*) > 0 WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Having)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t LIMIT 1 WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::Limit)
+        );
+        assert_eq!(
+            updatability(
+                "CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM t WITH CHECK OPTION;"
+            ),
+            refused(ViewUpdatabilityReason::SetOperation)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t, u WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::SingleRelation)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT t FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::NoUpdatableColumns)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT ctid FROM t WITH CHECK OPTION;"),
+            refused(ViewUpdatabilityReason::NoUpdatableColumns)
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT a FROM t WHERE b > 0 WITH CHECK OPTION;"),
+            ViewUpdatabilityFact::Updatable
+        );
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT * FROM t WITH CHECK OPTION;"),
+            ViewUpdatabilityFact::Updatable
+        );
+        // A call the analyzer cannot place might be set-returning, so it stays
+        // unknown rather than guessing a refusal.
+        assert_eq!(
+            updatability("CREATE VIEW v AS SELECT upper('x') FROM t WITH CHECK OPTION;"),
+            ViewUpdatabilityFact::Unknown
+        );
     }
 
     #[test]
@@ -3190,6 +3275,14 @@ mod tests {
             (
                 "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
                 TypeCreationKind::Base { element: None },
+            ),
+            (
+                // PostgreSQL spells the base-type element `ELEMENT`; `typelem`
+                // is only the catalog column name.
+                "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out, ELEMENT = int4);",
+                TypeCreationKind::Base {
+                    element: Some("int4".to_string()),
+                },
             ),
         ] {
             let parsed = SourceFile::parse(sql);
@@ -3433,6 +3526,23 @@ mod tests {
         assert!(matches!(
             extract_view_action("ALTER VIEW report RESET (security_invoker);"),
             AlterViewAction::ResetOptions { .. }
+        ));
+    }
+
+    #[test]
+    fn a_malformed_owned_by_target_is_not_read_as_owned_by_none() {
+        // PostgreSQL refuses `OWNED BY column` with "invalid OWNED BY option",
+        // so the statement must stay unmodeled rather than become OWNED BY NONE.
+        assert!(parse_and_extract_statement("ALTER SEQUENCE public.s OWNED BY id").is_none());
+        let fact = parse_and_extract_statement("ALTER SEQUENCE public.s OWNED BY public.t.id")
+            .expect("a qualified target still extracts");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterSequence { options, .. }
+                if matches!(
+                    options.as_slice(),
+                    [crate::_internal::analysis::facts::SequenceOptionFact::OwnedBy(Some(_))]
+                )
         ));
     }
 

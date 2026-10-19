@@ -1,7 +1,7 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
-    LockModeFact, ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting,
-    TimeoutSettingValue,
+    AttributeFact, LockModeFact, ResetSettingTarget, SearchPathTarget, TableConstraintFact,
+    TimeoutSetting, TimeoutSettingValue, ViewUpdatabilityFact,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
@@ -43,8 +43,16 @@ pub(crate) enum ReindexTargetMutation {
 /// validate the name against the accepted surface for that kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReloptionTarget {
+    /// An ordinary table, which takes the heap option set.
+    Table,
     View,
     MaterializedView,
+    /// A partitioned table, which takes no storage parameter at all.
+    PartitionedTable,
+    /// A column's own option set (`n_distinct`, `n_distinct_inherited`).
+    Column,
+    /// An index, whose option set is chosen by its access method.
+    Index(crate::_internal::model::reloption::IndexMethod),
 }
 
 impl ReindexTargetMutation {
@@ -111,7 +119,7 @@ pub(crate) enum Mutation {
     ResetReloptions {
         id: ObjectId,
         kind: ReloptionTarget,
-        names: Vec<String>,
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
     /// Recognized, and provably irrelevant to the state the analyzer models.
     /// This is the only way a statement may change nothing, so silence has to
@@ -532,6 +540,12 @@ pub(crate) struct CreateView {
     /// Explicit output-column names, applied to the projection prefix.
     pub column_list: Vec<String>,
     pub projection_complete: bool,
+    /// `WITH (...)` options, plus a `check_option` folded from
+    /// `WITH [LOCAL] CHECK OPTION`.
+    pub options: Vec<AttributeFact>,
+    /// Whether the query is automatically updatable, which `check_option`
+    /// requires.
+    pub updatability: ViewUpdatabilityFact,
 }
 
 /// A view's output column. The type is only known when the projection is a
@@ -902,13 +916,13 @@ pub(crate) enum AlterTableActionMutation {
     },
     ResetColumnOptions {
         column: String,
-        names: Vec<String>,
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
     SetTableOptions {
         attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
     ResetTableOptions {
-        names: Vec<String>,
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
     AlterColumnInheritance,
     PartitionReshape,

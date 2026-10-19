@@ -1088,6 +1088,15 @@ fn load_provenance(
         .execute("SET LOCAL search_path = pg_catalog;", &[])
         .context("Failed to secure search_path")?;
 
+    // Recorded before the scope filter: absence proves the schema did not
+    // exist, not merely that the scope omitted it.
+    let existing_schemas: Vec<String> = client
+        .query("SELECT nspname FROM pg_catalog.pg_namespace", &[])
+        .context("Failed to load PostgreSQL schemas")?
+        .into_iter()
+        .map(|row| row.try_get(0).context("schema identity field"))
+        .collect::<Result<Vec<String>>>()?;
+
     let row = client
         .query_one(
             "SELECT current_database(), current_user, session_user,
@@ -1128,6 +1137,7 @@ fn load_provenance(
                     .context("synchronization provenance session-role field")?,
             ),
             source_search_path: Some(parse_search_path_setting(&search_path_setting)),
+            source_existing_schemas: Some(existing_schemas),
             source_lock_timeout_ms: lock_timeout_ms
                 .try_into()
                 .context("PostgreSQL returned a negative lock_timeout")?,
@@ -1323,6 +1333,7 @@ fn load_relations_and_columns(
             c.relpersistence AS persistence,
             c.relrowsecurity AS row_security,
             c.relforcerowsecurity AS force_row_security,
+            (c.reltoastrelid <> 0) AS has_toast_table,
             CASE c.relreplident
                 WHEN 'd' THEN 'DEFAULT'
                 WHEN 'n' THEN 'NOTHING'
@@ -1448,6 +1459,10 @@ fn load_relations_and_columns(
         state.partition_type = partition_strategy_from_pg(partition_strategy.as_deref())
             .with_context(|| format!("relation '{}' partition strategy", object_id))?;
         state.is_populated = is_populated;
+        state.has_toast_table = Some(
+            row.try_get::<_, bool>("has_toast_table")
+                .context("relation TOAST table presence")?,
+        );
         state.partition_by = row
             .try_get::<_, Option<String>>("partition_key")?
             .map(|key| format!("PARTITION BY {key}"));
@@ -2438,7 +2453,7 @@ fn load_index_attachments(
         JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
         JOIN pg_class parent ON parent.oid = inh.inhparent
         JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
-        WHERE child.relkind = 'i'
+        WHERE child.relkind IN ('i', 'I')
           AND parent.relkind = 'I'
           AND child_ns.nspname NOT IN ('pg_catalog', 'information_schema')
           AND parent_ns.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -3444,6 +3459,7 @@ fn load_publications(
             crate::_internal::analysis::facts::AttributeFact {
                 name: "publish".to_string(),
                 value: operations.join(", "),
+                namespace: None,
             },
             crate::_internal::analysis::facts::AttributeFact {
                 name: "publish_via_partition_root".to_string(),
@@ -3451,6 +3467,7 @@ fn load_publications(
                     .try_get::<_, bool>("pubviaroot")
                     .context("publication partition-root mode")?
                     .to_string(),
+                namespace: None,
             },
         ];
         if let Some(generated_columns) = row
@@ -3467,6 +3484,7 @@ fn load_publications(
             params.push(crate::_internal::analysis::facts::AttributeFact {
                 name: "publish_generated_columns".to_string(),
                 value: value.to_string(),
+                namespace: None,
             });
         }
         let scope = if row
@@ -3704,16 +3722,19 @@ fn load_subscriptions(
                         .try_get::<_, bool>("subbinary")
                         .with_context(|| format!("subscription '{name}' binary mode"))?
                         .to_string(),
+                    namespace: None,
                 },
                 crate::_internal::analysis::facts::AttributeFact {
                     name: "streaming".to_string(),
                     value: streaming.to_string(),
+                    namespace: None,
                 },
                 crate::_internal::analysis::facts::AttributeFact {
                     name: "synchronous_commit".to_string(),
                     value: row
                         .try_get("subsynccommit")
                         .with_context(|| format!("subscription '{name}' synchronous_commit"))?,
+                    namespace: None,
                 },
             ];
             let two_phase = row
@@ -3726,6 +3747,7 @@ fn load_subscriptions(
                     params.push(crate::_internal::analysis::facts::AttributeFact {
                         name: param_name.to_string(),
                         value,
+                        namespace: None,
                     });
                 }
             };

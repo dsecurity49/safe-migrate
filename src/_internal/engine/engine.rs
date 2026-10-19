@@ -6,7 +6,7 @@ use crate::_internal::analysis::state::{AnalysisState, PreState};
 use crate::_internal::ast::visitor::AstVisitor;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::_internal::rules::registry;
-use crate::_internal::rules::{Rule, RuleContext};
+use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
 use crate::api::config::Config;
 use squawk_syntax::{
     Parse, SyntaxKind,
@@ -433,8 +433,10 @@ impl SafeMigrateEngine {
                         continue;
                     }
 
+                    let transition =
+                        TransitionRecord::new(&mutation, &result, &pre_state, pre_cascade.as_ref());
                     if let Some(cause) = result.unresolved_cause()
-                        && !rule.evaluates_when_unresolved()
+                        && !rule.evaluates_when_unresolved(&transition)
                     {
                         state.record_not_evaluated(
                             crate::_internal::report::violations::NotEvaluated {

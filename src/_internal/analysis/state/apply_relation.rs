@@ -1236,6 +1236,8 @@ impl AnalysisState {
         }
 
         let mut inherited_columns = Vec::new();
+        // Every column source must be complete for the result to be.
+        let mut sources_complete = true;
         let mut inherited_names = HashSet::new();
         let mut inherited_generated_columns = std::collections::HashMap::new();
         let mut inherited_check_constraints: std::collections::HashMap<
@@ -1272,6 +1274,7 @@ impl AnalysisState {
             let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent_id) else {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             };
+            sources_complete &= parent.columns_complete;
             for column in &parent.columns {
                 if !inherited_names.insert(column.name.clone()) {
                     let existing = inherited_columns
@@ -1417,6 +1420,7 @@ impl AnalysisState {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             };
             let source = source.clone();
+            sources_complete &= source.columns_complete;
             if like_source.properties.statistics {
                 for statistics in source.extended_statistics.values() {
                     let id = self.next_generated_statistics_name_avoiding(
@@ -1667,6 +1671,7 @@ impl AnalysisState {
             let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent_id) else {
                 unreachable!("partition parent presence was checked above")
             };
+            sources_complete &= parent.columns_complete;
             if parent.partition_type.is_none() {
                 return MutationResult::conflict(format!(
                     "partition parent '{}' is not partitioned",
@@ -2486,6 +2491,8 @@ impl AnalysisState {
         });
         rel_state.of_type = create.of_type.clone();
         rel_state.columns = inherited_columns;
+        rel_state.columns_complete =
+            sources_complete && (!create.as_select || create.as_select_columns_known);
         rel_state.identity_columns.extend(
             like_identity_columns
                 .iter()
@@ -3197,8 +3204,11 @@ impl AnalysisState {
                 "DETACH PARTITION CONCURRENTLY cannot run inside a transaction",
             );
         }
-        // `ALTER TABLE` accepts a foreign table for everything except RLS.
-        match self.relation_lookup(&alter.id, |kind| kind.is_table_like()) {
+        // `ALTER TABLE` is overloaded for views, materialized views and foreign
+        // tables, but PostgreSQL admits each action only for specific relkinds
+        // (`ATSimplePermissions`).  A partitioned table is a table for the
+        // actions that include it and a distinct target for the ones that do not.
+        match self.relation_lookup(&alter.id, |_| true) {
             ObjectLookup::Present => {}
             ObjectLookup::WrongKind => {
                 return MutationResult::conflict(format!("object '{}' is not a table", alter.id));
@@ -3209,6 +3219,25 @@ impl AnalysisState {
             ObjectLookup::Unknown => {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             }
+        }
+        let target = self
+            .local
+            .relations
+            .get(&alter.id)
+            .and_then(|overlay| match overlay {
+                RelationOverlay::Present(relation) => {
+                    Some((relation.kind.clone(), relation.partition_type.is_some()))
+                }
+                RelationOverlay::Dropped => None,
+            });
+        let Some((kind, partitioned)) = target else {
+            return self.unresolved(EvidenceCode::UnknownObjectState);
+        };
+        if !alter_table_action_permits(&alter.action, &kind, partitioned) {
+            return MutationResult::conflict(format!(
+                "ALTER action cannot be performed on relation '{}'",
+                alter.id
+            ));
         }
 
         if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
@@ -4795,6 +4824,32 @@ impl AnalysisState {
             }
             _ => None,
         };
+        // Reloption validation reads the target's catalogue kind and taints,
+        // both of which the overlay borrow below would otherwise block.
+        match &alter.action {
+            AlterTableActionMutation::SetTableOptions { attributes } => {
+                if let Err(result) = self.validate_alter_table_set_options(&alter.id, attributes) {
+                    return result;
+                }
+            }
+            AlterTableActionMutation::ResetTableOptions { attributes } => {
+                if let Err(result) = self.validate_alter_table_reset_options(&alter.id, attributes)
+                {
+                    return result;
+                }
+            }
+            AlterTableActionMutation::SetColumnOptions { attributes, .. } => {
+                if let Err(result) = self.validate_column_options(attributes) {
+                    return result;
+                }
+            }
+            AlterTableActionMutation::ResetColumnOptions { attributes, .. } => {
+                if let Err(result) = self.validate_column_reset_options(attributes) {
+                    return result;
+                }
+            }
+            _ => {}
+        }
 
         let rel_overlay = self.local.relations.get_mut(&alter.id);
         #[allow(clippy::collapsible_if)]
@@ -5000,14 +5055,14 @@ impl AnalysisState {
                         name: column.clone(),
                         options: attributes
                             .iter()
-                            .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+                            .map(|attribute| (attribute.key(), attribute.value.clone()))
                             .collect(),
                     });
                 }
-                AlterTableActionMutation::ResetColumnOptions { column, names } => {
+                AlterTableActionMutation::ResetColumnOptions { column, attributes } => {
                     rel.apply_column_action(&ColumnAction::ResetOptions {
                         name: column.clone(),
-                        names: names.clone(),
+                        names: attributes.iter().map(|attribute| attribute.key()).collect(),
                     });
                 }
                 AlterTableActionMutation::DropGeneratedExpression { column, .. } => {
@@ -5602,12 +5657,12 @@ impl AnalysisState {
                 AlterTableActionMutation::SetTableOptions { attributes } => {
                     for attribute in attributes {
                         rel.table_options
-                            .insert(attribute.name.clone(), attribute.value.clone());
+                            .insert(attribute.key(), attribute.value.clone());
                     }
                 }
-                AlterTableActionMutation::ResetTableOptions { names } => {
-                    for name in names {
-                        rel.table_options.remove(name);
+                AlterTableActionMutation::ResetTableOptions { attributes } => {
+                    for attribute in attributes {
+                        rel.table_options.remove(&attribute.key());
                     }
                 }
                 AlterTableActionMutation::SetGeneratedExpression {
@@ -7775,5 +7830,68 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             })
         }
         PartitionType::PartitionDefault(_) => Some(TypedBound::Default),
+    }
+}
+
+/// The relation kinds PostgreSQL's `ATSimplePermissions` admits for each
+/// `ALTER TABLE` action.  A partitioned table is tracked separately because
+/// some actions accept only plain tables and some only partitioned ones.
+fn alter_table_action_permits(
+    action: &AlterTableActionMutation,
+    kind: &RelationKind,
+    partitioned: bool,
+) -> bool {
+    use AlterTableActionMutation as Action;
+    let table = *kind == RelationKind::Table && !partitioned;
+    let partitioned_table = *kind == RelationKind::Table && partitioned;
+    let view = *kind == RelationKind::View;
+    let matview = *kind == RelationKind::MaterializedView;
+    let foreign = *kind == RelationKind::ForeignTable;
+    let table_like = table || partitioned_table || foreign;
+    match action {
+        Action::AddColumn { .. } | Action::DropColumn { .. } | Action::SetType { .. } => table_like,
+        Action::RenameColumn { .. } => table_like || view || matview,
+        Action::AddForeignKey { .. }
+        | Action::AddCheckConstraint { .. }
+        | Action::AddExcludeConstraint { .. }
+        | Action::DropConstraint { .. }
+        | Action::ValidateConstraint { .. }
+        | Action::InheritTable { .. }
+        | Action::NoInheritTable { .. }
+        | Action::AlterColumnInheritance
+        | Action::SetNotNull { .. }
+        | Action::DropNotNull { .. }
+        | Action::SetGeneratedExpression { .. }
+        | Action::DropGeneratedExpression { .. }
+        | Action::DisableTrigger { .. }
+        | Action::EnableTrigger { .. }
+        | Action::SetTriggerMode { .. } => table_like,
+        Action::AddUniqueConstraint { using_index, .. }
+        | Action::AddPrimaryKeyConstraint { using_index, .. } => {
+            table || partitioned_table || (using_index.is_none() && foreign)
+        }
+        Action::SetDefault { .. } => table || partitioned_table || view || foreign,
+        Action::SetColumnOptions { .. }
+        | Action::ResetColumnOptions { .. }
+        | Action::SetStorage { .. } => table || partitioned_table || matview || foreign,
+        Action::SetTableOptions { .. } | Action::ResetTableOptions { .. } => {
+            table || partitioned_table || view || matview
+        }
+        Action::SetCompression { .. }
+        | Action::SetAccessMethod { .. }
+        | Action::SetTablespace { .. }
+        | Action::SetCluster { .. }
+        | Action::SetReplicaIdentity { .. } => table || partitioned_table || matview,
+        Action::SetStatistics { .. } => table || partitioned_table || matview || foreign,
+        Action::SetPersistence { .. } => table,
+        Action::AlterConstraint { .. }
+        | Action::SetRowSecurity { .. }
+        | Action::SetForceRowSecurity { .. }
+        | Action::SetRuleMode { .. }
+        | Action::SetOfType { .. }
+        | Action::PartitionReshape => table || partitioned_table,
+        Action::RenameConstraint { .. } => table_like,
+        Action::AttachPartition { .. } | Action::DetachPartition { .. } => partitioned_table,
+        Action::OwnerTo { .. } => table_like || view || matview,
     }
 }

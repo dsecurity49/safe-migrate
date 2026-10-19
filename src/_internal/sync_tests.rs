@@ -201,6 +201,7 @@ mod tests {
         cache.metadata.source_role = Some("app_user".into());
         cache.metadata.source_session_role = Some("login_user".into());
         cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
+        cache.metadata.source_existing_schemas = Some(vec!["accounting".into(), "public".into()]);
         cache.metadata.source_lock_timeout_ms = 750;
         cache.metadata.source_statement_timeout_ms = 30_000;
         cache.metadata.schemas = Some(vec!["app".into(), "public".into()]);
@@ -306,6 +307,7 @@ mod tests {
                 params: vec![crate::_internal::analysis::facts::AttributeFact {
                     name: "publish".into(),
                     value: "insert, update".into(),
+                    namespace: None,
                 }],
                 generation: 0,
             },
@@ -320,6 +322,7 @@ mod tests {
                 params: Some(vec![crate::_internal::analysis::facts::AttributeFact {
                     name: "streaming".into(),
                     value: "parallel".into(),
+                    namespace: None,
                 }]),
                 enabled: false,
                 slot_name: None,
@@ -359,6 +362,10 @@ mod tests {
         assert_eq!(
             deserialized.metadata.source_search_path.as_deref(),
             Some(["$user".to_string(), "public".to_string()].as_slice())
+        );
+        assert_eq!(
+            deserialized.metadata.source_existing_schemas.as_deref(),
+            Some(["accounting".to_string(), "public".to_string()].as_slice())
         );
         assert_eq!(deserialized.metadata.source_lock_timeout_ms, 750);
         assert_eq!(deserialized.metadata.source_statement_timeout_ms, 30_000);

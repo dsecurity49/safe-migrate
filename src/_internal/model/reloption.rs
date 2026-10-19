@@ -34,21 +34,60 @@ pub(crate) enum ReloptionValue {
 ///
 /// PostgreSQL applies the heap options to materialized views and ordinary
 /// tables alike, and the view options only to views, so the two sets do not
-/// overlap.
+/// overlap. `toast` is a separate axis: an option under the `toast.` namespace
+/// is only valid when the relation has a TOAST table, and that table accepts a
+/// strict subset of the heap set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReloptionKinds {
     pub heap: bool,
     pub view: bool,
+    pub toast: bool,
+    /// A column's `attoptions`, a set of its own.
+    pub attribute: bool,
 }
 
 const HEAP: ReloptionKinds = ReloptionKinds {
     heap: true,
     view: false,
+    toast: false,
+    attribute: false,
+};
+/// A heap option the TOAST relation also accepts.
+const HEAP_TOAST: ReloptionKinds = ReloptionKinds {
+    heap: true,
+    view: false,
+    toast: true,
+    attribute: false,
 };
 const VIEW: ReloptionKinds = ReloptionKinds {
     heap: false,
     view: true,
+    toast: false,
+    attribute: false,
 };
+const ATTRIBUTE: ReloptionKinds = ReloptionKinds {
+    heap: false,
+    view: false,
+    toast: false,
+    attribute: true,
+};
+/// A kind with no option parser, so no name is ever accepted for it.
+const NONE: ReloptionKinds = ReloptionKinds {
+    heap: false,
+    view: false,
+    toast: false,
+    attribute: false,
+};
+
+impl ReloptionKinds {
+    /// Whether an option belongs to the target's own option set, ignoring the
+    /// toast axis.
+    const fn applies_to(self, target: ReloptionKinds) -> bool {
+        (self.heap && target.heap)
+            || (self.view && target.view)
+            || (self.attribute && target.attribute)
+    }
+}
 
 /// One recognised option.
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +106,9 @@ const SECURITY_INVOKER_VERSION: u32 = 150_000;
 const EAGER_FREEZE_VERSION: u32 = 180_000;
 
 const CHECK_OPTION_VALUES: &[&str] = &["local", "cascaded"];
-const VACUUM_INDEX_CLEANUP_VALUES: &[&str] = &["auto", "on", "off"];
+// `auto`/`on`/`off` plus the boolean spellings an enum option also accepts.
+const VACUUM_INDEX_CLEANUP_VALUES: &[&str] =
+    &["auto", "on", "off", "true", "false", "yes", "no", "1", "0"];
 
 const INT_MAX: i64 = i32::MAX as i64;
 
@@ -106,7 +147,7 @@ const OPTIONS: &[ReloptionSpec] = &[
         name: "autovacuum_enabled",
         value: ReloptionValue::Bool,
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_vacuum_threshold",
@@ -115,7 +156,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: INT_MAX,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_vacuum_max_threshold",
@@ -124,7 +165,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: INT_MAX,
         },
         since: Some(EAGER_FREEZE_VERSION),
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_vacuum_insert_threshold",
@@ -133,7 +174,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: INT_MAX,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_analyze_threshold",
@@ -151,7 +192,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 10_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_vacuum_cost_delay",
@@ -160,7 +201,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 100.0,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_vacuum_scale_factor",
@@ -169,7 +210,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 100.0,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_vacuum_insert_scale_factor",
@@ -178,7 +219,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 100.0,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_analyze_scale_factor",
@@ -196,7 +237,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 1_000_000_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_freeze_max_age",
@@ -205,7 +246,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 2_000_000_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_freeze_table_age",
@@ -214,7 +255,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 2_000_000_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_multixact_freeze_min_age",
@@ -223,7 +264,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 1_000_000_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_multixact_freeze_max_age",
@@ -232,7 +273,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 2_000_000_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "autovacuum_multixact_freeze_table_age",
@@ -241,7 +282,7 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: 2_000_000_000,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "log_autovacuum_min_duration",
@@ -250,25 +291,25 @@ const OPTIONS: &[ReloptionSpec] = &[
             max: INT_MAX,
         },
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "vacuum_index_cleanup",
         value: ReloptionValue::Enum(VACUUM_INDEX_CLEANUP_VALUES),
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "vacuum_truncate",
         value: ReloptionValue::Ternary,
         since: None,
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "vacuum_max_eager_freeze_failure_rate",
         value: ReloptionValue::Real { min: 0.0, max: 1.0 },
         since: Some(EAGER_FREEZE_VERSION),
-        kinds: HEAP,
+        kinds: HEAP_TOAST,
     },
     ReloptionSpec {
         name: "parallel_workers",
@@ -291,6 +332,25 @@ const OPTIONS: &[ReloptionSpec] = &[
         since: None,
         kinds: HEAP,
     },
+    // Column options (`pg_attribute.attoptions`).
+    ReloptionSpec {
+        name: "n_distinct",
+        value: ReloptionValue::Real {
+            min: -1.0,
+            max: f64::MAX,
+        },
+        since: None,
+        kinds: ATTRIBUTE,
+    },
+    ReloptionSpec {
+        name: "n_distinct_inherited",
+        value: ReloptionValue::Real {
+            min: -1.0,
+            max: f64::MAX,
+        },
+        since: None,
+        kinds: ATTRIBUTE,
+    },
 ];
 
 /// The relation an option is being set on.
@@ -299,12 +359,138 @@ const OPTIONS: &[ReloptionSpec] = &[
 /// two ways.
 pub(crate) use crate::_internal::analysis::mutations::ReloptionTarget;
 
+/// The built-in index access methods, each with its own option parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexMethod {
+    Btree,
+    Hash,
+    Gin,
+    Gist,
+    Spgist,
+    Brin,
+}
+
+impl IndexMethod {
+    /// The access method PostgreSQL names in `pg_am.amname`. Statements store
+    /// it folded to upper case, the catalog keeps it lower case.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("btree") {
+            Some(Self::Btree)
+        } else if name.eq_ignore_ascii_case("hash") {
+            Some(Self::Hash)
+        } else if name.eq_ignore_ascii_case("gin") {
+            Some(Self::Gin)
+        } else if name.eq_ignore_ascii_case("gist") {
+            Some(Self::Gist)
+        } else if name.eq_ignore_ascii_case("spgist") {
+            Some(Self::Spgist)
+        } else if name.eq_ignore_ascii_case("brin") {
+            Some(Self::Brin)
+        } else {
+            None
+        }
+    }
+}
+
+/// One option of an index access method.
+struct IndexOptionSpec {
+    name: &'static str,
+    value: ReloptionValue,
+    since: Option<u32>,
+    methods: &'static [IndexMethod],
+}
+
+const BTREE_OPTIONS: &[IndexMethod] = &[IndexMethod::Btree];
+const GIN_OPTIONS: &[IndexMethod] = &[IndexMethod::Gin];
+const GIST_OPTIONS: &[IndexMethod] = &[IndexMethod::Gist];
+const BRIN_OPTIONS: &[IndexMethod] = &[IndexMethod::Brin];
+/// `fillfactor` is the one option several methods share, with the same bounds.
+const FILLFACTOR_METHODS: &[IndexMethod] = &[
+    IndexMethod::Btree,
+    IndexMethod::Hash,
+    IndexMethod::Gist,
+    IndexMethod::Spgist,
+];
+
+/// PostgreSQL 13 added btree deduplication.
+const DEDUPLICATE_ITEMS_VERSION: u32 = 130_000;
+
+const INDEX_OPTIONS: &[IndexOptionSpec] = &[
+    IndexOptionSpec {
+        name: "fillfactor",
+        value: ReloptionValue::Int { min: 10, max: 100 },
+        since: None,
+        methods: FILLFACTOR_METHODS,
+    },
+    IndexOptionSpec {
+        name: "deduplicate_items",
+        value: ReloptionValue::Bool,
+        since: Some(DEDUPLICATE_ITEMS_VERSION),
+        methods: BTREE_OPTIONS,
+    },
+    IndexOptionSpec {
+        name: "vacuum_cleanup_index_scale_factor",
+        value: ReloptionValue::Real {
+            min: 0.0,
+            max: 1e10,
+        },
+        since: None,
+        methods: BTREE_OPTIONS,
+    },
+    IndexOptionSpec {
+        name: "fastupdate",
+        value: ReloptionValue::Bool,
+        since: None,
+        methods: GIN_OPTIONS,
+    },
+    IndexOptionSpec {
+        name: "gin_pending_list_limit",
+        value: ReloptionValue::Int {
+            min: 64,
+            max: INT_MAX,
+        },
+        since: None,
+        methods: GIN_OPTIONS,
+    },
+    IndexOptionSpec {
+        name: "buffering",
+        value: ReloptionValue::Enum(&["auto", "on", "off"]),
+        since: None,
+        methods: GIST_OPTIONS,
+    },
+    IndexOptionSpec {
+        name: "pages_per_range",
+        value: ReloptionValue::Int {
+            min: 1,
+            max: 131_072,
+        },
+        since: None,
+        methods: BRIN_OPTIONS,
+    },
+    IndexOptionSpec {
+        name: "autosummarize",
+        value: ReloptionValue::Bool,
+        since: None,
+        methods: BRIN_OPTIONS,
+    },
+];
+
 impl ReloptionTarget {
     const fn kinds(self) -> ReloptionKinds {
         match self {
+            Self::Table | Self::MaterializedView => HEAP,
             Self::View => VIEW,
-            Self::MaterializedView => HEAP,
+            Self::PartitionedTable => NONE,
+            Self::Column => ATTRIBUTE,
+            // Index methods are matched against their own table in `evaluate`.
+            Self::Index(_) => NONE,
         }
+    }
+
+    /// Whether PostgreSQL refuses every storage parameter on this kind, as it
+    /// does for a partitioned table, rather than judging each name.
+    pub(crate) const fn rejects_storage_parameters(self) -> bool {
+        matches!(self, Self::PartitionedTable)
     }
 }
 
@@ -325,6 +511,30 @@ pub(crate) enum ReloptionOutcome {
     },
 }
 
+/// The namespace an option was written under. PostgreSQL accepts only the
+/// `toast` namespace besides the default one, and it rejects any other in the
+/// transform stage before the option parsers run, so `evaluate` never sees an
+/// unknown namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReloptionNamespace {
+    /// No namespace: the ordinary option set for the target's kind.
+    Main,
+    /// The `toast.` namespace.
+    Toast(ToastOptions),
+}
+
+/// Whether the target has a TOAST table, which decides if `toast.` options are
+/// checked, silently dropped, or cannot be placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToastOptions {
+    /// A TOAST table exists, so the option is validated against its set.
+    Validated,
+    /// No TOAST table, so PostgreSQL silently ignores the option.
+    Ignored,
+    /// The analyzer cannot tell whether a TOAST table exists.
+    Unknown,
+}
+
 /// Whether `value` is a `parse_bool` input.
 pub(crate) fn parses_as_bool(value: &str) -> bool {
     crate::_internal::analysis::state::AnalysisState::reloption_parses_bool(value)
@@ -333,38 +543,91 @@ pub(crate) fn parses_as_bool(value: &str) -> bool {
 /// The `toast.` prefix PostgreSQL namespaces heap options under.
 const TOAST_NAMESPACE: &str = "toast.";
 
-/// Whether the option table holds `name`, whatever kind it belongs to.
+/// Whether either option table holds `name`, whatever kind or access method it
+/// belongs to.
 ///
 /// An unrecognized name that is absent here is one this build does not model,
 /// which is different from one a known version cannot place.
-pub(crate) fn spec_by_name(name: &str) -> Option<&'static ReloptionSpec> {
+pub(crate) fn is_known_option_name(name: &str) -> bool {
     let lookup = name.strip_prefix(TOAST_NAMESPACE).unwrap_or(name);
-    OPTIONS.iter().find(|spec| spec.name == lookup)
+    OPTIONS.iter().any(|spec| spec.name == lookup)
+        || INDEX_OPTIONS.iter().any(|spec| spec.name == lookup)
 }
 
-/// Resolve one option against a target and version.
+/// Resolve one option against a target, version, and namespace scope.
 pub(crate) fn evaluate(
     name: &str,
+    namespace: ReloptionNamespace,
     value: Option<&str>,
     target: ReloptionTarget,
     version: PgVersion,
 ) -> ReloptionOutcome {
-    let kinds = target.kinds();
-    // A namespaced name must resolve to an option of that namespace's kind,
-    // which is why a view can never carry `toast.` options.
-    let (lookup_name, lookup_kinds) = match name.strip_prefix(TOAST_NAMESPACE) {
-        Some(inner) => (inner, HEAP),
-        None => (name, kinds),
+    let unrecognized = || ReloptionOutcome::Unrecognized {
+        name: name.to_string(),
     };
-    let Some(spec) = OPTIONS
-        .iter()
-        .find(|spec| spec.name == lookup_name && spec.kinds == lookup_kinds)
-    else {
-        return ReloptionOutcome::Unrecognized {
-            name: name.to_string(),
-        };
-    };
-    if let Some(since) = spec.since {
+    match namespace {
+        ReloptionNamespace::Main => match target {
+            ReloptionTarget::Index(method) => match INDEX_OPTIONS
+                .iter()
+                .find(|spec| spec.name == name && spec.methods.contains(&method))
+            {
+                Some(spec) => check_option(name, value, spec.value, spec.since, version),
+                None => unrecognized(),
+            },
+            _ => match OPTIONS
+                .iter()
+                .find(|spec| spec.name == name && spec.kinds.applies_to(target.kinds()))
+            {
+                Some(spec) => check_value(spec, name, value, version),
+                None => unrecognized(),
+            },
+        },
+        ReloptionNamespace::Toast(ToastOptions::Ignored) => ReloptionOutcome::Accepted,
+        ReloptionNamespace::Toast(ToastOptions::Validated) => {
+            match OPTIONS
+                .iter()
+                .find(|spec| spec.name == name && spec.kinds.toast)
+            {
+                Some(spec) => check_value(spec, name, value, version),
+                None => unrecognized(),
+            }
+        }
+        ReloptionNamespace::Toast(ToastOptions::Unknown) => {
+            // Whether the option is checked at all hinges on a TOAST table the
+            // analyzer cannot see, so only a cleanly accepted option is certain.
+            match OPTIONS
+                .iter()
+                .find(|spec| spec.name == name && spec.kinds.toast)
+            {
+                Some(spec) => match check_value(spec, name, value, version) {
+                    ReloptionOutcome::Accepted => ReloptionOutcome::Accepted,
+                    _ => ReloptionOutcome::Unplaced,
+                },
+                None => ReloptionOutcome::Unplaced,
+            }
+        }
+    }
+}
+
+/// Check a recognised option's release and value domain.
+fn check_value(
+    spec: &ReloptionSpec,
+    name: &str,
+    value: Option<&str>,
+    version: PgVersion,
+) -> ReloptionOutcome {
+    check_option(name, value, spec.value, spec.since, version)
+}
+
+/// Check one option's release and the domain its value must fall in.
+fn check_option(
+    name: &str,
+    value: Option<&str>,
+    domain: ReloptionValue,
+    since: Option<u32>,
+    version: PgVersion,
+) -> ReloptionOutcome {
+    if let Some(since) = since {
         match version {
             PgVersion::Observed(found) | PgVersion::Assumed(found) if found >= since => {}
             PgVersion::Observed(_) | PgVersion::Assumed(_) => {
@@ -378,7 +641,7 @@ pub(crate) fn evaluate(
     let Some(value) = value else {
         return ReloptionOutcome::Accepted;
     };
-    let rejection = match spec.value {
+    let rejection = match domain {
         ReloptionValue::Bool | ReloptionValue::Ternary => {
             if parses_as_bool(value) {
                 None

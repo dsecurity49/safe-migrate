@@ -1341,10 +1341,12 @@ fn publication_option_normalization_ignores_catalog_order() {
         safe_migrate::_internal::analysis::facts::AttributeFact {
             name: "publish".into(),
             value: "insert".into(),
+            namespace: None,
         },
         safe_migrate::_internal::analysis::facts::AttributeFact {
             name: "publish_via_partition_root".into(),
             value: "false".into(),
+            namespace: None,
         },
     ];
     let mut second = first.clone();
@@ -2415,7 +2417,7 @@ fn snapshot_live_state(
             JOIN pg_namespace cn ON cn.oid = cc.relnamespace
             WHERE pn.nspname = ANY($1) AND cn.nspname = ANY($1)
               AND pc.relkind = 'I'
-              AND cc.relkind = 'i'
+              AND cc.relkind IN ('i', 'I')
             ",
             &[&schema_names],
         )? {

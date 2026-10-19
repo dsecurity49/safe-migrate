@@ -1,7 +1,9 @@
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
-use crate::_internal::rules::{BASELINE_RELATION_CAPABILITIES, Rule, RuleCapability, RuleContext};
+use crate::_internal::rules::{
+    BASELINE_RELATION_CAPABILITIES, Rule, RuleCapability, RuleContext, TransitionRecord,
+};
 
 pub(crate) struct DriftDetectionRule;
 
@@ -20,7 +22,7 @@ impl Rule for DriftDetectionRule {
         BASELINE_RELATION_CAPABILITIES
     }
 
-    fn evaluates_when_unresolved(&self) -> bool {
+    fn evaluates_when_unresolved(&self, _transition: &TransitionRecord<'_>) -> bool {
         // This rule's finding *is* the missing evidence, so it must speak when
         // the post-state is unknown.
         true

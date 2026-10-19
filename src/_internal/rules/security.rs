@@ -1,7 +1,7 @@
 use crate::_internal::analysis::mutations::Mutation;
 
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
-use crate::_internal::rules::{Rule, RuleContext};
+use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
 
 pub(crate) struct OverbroadGrantRule;
 
@@ -16,22 +16,16 @@ impl Rule for OverbroadGrantRule {
         "Avoid GRANT ALL to public roles. Use granular privileges."
     }
 
-    fn evaluates_when_unresolved(&self) -> bool {
-        // A grant to PUBLIC is a policy question answered by the statement text.
-        true
+    fn evaluates_when_unresolved(&self, transition: &TransitionRecord<'_>) -> bool {
+        // A grant's finding comes from the statement text and an
+        // already-resolved target, so it survives an unapplied privilege
+        // matrix. Every other statement is recorded as not evaluated.
+        matches!(transition.mutation(), Mutation::Grant(_))
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        // `WITH GRANT OPTION` is itself the security-sensitive operation. The
-        // state matrix intentionally skips it because grant chains are not
-        // modeled, but that uncertainty must not suppress the syntax-level
-        // warning for a statement PostgreSQL will execute.
-        let skipped_grant_option = context.result().is_unresolved()
-            && matches!(
-                context.mutation(),
-                Mutation::Grant(grant) if grant.with_grant_option
-            );
-        if context.result().is_unresolved() && !skipped_grant_option {
+        // Nothing was granted, so there is no privilege to report.
+        if context.result().is_noop() {
             return vec![];
         }
         let mut violations = Vec::new();

@@ -1,5 +1,6 @@
 use super::Resolver;
 use crate::_internal::analysis::expr_ir::ExprIr;
+use crate::_internal::analysis::facts::ViewUpdatabilityFact;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
     ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
@@ -11,11 +12,12 @@ use crate::_internal::analysis::mutations::{
     RefreshMaterializedViewMutation, ReindexTargetMutation, ReloptionTarget, Rename,
     RenameTriggerMutation, ViewColumn, ViewRoutine,
 };
-use crate::_internal::analysis::state::AnalysisState;
+use crate::_internal::analysis::state::{AnalysisState, RelationOverlay};
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use crate::_internal::model::relation::RelationKind;
+use crate::_internal::model::relation::ViewUpdatabilityReason;
 
 impl Resolver {
     pub(super) fn resolve_reindex(
@@ -57,6 +59,8 @@ impl Resolver {
         or_replace: bool,
         depends_on: &[QualifiedName],
         column_list: &[String],
+        options: &[crate::_internal::analysis::facts::AttributeFact],
+        updatability: crate::_internal::analysis::facts::ViewUpdatabilityFact,
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
@@ -66,6 +70,20 @@ impl Resolver {
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
         let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
+        // A view over a materialized view is not auto-updatable, which is the
+        // one catalog fact the syntactic analysis cannot see.
+        let updatability = match updatability {
+            ViewUpdatabilityFact::Updatable
+                if matches!(
+                    source.as_ref().and_then(|id| state.local.relations.get(id)),
+                    Some(RelationOverlay::Present(relation))
+                        if relation.kind == RelationKind::MaterializedView
+                ) =>
+            {
+                ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::SingleRelation)
+            }
+            other => other,
+        };
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -76,6 +94,8 @@ impl Resolver {
             columns,
             column_list: column_list.to_vec(),
             projection_complete,
+            options: options.to_vec(),
+            updatability,
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
         })
@@ -251,7 +271,7 @@ impl Resolver {
             AlterViewAction::ResetOptions { options } => Mutation::ResetReloptions {
                 id: Self::resolve_relation_lookup_name(name, state),
                 kind: ReloptionTarget::View,
-                names: options.iter().map(|option| option.name.clone()).collect(),
+                attributes: options.clone(),
             },
         };
         Mutation::AlterViewFamily(AlterViewFamily {
@@ -361,7 +381,7 @@ impl Resolver {
                 Mutation::ResetReloptions {
                     id: Self::resolve_relation_lookup_name(name, state),
                     kind: ReloptionTarget::MaterializedView,
-                    names: options.iter().map(|option| option.name.clone()).collect(),
+                    attributes: options.clone(),
                 }
             }
         }

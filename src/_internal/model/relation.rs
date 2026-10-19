@@ -419,6 +419,61 @@ impl RelationKind {
     }
 }
 
+/// Whether a view's defining query is automatically updatable, which its
+/// `check_option` option requires. `Unknown` covers a view whose definition
+/// the analyzer did not see, such as one synchronized from the catalog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ViewUpdatability {
+    #[default]
+    Unknown,
+    Updatable,
+    NotUpdatable(ViewUpdatabilityReason),
+}
+
+/// Why PostgreSQL's `view_query_is_auto_updatable(query, true)` rejects a view
+/// query, which `check_option` requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ViewUpdatabilityReason {
+    Distinct,
+    GroupBy,
+    Having,
+    SetOperation,
+    With,
+    Limit,
+    Aggregate,
+    Window,
+    SingleRelation,
+    Tablesample,
+    NoUpdatableColumns,
+}
+
+impl ViewUpdatabilityReason {
+    /// The hint PostgreSQL reports alongside the refusal.
+    pub(crate) fn hint(self) -> &'static str {
+        match self {
+            Self::Distinct => "Views containing DISTINCT are not automatically updatable.",
+            Self::GroupBy => "Views containing GROUP BY are not automatically updatable.",
+            Self::Having => "Views containing HAVING are not automatically updatable.",
+            Self::SetOperation => {
+                "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable."
+            }
+            Self::With => "Views containing WITH are not automatically updatable.",
+            Self::Limit => "Views containing LIMIT or OFFSET are not automatically updatable.",
+            Self::Aggregate => {
+                "Views that return aggregate functions are not automatically updatable."
+            }
+            Self::Window => "Views that return window functions are not automatically updatable.",
+            Self::SingleRelation => {
+                "Views that do not select from a single table or view are not automatically updatable."
+            }
+            Self::Tablesample => "Views containing TABLESAMPLE are not automatically updatable.",
+            Self::NoUpdatableColumns => {
+                "Views that have no updatable columns are not automatically updatable."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Persistence {
     Permanent,
@@ -557,6 +612,10 @@ pub(crate) struct RelationState {
     /// catalog did not provide this relation-specific fact; it is ignored for
     /// tables and ordinary views and treated conservatively for refreshes.
     pub is_populated: Option<bool>,
+    /// Whether a view is automatically updatable, which its `check_option`
+    /// option requires. `Unknown` for a view the analyzer did not create.
+    #[serde(default)]
+    pub view_updatability: ViewUpdatability,
     /// Physical/catalog attributes are optional for caches produced before
     /// this metadata was synchronized.
     #[serde(default)]
@@ -576,6 +635,21 @@ pub(crate) struct RelationState {
     /// Composite row type selected by `CREATE TABLE ... OF`.
     #[serde(default)]
     pub of_type: Option<ObjectId>,
+    /// Whether `columns` holds the complete attribute list. A relation built
+    /// from a projection the analyzer could not derive keeps only the columns
+    /// it could resolve, so an empty list need not mean the column is absent.
+    /// `sync` reads every attribute, so a hydrated relation is always complete.
+    #[serde(default = "columns_are_complete")]
+    pub columns_complete: bool,
+    /// Whether the relation has a TOAST table, from `pg_class.reltoastrelid`.
+    /// `None` means it is unknown (a relation created by the migration, whose
+    /// TOAST presence depends on its column types).
+    #[serde(default)]
+    pub has_toast_table: Option<bool>,
+}
+
+fn columns_are_complete() -> bool {
+    true
 }
 
 impl Default for RelationState {
@@ -608,6 +682,7 @@ impl Default for RelationState {
             partition_constraint: None,
             is_fk_dependency: false,
             is_populated: None,
+            view_updatability: ViewUpdatability::Unknown,
             tablespace: None,
             access_method: None,
             cluster_index: None,
@@ -616,6 +691,8 @@ impl Default for RelationState {
             replica_identity: None,
             table_options: Default::default(),
             of_type: None,
+            columns_complete: true,
+            has_toast_table: None,
         }
     }
 }
@@ -669,6 +746,7 @@ impl RelationState {
             partition_constraint: None,
             is_fk_dependency: false,
             is_populated: None,
+            view_updatability: ViewUpdatability::Unknown,
             tablespace: None,
             access_method: None,
             cluster_index: None,
@@ -677,6 +755,8 @@ impl RelationState {
             replica_identity: None,
             table_options: Default::default(),
             of_type: None,
+            columns_complete: true,
+            has_toast_table: None,
         }
     }
 

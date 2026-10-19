@@ -127,10 +127,12 @@ impl AnalysisState {
         let mut params = vec![
             AttributeFact {
                 name: "publish".to_string(),
+                namespace: None,
                 value: publish_value,
             },
             AttributeFact {
                 name: "publish_via_partition_root".to_string(),
+                namespace: None,
                 value: explicit
                     .iter()
                     .find(|fact| fact.name == "publish_via_partition_root")
@@ -141,6 +143,7 @@ impl AnalysisState {
         if self.pg_version().conservative_num() >= 180_000 {
             params.push(AttributeFact {
                 name: "publish_generated_columns".to_string(),
+                namespace: None,
                 value: explicit
                     .iter()
                     .find(|fact| fact.name == "publish_generated_columns")

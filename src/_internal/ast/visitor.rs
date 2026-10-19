@@ -15,12 +15,73 @@ use squawk_syntax::ast::{
     Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
-    Path, PathRef, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke,
-    RevokeCommand, Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg,
+    DropTable, DropTrigger, DropType, DropView, Grant, HasSelectTail, Lock, NameRef, PartitionBy,
+    PartitionType, Path, PathRef, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint,
+    Revoke, RevokeCommand, Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg,
     TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
+
+/// The `pg_catalog` aggregate function names. A call to one of these in a view
+/// target list makes the view non-updatable; the analyzer resolves no catalog
+/// functions, so the names are listed rather than looked up. An aggregate in
+/// another schema is not recognised and stays unknown.
+const BUILTIN_AGGREGATES: &[&str] = &[
+    "any_value",
+    "array_agg",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "count",
+    "covar_pop",
+    "covar_samp",
+    "cume_dist",
+    "dense_rank",
+    "every",
+    "json_agg",
+    "json_agg_strict",
+    "json_object_agg",
+    "json_object_agg_strict",
+    "json_object_agg_unique",
+    "json_object_agg_unique_strict",
+    "jsonb_agg",
+    "jsonb_agg_strict",
+    "jsonb_object_agg",
+    "jsonb_object_agg_strict",
+    "jsonb_object_agg_unique",
+    "jsonb_object_agg_unique_strict",
+    "max",
+    "min",
+    "mode",
+    "percent_rank",
+    "percentile_cont",
+    "percentile_disc",
+    "range_agg",
+    "range_intersect_agg",
+    "rank",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "sum",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "xmlagg",
+];
 
 pub(crate) struct AstVisitor;
 
@@ -1155,15 +1216,10 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::ResetOptions(options) => {
-                    let names = options.attribute_list().map(|list| {
-                        list.attribute_options()
-                            .filter_map(|option| {
-                                option.name().map(|name| name.syntax().text().to_string())
-                            })
-                            .collect::<Vec<_>>()
-                    });
-                    if let Some(names) = names.filter(|names| !names.is_empty()) {
-                        actions.push(AlterTableActionFact::ResetTableOptions { names });
+                    if let Some(attributes) =
+                        Self::extract_attribute_options_raw(options.attribute_list())
+                    {
+                        actions.push(AlterTableActionFact::ResetTableOptions { attributes });
                     } else {
                         unsupported_action = true;
                     }
@@ -1714,17 +1770,10 @@ impl AstVisitor {
                 column: col_name,
                 attributes: Self::extract_attribute_options(options.attribute_list())?,
             }),
-            AlterColumnOption::ResetOptions(options) => {
-                let names = options
-                    .attribute_list()?
-                    .attribute_options()
-                    .map(|option| option.name().map(|name| name.syntax().text().to_string()))
-                    .collect::<Option<Vec<_>>>()?;
-                (!names.is_empty()).then_some(AlterTableActionFact::ResetOptions {
-                    column: col_name,
-                    names,
-                })
-            }
+            AlterColumnOption::ResetOptions(options) => Some(AlterTableActionFact::ResetOptions {
+                column: col_name,
+                attributes: Self::extract_attribute_options_raw(options.attribute_list())?,
+            }),
             AlterColumnOption::Inherit(i) => Some(AlterTableActionFact::Inherit {
                 column: col_name,
                 parent: i
@@ -1751,7 +1800,32 @@ impl AstVisitor {
         }
     }
 
+    /// The option's namespace, normalized the way PostgreSQL folds an
+    /// unquoted identifier. `None` when the SQL gave a bare name.
+    fn attribute_namespace(option: &ast::AttributeOption) -> Option<String> {
+        option.namespace().map(|namespace| {
+            Self::resolve_identifier_token(namespace.syntax().text().to_string().trim())
+        })
+    }
+
+    /// The options of a `SET (...)` list. A name written without a value means
+    /// `true`, as the server's `transformRelOptions` reads it.
     fn extract_attribute_options(
+        list: Option<ast::AttributeList>,
+    ) -> Option<Vec<crate::_internal::analysis::facts::AttributeFact>> {
+        let mut attributes = Self::extract_attribute_options_raw(list)?;
+        for attribute in &mut attributes {
+            if attribute.value.is_empty() {
+                attribute.value = "true".to_string();
+            }
+        }
+        Some(attributes)
+    }
+
+    /// The options of a `SET`/`RESET` list with the value exactly as written. An
+    /// absent value stays empty, which is how a `RESET` tells that PostgreSQL
+    /// would refuse the value it carries.
+    fn extract_attribute_options_raw(
         list: Option<ast::AttributeList>,
     ) -> Option<Vec<crate::_internal::analysis::facts::AttributeFact>> {
         let attributes = list?
@@ -1759,7 +1833,11 @@ impl AstVisitor {
             .map(|option| {
                 Some(crate::_internal::analysis::facts::AttributeFact {
                     name: option.name()?.syntax().text().to_string(),
-                    value: option.attribute_value()?.syntax().text().to_string(),
+                    value: option
+                        .attribute_value()
+                        .map(|value| value.syntax().text().to_string())
+                        .unwrap_or_default(),
+                    namespace: Self::attribute_namespace(&option),
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -2320,7 +2398,8 @@ impl AstVisitor {
                 actions.push(AlterIndexActionFact::SetOptions { options });
             }
             squawk_syntax::ast::AlterIndexAction::ResetOptions(ro) => {
-                let options = Self::extract_attribute_list(ro.attribute_list());
+                let options =
+                    Self::extract_attribute_options_raw(ro.attribute_list()).unwrap_or_default();
                 actions.push(AlterIndexActionFact::ResetOptions { options });
             }
         }
@@ -2387,15 +2466,29 @@ impl AstVisitor {
     }
 
     fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
-        // View options and WITH CHECK OPTION alter write/security semantics
-        // that are not represented by the relation state or dependency graph.
-        if node.with_check_option().is_some() || node.with_params().is_some() {
-            return None;
-        }
         let path = node.view()?.path()?;
-        let (select_source, select_outputs) = Self::extract_single_source_projection(node.query());
+        let query = node.query();
+        let (select_source, select_outputs) = Self::extract_single_source_projection(query.clone());
         let projection_was_complete = select_outputs.is_some();
         let select_outputs = select_outputs.unwrap_or_default();
+        let mut options = node
+            .with_params()
+            .and_then(|params| params.attribute_list())
+            .map(|attribute_list| Self::extract_attribute_list(Some(attribute_list)))
+            .unwrap_or_default();
+        // `WITH [LOCAL] CHECK OPTION` is a `check_option` reloption, and is
+        // what makes the auto-updatable precondition apply.
+        if let Some(check) = node.with_check_option() {
+            let local = matches!(
+                check.check_option_level(),
+                Some(ast::CheckOptionLevel::LocalCheckOption(_))
+            );
+            options.push(crate::_internal::analysis::facts::AttributeFact {
+                name: "check_option".to_string(),
+                value: if local { "local" } else { "cascaded" }.to_string(),
+                namespace: None,
+            });
+        }
         Some(StatementFact::CreateView {
             name: Self::path_to_qualified_name(&path)?,
             or_replace: node.or_replace().is_some(),
@@ -2410,12 +2503,216 @@ impl AstVisitor {
                         .collect()
                 })
                 .unwrap_or_default(),
+            options,
+            updatability: Self::view_updatability(query),
             select_projection_complete: select_source.is_some() && projection_was_complete,
             select_outputs,
             select_source,
             routines: Self::extract_view_routines(node.syntax()),
             cast_types: Self::extract_view_cast_types(node.syntax()),
         })
+    }
+
+    /// Whether PostgreSQL would accept `WITH CHECK OPTION` on this view query,
+    /// mirroring `view_query_is_auto_updatable(query, true)`. The syntactic
+    /// disqualifiers are exact; a target expression the analyzer cannot place
+    /// stays unknown rather than guessing.
+    fn view_updatability(
+        query: Option<ast::SelectVariant>,
+    ) -> crate::_internal::analysis::facts::ViewUpdatabilityFact {
+        use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
+        use crate::_internal::model::relation::ViewUpdatabilityReason as R;
+        match query {
+            Some(ast::SelectVariant::Select(select)) => Self::select_updatability(&select),
+            Some(ast::SelectVariant::ParenSelect(paren)) => Self::view_updatability(paren.select()),
+            Some(ast::SelectVariant::CompoundSelect(_)) => V::NotUpdatable(R::SetOperation),
+            Some(ast::SelectVariant::Values(_)) => V::NotUpdatable(R::SingleRelation),
+            // `TABLE t` and `SELECT ... INTO` are not a plain projection the
+            // rest of the analysis expects, so do not claim a verdict.
+            Some(ast::SelectVariant::Table(_)) | Some(ast::SelectVariant::SelectInto(_)) | None => {
+                V::Unknown
+            }
+        }
+    }
+
+    fn select_updatability(
+        select: &ast::Select,
+    ) -> crate::_internal::analysis::facts::ViewUpdatabilityFact {
+        use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
+        use crate::_internal::model::relation::ViewUpdatabilityReason as R;
+        if select
+            .select_clause()
+            .and_then(|clause| clause.select_quantifier())
+            .is_some_and(|quantifier| {
+                matches!(quantifier, ast::SelectQuantifier::DistinctClause(_))
+            })
+        {
+            return V::NotUpdatable(R::Distinct);
+        }
+        if select.group_by_clause().is_some() {
+            return V::NotUpdatable(R::GroupBy);
+        }
+        if select.having_clause().is_some() {
+            return V::NotUpdatable(R::Having);
+        }
+        if select.with_clause().is_some() {
+            return V::NotUpdatable(R::With);
+        }
+        if select.limit_clause().is_some()
+            || select.offset_clause().is_some()
+            || select.fetch_clause().is_some()
+        {
+            return V::NotUpdatable(R::Limit);
+        }
+        // An aggregate or window function in the target list makes each output
+        // row a summary, never a row of the base relation; a set-returning
+        // function multiplies rows. Aggregates and windows are recognised by
+        // name, and a call that is neither might be a set-returning function
+        // the analyzer cannot identify, so it taints.
+        let targets = select
+            .select_clause()
+            .and_then(|clause| clause.target_list())
+            .map(|list| list.targets().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut aggregate = false;
+        let mut window = false;
+        let mut unknown_call = false;
+        for target in targets.iter() {
+            let Some(expr) = target.expr() else { continue };
+            if let ast::Expr::CallExpr(call) = Self::unwrap_parens(expr) {
+                if call.over_clause().is_some() {
+                    window = true;
+                } else if Self::is_builtin_aggregate(&call) {
+                    aggregate = true;
+                } else {
+                    unknown_call = true;
+                }
+            }
+        }
+        if aggregate {
+            return V::NotUpdatable(R::Aggregate);
+        }
+        if window {
+            return V::NotUpdatable(R::Window);
+        }
+        if unknown_call {
+            return V::Unknown;
+        }
+        let whole_row = match Self::single_source_relation(select) {
+            Ok(whole_row) => whole_row,
+            Err(reason) => return V::NotUpdatable(reason),
+        };
+        // With `check_cols`, PostgreSQL requires at least one updatable column:
+        // a star, or a reference to a user column of the base relation.
+        if targets.iter().any(|target| {
+            target.star_token().is_some() || Self::is_column_reference(target, &whole_row)
+        }) {
+            V::Updatable
+        } else {
+            V::NotUpdatable(R::NoUpdatableColumns)
+        }
+    }
+
+    fn unwrap_parens(mut expr: ast::Expr) -> ast::Expr {
+        loop {
+            match expr {
+                ast::Expr::ParenExpr(paren) => match paren.expr() {
+                    Some(inner) => expr = inner,
+                    None => return ast::Expr::ParenExpr(paren),
+                },
+                other => return other,
+            }
+        }
+    }
+
+    /// Whether a target is a user column of the single base relation. A
+    /// whole-row or system-column reference is not, and neither is an
+    /// expression.
+    fn is_column_reference(target: &ast::Target, whole_row: &str) -> bool {
+        let Some(expr) = target.expr() else {
+            return false;
+        };
+        let name = match Self::unwrap_parens(expr) {
+            ast::Expr::NameRef(name) => name.syntax().first_token(),
+            // `t.a` and `t.*` address the base relation's columns; PostgreSQL
+            // spells a qualified reference this way.
+            ast::Expr::FieldExpr(field) => {
+                if field.star_token().is_some() {
+                    return true;
+                }
+                field.field().and_then(|field| field.syntax().first_token())
+            }
+            _ => return false,
+        };
+        match name {
+            Some(token) => {
+                let name = Self::resolve_identifier_token(token.text());
+                !Self::is_system_column(&name) && name != whole_row
+            }
+            None => false,
+        }
+    }
+
+    /// The name a bare reference to the single base relation denotes as a
+    /// whole row: the table alias when given, otherwise the relation's own
+    /// name. Also reports the from clauses PostgreSQL refuses.
+    fn single_source_relation(
+        select: &ast::Select,
+    ) -> Result<String, crate::_internal::model::relation::ViewUpdatabilityReason> {
+        use crate::_internal::model::relation::ViewUpdatabilityReason as R;
+        let Some(from) = select.from_clause() else {
+            return Err(R::SingleRelation);
+        };
+        let mut items = from.items();
+        let Some(item) = items.next() else {
+            return Err(R::SingleRelation);
+        };
+        if items.next().is_some() {
+            return Err(R::SingleRelation);
+        }
+        let ast::FromListItem::FromItem(ast::FromItem::RelationFromItem(relation)) = item else {
+            return Err(R::SingleRelation);
+        };
+        if relation.tablesample_clause().is_some() {
+            return Err(R::Tablesample);
+        }
+        if let Some(alias) = relation.alias().and_then(|alias| alias.name()) {
+            return alias
+                .ident_token()
+                .map(|token| Self::resolve_identifier_token(token.text()))
+                .ok_or(R::SingleRelation);
+        }
+        let qualified = relation
+            .relation_name_ref()
+            .and_then(|name| name.path_ref())
+            .and_then(|path| Self::path_ref_to_qualified_name(&path))
+            .ok_or(R::SingleRelation)?;
+        Ok(qualified.name.resolve())
+    }
+
+    /// PostgreSQL's system columns, which a view cannot update.
+    fn is_system_column(name: &str) -> bool {
+        matches!(
+            name,
+            "tableoid" | "ctid" | "xmin" | "cmin" | "xmax" | "cmax"
+        )
+    }
+
+    /// Whether a call names a `pg_catalog` aggregate. A function of the same
+    /// name in another schema is not that aggregate.
+    fn is_builtin_aggregate(call: &ast::CallExpr) -> bool {
+        let Some(callee) = call.expr() else {
+            return false;
+        };
+        let text = callee.syntax().text().to_string();
+        let (schema, name) = match text.rsplit_once('.') {
+            Some((schema, name)) => (Some(schema.trim_matches('"').to_ascii_lowercase()), name),
+            None => (None, text.as_str()),
+        };
+        if schema.is_some_and(|schema| schema != "pg_catalog") {
+            return false;
+        }
+        BUILTIN_AGGREGATES.contains(&name.trim_matches('"').to_ascii_lowercase().as_str())
     }
 
     /// The qualified name a cast target writes.
@@ -2619,7 +2916,8 @@ impl AstVisitor {
             }
             ast::AlterViewAction::ResetOptions(ro) => {
                 crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
-                    options: Self::extract_attribute_list(ro.attribute_list()),
+                    options: Self::extract_attribute_options_raw(ro.attribute_list())
+                        .unwrap_or_default(),
                 }
             }
         })
@@ -2734,7 +3032,8 @@ impl AstVisitor {
                     }
                     ast::AlterTableAction::ResetOptions(ro) => {
                         crate::_internal::analysis::facts::AlterMaterializedViewActionFact::ResetOptions {
-                            options: Self::extract_attribute_list(ro.attribute_list()),
+                            options: Self::extract_attribute_options_raw(ro.attribute_list())
+                                .unwrap_or_default(),
                         }
                     }
                     ast::AlterTableAction::ClusterOn(co) => {
@@ -3002,7 +3301,7 @@ impl AstVisitor {
                         ast::SequenceOption::OptionUnlogged(_) => OptionFact::Logged(false),
                         ast::SequenceOption::OptionOwnedBy(o) => match o.owned_by_target() {
                             Some(ast::OwnedByTarget::OwnedByNone(_)) => OptionFact::OwnedBy(None),
-                            Some(_) => OptionFact::OwnedBy(Self::extract_owned_by(&o)),
+                            Some(_) => OptionFact::OwnedBy(Some(Self::extract_owned_by(&o)?)),
                             None => return None,
                         },
                         ast::SequenceOption::OptionSequenceName(o) => OptionFact::SequenceName(
@@ -3221,7 +3520,7 @@ impl AstVisitor {
             ast::CreateTypeKind::BaseType(base) => TypeCreationKind::Base {
                 element: Self::type_attribute(
                     Self::extract_attribute_list(base.attribute_list()),
-                    "typelem",
+                    "element",
                 ),
             },
         };
@@ -3976,6 +4275,7 @@ impl AstVisitor {
                             Self::resolve_identifier_token(name.syntax().text().to_string().trim())
                         })
                         .unwrap_or_default(),
+                    namespace: Self::attribute_namespace(&option),
                     value: option
                         .attribute_value()
                         .map(|value| {

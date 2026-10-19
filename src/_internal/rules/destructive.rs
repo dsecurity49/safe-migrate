@@ -147,6 +147,10 @@ impl Rule for SizeAwareAddColumnRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        // The statement was skipped, so no column was added and nothing is rewritten.
+        if context.result().is_noop() {
+            return vec![];
+        }
         let mutation = context.mutation();
         let pre_state = context.pre_state();
         let state = context.state();

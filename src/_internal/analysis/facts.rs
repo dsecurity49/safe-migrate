@@ -216,6 +216,12 @@ pub(crate) enum StatementFact {
         depends_on: Vec<QualifiedName>,
         /// An explicit `v (a, b)` column list, which renames the outputs.
         column_list: Vec<String>,
+        /// `WITH (...)` options plus a `WITH [LOCAL] CHECK OPTION` clause,
+        /// which PostgreSQL folds into a `check_option` option.
+        options: Vec<AttributeFact>,
+        /// Whether the query is automatically updatable, which a
+        /// `check_option` option requires.
+        updatability: ViewUpdatabilityFact,
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
@@ -1070,6 +1076,22 @@ pub(crate) struct DropDatabaseFact {
 pub(crate) struct AttributeFact {
     pub name: String,
     pub value: String,
+    /// The option's `namespace.name` namespace, when the SQL spelled one.
+    /// Only relation options accept a namespace (`toast.`); PostgreSQL keeps it
+    /// separate from the name, so the analyzer does too.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+impl AttributeFact {
+    /// The key PostgreSQL stores the option under: `namespace.name` when
+    /// namespaced, otherwise the bare name.
+    pub(crate) fn key(&self) -> String {
+        match &self.namespace {
+            Some(namespace) => format!("{namespace}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1119,6 +1141,20 @@ pub(crate) enum SelectOutputFact {
         source_name: String,
         output_name: String,
     },
+}
+
+/// Whether PostgreSQL's `view_query_is_auto_updatable(query, true)` would
+/// accept a view query, which `check_option` requires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewUpdatabilityFact {
+    /// Every syntactic check passed; the base relation's kind is still
+    /// verified against the catalogue before the option is accepted.
+    Updatable,
+    /// PostgreSQL refuses the option, with this reason as its hint.
+    NotUpdatable(crate::_internal::model::relation::ViewUpdatabilityReason),
+    /// A target expression the analyzer cannot classify as a scalar function
+    /// or an aggregate keeps the answer unknown rather than guessing.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1261,13 +1297,13 @@ pub(crate) enum AlterTableActionFact {
     },
     ResetOptions {
         column: String,
-        names: Vec<String>,
+        attributes: Vec<AttributeFact>,
     },
     SetTableOptions {
         attributes: Vec<AttributeFact>,
     },
     ResetTableOptions {
-        names: Vec<String>,
+        attributes: Vec<AttributeFact>,
     },
     Inherit {
         column: String,

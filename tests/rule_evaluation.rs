@@ -6,7 +6,9 @@ mod rule_evaluation_tests {
     use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState, RoutineKind};
-    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::model::relation::{
+        Persistence, RelationKind, RelationState, ViewUpdatability,
+    };
     use safe_migrate::_internal::report::violations::ViolationTier;
     use safe_migrate::api::{Certainty, Config, RuleConfig};
 
@@ -1116,12 +1118,125 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
+    fn an_unresolvable_create_index_records_the_concurrent_index_rule_as_unevaluated() {
         let engine = setup_engine();
         let mut cache = crate::common::synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let mut state = AnalysisState::new(cache);
 
+        let violations = engine
+            .analyze("CREATE INDEX i ON public.secret_table (id);", &mut state)
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "require-concurrent-index"),
+            "the lock a synchronous index takes cannot be sized without the relation"
+        );
+        assert!(
+            state
+                .not_evaluated()
+                .iter()
+                .any(|entry| entry.rule_id == "require-concurrent-index"),
+            "a declined Tier1 check must be recorded so the verdict cannot stay SAFE"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_grant_to_public_is_still_reported() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT SELECT ON TABLE public.secret_table TO PUBLIC;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule_id == "overbroad-grant" && v.reason.contains("Grant to PUBLIC")),
+            "the grantee comes from the statement, so an unknown relation cannot excuse it"
+        );
+    }
+
+    #[test]
+    fn statements_postgresql_skips_draw_no_findings() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.source_lock_timeout_ms = 1_000;
+        cache.metadata.source_statement_timeout_ms = 10_000;
+        let mut table = RelationState::new(
+            object_id("public", "t"),
+            object_id("public", "postgres"),
+            0,
+            Some(1_000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        table.columns.push(Column::migration_created(
+            "id".to_string(),
+            Some("integer".to_string()),
+            true,
+            None,
+        ));
+        table.columns.push(Column::migration_created(
+            "note".to_string(),
+            Some("text".to_string()),
+            true,
+            None,
+        ));
+        cache.insert_baseline(object_id("public", "t"), table);
+        // Holds the index namespace, exactly as a same-name relation would.
+        cache.insert_baseline(
+            object_id("public", "t_idx"),
+            RelationState::new(
+                object_id("public", "t_idx"),
+                object_id("public", "postgres"),
+                0,
+                Some(0),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE IF NOT EXISTS t (id int, note text DEFAULT random());
+                 ALTER TABLE t ADD COLUMN IF NOT EXISTS note text DEFAULT random();
+                 CREATE INDEX IF NOT EXISTS t_idx ON t (id);
+                 DROP INDEX IF EXISTS t_missing_idx;
+                 DROP TABLE IF EXISTS t_missing;",
+                &mut state,
+            )
+            .unwrap();
+
+        // PostgreSQL skipped every statement, so no rule about what a migration
+        // changes has a subject. A new rule that reports on a skipped statement
+        // fails here rather than in production.
+        assert_eq!(
+            violations
+                .iter()
+                .map(|violation| violation.rule_id)
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let mut state = AnalysisState::new(cache);
         let violations = engine
             .analyze(
                 "ALTER TABLE public.external_table ADD COLUMN note text;",
@@ -1565,10 +1680,110 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn view_check_option_requires_an_auto_updatable_query() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_co (id int);
+                 CREATE VIEW updatable AS SELECT id FROM base_co WITH CHECK OPTION;
+                 CREATE VIEW aggregated AS SELECT count(*) FROM base_co WITH CHECK OPTION;
+                 CREATE VIEW filtered AS SELECT DISTINCT id FROM base_co WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        let reasons: Vec<&str> = v
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            2,
+            "only the aggregate and distinct views conflict: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| reason.contains("automatically updatable views")),
+            "the refusal names the check option: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("aggregate functions")),
+            "the aggregate view reports its reason: {reasons:?}"
+        );
+
+        let relation = state
+            .get_relation(&object_id("public", "updatable"))
+            .expect("view must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+            "an updatable view records its verdict: {relation:?}"
+        );
+    }
+
+    #[test]
+    fn altering_a_view_check_option_requires_an_auto_updatable_query() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_ac (id int);
+                 CREATE VIEW bad AS SELECT DISTINCT id FROM base_ac;
+                 ALTER VIEW bad SET (security_barrier = true);
+                 ALTER VIEW bad SET (check_option = cascaded);
+                 CREATE VIEW good AS SELECT id FROM base_ac;
+                 ALTER TABLE good SET (check_option = local);",
+                &mut state,
+            )
+            .unwrap();
+
+        let reasons: Vec<&str> = v
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .map(|v| v.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the check_option SET conflicts: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("automatically updatable views"),
+            "the refusal names the check option: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn an_unplaced_view_call_taints_rather_than_conflicting() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_call (x int);
+                 CREATE VIEW maybe AS SELECT upper('x') FROM base_call WITH CHECK OPTION;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unclassified call must not be claimed as a conflict: {v:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
     fn security_definer_is_not_a_view_reloption_on_any_version() {
         use crate::_internal::analysis::mutations::ReloptionTarget;
         use crate::_internal::analysis::state::PgVersion;
-        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+        use crate::_internal::model::reloption::{ReloptionNamespace, ReloptionOutcome, evaluate};
 
         // It is a routine attribute. PostgreSQL 15 added security_invoker
         // beside security_barrier rather than replacing anything.
@@ -1576,6 +1791,7 @@ mod rule_evaluation_tests {
             assert_eq!(
                 evaluate(
                     "security_definer",
+                    ReloptionNamespace::Main,
                     Some("true"),
                     ReloptionTarget::View,
                     PgVersion::Observed(version)
@@ -1592,12 +1808,13 @@ mod rule_evaluation_tests {
     fn a_reloption_added_in_a_later_release_is_rejected_before_it() {
         use crate::_internal::analysis::mutations::ReloptionTarget;
         use crate::_internal::analysis::state::PgVersion;
-        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+        use crate::_internal::model::reloption::{ReloptionNamespace, ReloptionOutcome, evaluate};
 
         let target = ReloptionTarget::View;
         assert_eq!(
             evaluate(
                 "security_invoker",
+                ReloptionNamespace::Main,
                 Some("true"),
                 target,
                 PgVersion::Observed(140_000)
@@ -1609,6 +1826,7 @@ mod rule_evaluation_tests {
         assert_eq!(
             evaluate(
                 "security_invoker",
+                ReloptionNamespace::Main,
                 Some("true"),
                 target,
                 PgVersion::Observed(150_000)
@@ -1621,13 +1839,15 @@ mod rule_evaluation_tests {
     fn reloption_values_are_checked_against_their_domain() {
         use crate::_internal::analysis::mutations::ReloptionTarget;
         use crate::_internal::analysis::state::PgVersion;
-        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate, parses_as_bool};
+        use crate::_internal::model::reloption::{
+            ReloptionNamespace, ReloptionOutcome, evaluate, parses_as_bool,
+        };
 
         let version = PgVersion::Observed(180_000);
         let view = ReloptionTarget::View;
         let bad = |name: &'static str, value: &str| {
             matches!(
-                evaluate(name, Some(value), view, version),
+                evaluate(name, ReloptionNamespace::Main, Some(value), view, version),
                 ReloptionOutcome::BadValue { .. }
             )
         };
@@ -1647,35 +1867,103 @@ mod rule_evaluation_tests {
         assert!(bad("check_option", "banana"));
         assert!(!bad("check_option", "cascaded"));
         assert_eq!(
-            evaluate("check_option", Some("LOCAL"), view, version),
+            evaluate(
+                "check_option",
+                ReloptionNamespace::Main,
+                Some("LOCAL"),
+                view,
+                version
+            ),
             ReloptionOutcome::Accepted
         );
 
         let heap = ReloptionTarget::MaterializedView;
         assert_eq!(
-            evaluate("fillfactor", Some("100"), heap, version),
+            evaluate(
+                "fillfactor",
+                ReloptionNamespace::Main,
+                Some("100"),
+                heap,
+                version
+            ),
             ReloptionOutcome::Accepted
         );
         assert!(matches!(
-            evaluate("fillfactor", Some("5"), heap, version),
+            evaluate(
+                "fillfactor",
+                ReloptionNamespace::Main,
+                Some("5"),
+                heap,
+                version
+            ),
             ReloptionOutcome::BadValue { .. }
         ));
         assert!(matches!(
-            evaluate("fillfactor", Some("banana"), heap, version),
+            evaluate(
+                "fillfactor",
+                ReloptionNamespace::Main,
+                Some("banana"),
+                heap,
+                version
+            ),
             ReloptionOutcome::BadValue { .. }
         ));
+    }
+
+    #[test]
+    fn vacuum_index_cleanup_accepts_the_boolean_spellings() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionNamespace, ReloptionOutcome, evaluate};
+
+        // Verified live on PostgreSQL 18.6: `vacuum_index_cleanup` is an enum
+        // option, and an enum option also accepts `parse_bool` spellings.
+        let heap = ReloptionTarget::MaterializedView;
+        let version = PgVersion::Observed(180_000);
+        for value in [
+            "auto", "on", "off", "true", "false", "yes", "no", "1", "0", "AUTO",
+        ] {
+            assert_eq!(
+                evaluate(
+                    "vacuum_index_cleanup",
+                    ReloptionNamespace::Main,
+                    Some(value),
+                    heap,
+                    version
+                ),
+                ReloptionOutcome::Accepted,
+                "{value}"
+            );
+        }
+        // PostgreSQL lists only on/off/auto, and rejects anything else.
+        for value in ["bogus", "2", "always"] {
+            assert!(
+                matches!(
+                    evaluate(
+                        "vacuum_index_cleanup",
+                        ReloptionNamespace::Main,
+                        Some(value),
+                        heap,
+                        version
+                    ),
+                    ReloptionOutcome::BadValue { .. }
+                ),
+                "{value} must be rejected"
+            );
+        }
     }
 
     #[test]
     fn materialized_view_uses_the_heap_options_and_views_do_not() {
         use crate::_internal::analysis::mutations::ReloptionTarget;
         use crate::_internal::analysis::state::PgVersion;
-        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+        use crate::_internal::model::reloption::{ReloptionNamespace, ReloptionOutcome, evaluate};
 
         let version = PgVersion::Observed(180_000);
         assert_eq!(
             evaluate(
                 "fillfactor",
+                ReloptionNamespace::Main,
                 Some("70"),
                 ReloptionTarget::MaterializedView,
                 version
@@ -1683,7 +1971,13 @@ mod rule_evaluation_tests {
             ReloptionOutcome::Accepted
         );
         assert_eq!(
-            evaluate("fillfactor", Some("70"), ReloptionTarget::View, version),
+            evaluate(
+                "fillfactor",
+                ReloptionNamespace::Main,
+                Some("70"),
+                ReloptionTarget::View,
+                version
+            ),
             ReloptionOutcome::Unrecognized {
                 name: "fillfactor".to_string()
             },
@@ -1693,6 +1987,7 @@ mod rule_evaluation_tests {
             assert_eq!(
                 evaluate(
                     view_only,
+                    ReloptionNamespace::Main,
                     Some("true"),
                     ReloptionTarget::MaterializedView,
                     version
@@ -1701,6 +1996,780 @@ mod rule_evaluation_tests {
                     name: view_only.to_string()
                 },
                 "{view_only} is a view option and must not reach a materialized view"
+            );
+        }
+    }
+
+    #[test]
+    fn toast_reloptions_depend_on_the_namespace_and_the_toast_table() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{
+            ReloptionNamespace, ReloptionOutcome, ToastOptions, evaluate,
+        };
+
+        let version = PgVersion::Observed(180_000);
+        let matview = ReloptionTarget::MaterializedView;
+        let toast = ReloptionNamespace::Toast;
+        // `autovacuum_enabled` is one of the options the TOAST table takes;
+        // `fillfactor` and `autovacuum_analyze_threshold` are heap options it
+        // does not, which is why a matview accepts them but its toast table
+        // cannot.
+        assert_eq!(
+            evaluate(
+                "autovacuum_enabled",
+                toast(ToastOptions::Validated),
+                Some("false"),
+                matview,
+                version
+            ),
+            ReloptionOutcome::Accepted
+        );
+        for name in ["fillfactor", "autovacuum_analyze_threshold"] {
+            assert_eq!(
+                evaluate(
+                    name,
+                    toast(ToastOptions::Validated),
+                    Some("70"),
+                    matview,
+                    version
+                ),
+                ReloptionOutcome::Unrecognized {
+                    name: name.to_string()
+                },
+                "{name} is not a TOAST option"
+            );
+        }
+        // Without a TOAST table PostgreSQL drops the option without parsing it,
+        // so even an out-of-set or ill-formed value is accepted.
+        for name in ["autovacuum_enabled", "fillfactor", "not_a_thing"] {
+            assert_eq!(
+                evaluate(
+                    name,
+                    toast(ToastOptions::Ignored),
+                    Some("banana"),
+                    matview,
+                    version
+                ),
+                ReloptionOutcome::Accepted
+            );
+        }
+        // When presence is unknown only a cleanly valid option is certain.
+        assert_eq!(
+            evaluate(
+                "autovacuum_enabled",
+                toast(ToastOptions::Unknown),
+                Some("false"),
+                matview,
+                version
+            ),
+            ReloptionOutcome::Accepted
+        );
+        assert_eq!(
+            evaluate(
+                "fillfactor",
+                toast(ToastOptions::Unknown),
+                Some("70"),
+                matview,
+                version
+            ),
+            ReloptionOutcome::Unplaced
+        );
+    }
+
+    #[test]
+    fn create_materialized_view_validates_the_toast_namespace() {
+        let analyze = |sql: &str| {
+            let engine = setup_engine();
+            let mut cache = crate::common::synced_cache();
+            cache.pg_version_num = Some(180_000);
+            let mut state = AnalysisState::new(cache);
+            state.baseline_available = true;
+            engine.analyze(sql, &mut state).unwrap()
+        };
+
+        // The matview itself takes `fillfactor`, but its TOAST table does not.
+        let rejected = analyze(
+            "CREATE TABLE base (id int);
+             CREATE MATERIALIZED VIEW mv WITH (toast.fillfactor = 70) AS SELECT id FROM base;",
+        );
+        assert!(
+            rejected
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "a TOAST name the toast table does not take must be rejected: {rejected:?}"
+        );
+
+        let accepted = analyze(
+            "CREATE TABLE base (id int);
+             CREATE MATERIALIZED VIEW mv WITH (toast.autovacuum_enabled = false) AS SELECT id FROM base;",
+        );
+        assert!(
+            !accepted
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "a real TOAST option must be accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn a_toast_option_on_a_view_is_ignored_like_postgresql() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // A view has no storage, so PostgreSQL drops `toast.` options instead
+        // of validating them.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base (id int);
+                 CREATE VIEW v AS SELECT id FROM base;
+                 ALTER VIEW v SET (toast.fillfactor = 70);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a view silently ignores toast options: {v:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn an_unknown_reloption_namespace_is_a_conflict() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base (id int);
+                 CREATE VIEW v AS SELECT id FROM base;
+                 ALTER VIEW v SET (foo.bar = 1);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("unrecognized parameter namespace")),
+            "only the toast namespace exists: {v:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_toast_options_are_rejected_within_their_namespace() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let duplicate = engine
+            .analyze(
+                "CREATE TABLE base (id int);
+                 CREATE MATERIALIZED VIEW mv WITH (toast.autovacuum_enabled = true, toast.autovacuum_enabled = false) AS SELECT id FROM base;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            duplicate
+                .iter()
+                .any(|v| v.reason.contains("specified more than once")),
+            "a repeated option within one namespace is a conflict: {duplicate:?}"
+        );
+
+        // The same bare name in two namespaces is not a repetition.
+        let distinct = engine
+            .analyze(
+                "CREATE TABLE base2 (id int);
+                 CREATE MATERIALIZED VIEW mv2 WITH (autovacuum_enabled = true, toast.autovacuum_enabled = false) AS SELECT id FROM base2;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !distinct
+                .iter()
+                .any(|v| v.reason.contains("specified more than once")),
+            "different namespaces are different parameters: {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn resetting_a_toast_option_leaves_the_main_option() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE base (id int);
+                 CREATE MATERIALIZED VIEW mv WITH (fillfactor = 70, toast.autovacuum_enabled = false) AS SELECT id FROM base;
+                 ALTER MATERIALIZED VIEW mv RESET (toast.autovacuum_enabled);",
+                &mut state,
+            )
+            .unwrap();
+
+        let relation = state
+            .get_relation(&object_id("public", "mv"))
+            .expect("matview must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.table_options.get("fillfactor") == Some(&"70".to_string())
+                    && !r.table_options.contains_key("toast.autovacuum_enabled")),
+            "RESET must only clear the namespaced option: {relation:?}"
+        );
+    }
+
+    #[test]
+    fn alter_materialized_view_toast_option_depends_on_the_toast_table() {
+        let analyze = |has_toast: bool| {
+            let engine = setup_engine();
+            let mut cache = crate::common::synced_cache();
+            cache.pg_version_num = Some(180_000);
+            let mut mv = RelationState::new(
+                object_id("public", "mv"),
+                ObjectId::new("public", "postgres"),
+                0,
+                None,
+                RelationKind::MaterializedView,
+                Persistence::Permanent,
+                0,
+            );
+            mv.has_toast_table = Some(has_toast);
+            cache.insert_baseline(object_id("public", "mv"), mv);
+            let mut state = AnalysisState::new(cache);
+            state.baseline_available = true;
+            engine
+                .analyze(
+                    "ALTER MATERIALIZED VIEW mv SET (toast.fillfactor = 70);",
+                    &mut state,
+                )
+                .unwrap()
+        };
+
+        let with_toast = analyze(true);
+        assert!(
+            with_toast
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "a toast table rejects a name it does not take: {with_toast:?}"
+        );
+        let without_toast = analyze(false);
+        assert!(
+            !without_toast
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "no toast table means the option is dropped, not checked: {without_toast:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_set_options_validate_against_the_table_option_set() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // The view-only option is not a heap option, so the table rejects it;
+        // the heap option is stored and the statement is exact.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base (id int);
+                 ALTER TABLE base SET (security_barrier = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter().any(|v| v
+                .reason
+                .contains("unrecognized parameter \"security_barrier\"")),
+            "a table must reject a view-only option: {v:?}"
+        );
+
+        engine
+            .analyze(
+                "CREATE TABLE base2 (id int);
+                 ALTER TABLE base2 SET (fillfactor = 70);",
+                &mut state,
+            )
+            .unwrap();
+        let relation = state
+            .get_relation(&object_id("public", "base2"))
+            .expect("table must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.table_options.get("fillfactor") == Some(&"70".to_string())),
+            "a heap option must be stored: {relation:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_set_options_reject_storage_parameters_on_a_partitioned_table() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE part (id int) PARTITION BY RANGE (id);
+                 ALTER TABLE part SET (fillfactor = 70);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("cannot specify storage parameters")),
+            "a partitioned table takes no storage parameter: {v:?}"
+        );
+
+        // A toast option is dropped, and an unknown namespace is still rejected
+        // before the storage-parameter rule.
+        let accepted = engine
+            .analyze(
+                "CREATE TABLE part2 (id int) PARTITION BY RANGE (id);
+                 ALTER TABLE part2 SET (toast.autovacuum_enabled = false);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !accepted
+                .iter()
+                .any(|v| v.reason.contains("storage parameters")),
+            "a partitioned table silently drops toast options: {accepted:?}"
+        );
+        let namespace = engine
+            .analyze("ALTER TABLE part2 SET (foo.bar = 1);", &mut state)
+            .unwrap();
+        assert!(
+            namespace
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter namespace")),
+            "the namespace is checked before the kind: {namespace:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_toast_option_depends_on_the_toast_table() {
+        let analyze = |has_toast: bool| {
+            let engine = setup_engine();
+            let mut cache = crate::common::synced_cache();
+            cache.pg_version_num = Some(180_000);
+            let mut table = RelationState::new(
+                object_id("public", "t"),
+                ObjectId::new("public", "postgres"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            );
+            table.has_toast_table = Some(has_toast);
+            cache.insert_baseline(object_id("public", "t"), table);
+            let mut state = AnalysisState::new(cache);
+            state.baseline_available = true;
+            engine
+                .analyze("ALTER TABLE t SET (toast.fillfactor = 70);", &mut state)
+                .unwrap()
+        };
+
+        let with_toast = analyze(true);
+        assert!(
+            with_toast
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "a toast table rejects a name it does not take: {with_toast:?}"
+        );
+        let without_toast = analyze(false);
+        assert!(
+            !without_toast
+                .iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "no toast table means the option is dropped, not checked: {without_toast:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_toast_options_are_not_checked_without_a_toast_table() {
+        let analyze = |has_toast: bool| {
+            let engine = setup_engine();
+            let mut cache = crate::common::synced_cache();
+            cache.pg_version_num = Some(180_000);
+            let mut table = RelationState::new(
+                object_id("public", "t"),
+                ObjectId::new("public", "postgres"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            );
+            table.has_toast_table = Some(has_toast);
+            cache.insert_baseline(object_id("public", "t"), table);
+            let mut state = AnalysisState::new(cache);
+            state.baseline_available = true;
+            engine
+                .analyze(
+                    "ALTER TABLE t SET (toast.autovacuum_enabled = true, toast.autovacuum_enabled = false);",
+                    &mut state,
+                )
+                .unwrap()
+        };
+
+        // A repeated name is only parsed into an option array when the toast
+        // table exists; otherwise PostgreSQL drops the whole set.
+        assert!(
+            analyze(true)
+                .iter()
+                .any(|v| v.reason.contains("specified more than once")),
+            "a toast table parses the set and repeats are rejected"
+        );
+        assert!(
+            !analyze(false)
+                .iter()
+                .any(|v| v.reason.contains("specified more than once")),
+            "no toast table means the repeated set is never parsed"
+        );
+    }
+
+    #[test]
+    fn alter_table_reloptions_are_refused_on_a_foreign_table() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let foreign = RelationState::new(
+            object_id("public", "ft"),
+            ObjectId::new("public", "postgres"),
+            0,
+            None,
+            RelationKind::ForeignTable,
+            Persistence::Permanent,
+            0,
+        );
+        cache.insert_baseline(object_id("public", "ft"), foreign);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let set = engine
+            .analyze("ALTER TABLE ft SET (fillfactor = 70);", &mut state)
+            .unwrap();
+        assert!(
+            set.iter()
+                .any(|v| v.reason.contains("ALTER action cannot be performed")),
+            "a foreign table cannot take SET options: {set:?}"
+        );
+        let reset = engine
+            .analyze("ALTER TABLE ft RESET (fillfactor);", &mut state)
+            .unwrap();
+        assert!(
+            reset
+                .iter()
+                .any(|v| v.reason.contains("ALTER action cannot be performed")),
+            "a foreign table cannot take RESET options: {reset:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_reloptions_follow_the_target_relation_kind() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // `ALTER TABLE` is overloaded for a view, and its options come from the
+        // view set rather than the heap set.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_target (id int);
+                 CREATE VIEW target_view AS SELECT id FROM base_target;
+                 ALTER TABLE target_view SET (security_barrier = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a view accepts the actions its relkind admits: {v:?}"
+        );
+        let view = state
+            .get_relation(&object_id("public", "target_view"))
+            .expect("view must exist");
+        assert!(
+            matches!(view, RelationOverlay::Present(r)
+                if r.table_options.get("security_barrier") == Some(&"true".to_string())),
+            "the view option must be stored: {view:?}"
+        );
+
+        let v = engine
+            .analyze("ALTER TABLE target_view ADD COLUMN extra int;", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("ALTER action cannot be performed")),
+            "a view cannot gain a column: {v:?}"
+        );
+
+        let v = engine
+            .analyze(
+                "ALTER TABLE target_view RENAME COLUMN id TO renamed;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a view column can be renamed: {v:?}"
+        );
+
+        let v = engine
+            .analyze(
+                "ALTER TABLE target_view ALTER COLUMN renamed SET STATISTICS 100;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("ALTER action cannot be performed")),
+            "a view column cannot take statistics: {v:?}"
+        );
+
+        // A materialized view takes the heap set.
+        engine
+            .analyze(
+                "CREATE MATERIALIZED VIEW target_mat AS SELECT id FROM base_target;
+                 ALTER TABLE target_mat SET (fillfactor = 70);",
+                &mut state,
+            )
+            .unwrap();
+        let mat = state
+            .get_relation(&object_id("public", "target_mat"))
+            .expect("materialized view must exist");
+        assert!(
+            matches!(mat, RelationOverlay::Present(r)
+                if r.table_options.get("fillfactor") == Some(&"70".to_string())),
+            "a materialized view stores a heap option: {mat:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_permissions_distinguish_partitioned_tables() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE plain_attach (id int);
+                 CREATE TABLE partitioned_child (id int) PARTITION BY RANGE (id);
+                 ALTER TABLE plain_attach ATTACH PARTITION partitioned_child FOR VALUES FROM (1) TO (2);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("ALTER action cannot be performed")),
+            "only a partitioned table can attach a partition: {v:?}"
+        );
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE partitioned_persist (id int) PARTITION BY RANGE (id);
+                 ALTER TABLE partitioned_persist SET UNLOGGED;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("ALTER action cannot be performed")),
+            "a partitioned table cannot change persistence: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_set_option_without_a_value_means_true() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // A boolean option takes the implied `true`; an integer option then
+        // rejects it the way the server does.
+        engine
+            .analyze(
+                "CREATE TABLE base_set (id int);
+                 ALTER TABLE base_set SET (autovacuum_enabled);",
+                &mut state,
+            )
+            .unwrap();
+        let relation = state
+            .get_relation(&object_id("public", "base_set"))
+            .expect("table must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.table_options.get("autovacuum_enabled") == Some(&"true".to_string())),
+            "a name alone means true: {relation:?}"
+        );
+
+        let v = engine
+            .analyze("ALTER TABLE base_set SET (fillfactor);", &mut state)
+            .unwrap();
+        assert!(
+            v.iter().any(|v| v
+                .reason
+                .contains("invalid value for parameter \"fillfactor\"")),
+            "an implied true is not an integer: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_reset_option_must_not_carry_a_value() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+        engine
+            .analyze(
+                "CREATE TABLE base_reset (id int);
+                 CREATE VIEW view_reset AS SELECT id FROM base_reset;",
+                &mut state,
+            )
+            .unwrap();
+
+        for sql in [
+            "ALTER TABLE base_reset RESET (fillfactor = 70);",
+            "ALTER TABLE base_reset ALTER COLUMN id RESET (n_distinct = 1);",
+            "ALTER VIEW view_reset RESET (security_barrier = true);",
+        ] {
+            let v = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                v.iter()
+                    .any(|v| v.reason.contains("RESET must not include values")),
+                "{sql} must be rejected: {v:?}"
+            );
+        }
+
+        // A name alone, even one PostgreSQL does not know, is accepted.
+        let v = engine
+            .analyze("ALTER VIEW view_reset RESET (not_an_option);", &mut state)
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "RESET checks no name: {v:?}"
+        );
+    }
+
+    #[test]
+    fn column_options_use_the_attribute_option_set() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+        engine
+            .analyze("CREATE TABLE base_col (id int);", &mut state)
+            .unwrap();
+
+        let accepted = engine
+            .analyze(
+                "ALTER TABLE base_col ALTER COLUMN id SET (n_distinct = 100, n_distinct_inherited = -1);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !accepted.iter().any(|v| v.rule_id == "chain-conflict"),
+            "valid attribute options: {accepted:?}"
+        );
+
+        for (sql, message) in [
+            (
+                "ALTER TABLE base_col ALTER COLUMN id SET (n_distinct = -2);",
+                "invalid value for parameter \"n_distinct\"",
+            ),
+            (
+                "ALTER TABLE base_col ALTER COLUMN id SET (fillfactor = 70);",
+                "unrecognized parameter \"fillfactor\"",
+            ),
+            (
+                "ALTER TABLE base_col ALTER COLUMN id SET (toast.n_distinct = 1);",
+                "unrecognized parameter namespace \"toast\"",
+            ),
+            (
+                "ALTER TABLE base_col ALTER COLUMN id SET (n_distinct = 1, n_distinct = 2);",
+                "specified more than once",
+            ),
+        ] {
+            let v = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                v.iter().any(|v| v.reason.contains(message)),
+                "{sql} must be rejected: {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_options_follow_the_access_method() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+        engine
+            .analyze(
+                "CREATE TABLE base_idx (id int, arr int[], r int4range);
+                 CREATE INDEX idx_btree ON base_idx (id);
+                 CREATE INDEX idx_hash ON base_idx USING hash (id);
+                 CREATE INDEX idx_gin ON base_idx USING gin (arr);
+                 CREATE INDEX idx_gist ON base_idx USING gist (r);
+                 CREATE INDEX idx_brin ON base_idx USING brin (id);",
+                &mut state,
+            )
+            .unwrap();
+
+        let accepted = engine
+            .analyze(
+                "ALTER INDEX idx_btree SET (fillfactor = 70);
+                 ALTER INDEX idx_hash SET (fillfactor = 70);
+                 ALTER INDEX idx_gin SET (fastupdate = off);
+                 ALTER INDEX idx_gist SET (buffering = on);
+                 ALTER INDEX idx_brin SET (pages_per_range = 32);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !accepted.iter().any(|v| v.rule_id == "chain-conflict"),
+            "each method takes its own options: {accepted:?}"
+        );
+
+        for (sql, message) in [
+            (
+                "ALTER INDEX idx_btree SET (fastupdate = on);",
+                "unrecognized parameter \"fastupdate\"",
+            ),
+            (
+                "ALTER INDEX idx_gin SET (fillfactor = 70);",
+                "unrecognized parameter \"fillfactor\"",
+            ),
+            (
+                "ALTER INDEX idx_brin SET (autosummarize = on, autosummarize = off);",
+                "specified more than once",
+            ),
+            (
+                "ALTER INDEX idx_btree RESET (fillfactor = 70);",
+                "RESET must not include values",
+            ),
+        ] {
+            let v = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                v.iter().any(|v| v.reason.contains(message)),
+                "{sql} must be rejected: {v:?}"
             );
         }
     }
@@ -1756,6 +2825,21 @@ mod rule_evaluation_tests {
                 "{form} inside a transaction block"
             );
         }
+        assert_eq!(
+            reason("REINDEX TABLE CONCURRENTLY pg_catalog.pg_class;"),
+            "Migration chain conflict: cannot reindex system catalogs concurrently"
+        );
+        // Verified live on PostgreSQL 18.6: only a `pg_catalog` relation has no
+        // concurrent form. A user table whose name merely begins with
+        // `pg_toast_` reindexes concurrently, in any schema.
+        assert_eq!(
+            reason(
+                "CREATE TABLE public.pg_toast_archive (a int);
+                 REINDEX TABLE CONCURRENTLY public.pg_toast_archive;"
+            ),
+            "",
+            "a user table is not a TOAST table"
+        );
         assert!(
             reason("CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; REINDEX TABLE v;")
                 .contains("is not a table or materialized view"),

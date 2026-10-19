@@ -109,6 +109,9 @@ pub(crate) mod pg_typmod {
     pub(crate) const NUMERIC_SCALE: std::ops::RangeInclusive<i32> = -1_000..=1_000;
     /// PostgreSQL packs a numeric precision and scale into one integer.
     pub(crate) const NUMERIC_SHIFT: i32 = 16;
+    /// The scale occupies 11 two's-complement bits, so a negative scale is
+    /// stored as `scale & MASK` rather than by setting sign bits.
+    pub(crate) const NUMERIC_SCALE_MASK: i32 = 0x7ff;
 }
 
 /// A character length PostgreSQL has accepted. Holding the bound here is what
@@ -483,8 +486,8 @@ impl ParsedDataType {
             // `numeric(p)` is stored as `numeric(p, 0)`.
             TypeTypmod::Numeric { precision, scale } => Some(
                 ((precision.get() << pg_typmod::NUMERIC_SHIFT)
-                    | scale.map_or(0, NumericScale::get))
-                .checked_add(pg_typmod::VARHDRSZ)?,
+                    | (scale.map_or(0, NumericScale::get) & pg_typmod::NUMERIC_SCALE_MASK))
+                    .checked_add(pg_typmod::VARHDRSZ)?,
             ),
             TypeTypmod::NotApplicable | TypeTypmod::Unbounded | TypeTypmod::OutOfRange => None,
         }
@@ -816,11 +819,13 @@ mod tests {
     #[test]
     fn atttypmod_covers_numeric_as_well_as_character_lengths() {
         // Verified against PostgreSQL 18.6 `pg_attribute.atttypmod`:
-        // numeric(5,2) is 327686, numeric(7) is 458756, varchar(10) is 14,
+        // numeric(5,2) is 327686, numeric(7) is 458756, numeric(10,-3) is
+        // 657409 (the scale is masked into 11 bits), varchar(10) is 14,
         // text is -1.
         for (declaration, expected) in [
             ("numeric(5,2)", Some(327_686)),
             ("numeric(7)", Some(458_756)),
+            ("numeric(10,-3)", Some(657_409)),
             ("numeric(1000,1000)", Some(((1000_i32 << 16) | 1000) + 4)),
             ("varchar(10)", Some(14)),
             ("numeric", None),

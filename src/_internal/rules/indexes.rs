@@ -3,7 +3,7 @@ use crate::_internal::analysis::mutations::{Mutation, ReindexTargetMutation};
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
-    BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
+    BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext, TransitionRecord,
 };
 
 pub(crate) struct ConcurrentIndexRule;
@@ -23,26 +23,19 @@ impl Rule for ConcurrentIndexRule {
         BASELINE_STATS_DEPENDENCY_CAPABILITIES
     }
 
-    fn evaluates_when_unresolved(&self) -> bool {
-        // A DROP INDEX on a known target is synchronous regardless of catalog
-        // completeness, so the risk stands even when the post-state is unknown.
-        true
+    fn evaluates_when_unresolved(&self, transition: &TransitionRecord<'_>) -> bool {
+        // A DROP INDEX on a target present in the pre-state blocks writes even
+        // when catalog metadata is incomplete. Every other transition needs the
+        // post-state to size the lock, so the engine records those.
+        matches!(transition.mutation(), Mutation::DropIndex(drop)
+            if drop.ids.iter().any(|id| transition.pre_state().indexes.iter().any(|edge| edge.dependent == *id)))
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if context.result().is_unresolved() {
-            // An index that is present in the pre-state still incurs the
-            // synchronous DROP INDEX risk even when catalog metadata is too
-            // incomplete to mutate it exactly (for example, eligibility for
-            // a backing constraint is not serialized).  A truly absent,
-            // guarded drop remains a no-op and is correctly suppressed.
-            let known_drop_target = matches!(context.mutation(), Mutation::DropIndex(drop)
-                if drop.ids.iter().any(|id| context.pre_state().indexes.iter().any(|edge| edge.dependent == *id)));
-            if !known_drop_target {
-                return vec![];
-            }
+        // The statement was skipped, so no index was built or dropped.
+        if context.result().is_noop() {
+            return vec![];
         }
-
         let mut violations = Vec::new();
 
         match context.mutation() {

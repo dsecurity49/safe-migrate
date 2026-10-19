@@ -5,7 +5,7 @@
 //! and compared against what this build knows about. A grammar that grows a
 //! new list fails here by name instead of failing silently in analysis.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 /// How this build treats a production whose grammar carries a list.
 ///
@@ -44,82 +44,46 @@ const CLASSIFIED: &[(&str, Handling)] = &[
 ];
 
 /// The `squawk-syntax` version this build is locked to. The census describes
-/// the grammar that is actually compiled, not whatever else is in the
-/// registry, so the lockfile — not path ordering — is the source of truth.
+/// the grammar that this build actually compiles, so the resolved package —
+/// not a copy found on disk — is the source of truth.
 const PINNED_SQUAWK_VERSION: &str = "2.65.0";
-
-fn locked_squawk_version() -> String {
-    let lockfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
-    let contents = std::fs::read_to_string(&lockfile)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", lockfile.display()));
-    for entry in contents.split("[[package]]") {
-        let is_squawk = entry
-            .lines()
-            .any(|line| line.trim() == r#"name = "squawk-syntax""#);
-        if !is_squawk {
-            continue;
-        }
-        let version = entry.lines().find_map(|line| {
-            line.trim()
-                .strip_prefix("version = \"")?
-                .strip_suffix('"')
-                .map(str::to_owned)
-        });
-        return version.unwrap_or_else(|| panic!("squawk-syntax in Cargo.lock has no version"));
-    }
-    panic!("Cargo.lock does not pin squawk-syntax");
-}
 
 /// The pinned `squawk-syntax` grammar, whose list-bearing productions this
 /// build must classify.
 fn pinned_grammar() -> String {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+    let package = metadata["packages"]
+        .as_array()
+        .expect("metadata lists packages")
+        .iter()
+        .find(|package| package["name"] == "squawk-syntax")
+        .expect("squawk-syntax is a resolved dependency");
     assert_eq!(
-        locked_squawk_version(),
-        PINNED_SQUAWK_VERSION,
+        package["version"].as_str(),
+        Some(PINNED_SQUAWK_VERSION),
         "squawk-syntax moved. Update PINNED_SQUAWK_VERSION and re-audit every \
          production the new grammar gives a list."
     );
-    let cargo_home = std::env::var("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME must be set to locate the registry");
-            PathBuf::from(home).join(".cargo")
-        });
-    let sources = cargo_home.join("registry/src");
-    let wanted = format!("squawk-syntax-{PINNED_SQUAWK_VERSION}");
-    let mut found: Vec<PathBuf> = Vec::new();
-    for registry in std::fs::read_dir(&sources)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", sources.display()))
-    {
-        let registry = registry.expect("a readable registry entry");
-        let Ok(crates) = std::fs::read_dir(registry.path()) else {
-            continue;
-        };
-        for crate_dir in crates.flatten() {
-            if crate_dir.file_name() != std::ffi::OsStr::new(&wanted) {
-                continue;
-            }
-            let path = crate_dir.path().join("src/postgresql.ungram");
-            if path.is_file() {
-                found.push(path);
-            }
-        }
-    }
-    found.sort();
-    assert!(
-        !found.is_empty(),
-        "the pinned {wanted} grammar was not found under {}; \
-         this test must fail rather than pass unverified",
-        sources.display()
-    );
-    assert!(
-        found.len() == 1,
-        "expected exactly one unpacked {wanted}, found {}: {found:?}; a census of \
-         the wrong copy would describe a grammar this build does not compile",
-        found.len()
-    );
-    let grammar = found.remove(0);
-    std::fs::read_to_string(grammar).expect("grammar is readable")
+    let manifest = package["manifest_path"]
+        .as_str()
+        .expect("a resolved package has a manifest path");
+    let grammar = Path::new(manifest)
+        .parent()
+        .expect("a manifest path has a parent")
+        .join("src/postgresql.ungram");
+    std::fs::read_to_string(&grammar)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", grammar.display()))
 }
 
 /// Whether a production body carries a repeatable list, in either spelling:

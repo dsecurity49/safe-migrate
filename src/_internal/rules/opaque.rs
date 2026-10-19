@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
-use crate::_internal::rules::{Rule, RuleContext};
+use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
 
 pub(crate) struct OpaqueDynamicSqlRule;
 
@@ -15,7 +15,7 @@ impl Rule for OpaqueDynamicSqlRule {
         "Procedural or dynamic SQL (DO blocks, EXECUTE) obscures schema mutations. Lock analysis confidence is heavily degraded."
     }
 
-    fn evaluates_when_unresolved(&self) -> bool {
+    fn evaluates_when_unresolved(&self, _transition: &TransitionRecord<'_>) -> bool {
         // The mutation is opaque by construction; nothing later resolves it.
         true
     }

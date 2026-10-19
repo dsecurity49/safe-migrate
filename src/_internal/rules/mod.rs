@@ -34,7 +34,7 @@ pub(crate) struct TransitionRecord<'a> {
 }
 
 impl<'a> TransitionRecord<'a> {
-    fn new(
+    pub(crate) fn new(
         mutation: &'a Mutation,
         result: &'a MutationResult,
         pre_state: &'a crate::_internal::analysis::state::PreState,
@@ -46,6 +46,14 @@ impl<'a> TransitionRecord<'a> {
             pre_state,
             cascade_closure,
         }
+    }
+
+    pub(crate) fn mutation(&self) -> &'a Mutation {
+        self.mutation
+    }
+
+    pub(crate) fn pre_state(&self) -> &'a crate::_internal::analysis::state::PreState {
+        self.pre_state
     }
 }
 
@@ -240,10 +248,12 @@ pub(crate) trait Rule {
     fn recipe(&self) -> &'static str;
 
     /// Whether this rule can still state findings when the post-state is
-    /// unresolved. True only where the finding provable from the statement and
-    /// pre-state alone; the engine suppresses and records every other rule, so
-    /// this stays a single decision rather than a per-rule guard.
-    fn evaluates_when_unresolved(&self) -> bool {
+    /// unresolved. A rule opts in only for transitions it can answer from the
+    /// statement and pre-state alone. The engine records a `NotEvaluated` entry
+    /// for every transition the rule declines, so this stays the single
+    /// decision rather than a guard inside `evaluate`; `transition` omits the
+    /// post-state because the decision must not depend on it.
+    fn evaluates_when_unresolved(&self, _transition: &TransitionRecord<'_>) -> bool {
         false
     }
 

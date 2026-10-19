@@ -187,6 +187,9 @@ pub(crate) struct LocalState {
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
     pub default_search_path_template: Vec<String>,
+    /// Schemas that existed at synchronization time, before the scope filter.
+    /// Absence proves a default-template entry named no schema.
+    pub source_existing_schemas: Option<HashSet<String>>,
     pub lock_timeout: ScopedSetting<Option<u64>>,
     pub statement_timeout: ScopedSetting<Option<u64>>,
     /// Role currently active for this session context (updated by SET ROLE /
@@ -983,6 +986,10 @@ impl AnalysisState {
             .source_search_path
             .clone()
             .unwrap_or_else(|| default_search_path.clone());
+        let source_existing_schemas = baseline_available
+            .then(|| cache.metadata.source_existing_schemas.clone())
+            .flatten()
+            .map(|schemas| schemas.into_iter().collect::<HashSet<_>>());
         let current_role_known = cache.metadata.source_role.is_some();
         let current_role = cache
             .metadata
@@ -1417,6 +1424,7 @@ impl AnalysisState {
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
                 default_search_path_template,
+                source_existing_schemas,
                 lock_timeout: ScopedSetting::new(source_lock_timeout),
                 statement_timeout: ScopedSetting::new(source_statement_timeout),
                 current_role,
@@ -2376,12 +2384,12 @@ impl AnalysisState {
         }
     }
 
-    /// Whether `target` names a system catalog or a TOAST table.
+    /// Whether `target` names a relation in `pg_catalog`.
     ///
-    /// Neither has a concurrent reindex form, and the analyzer does not carry
-    /// a catalog flag, so this recognizes the naming the server uses. A name
-    /// it cannot place is not a catalog as far as this check is concerned,
-    /// which leaves the statement to the ordinary relation checks.
+    /// The server refuses a concurrent reindex only for a catalog relation
+    /// (`IsCatalogRelation` is a namespace test); a TOAST table named directly
+    /// reindexes concurrently like any other. The analyzer does not carry a
+    /// catalog flag, so this recognizes the schema the server uses.
     pub(crate) fn target_is_catalog(
         &self,
         target: &crate::_internal::analysis::mutations::ReindexTargetMutation,
@@ -2393,7 +2401,7 @@ impl AnalysisState {
             | ReindexTargetMutation::Schema(_)
             | ReindexTargetMutation::System(_) => return false,
         };
-        id.schema == "pg_catalog" || id.name.starts_with("pg_toast_")
+        id.schema == "pg_catalog"
     }
 
     pub(crate) fn index_is_present(&self, id: &ObjectId) -> bool {
@@ -3223,10 +3231,11 @@ impl AnalysisState {
     /// PostgreSQL silently ignores a path entry that does not name an existing
     /// schema, so the model drops entries it can prove absent and keeps every
     /// other one — a schema it cannot prove anything about stays as an
-    /// unresolved placeholder rather than disappearing. Nothing is tainted
-    /// here: an unresolved entry only makes an answer uncertain when a lookup
-    /// actually resolves past it (`path_shadows`), which is where the taint
-    /// belongs.
+    /// unresolved placeholder rather than disappearing. Absence is proven by
+    /// the schema overlay or, outside a synchronized scope, by the
+    /// synchronizer's namespace record. Nothing is tainted here: an unresolved
+    /// entry only makes an answer uncertain when a lookup actually resolves
+    /// past it (`path_shadows`), which is where the taint belongs.
     fn refresh_role_sensitive_search_path(&mut self) {
         let template = self.local.search_path_template.clone();
         let mut effective: Vec<SearchPathEntry> = Vec::new();
@@ -3261,7 +3270,9 @@ impl AnalysisState {
             SearchPathEntry::Schema(schema)
         } else if self.schema_is_present(&schema) {
             SearchPathEntry::Schema(schema)
-        } else if self.schema_absence_is_authoritative(&schema) {
+        } else if self.schema_absence_is_authoritative(&schema)
+            || self.schema_did_not_exist_at_sync(&schema)
+        {
             return;
         } else {
             SearchPathEntry::Unresolved(Some(schema))
@@ -3269,6 +3280,15 @@ impl AnalysisState {
         if !effective.contains(&entry) {
             effective.push(entry);
         }
+    }
+
+    /// A default-template entry the record omits named no schema at sync
+    /// time, so it is provably absent even outside the synchronized scope.
+    fn schema_did_not_exist_at_sync(&self, name: &str) -> bool {
+        self.local
+            .source_existing_schemas
+            .as_ref()
+            .is_some_and(|schemas| !schemas.contains(name))
     }
 
     fn remap_schema_id(id: &mut ObjectId, old_name: &str, new_name: &str) {
@@ -3625,9 +3645,11 @@ impl AnalysisState {
                 default,
             } => self.apply_set_column_default(id, column, default.as_ref()),
             Mutation::NoStateChange { .. } => MutationResult::Applied,
-            Mutation::ResetReloptions { id, kind, names } => {
-                self.apply_reset_reloptions(id, *kind, names)
-            }
+            Mutation::ResetReloptions {
+                id,
+                kind,
+                attributes,
+            } => self.apply_reset_reloptions(id, *kind, attributes),
             Mutation::SearchPath(search_path) => self.apply_search_path(search_path),
             Mutation::TimeoutSetting(timeout) => self.apply_timeout_setting(timeout),
             Mutation::ResetSettings(target) => self.apply_reset_settings(target),

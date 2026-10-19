@@ -406,14 +406,16 @@ impl DependencyGraph {
         index: &ObjectId,
         apply: impl FnOnce(&mut crate::_internal::model::index::IndexDefinition),
     ) {
-        for edge in &mut self.edges {
-            if edge.dependent == *index
-                && let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind
-            {
-                apply(definition);
-                return;
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                if edge.dependent == *index
+                    && let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind
+                {
+                    apply(definition);
+                    return;
+                }
             }
-        }
+        });
     }
 
     pub(crate) fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
@@ -535,6 +537,15 @@ impl DependencyGraph {
                     remap(&mut edge.referenced);
                     remap(trigger_id);
                     remap(function_id);
+                }
+                // The written name is schema-qualified too, so a rename that
+                // leaves it stale makes a later drop miss this view.
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: Some(name),
+                } => {
+                    remap(&mut edge.dependent);
+                    remap(&mut edge.referenced);
+                    remap(name);
                 }
                 _ => {
                     remap(&mut edge.dependent);
@@ -985,6 +996,66 @@ mod tests {
                 referenced_column: None,
             },
         )
+    }
+
+    #[test]
+    fn a_definition_update_keeps_the_edge_set_in_step() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(relation_edge(
+            "index",
+            "table",
+            DependencyKind::IndexOnRelation {
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: false,
+                    ready: false,
+                    live: true,
+                },
+                dependency_columns: Vec::new(),
+                dependency_columns_known: true,
+                is_concurrent: false,
+                is_immediate: true,
+                eligibility_known: true,
+            },
+        ));
+        graph.update_index_definition(&id("index"), |definition| {
+            definition.valid = true;
+            definition.ready = true;
+        });
+
+        // The updated edge is the one now in the graph, so re-adding it must be
+        // rejected as a duplicate rather than inserted beside itself.
+        let updated = graph.edges()[0].clone();
+        graph.add_edge(updated);
+        assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn a_schema_rename_remaps_a_name_only_view_routine_reference() {
+        let mut graph = DependencyGraph::new();
+        let written = ObjectId::new("s", "f");
+        graph.add_edge(DependencyEdge::new(
+            ObjectId::new("s", "v"),
+            written.clone(),
+            DependencyKind::ViewUsesRoutine {
+                unresolved_name: Some(written.clone()),
+            },
+        ));
+
+        graph.remap_schema_namespace("s", "t");
+
+        // A later `DROP FUNCTION t.f(...)` must find the view the rename moved.
+        let renamed = ObjectId::new("t", "f");
+        assert_eq!(graph.views_for_function(&renamed).len(), 1);
+        assert!(graph.has_view_reference_to_name(&renamed));
+        assert!(!graph.has_view_reference_to_name(&written));
     }
 
     #[test]

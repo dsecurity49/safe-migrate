@@ -27,6 +27,24 @@ type DropTarget = (
     Vec<(ObjectId, Option<ObjectId>)>,
 );
 
+/// The `RETURNS` clause a routine's declaration spells.
+#[derive(Clone, Debug)]
+enum DeclaredReturn {
+    Record,
+    Scalar(String),
+    Table,
+    None,
+}
+
+/// `pg_proc`'s view of a routine's result: `prorettype`, plus the descriptor
+/// the output parameters define when that type is the anonymous `record`.
+#[derive(Debug, PartialEq, Eq)]
+enum RoutineResult {
+    Void,
+    Scalar(String),
+    Record(Vec<(Option<String>, String)>),
+}
+
 /// The identity constraints `CREATE OR REPLACE` places on an existing routine.
 ///
 /// PostgreSQL keeps the routine's identity and lets only the body change. The
@@ -68,30 +86,94 @@ impl AnalysisState {
         }
     }
 
-    /// The routine's return type as `FunctionState` spells it.
+    /// The return type as `FunctionState` spells it: a scalar type, or the
+    /// `TABLE(...)` form `pg_get_function_result` renders.
     fn render_routine_return_type(return_type: Option<&RetTypeFact>) -> String {
         return_type
             .map(|return_type| match return_type {
                 RetTypeFact::Scalar { ty, .. } => ty.clone(),
-                RetTypeFact::Table(columns) => columns
-                    .iter()
-                    .map(|column| {
-                        format!(
-                            "{} {}",
-                            column.name,
-                            column.ty.as_deref().unwrap_or("unknown")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                RetTypeFact::Table(columns) => format!(
+                    "TABLE({})",
+                    columns
+                        .iter()
+                        .map(|column| {
+                            format!(
+                                "{} {}",
+                                column.name,
+                                column.ty.as_deref().unwrap_or("unknown")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             })
             .unwrap_or_default()
     }
 
     /// Whether a declaration returns a set, which PostgreSQL records in
-    /// `pg_proc.proretset`.
+    /// `pg_proc.proretset`; `RETURNS TABLE` is set-returning.
     fn routine_declares_setof(return_type: Option<&RetTypeFact>) -> bool {
-        matches!(return_type, Some(RetTypeFact::Scalar { setof: true, .. }))
+        matches!(
+            return_type,
+            Some(RetTypeFact::Scalar { setof: true, .. } | RetTypeFact::Table(_))
+        )
+    }
+
+    /// What PostgreSQL derives from the declaration and its parameters: two or
+    /// more output parameters make an anonymous `record`, exactly one makes
+    /// that parameter's type, and none leaves the `RETURNS` clause in charge.
+    /// A procedure has no clause, so its output parameters alone decide.
+    fn routine_result(
+        kind: RoutineKind,
+        parameters: &[crate::_internal::model::function::RoutineParameter],
+        declared: DeclaredReturn,
+    ) -> RoutineResult {
+        let outputs = || {
+            parameters
+                .iter()
+                .filter(|parameter| parameter.mode.is_output())
+                .map(|parameter| (parameter.name.clone(), parameter.ty.clone()))
+                .collect::<Vec<_>>()
+        };
+        if kind == RoutineKind::Procedure {
+            return if parameters
+                .iter()
+                .any(|parameter| parameter.mode.is_output())
+            {
+                RoutineResult::Record(outputs())
+            } else {
+                RoutineResult::Void
+            };
+        }
+        let outputs = outputs();
+        match outputs.len() {
+            0 => match declared {
+                DeclaredReturn::Record | DeclaredReturn::Table => RoutineResult::Record(Vec::new()),
+                DeclaredReturn::Scalar(ty) => RoutineResult::Scalar(ty),
+                DeclaredReturn::None => RoutineResult::Void,
+            },
+            1 if matches!(declared, DeclaredReturn::Record) => RoutineResult::Record(outputs),
+            1 => RoutineResult::Scalar(outputs[0].1.clone()),
+            _ => RoutineResult::Record(outputs),
+        }
+    }
+
+    /// Spell every type a result names the way the catalog does, so `int` and
+    /// `integer` compare equal.
+    fn canonicalize_result(
+        result: RoutineResult,
+        canonical: &impl Fn(&str) -> String,
+    ) -> RoutineResult {
+        match result {
+            RoutineResult::Void => RoutineResult::Void,
+            RoutineResult::Scalar(ty) => RoutineResult::Scalar(canonical(&ty)),
+            RoutineResult::Record(columns) => RoutineResult::Record(
+                columns
+                    .into_iter()
+                    .map(|(name, ty)| (name, canonical(&ty)))
+                    .collect(),
+            ),
+        }
     }
 
     /// The declared parameters as `pg_proc` records them: `OUT` parameters and
@@ -174,25 +256,7 @@ impl AnalysisState {
             id
         );
         let declaration = Self::routine_parameters(params, return_type);
-        let declares_outputs = declaration
-            .iter()
-            .any(|parameter| parameter.mode.is_output());
 
-        // The return type and the `SETOF` flag are separate catalog columns,
-        // and either may not change. A procedure has no user-visible return
-        // type: PostgreSQL stores `void` unless it declares output parameters.
-        let (rendered_return_type, returns_set) = if existing.routine_kind == RoutineKind::Procedure
-        {
-            (
-                if declares_outputs { "record" } else { "void" }.to_string(),
-                false,
-            )
-        } else {
-            (
-                Self::render_routine_return_type(return_type),
-                Self::routine_declares_setof(return_type),
-            )
-        };
         // A migration may spell a type the way the user wrote it while the
         // catalog reports `format_type`'s spelling, so both sides are reduced
         // through the built-in catalogue before they are compared.
@@ -203,34 +267,60 @@ impl AnalysisState {
             )
             .render()
         };
-        if canonical(&rendered_return_type) != canonical(&existing.return_type)
-            || returns_set != existing.returns_set
-        {
-            let message = if existing.routine_kind == RoutineKind::Procedure {
-                // PostgreSQL reports the change as one of output parameters.
-                "cannot change whether a procedure has output parameters".to_string()
-            } else {
-                "cannot change return type of existing function".to_string()
-            };
-            return Err(MutationResult::conflict(format!("{message}; {hint}")));
-        }
-
-        // A `RETURNS record` routine's row descriptor is its OUT parameters,
-        // so the descriptor itself is part of what cannot change.
-        if existing.return_type == "record" {
-            let outputs = |parameters: &[crate::_internal::model::function::RoutineParameter]| {
-                parameters
-                    .iter()
-                    .filter(|parameter| parameter.mode.is_output())
-                    .map(|parameter| (parameter.name.clone(), parameter.ty.clone()))
-                    .collect::<Vec<_>>()
-            };
-            if outputs(&existing.parameters) != outputs(&declaration) {
-                return Err(MutationResult::conflict(format!(
-                    "cannot change return type of existing function; \
-                     row type defined by OUT parameters is different; {hint}"
-                )));
+        let declared = match return_type {
+            Some(RetTypeFact::Table(_)) => DeclaredReturn::Table,
+            Some(RetTypeFact::Scalar { ty, .. }) if canonical(ty) == "record" => {
+                DeclaredReturn::Record
             }
+            Some(RetTypeFact::Scalar { ty, .. }) => DeclaredReturn::Scalar(ty.clone()),
+            None => DeclaredReturn::None,
+        };
+        let existing_declared = if existing.return_type.is_empty() {
+            DeclaredReturn::None
+        } else if existing.return_type.starts_with("TABLE(") {
+            DeclaredReturn::Table
+        } else if existing.return_type == "record" {
+            DeclaredReturn::Record
+        } else {
+            DeclaredReturn::Scalar(existing.return_type.clone())
+        };
+        let new_result = Self::canonicalize_result(
+            Self::routine_result(existing.routine_kind, &declaration, declared),
+            &canonical,
+        );
+        let existing_result = Self::canonicalize_result(
+            Self::routine_result(
+                existing.routine_kind,
+                &existing.parameters,
+                existing_declared,
+            ),
+            &canonical,
+        );
+
+        // PostgreSQL reports a changed `prorettype`/`proretset` and a changed
+        // output-parameter descriptor as different refusals.
+        let category_message = if existing.routine_kind == RoutineKind::Procedure {
+            "cannot change whether a procedure has output parameters"
+        } else {
+            "cannot change return type of existing function"
+        };
+        let refusal = match (&new_result, &existing_result) {
+            _ if Self::routine_declares_setof(return_type) != existing.returns_set => {
+                Some(category_message.to_string())
+            }
+            (RoutineResult::Record(new_columns), RoutineResult::Record(old_columns)) => {
+                (new_columns != old_columns).then(|| {
+                    "cannot change return type of existing function; \
+                     row type defined by OUT parameters is different"
+                        .to_string()
+                })
+            }
+            (new_result, existing_result) => {
+                (new_result != existing_result).then(|| category_message.to_string())
+            }
+        };
+        if let Some(message) = refusal {
+            return Err(MutationResult::conflict(format!("{message}; {hint}")));
         }
 
         // A parameter that already carries a name keeps it; PostgreSQL allows a
@@ -609,20 +699,20 @@ impl AnalysisState {
                         .collect();
                     if !dependent_views.is_empty() && !function.cascade {
                         // A reference that never resolved names the routine
-                        // only; only when another overload share the name is
+                        // only; only when another overload shares the name is
                         // it undecidable which one the view calls.
-                        let ambiguous = dependent_views.iter().any(|(_, unresolved_name)| {
+                        let definite = dependent_views.iter().find(|(_, unresolved_name)| {
                             unresolved_name
                                 .as_ref()
-                                .is_some_and(|name| self.routine_overloads_under(name).count() > 1)
+                                .is_none_or(|name| self.routine_overloads_under(name).count() <= 1)
                         });
-                        if ambiguous {
-                            return self.unresolved(EvidenceCode::UnresolvedReference);
+                        if let Some((view, _)) = definite {
+                            return MutationResult::conflict(format!(
+                                "function '{}' is required by view '{}'; use CASCADE",
+                                id, view
+                            ));
                         }
-                        return MutationResult::conflict(format!(
-                            "function '{}' is required by view '{}'; use CASCADE",
-                            id, dependent_views[0].0
-                        ));
+                        return self.unresolved(EvidenceCode::UnresolvedReference);
                     }
                     if !targets.iter().any(|(existing, _, _)| existing == &id) {
                         targets.push((id, dependent_triggers, dependent_views));
@@ -935,10 +1025,10 @@ impl AnalysisState {
     /// signature. A routine signature is `<name>(<types>)`, so the bare name
     /// is what precedes the first parenthesis.
     fn routine_named(&self, name: &str) -> bool {
-        self.local
-            .functions
-            .keys()
-            .any(|id| id.name.split('(').next().is_some_and(|bare| bare == name))
+        self.local.functions.iter().any(|(id, overlay)| {
+            matches!(overlay, FunctionOverlay::Present(_))
+                && id.name.split('(').next().is_some_and(|bare| bare == name)
+        })
     }
 
     /// Refuse a `CREATE AGGREGATE` attribute whose name resolves to nothing in
@@ -1269,18 +1359,18 @@ impl AnalysisState {
             })
             .collect();
         if !dependent_views.is_empty() && !aggregate.cascade {
-            let ambiguous = dependent_views.iter().any(|(_, unresolved_name)| {
+            let definite = dependent_views.iter().find(|(_, unresolved_name)| {
                 unresolved_name
                     .as_ref()
-                    .is_some_and(|name| self.routine_overloads_under(name).count() > 1)
+                    .is_none_or(|name| self.routine_overloads_under(name).count() <= 1)
             });
-            if ambiguous {
-                return self.unresolved(EvidenceCode::UnresolvedReference);
+            if let Some((view, _)) = definite {
+                return MutationResult::conflict(format!(
+                    "aggregate '{}' is required by view '{}'; use CASCADE",
+                    targets[0], view
+                ));
             }
-            return MutationResult::conflict(format!(
-                "aggregate '{}' is required by view '{}'; use CASCADE",
-                targets[0], dependent_views[0].0
-            ));
+            return self.unresolved(EvidenceCode::UnresolvedReference);
         }
         let dropped_ids: HashSet<&ObjectId> = targets.iter().collect();
         let mut surviving_reference = false;

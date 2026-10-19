@@ -11,8 +11,12 @@ use crate::_internal::analysis::mutations::{
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
 use crate::_internal::model::index::{IndexDefinition, index_keys};
-use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
-use crate::_internal::model::reloption::{ReloptionOutcome, evaluate, spec_by_name};
+use crate::_internal::model::relation::{
+    Persistence, RelationKind, RelationState, ViewUpdatability,
+};
+use crate::_internal::model::reloption::{
+    IndexMethod, ReloptionNamespace, ReloptionOutcome, ToastOptions, evaluate, is_known_option_name,
+};
 use std::collections::{BTreeSet, HashSet};
 
 type RelationLookup = ObjectLookup;
@@ -57,7 +61,16 @@ impl AnalysisState {
         kind: ReloptionTarget,
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> MutationResult {
-        if let Err(result) = self.validate_reloptions(attributes, kind) {
+        if let Err(result) =
+            self.validate_reloptions(attributes, kind, self.relation_toast_options(id, kind))
+        {
+            return result;
+        }
+
+        if matches!(kind, ReloptionTarget::View)
+            && Self::has_check_option(attributes)
+            && let Err(result) = self.validate_check_option(self.stored_view_updatability(id))
+        {
             return result;
         }
 
@@ -72,10 +85,202 @@ impl AnalysisState {
             for attribute in attributes {
                 relation
                     .table_options
-                    .insert(attribute.name.clone(), attribute.value.clone());
+                    .insert(attribute.key(), attribute.value.clone());
             }
         }
         MutationResult::Applied
+    }
+
+    /// Whether `toast.` options on this relation are checked, ignored, or
+    /// cannot be placed. A view has no storage and a partitioned table never
+    /// has a TOAST table, so PostgreSQL drops them on both; a table's TOAST
+    /// table presence is what decides.
+    fn relation_toast_options(&self, id: &ObjectId, kind: ReloptionTarget) -> ToastOptions {
+        match kind {
+            ReloptionTarget::View
+            | ReloptionTarget::PartitionedTable
+            | ReloptionTarget::Column
+            | ReloptionTarget::Index(_) => ToastOptions::Ignored,
+            ReloptionTarget::Table | ReloptionTarget::MaterializedView => {
+                match self.local.relations.get(id) {
+                    Some(RelationOverlay::Present(relation)) => match relation.has_toast_table {
+                        Some(true) => ToastOptions::Validated,
+                        Some(false) => ToastOptions::Ignored,
+                        None => ToastOptions::Unknown,
+                    },
+                    _ => ToastOptions::Unknown,
+                }
+            }
+        }
+    }
+
+    /// The option set `ALTER TABLE ... SET/RESET (...)` targets, or `None` when
+    /// PostgreSQL refuses the action on this relation kind, as it does for a
+    /// foreign table.
+    fn alter_table_reloption_target(relation: &RelationState) -> Option<ReloptionTarget> {
+        Some(match relation.kind {
+            RelationKind::View => ReloptionTarget::View,
+            RelationKind::MaterializedView => ReloptionTarget::MaterializedView,
+            RelationKind::Table if relation.partition_type.is_some() => {
+                ReloptionTarget::PartitionedTable
+            }
+            RelationKind::Table => ReloptionTarget::Table,
+            RelationKind::ForeignTable => return None,
+        })
+    }
+
+    /// Validate `ALTER TABLE ... SET (...)` against the target's catalogue kind,
+    /// which is what selects the option parser PostgreSQL runs.
+    pub(super) fn validate_alter_table_set_options(
+        &mut self,
+        id: &ObjectId,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Result<(), MutationResult> {
+        let (target, updatability) = {
+            let Some(RelationOverlay::Present(relation)) = self.local.relations.get(id) else {
+                return Ok(());
+            };
+            let Some(target) = Self::alter_table_reloption_target(relation) else {
+                return Err(MutationResult::conflict(format!(
+                    "ALTER action SET cannot be performed on relation \"{id}\""
+                )));
+            };
+            (target, relation.view_updatability)
+        };
+        let toast = self.relation_toast_options(id, target);
+        self.validate_reloptions(attributes, target, toast)?;
+        if matches!(target, ReloptionTarget::View) && Self::has_check_option(attributes) {
+            self.validate_check_option(updatability)?;
+        }
+        Ok(())
+    }
+
+    /// The stored verdict for a relation the analyzer may not have modeled;
+    /// an absent or non-view relation is unknown rather than updatable.
+    fn stored_view_updatability(&self, id: &ObjectId) -> ViewUpdatability {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) => relation.view_updatability,
+            _ => ViewUpdatability::Unknown,
+        }
+    }
+
+    fn has_check_option(attributes: &[crate::_internal::analysis::facts::AttributeFact]) -> bool {
+        attributes
+            .iter()
+            .any(|attribute| attribute.namespace.is_none() && attribute.name == "check_option")
+    }
+
+    /// PostgreSQL refuses `check_option` unless the view query is
+    /// automatically updatable, reporting the query's fault as a hint. An
+    /// unknown verdict only taints, so a view the analyzer did not define never
+    /// becomes a false conflict.
+    fn validate_check_option(
+        &mut self,
+        updatability: ViewUpdatability,
+    ) -> Result<(), MutationResult> {
+        match updatability {
+            ViewUpdatability::Updatable => Ok(()),
+            ViewUpdatability::NotUpdatable(reason) => Err(MutationResult::conflict(format!(
+                "WITH CHECK OPTION is supported only on automatically updatable views; {}",
+                reason.hint()
+            ))),
+            ViewUpdatability::Unknown => {
+                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                Ok(())
+            }
+        }
+    }
+
+    fn view_updatability_state(
+        fact: crate::_internal::analysis::facts::ViewUpdatabilityFact,
+    ) -> ViewUpdatability {
+        use crate::_internal::analysis::facts::ViewUpdatabilityFact;
+        match fact {
+            ViewUpdatabilityFact::Updatable => ViewUpdatability::Updatable,
+            ViewUpdatabilityFact::NotUpdatable(reason) => ViewUpdatability::NotUpdatable(reason),
+            ViewUpdatabilityFact::Unknown => ViewUpdatability::Unknown,
+        }
+    }
+
+    /// `ALTER TABLE ... RESET (...)` checks no name, but PostgreSQL still
+    /// refuses the action on a relation kind that cannot take options and
+    /// refuses any option that carries a value.
+    pub(super) fn validate_alter_table_reset_options(
+        &self,
+        id: &ObjectId,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Result<(), MutationResult> {
+        if let Some(RelationOverlay::Present(relation)) = self.local.relations.get(id)
+            && Self::alter_table_reloption_target(relation).is_none()
+        {
+            return Err(MutationResult::conflict(format!(
+                "ALTER action RESET cannot be performed on relation \"{id}\""
+            )));
+        }
+        Self::reset_reloption_names(attributes).map(|_| ())
+    }
+
+    /// Validate `ALTER COLUMN ... SET (options)`. Column options accept no
+    /// namespace at all: the attribute parser has no `toast` set to route to.
+    pub(super) fn validate_column_options(
+        &mut self,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Result<(), MutationResult> {
+        for attribute in attributes {
+            if let Some(namespace) = attribute.namespace.as_deref() {
+                return Err(MutationResult::conflict(format!(
+                    "unrecognized parameter namespace \"{namespace}\""
+                )));
+            }
+        }
+        self.validate_option_set(
+            attributes.iter(),
+            ReloptionNamespace::Main,
+            ReloptionTarget::Column,
+        )
+    }
+
+    /// `ALTER COLUMN ... RESET (...)` checks no name, but it still refuses a
+    /// value on an option.
+    pub(super) fn validate_column_reset_options(
+        &self,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Result<(), MutationResult> {
+        Self::reset_reloption_names(attributes).map(|_| ())
+    }
+
+    /// Validate `ALTER INDEX ... SET (options)`. The access method selects the
+    /// option table; a method the analyzer does not model can take any name, so
+    /// it taints rather than guessing.
+    pub(super) fn validate_index_set_options(
+        &mut self,
+        id: &ObjectId,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Result<(), MutationResult> {
+        // The namespace is checked before the method's parser runs, except that
+        // `toast` is valid everywhere and dropped on an index.
+        for attribute in attributes {
+            if let Some(namespace) = attribute.namespace.as_deref()
+                && namespace != "toast"
+            {
+                return Err(MutationResult::conflict(format!(
+                    "unrecognized parameter namespace \"{namespace}\""
+                )));
+            }
+        }
+        let method = self
+            .index_definition_of(id)
+            .and_then(|definition| definition.method.as_deref())
+            .and_then(IndexMethod::from_name);
+        let Some(method) = method else {
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+            return Ok(());
+        };
+        self.validate_reloptions(
+            attributes,
+            ReloptionTarget::Index(method),
+            ToastOptions::Ignored,
+        )
     }
 
     /// Validate a `WITH (...)` option list the way PostgreSQL does for `SET`
@@ -87,20 +292,86 @@ impl AnalysisState {
         &mut self,
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
         kind: ReloptionTarget,
+        toast: ToastOptions,
+    ) -> Result<(), MutationResult> {
+        // The namespace of every option is checked before any set is parsed.
+        for attribute in attributes {
+            if let Some(namespace) = attribute.namespace.as_deref()
+                && namespace != "toast"
+            {
+                return Err(MutationResult::conflict(format!(
+                    "unrecognized parameter namespace \"{namespace}\""
+                )));
+            }
+        }
+
+        // A partitioned table rejects any storage parameter outright, whatever
+        // its name, so it is judged before the names are.
+        if kind.rejects_storage_parameters() {
+            if attributes
+                .iter()
+                .any(|attribute| attribute.namespace.is_none())
+            {
+                return Err(MutationResult::conflict(
+                    "cannot specify storage parameters for a partitioned table".to_string(),
+                ));
+            }
+        } else {
+            self.validate_option_set(
+                attributes
+                    .iter()
+                    .filter(|attribute| attribute.namespace.is_none()),
+                ReloptionNamespace::Main,
+                kind,
+            )?;
+        }
+
+        // `toast.` options are only parsed when the relation has a TOAST table.
+        if toast != ToastOptions::Ignored {
+            self.validate_option_set(
+                attributes
+                    .iter()
+                    .filter(|attribute| attribute.namespace.as_deref() == Some("toast")),
+                ReloptionNamespace::Toast(toast),
+                kind,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Validate one namespace's options the way PostgreSQL parses a single
+    /// option array. A `toast.` set whose TOAST table the analyzer cannot see
+    /// may or may not be parsed, so its faults are uncertain rather than wrong.
+    fn validate_option_set<'a>(
+        &mut self,
+        options: impl Iterator<Item = &'a crate::_internal::analysis::facts::AttributeFact>,
+        namespace: ReloptionNamespace,
+        kind: ReloptionTarget,
     ) -> Result<(), MutationResult> {
         let version = self.pg_version();
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for attribute in attributes {
+        let uncertain = matches!(namespace, ReloptionNamespace::Toast(ToastOptions::Unknown));
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for attribute in options {
             // PostgreSQL rejects a repeated option before applying anything.
-            if !seen.insert(attribute.name.as_str()) {
+            if !seen.insert(attribute.key()) {
+                if uncertain {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                    continue;
+                }
                 return Err(MutationResult::conflict(format!(
                     "parameter \"{}\" specified more than once",
                     attribute.name
                 )));
             }
-            match evaluate(&attribute.name, Some(&attribute.value), kind, version) {
+            match evaluate(
+                &attribute.name,
+                namespace,
+                Some(&attribute.value),
+                kind,
+                version,
+            ) {
                 ReloptionOutcome::Unrecognized { name } => {
-                    if spec_by_name(&name).is_some() {
+                    if is_known_option_name(&name) {
                         return Err(MutationResult::conflict(format!(
                             "unrecognized parameter \"{name}\""
                         )));
@@ -153,8 +424,12 @@ impl AnalysisState {
         &mut self,
         id: &ObjectId,
         _kind: ReloptionTarget,
-        names: &[String],
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> MutationResult {
+        let names = match Self::reset_reloption_names(attributes) {
+            Ok(names) => names,
+            Err(result) => return result,
+        };
         if !matches!(
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
@@ -164,10 +439,25 @@ impl AnalysisState {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
             for name in names {
-                relation.table_options.remove(name);
+                relation.table_options.remove(&name);
             }
         }
         MutationResult::Applied
+    }
+
+    /// The keys a `RESET (...)` drops. A value on any option is an error the
+    /// server raises before it changes anything.
+    pub(super) fn reset_reloption_names(
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Result<Vec<String>, MutationResult> {
+        for attribute in attributes {
+            if !attribute.value.is_empty() {
+                return Err(MutationResult::conflict(
+                    "RESET must not include values for parameters".to_string(),
+                ));
+            }
+        }
+        Ok(attributes.iter().map(|attribute| attribute.key()).collect())
     }
 
     fn validate_view_dependencies(
@@ -373,6 +663,14 @@ impl AnalysisState {
         if let Err(result) = self.validate_view_dependencies(&create.id, &create.depends_on) {
             return result;
         }
+        // `WITH [LOCAL] CHECK OPTION` is a `check_option` option and is checked
+        // before the column list, as `DefineView` does.
+        if Self::has_check_option(&create.options)
+            && let Err(result) =
+                self.validate_check_option(Self::view_updatability_state(create.updatability))
+        {
+            return result;
+        }
         let columns = match self.name_view_columns(
             &create.id,
             &create.columns,
@@ -383,6 +681,13 @@ impl AnalysisState {
             Ok(columns) => columns,
             Err(result) => return result,
         };
+        if let Err(result) = self.validate_reloptions(
+            &create.options,
+            ReloptionTarget::View,
+            ToastOptions::Ignored,
+        ) {
+            return result;
+        }
         let owner = self
             .local
             .relations
@@ -419,6 +724,7 @@ impl AnalysisState {
         relation.generation = generation;
         relation.kind = RelationKind::View;
         relation.persistence = Persistence::Permanent;
+        relation.columns_complete = create.projection_complete;
         if !create.projection_complete {
             // A view whose output list could not be derived still exists, but
             // its columns are unknown, so any column-level claim is unsound.
@@ -430,6 +736,15 @@ impl AnalysisState {
             relation.columns = view_state_columns(&columns);
         } else {
             relation.columns = view_state_columns(&columns);
+        }
+        // `CREATE OR REPLACE VIEW` replaces the option list outright, even with
+        // an empty one; a fresh view starts from the options it was given.
+        relation.view_updatability = Self::view_updatability_state(create.updatability);
+        relation.table_options.clear();
+        for option in &create.options {
+            relation
+                .table_options
+                .insert(option.key(), option.value.clone());
         }
         self.local
             .relations
@@ -477,9 +792,11 @@ impl AnalysisState {
         if let Err(result) = self.validate_view_dependencies(&create.id, &create.depends_on) {
             return result;
         }
-        if let Err(result) =
-            self.validate_reloptions(&create.options, ReloptionTarget::MaterializedView)
-        {
+        if let Err(result) = self.validate_reloptions(
+            &create.options,
+            ReloptionTarget::MaterializedView,
+            ToastOptions::Validated,
+        ) {
             return result;
         }
         let columns = match self.name_view_columns(
@@ -511,11 +828,12 @@ impl AnalysisState {
         for option in &create.options {
             relation
                 .table_options
-                .insert(option.name.clone(), option.value.clone());
+                .insert(option.key(), option.value.clone());
         }
         if !create.projection_complete {
             // A view whose output list could not be derived still exists, but
             // its columns are unknown, so any column-level claim is unsound.
+            relation.columns_complete = false;
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
         } else {
             relation.columns = view_state_columns(&columns);
@@ -764,13 +1082,12 @@ impl AnalysisState {
         ) {
             return result;
         }
-        // Every named key and INCLUDE column must exist on the relation.
-        // PostgreSQL looks each one up by name and rejects an unknown column
-        // before building anything. An expression key is typed rather than
-        // looked up, so only the named columns are checked here.
+        // PostgreSQL looks every named key and INCLUDE column up by name and
+        // rejects an unknown one. An expression key is typed, not looked up,
+        // and an incomplete column list cannot prove absence.
         let target_columns: Option<std::collections::HashSet<String>> =
             match self.local.relations.get(&create.table) {
-                Some(RelationOverlay::Present(relation)) => Some(
+                Some(RelationOverlay::Present(relation)) if relation.columns_complete => Some(
                     relation
                         .columns
                         .iter()
@@ -1072,22 +1389,35 @@ impl AnalysisState {
         }
         // An attached child index cannot be dropped on its own. PostgreSQL
         // refuses unconditionally here: CASCADE does not help and IF EXISTS
-        // does not downgrade it.
+        // does not downgrade it. A statement that drops the parent too is
+        // exempt, because PostgreSQL applies a statement's targets as a batch.
         for target in &targets {
-            if let Some(parent) = self.index_parent_of(target) {
+            if let Some(parent) = self.index_parent_of(target)
+                && !targets.iter().any(|other| {
+                    self.local.graph.resolve_rename(other)
+                        == self.local.graph.resolve_rename(parent)
+                })
+            {
                 return MutationResult::conflict(format!(
                     "cannot drop index '{}' because index '{}' requires it",
                     target.name, parent.name
                 ));
             }
         }
-        // An attached partition index goes with its parent.
-        let attached_children: Vec<ObjectId> = targets
-            .iter()
-            .flat_map(|target| self.index_partitions_of(target))
-            .collect();
+        // An attached partition index goes with its parent, and an intermediate
+        // partitioned index carries its own attached children.
+        let mut attached_children: Vec<ObjectId> = Vec::new();
+        let mut frontier: Vec<ObjectId> = targets.clone();
+        while let Some(parent) = frontier.pop() {
+            for child in self.index_partitions_of(&parent) {
+                if !attached_children.contains(&child) {
+                    frontier.push(child.clone());
+                    attached_children.push(child);
+                }
+            }
+        }
         let mut removed = targets.clone();
-        removed.extend(attached_children.iter().cloned());
+        removed.extend(attached_children);
         let table_indexes = self
             .local
             .graph

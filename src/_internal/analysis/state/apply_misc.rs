@@ -273,11 +273,20 @@ impl AnalysisState {
                         return result;
                     }
                 }
-                // Tablespace, storage options and reloptions are physical or
-                // advisory metadata not tracked in the schema model.
-                AlterIndexActionMutation::SetTablespace { .. }
-                | AlterIndexActionMutation::SetOptions { .. }
-                | AlterIndexActionMutation::ResetOptions { .. } => {}
+                // Tablespace and reloptions are physical or advisory metadata
+                // not tracked in the schema model, but SET options are still
+                // validated against the access method's option table.
+                AlterIndexActionMutation::SetTablespace { .. } => {}
+                AlterIndexActionMutation::SetOptions { options } => {
+                    if let Err(result) = self.validate_index_set_options(&alter.index_id, options) {
+                        return result;
+                    }
+                }
+                AlterIndexActionMutation::ResetOptions { options } => {
+                    if let Err(result) = Self::reset_reloption_names(options) {
+                        return result;
+                    }
+                }
                 AlterIndexActionMutation::SetStatistics { column, target } => {
                     let result =
                         self.apply_alter_index_set_statistics(&alter.index_id, column, target);

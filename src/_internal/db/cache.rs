@@ -429,6 +429,10 @@ pub(crate) struct CacheMetadata {
     pub source_session_role: Option<String>,
     /// Parsed `search_path` setting before PostgreSQL expands `$user`.
     pub source_search_path: Option<Vec<String>>,
+    /// Every schema that existed at sync time, before the scope filter. A
+    /// default search-path entry absent here named no schema then, which
+    /// PostgreSQL skips rather than resolving.
+    pub source_existing_schemas: Option<Vec<String>>,
     /// Effective `lock_timeout` observed on the fresh synchronization
     /// connection, normalized to milliseconds. PostgreSQL uses zero to mean
     /// that the timeout is disabled.
@@ -745,6 +749,14 @@ impl DbCache {
         {
             return Err(
                 "cache metadata source search path contains an empty schema identity".to_string(),
+            );
+        }
+        if let Some(existing) = &self.metadata.source_existing_schemas
+            && existing.iter().any(String::is_empty)
+        {
+            return Err(
+                "cache metadata source existing schemas contain an empty schema identity"
+                    .to_string(),
             );
         }
         let mut search_path = HashSet::new();
@@ -3054,6 +3066,11 @@ mod tests {
         cache.metadata.source_search_path = Some(vec![String::new()]);
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("source search path contains an empty"));
+
+        let mut cache = synced_cache();
+        cache.metadata.source_existing_schemas = Some(vec![String::new()]);
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("source existing schemas contain an empty"));
     }
 
     #[test]
