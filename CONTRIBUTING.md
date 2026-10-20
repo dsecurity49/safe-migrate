@@ -148,7 +148,7 @@ Use the pinned Squawk source and grammar when changing AST extraction:
 
 1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
 2. inspect the resolved dependency source and grammar;
-3. add an exact fact assertion in `src/_internal/ast/visitor_tests.rs`;
+3. add an exact fact assertion in the matching `src/_internal/ast/visitor_tests/*.rs` module;
 4. implement extraction in `src/_internal/ast/visitor.rs` or expression
    conversion in `src/_internal/analysis/expr_visitor.rs`;
 5. test resolver, state, and rule effects when behavior crosses layers;

@@ -37,7 +37,7 @@ mod live_auto_sync;
 mod live_cache_encryption;
 #[path = "../tests/live_catalog_sync.rs"]
 mod live_catalog_sync;
-#[path = "../tests/live_differential_harness.rs"]
+#[path = "../tests/live_differential_harness/mod.rs"]
 mod live_differential_harness;
 #[path = "../tests/live_parity_oracle_file.rs"]
 mod live_parity_oracle;
@@ -47,11 +47,11 @@ mod performance_scenarios_file;
 mod resolver_namespaces;
 #[path = "../tests/reversibility.rs"]
 mod reversibility;
-#[path = "../tests/rule_evaluation.rs"]
+#[path = "../tests/rule_evaluation/mod.rs"]
 mod rule_evaluation;
 #[path = "../tests/state_machine_guards.rs"]
 mod state_machine_guards;
-#[path = "../tests/state_mutation.rs"]
+#[path = "../tests/state_mutation/mod.rs"]
 mod state_mutation;
 #[path = "../tests/test_isolation.rs"]
 mod test_isolation;
