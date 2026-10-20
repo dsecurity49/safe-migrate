@@ -902,6 +902,19 @@ impl AnalysisOutcome {
     }
 }
 
+impl AnalysisOutcome {
+    fn from_internal(inner: InternalOutcome<InternalFinding>, baseline: BaselineReport) -> Self {
+        Self {
+            findings: inner.findings.iter().map(Finding::from).collect(),
+            confidence: inner.confidence.clone().into(),
+            evidence: inner.evidence.iter().map(Evidence::from).collect(),
+            baseline,
+            not_evaluated: Vec::new(),
+            inner,
+        }
+    }
+}
+
 /// Opaque, validated database baseline used for analysis.
 #[derive(Clone)]
 pub struct Baseline {
@@ -1072,6 +1085,150 @@ impl Baseline {
             },
         }
     }
+}
+
+fn decode_cache(
+    path: &Path,
+    cache_encryption: bool,
+) -> Result<(InternalDbCache, u32, bool), Error> {
+    let encoded = read_cache_bytes(path).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to read {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    let encrypted = is_encrypted_cache_bytes(&encoded);
+    let decrypted = unprotect_cache_bytes(encoded, cache_encryption).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to unlock {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    decode_cache_payload(path, decrypted, encrypted)
+}
+
+fn decode_cache_payload(
+    path: &Path,
+    decrypted: Vec<u8>,
+    encrypted: bool,
+) -> Result<(InternalDbCache, u32, bool), Error> {
+    let decrypted = Zeroizing::new(decrypted);
+    let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(decrypted)).map_err(|error| {
+        Error::with_source(
+            ErrorKind::Cache,
+            format!("{}: zstd initialization failed", path.display()),
+            error,
+        )
+    })?;
+    let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
+    let mut header = Vec::with_capacity(CACHE_MAGIC.len());
+    decoder
+        .by_ref()
+        .take(CACHE_MAGIC.len() as u64)
+        .read_to_end(&mut header)
+        .map_err(|error| {
+            Error::with_source(
+                ErrorKind::Cache,
+                format!("{} is truncated or corrupted", path.display()),
+                error,
+            )
+        })?;
+    if header.len() < CACHE_MAGIC.len() && CACHE_MAGIC.starts_with(&header) {
+        return Err(Error::cache(format!(
+            "{} is truncated or corrupted",
+            path.display()
+        )));
+    }
+    if header != CACHE_MAGIC {
+        return Err(Error::cache(format!(
+            "{} uses an unsupported cache format; run `safe-migrate sync`",
+            path.display()
+        )));
+    }
+    let codec = bincode::config::standard()
+        .with_variable_int_encoding()
+        .with_limit::<MAX_CACHE_DECODE_BYTES>();
+    let versioned: DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, codec)
+        .map_err(|error| {
+            let detail = if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
+                format!(
+                    "exceeds the {} MiB decoded-size limit",
+                    MAX_CACHE_DECODE_BYTES / (1024 * 1024)
+                )
+            } else {
+                error.to_string()
+            };
+            Error::with_source(
+                ErrorKind::Cache,
+                format!("{} is corrupted (bincode): {detail}", path.display()),
+                error,
+            )
+        })?;
+    let remaining_before_trailing = decoder.limit();
+    std::io::copy(&mut decoder, &mut std::io::sink()).map_err(|error| {
+        Error::with_source(
+            ErrorKind::Cache,
+            format!("{} is corrupted while decompressing", path.display()),
+            error,
+        )
+    })?;
+    let decompressed = (MAX_CACHE_DECODE_BYTES as u64 + 1) - decoder.limit();
+    if decompressed > MAX_CACHE_DECODE_BYTES as u64 {
+        return Err(Error::cache(format!(
+            "{} exceeds the {} MiB decoded-size limit",
+            path.display(),
+            MAX_CACHE_DECODE_BYTES / (1024 * 1024)
+        )));
+    }
+    if decoder.limit() != remaining_before_trailing {
+        return Err(Error::cache(format!(
+            "{} contains trailing payload data",
+            path.display()
+        )));
+    }
+    let format_version = versioned.format_version();
+    if format_version != CACHE_FORMAT_VERSION {
+        return Err(Error::cache(format!(
+            "{} has a mismatched cache format header",
+            path.display()
+        )));
+    }
+    let cache = versioned.into_cache().map_err(Error::cache)?;
+    Ok((cache, format_version, encrypted))
+}
+
+fn decode_cache_with_key(
+    path: &Path,
+    key: &CacheKey,
+) -> Result<(InternalDbCache, u32, bool), Error> {
+    let encoded = read_cache_bytes(path).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to read {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    let decrypted = unprotect_cache_bytes_with_key(encoded, key.expose()).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to unlock {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    decode_cache_payload(path, decrypted, true)
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn require_cache_encryption(config: &Config) -> Result<(), Error> {
@@ -1613,163 +1770,6 @@ pub fn analyze_chain(
         outcome = outcome.with_evidence(EvidenceCode::BaselineStale, EvidenceScope::Chain);
     }
     Ok(outcome)
-}
-
-fn decode_cache(
-    path: &Path,
-    cache_encryption: bool,
-) -> Result<(InternalDbCache, u32, bool), Error> {
-    let encoded = read_cache_bytes(path).map_err(|error| {
-        let detail = error.to_string();
-        Error::with_anyhow_source(
-            ErrorKind::Cache,
-            format!("failed to read {}: {detail}", path.display()),
-            error,
-        )
-    })?;
-    let encrypted = is_encrypted_cache_bytes(&encoded);
-    let decrypted = unprotect_cache_bytes(encoded, cache_encryption).map_err(|error| {
-        let detail = error.to_string();
-        Error::with_anyhow_source(
-            ErrorKind::Cache,
-            format!("failed to unlock {}: {detail}", path.display()),
-            error,
-        )
-    })?;
-    decode_cache_payload(path, decrypted, encrypted)
-}
-
-fn decode_cache_payload(
-    path: &Path,
-    decrypted: Vec<u8>,
-    encrypted: bool,
-) -> Result<(InternalDbCache, u32, bool), Error> {
-    let decrypted = Zeroizing::new(decrypted);
-    let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(decrypted)).map_err(|error| {
-        Error::with_source(
-            ErrorKind::Cache,
-            format!("{}: zstd initialization failed", path.display()),
-            error,
-        )
-    })?;
-    let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = Vec::with_capacity(CACHE_MAGIC.len());
-    decoder
-        .by_ref()
-        .take(CACHE_MAGIC.len() as u64)
-        .read_to_end(&mut header)
-        .map_err(|error| {
-            Error::with_source(
-                ErrorKind::Cache,
-                format!("{} is truncated or corrupted", path.display()),
-                error,
-            )
-        })?;
-    if header.len() < CACHE_MAGIC.len() && CACHE_MAGIC.starts_with(&header) {
-        return Err(Error::cache(format!(
-            "{} is truncated or corrupted",
-            path.display()
-        )));
-    }
-    if header != CACHE_MAGIC {
-        return Err(Error::cache(format!(
-            "{} uses an unsupported cache format; run `safe-migrate sync`",
-            path.display()
-        )));
-    }
-    let codec = bincode::config::standard()
-        .with_variable_int_encoding()
-        .with_limit::<MAX_CACHE_DECODE_BYTES>();
-    let versioned: DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, codec)
-        .map_err(|error| {
-            let detail = if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
-                format!(
-                    "exceeds the {} MiB decoded-size limit",
-                    MAX_CACHE_DECODE_BYTES / (1024 * 1024)
-                )
-            } else {
-                error.to_string()
-            };
-            Error::with_source(
-                ErrorKind::Cache,
-                format!("{} is corrupted (bincode): {detail}", path.display()),
-                error,
-            )
-        })?;
-    let remaining_before_trailing = decoder.limit();
-    std::io::copy(&mut decoder, &mut std::io::sink()).map_err(|error| {
-        Error::with_source(
-            ErrorKind::Cache,
-            format!("{} is corrupted while decompressing", path.display()),
-            error,
-        )
-    })?;
-    let decompressed = (MAX_CACHE_DECODE_BYTES as u64 + 1) - decoder.limit();
-    if decompressed > MAX_CACHE_DECODE_BYTES as u64 {
-        return Err(Error::cache(format!(
-            "{} exceeds the {} MiB decoded-size limit",
-            path.display(),
-            MAX_CACHE_DECODE_BYTES / (1024 * 1024)
-        )));
-    }
-    if decoder.limit() != remaining_before_trailing {
-        return Err(Error::cache(format!(
-            "{} contains trailing payload data",
-            path.display()
-        )));
-    }
-    let format_version = versioned.format_version();
-    if format_version != CACHE_FORMAT_VERSION {
-        return Err(Error::cache(format!(
-            "{} has a mismatched cache format header",
-            path.display()
-        )));
-    }
-    let cache = versioned.into_cache().map_err(Error::cache)?;
-    Ok((cache, format_version, encrypted))
-}
-
-fn decode_cache_with_key(
-    path: &Path,
-    key: &CacheKey,
-) -> Result<(InternalDbCache, u32, bool), Error> {
-    let encoded = read_cache_bytes(path).map_err(|error| {
-        let detail = error.to_string();
-        Error::with_anyhow_source(
-            ErrorKind::Cache,
-            format!("failed to read {}: {detail}", path.display()),
-            error,
-        )
-    })?;
-    let decrypted = unprotect_cache_bytes_with_key(encoded, key.expose()).map_err(|error| {
-        let detail = error.to_string();
-        Error::with_anyhow_source(
-            ErrorKind::Cache,
-            format!("failed to unlock {}: {detail}", path.display()),
-            error,
-        )
-    })?;
-    decode_cache_payload(path, decrypted, true)
-}
-
-fn now_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-impl AnalysisOutcome {
-    fn from_internal(inner: InternalOutcome<InternalFinding>, baseline: BaselineReport) -> Self {
-        Self {
-            findings: inner.findings.iter().map(Finding::from).collect(),
-            confidence: inner.confidence.clone().into(),
-            evidence: inner.evidence.iter().map(Evidence::from).collect(),
-            baseline,
-            not_evaluated: Vec::new(),
-            inner,
-        }
-    }
 }
 
 fn format_timeout(timeout_ms: Option<u64>) -> String {
