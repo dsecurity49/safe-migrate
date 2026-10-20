@@ -30,6 +30,11 @@ fn parse_and_extract_statement(sql: &str) -> Option<StatementFact> {
         .and_then(|stmt| AstVisitor::extract(&stmt))
 }
 
-mod misc;
+mod expressions;
+mod grants_roles;
+mod identifiers;
 mod objects;
 mod relations;
+mod settings;
+mod statements;
+mod transactions;

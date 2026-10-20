@@ -26,23 +26,23 @@ mod alter_table;
 mod databases;
 mod grants;
 mod indexes;
+mod names;
 mod publications;
 mod roles;
 mod routines;
 mod schemas;
 mod sequences;
 mod settings;
-mod support;
-/// The `pg_catalog` aggregate function names. A call to one of these in a view
-/// target list makes the view non-updatable; the analyzer resolves no catalog
-/// functions, so the names are listed rather than looked up. An aggregate in
-/// another schema is not recognised and stays unknown.
 mod tables;
 mod transactions;
 mod triggers_policies;
 mod types;
 mod views;
 
+/// The `pg_catalog` aggregate function names. A call to one of these in a view
+/// target list makes the view non-updatable; the analyzer resolves no catalog
+/// functions, so the names are listed rather than looked up. An aggregate in
+/// another schema is not recognised and stays unknown.
 const BUILTIN_AGGREGATES: &[&str] = &[
     "any_value",
     "array_agg",
