@@ -10,7 +10,7 @@ mod tests {
         terminal_inline, tier_label_with_color,
     };
     use crate::_internal::report::violations::{
-        ObjectKind, ReportFinding, SourceLocation, Violation, ViolationTier,
+        NotEvaluated, ObjectKind, ReportFinding, SourceLocation, Violation, ViolationTier,
     };
     use crate::api::Certainty;
 
@@ -377,39 +377,153 @@ mod tests {
         );
     }
 
+    fn make_skipped(
+        rule_id: &'static str,
+        tier: ViolationTier,
+        cause: EvidenceCode,
+        recipe: &str,
+    ) -> NotEvaluated {
+        NotEvaluated {
+            rule_id,
+            tier,
+            cause,
+            sql: None,
+            recipe: recipe.to_string(),
+            missing_schemas: Vec::new(),
+        }
+    }
+
     #[test]
     fn human_report_renders_skipped_checks_with_their_remedy() {
-        let skipped = vec![crate::_internal::report::violations::NotEvaluated {
-            rule_id: "destructive-cascade",
-            tier: ViolationTier::Tier1,
-            cause: crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
-            sql: None,
-            recipe: "Re-sync without `--schemas`.".to_string(),
-            missing_schemas: Vec::new(),
-        }];
+        let skipped = vec![make_skipped(
+            "destructive-cascade",
+            ViolationTier::Tier1,
+            EvidenceCode::CatalogCoverageIncomplete,
+            "Re-sync without `--schemas`.",
+        )];
 
         let rendered = human_not_evaluated(&skipped);
-        assert!(rendered.contains("Checks not evaluated:"));
-        assert!(rendered.contains("destructive-cascade [Tier1]"));
-        assert!(rendered.contains("cause  : catalog_coverage_incomplete"));
+        assert!(rendered.contains("Checks not evaluated (1):"));
+        assert!(rendered.contains("catalog_coverage_incomplete"));
+        assert!(rendered.contains("rules  : destructive-cascade [Tier1]"));
         assert!(rendered.contains("remedy : Re-sync without `--schemas`."));
         assert_eq!(human_not_evaluated(&[]), "");
     }
 
     #[test]
+    fn human_skipped_checks_group_by_cause_and_remedy() {
+        let skipped = vec![
+            make_skipped(
+                "rule-a",
+                ViolationTier::Tier1,
+                EvidenceCode::UnmodeledState,
+                "Outside the model.",
+            ),
+            make_skipped(
+                "rule-b",
+                ViolationTier::Tier2,
+                EvidenceCode::UnmodeledState,
+                "Outside the model.",
+            ),
+            make_skipped(
+                "rule-c",
+                ViolationTier::Tier1,
+                EvidenceCode::BaselineUnavailable,
+                "Run `safe-migrate sync` to build a baseline.",
+            ),
+        ];
+
+        let rendered = human_not_evaluated(&skipped);
+        assert!(rendered.contains("Checks not evaluated (3):"));
+        // Two rules sharing a cause and remedy collapse into one group.
+        assert_eq!(rendered.matches("unmodeled_state").count(), 1);
+        assert!(rendered.contains("rules  : rule-a [Tier1], rule-b [Tier2]"));
+        assert_eq!(rendered.matches("Outside the model.").count(), 1);
+        // A distinct remedy gets its own group.
+        assert!(rendered.contains("baseline_unavailable"));
+        assert!(rendered.contains("rules  : rule-c [Tier1]"));
+    }
+
+    #[test]
     fn human_skipped_checks_render_controls_inertly() {
-        let skipped = vec![crate::_internal::report::violations::NotEvaluated {
-            rule_id: "destructive-cascade",
-            tier: ViolationTier::Tier1,
-            cause: crate::_internal::analysis::evidence::EvidenceCode::UnmodeledState,
-            sql: None,
-            recipe: "run \u{1b}[2J sync".to_string(),
-            missing_schemas: Vec::new(),
-        }];
+        let skipped = vec![make_skipped(
+            "destructive-cascade",
+            ViolationTier::Tier1,
+            EvidenceCode::UnmodeledState,
+            "run \u{1b}[2J sync",
+        )];
 
         let rendered = human_not_evaluated(&skipped);
         assert!(!rendered.contains('\x1b'));
         assert!(rendered.contains("run \\u{1b}[2J sync"));
+    }
+
+    #[test]
+    fn markdown_report_folds_grouped_not_evaluated_checks_under_a_count() {
+        let outcome = AnalysisOutcome::new(Vec::new(), Confidence::Exact, Vec::new());
+        let skipped = vec![
+            make_skipped(
+                "rule-a",
+                ViolationTier::Tier1,
+                EvidenceCode::UnmodeledState,
+                "Outside the model.",
+            ),
+            make_skipped(
+                "rule-b",
+                ViolationTier::Tier2,
+                EvidenceCode::UnmodeledState,
+                "Outside the model.",
+            ),
+            make_skipped(
+                "rule-c",
+                ViolationTier::Tier1,
+                EvidenceCode::BaselineUnavailable,
+                "Run `safe-migrate sync` to build a baseline.",
+            ),
+        ];
+
+        let markdown = Reporter::markdown_outcome(&outcome, &skipped);
+        assert!(markdown.contains("## Not evaluated"));
+        assert!(markdown.contains("3 checks were not evaluated"));
+        assert!(markdown.contains("<details>"));
+        assert!(markdown.contains("</details>"));
+        assert!(markdown.contains("| Cause | Rules | Remedy |"));
+        // Same cause and remedy collapse into one row; the remedy appears once.
+        assert_eq!(markdown.matches("| `unmodeled_state` |").count(), 1);
+        assert!(markdown.contains("`rule-a` (Tier1)<br>`rule-b` (Tier2)"));
+        assert_eq!(markdown.matches("Outside the model.").count(), 1);
+        assert!(markdown.contains("| `baseline_unavailable` |"));
+        assert!(markdown.contains("`rule-c` (Tier1)"));
+    }
+
+    #[test]
+    fn markdown_single_not_evaluated_check_is_singular() {
+        let outcome = AnalysisOutcome::new(Vec::new(), Confidence::Exact, Vec::new());
+        let skipped = vec![make_skipped(
+            "rule-a",
+            ViolationTier::Tier1,
+            EvidenceCode::UnmodeledState,
+            "Outside the model.",
+        )];
+
+        let markdown = Reporter::markdown_outcome(&outcome, &skipped);
+        assert!(markdown.contains("1 check was not evaluated"));
+    }
+
+    #[test]
+    fn markdown_not_evaluated_cannot_forge_a_details_block() {
+        let outcome = AnalysisOutcome::new(Vec::new(), Confidence::Exact, Vec::new());
+        let skipped = vec![make_skipped(
+            "rule-a",
+            ViolationTier::Tier1,
+            EvidenceCode::UnmodeledState,
+            "close </details> | forged <details>",
+        )];
+
+        let markdown = Reporter::markdown_outcome(&outcome, &skipped);
+        assert!(markdown.contains("close \\</details\\> \\| forged \\<details\\>"));
+        assert_eq!(markdown.matches("<details>").count(), 1);
+        assert_eq!(markdown.matches("</details>").count(), 1);
     }
 
     #[test]

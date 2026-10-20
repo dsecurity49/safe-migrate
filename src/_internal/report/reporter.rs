@@ -1,7 +1,7 @@
 use crate::_internal::analysis::evidence::EvidenceRecord;
 use crate::_internal::analysis::outcome::AnalysisOutcome;
 use crate::_internal::analysis::state::Confidence;
-use crate::_internal::report::violations::{ReportFinding, Violation, ViolationTier};
+use crate::_internal::report::violations::{NotEvaluated, ReportFinding, Violation, ViolationTier};
 use crate::_internal::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
 use crate::_internal::rules::registry;
 use crate::api::Certainty;
@@ -275,6 +275,7 @@ impl Reporter {
 
         if findings.is_empty() {
             output.push_str("\nNo findings detected.\n");
+            append_markdown_not_evaluated(&mut output, not_evaluated);
             return output;
         }
 
@@ -328,6 +329,7 @@ impl Reporter {
         output.push_str(&Self::markdown_rules_catalogue(
             findings.iter().map(|finding| finding.violation.rule_id),
         ));
+        append_markdown_not_evaluated(&mut output, not_evaluated);
         output
     }
 
@@ -363,7 +365,6 @@ impl Reporter {
         let mut output =
             Self::markdown_report(&outcome.findings, &outcome.confidence, not_evaluated);
         append_markdown_evidence(&mut output, &outcome.evidence);
-        append_markdown_not_evaluated(&mut output, not_evaluated);
         output
     }
 
@@ -582,44 +583,88 @@ impl Reporter {
     }
 }
 
-fn append_markdown_not_evaluated(
-    output: &mut String,
-    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
-) {
+/// Rules skipped for the same reason and sharing the same remedy, so the
+/// remedy is stated once rather than once per rule.
+struct NotEvaluatedGroup<'a> {
+    cause: &'static str,
+    recipe: &'a str,
+    rules: Vec<(&'static str, &'a ViolationTier)>,
+}
+
+/// Group in first-seen order, so the output stays byte-stable.
+fn group_not_evaluated(not_evaluated: &[NotEvaluated]) -> Vec<NotEvaluatedGroup<'_>> {
+    let mut groups: Vec<NotEvaluatedGroup<'_>> = Vec::new();
+    for entry in not_evaluated {
+        let cause = entry.cause.as_str();
+        match groups
+            .iter_mut()
+            .find(|group| group.cause == cause && group.recipe == entry.recipe.as_str())
+        {
+            Some(group) => group.rules.push((entry.rule_id, &entry.tier)),
+            None => groups.push(NotEvaluatedGroup {
+                cause,
+                recipe: entry.recipe.as_str(),
+                rules: vec![(entry.rule_id, &entry.tier)],
+            }),
+        }
+    }
+    groups
+}
+
+fn append_markdown_not_evaluated(output: &mut String, not_evaluated: &[NotEvaluated]) {
     if not_evaluated.is_empty() {
         return;
     }
+    let groups = group_not_evaluated(not_evaluated);
+    let total = not_evaluated.len();
+    let (checks, verb) = if total == 1 {
+        ("check", "was")
+    } else {
+        ("checks", "were")
+    };
     output.push_str("\n## Not evaluated\n\n");
-    output.push_str(
-        "These checks did not run because the required evidence was unavailable.\n\n\
-         | Rule | Tier | Cause | Remedy |\n| --- | --- | --- | --- |\n",
-    );
-    for entry in not_evaluated {
+    // The count stays visible; the repeated detail is one click away.
+    output.push_str(&format!(
+        "<details>\n<summary>{total} {checks} {verb} not evaluated because the \
+required evidence was unavailable — expand for the rules and remedies.</summary>\n\n"
+    ));
+    output.push_str("| Cause | Rules | Remedy |\n| --- | --- | --- |\n");
+    for group in groups {
+        let rules = group
+            .rules
+            .iter()
+            .map(|(rule_id, tier)| format!("`{}` ({:?})", markdown_code(rule_id), tier))
+            .collect::<Vec<_>>()
+            .join("<br>");
         output.push_str(&format!(
-            "| `{}` | {:?} | `{}` | {} |\n",
-            entry.rule_id,
-            entry.tier,
-            entry.cause.as_str(),
-            markdown_escape(&entry.recipe)
+            "| `{}` | {} | {} |\n",
+            markdown_code(group.cause),
+            rules,
+            markdown_escape(group.recipe)
         ));
     }
+    output.push_str("\n</details>\n");
 }
 
 /// Human rendering of skipped checks, shared by the report and interactive viewer.
-pub(crate) fn human_not_evaluated(
-    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
-) -> String {
+pub(crate) fn human_not_evaluated(not_evaluated: &[NotEvaluated]) -> String {
     if not_evaluated.is_empty() {
         return String::new();
     }
-    let mut output = String::from(" Checks not evaluated:\n");
-    for entry in not_evaluated {
+    let groups = group_not_evaluated(not_evaluated);
+    let mut output = format!(" Checks not evaluated ({}):\n", not_evaluated.len());
+    for group in groups {
+        output.push_str(&format!("   - {}\n", terminal_inline(group.cause)));
+        let rules = group
+            .rules
+            .iter()
+            .map(|(rule_id, tier)| format!("{} [{:?}]", terminal_inline(rule_id), tier))
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!("       rules  : {rules}\n"));
         output.push_str(&format!(
-            "   - {} [{:?}]\n     cause  : {}\n     remedy : {}\n",
-            terminal_inline(entry.rule_id),
-            entry.tier,
-            terminal_inline(entry.cause.as_str()),
-            terminal_inline(&entry.recipe),
+            "       remedy : {}\n",
+            terminal_inline(group.recipe)
         ));
     }
     output.push('\n');

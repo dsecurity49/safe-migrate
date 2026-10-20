@@ -1258,8 +1258,8 @@ fn test_cli_human_report_renders_checks_that_did_not_run() {
         .success();
 
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    assert!(stdout.contains("Checks not evaluated:"), "{stdout}");
-    assert!(stdout.contains("cause  : "), "{stdout}");
+    assert!(stdout.contains("Checks not evaluated ("), "{stdout}");
+    assert!(stdout.contains("rules  : "), "{stdout}");
     assert!(stdout.contains("remedy : "), "{stdout}");
 }
 
@@ -1284,7 +1284,7 @@ fn test_cli_human_report_without_findings_still_renders_skipped_checks() {
 
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(stdout.contains("No violations detected."), "{stdout}");
-    assert!(stdout.contains("Checks not evaluated:"), "{stdout}");
+    assert!(stdout.contains("Checks not evaluated ("), "{stdout}");
     assert!(stdout.contains("SUMMARY"), "{stdout}");
 }
 
@@ -1310,7 +1310,7 @@ fn test_cli_interactive_without_findings_still_reports_skipped_checks() {
 
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(stdout.contains("No findings found!"), "{stdout}");
-    assert!(stdout.contains("Checks not evaluated:"), "{stdout}");
+    assert!(stdout.contains("Checks not evaluated ("), "{stdout}");
 }
 
 #[test]
