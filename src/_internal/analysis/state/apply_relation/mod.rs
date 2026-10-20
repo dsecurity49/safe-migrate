@@ -24,8 +24,8 @@ mod alter_table;
 mod create_table;
 mod drop;
 mod partition;
+mod relation_helpers;
 mod rename;
-mod support;
 
 /// Match PostgreSQL's stable `pg_get_expr(relpartbound, ...)` spelling for
 /// the bound forms represented by the typed Squawk node.
