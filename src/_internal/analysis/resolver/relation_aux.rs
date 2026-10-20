@@ -13,7 +13,7 @@ use crate::_internal::analysis::mutations::{
     RefreshMaterializedViewMutation, ReindexTargetMutation, ReloptionTarget, Rename,
     RenameTriggerMutation, ViewColumn, ViewRoutine,
 };
-use crate::_internal::analysis::state::{AnalysisState, RelationOverlay};
+use crate::_internal::analysis::state::{AggregateCallArgument, AnalysisState, RelationOverlay};
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
@@ -128,12 +128,24 @@ impl Resolver {
             let arguments = candidate
                 .arguments
                 .iter()
-                .map(|argument| match argument {
-                    AggregateArgumentFact::Column(column) => {
-                        Self::source_column_type(source, column, state)
+                .map(|argument| {
+                    let mut variadic = false;
+                    let mut argument = argument;
+                    while let AggregateArgumentFact::Variadic(inner) = argument {
+                        variadic = true;
+                        argument = inner.as_ref();
                     }
-                    AggregateArgumentFact::Typed(typed) => Some(typed.clone()),
-                    AggregateArgumentFact::Unknown => None,
+                    let type_name = match argument {
+                        AggregateArgumentFact::Column(column) => {
+                            Self::source_column_type(source, column, state)
+                        }
+                        AggregateArgumentFact::Typed(typed) => Some(typed.clone()),
+                        AggregateArgumentFact::Variadic(_) | AggregateArgumentFact::Unknown => None,
+                    };
+                    AggregateCallArgument {
+                        type_name,
+                        variadic,
+                    }
                 })
                 .collect::<Vec<_>>();
             match state.resolve_aggregate_candidate(&candidate.name, &arguments) {

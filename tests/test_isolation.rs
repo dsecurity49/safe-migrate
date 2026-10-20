@@ -8,6 +8,7 @@
 //! instead of a convention.
 
 mod test_isolation_tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     fn repo_root() -> PathBuf {
@@ -48,7 +49,7 @@ mod test_isolation_tests {
     /// Production may read it; the guard is the single place that may.
     #[test]
     fn only_production_and_the_live_guard_read_database_url_from_the_environment() {
-        const ALLOWED: [&str; 2] = ["src/_internal/sync.rs", "src/_internal/test_support.rs"];
+        const ALLOWED: [&str; 2] = ["src/_internal/sync/mod.rs", "src/_internal/test_support.rs"];
 
         let offenders: Vec<String> = all_rust_sources()
             .into_iter()
@@ -80,24 +81,39 @@ mod test_isolation_tests {
     /// test over the shared disposable fixtures.
     #[test]
     fn every_live_test_file_takes_the_live_database_guard() {
-        let live_files: Vec<PathBuf> = all_rust_sources()
-            .into_iter()
-            .filter(|path| {
-                relative(path).starts_with("tests/live_") && relative(path).ends_with(".rs")
-            })
-            .collect();
+        // A live suite is a unit: `tests/live_x.rs` or the `tests/live_x/`
+        // directory that replaces it when the suite grows submodules. The
+        // guard may live in any file of the unit.
+        let mut units: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for path in all_rust_sources() {
+            let rel = relative(&path);
+            if !rel.starts_with("tests/live_") || !rel.ends_with(".rs") {
+                continue;
+            }
+            let unit = match rel
+                .strip_prefix("tests/")
+                .and_then(|rest| rest.split_once('/'))
+            {
+                Some((directory, _)) => format!("tests/{directory}"),
+                None => rel.clone(),
+            };
+            units.entry(unit).or_default().push(path);
+        }
 
-        assert!(!live_files.is_empty(), "no live test files discovered");
+        assert!(!units.is_empty(), "no live test files discovered");
 
-        let offenders: Vec<String> = live_files
+        let offenders: Vec<String> = units
             .into_iter()
-            .filter(|path| {
-                let source = std::fs::read_to_string(path).expect("read live test file");
-                // A file may read the URL only through the guard, so requiring the
-                // guard to appear is the whole check.
-                !source.contains("live_database_test_lock")
+            .filter(|(_, files)| {
+                !files.iter().any(|path| {
+                    // A file may read the URL only through the guard, so requiring
+                    // the guard to appear is the whole check.
+                    std::fs::read_to_string(path)
+                        .expect("read live test file")
+                        .contains("live_database_test_lock")
+                })
             })
-            .map(|path| relative(&path))
+            .map(|(unit, _)| unit)
             .collect();
 
         assert!(

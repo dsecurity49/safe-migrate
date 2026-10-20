@@ -1,0 +1,1418 @@
+use super::*;
+
+#[test]
+fn routines_do_not_resolve_through_the_temporary_schema() {
+    // PostgreSQL skips the temp namespace for functions and operators, so a
+    // temp table must never satisfy a routine reference.
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let v = engine
+        .analyze(
+            "CREATE TEMP TABLE f (id int);
+                 DROP FUNCTION f();",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !state.relation_is_present(&object_id("public", "f")),
+        "the temp table must not be visible under public: {v:?}"
+    );
+}
+
+#[test]
+fn sequence_parameter_merge_mirrors_postgresql_init_params() {
+    use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+    let engine = setup_engine();
+    let parameters = |sql: &str| {
+        let mut state = setup_state();
+        engine
+            .analyze(sql, &mut state)
+            .expect("sequence statements should analyze");
+        let Some(SequenceOverlay::Present(sequence)) =
+            state.local.sequences.get(&object_id("public", "s"))
+        else {
+            panic!("sequence 's' should remain present");
+        };
+        sequence.parameters.clone()
+    };
+
+    // A bare type change re-derives a bound that sat at the old type's
+    // limit; an explicitly chosen bound is left alone.
+    let narrowed = parameters("CREATE SEQUENCE s; ALTER SEQUENCE s AS smallint;");
+    assert_eq!(narrowed.data_type, "smallint");
+    assert_eq!(narrowed.max_value, i16::MAX as i64);
+    assert_eq!(narrowed.min_value, 1);
+    assert_eq!(narrowed.start_value, 1);
+
+    let explicit = parameters("CREATE SEQUENCE s MAXVALUE 100; ALTER SEQUENCE s AS smallint;");
+    assert_eq!(explicit.data_type, "smallint");
+    assert_eq!(explicit.max_value, 100);
+
+    let overridden = parameters("CREATE SEQUENCE s; ALTER SEQUENCE s AS smallint MAXVALUE 100;");
+    assert_eq!(overridden.max_value, 100);
+
+    // The reset is per bound: only the bound at the old type's limit moves.
+    let per_bound = parameters(
+        "CREATE SEQUENCE s MINVALUE -9223372036854775808 START WITH -32768;
+             ALTER SEQUENCE s AS smallint;",
+    );
+    assert_eq!(per_bound.min_value, i16::MIN as i64);
+    assert_eq!(per_bound.max_value, i16::MAX as i64);
+
+    // NO MINVALUE / NO MAXVALUE derive from the final increment, so the
+    // clause order cannot change the outcome.
+    let bounds_early = parameters(
+        "CREATE SEQUENCE s MINVALUE -10 START WITH -1;
+             ALTER SEQUENCE s NO MAXVALUE NO MINVALUE INCREMENT BY -1;",
+    );
+    let bounds_late = parameters(
+        "CREATE SEQUENCE s MINVALUE -10 START WITH -1;
+             ALTER SEQUENCE s INCREMENT BY -1 NO MINVALUE NO MAXVALUE;",
+    );
+    assert_eq!(bounds_early, bounds_late);
+    assert_eq!(bounds_late.increment, -1);
+    assert_eq!(bounds_late.max_value, -1);
+    assert_eq!(bounds_late.min_value, i64::MIN);
+
+    // The create path derives the start from the final bounds and the
+    // increment from the data type.
+    let created = parameters("CREATE SEQUENCE s MINVALUE 10;");
+    assert_eq!(created.start_value, 10);
+    assert_eq!(created.min_value, 10);
+    let descending = parameters("CREATE SEQUENCE s AS smallint INCREMENT BY -1;");
+    assert_eq!(descending.min_value, i16::MIN as i64);
+    assert_eq!(descending.max_value, -1);
+    assert_eq!(descending.start_value, -1);
+}
+
+#[test]
+fn identity_sequence_parameters_mirror_postgresql() {
+    use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+    let engine = setup_engine();
+    let reason = |sql: &str| {
+        let mut state = setup_state();
+        engine
+            .analyze(sql, &mut state)
+            .expect("identity statements should analyze")
+            .into_iter()
+            .filter(|violation| violation.rule_id == "chain-conflict")
+            .map(|violation| violation.reason)
+            .next()
+            .unwrap_or_default()
+    };
+    let parameters = |sql: &str| {
+        let mut state = setup_state();
+        engine
+            .analyze(sql, &mut state)
+            .expect("identity statements should analyze");
+        let Some(SequenceOverlay::Present(identity)) =
+            state.local.sequences.get(&object_id("public", "t_id_seq"))
+        else {
+            panic!("identity sequence 't_id_seq' should be present");
+        };
+        identity.parameters.clone()
+    };
+
+    // The column type drives the bounds; the column type is the synthetic
+    // `AS`, so only these three integer types can back an identity column.
+    let ascending = parameters(
+        "CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (INCREMENT 2 START 5));",
+    );
+    assert_eq!(ascending.data_type, "smallint");
+    assert_eq!(ascending.increment, 2);
+    assert_eq!(ascending.start_value, 5);
+    assert_eq!(ascending.min_value, 1);
+    assert_eq!(ascending.max_value, i16::MAX as i64);
+
+    let bounded = parameters(
+        "CREATE TABLE t (id integer GENERATED BY DEFAULT AS IDENTITY (MINVALUE 3 MAXVALUE 900 START 10));",
+    );
+    assert_eq!(bounded.data_type, "integer");
+    assert_eq!(bounded.min_value, 3);
+    assert_eq!(bounded.max_value, 900);
+    assert_eq!(bounded.start_value, 10);
+
+    let descending =
+        parameters("CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY (INCREMENT -1));");
+    assert_eq!(descending.increment, -1);
+    assert_eq!(descending.min_value, i16::MIN as i64);
+    assert_eq!(descending.max_value, -1);
+    assert_eq!(descending.start_value, -1);
+
+    let duplicate_as =
+        reason("CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY (AS smallint));");
+    assert!(
+        duplicate_as.contains("conflicting or redundant options")
+            && duplicate_as.contains("\"as\""),
+        "a written AS duplicates the column type: {duplicate_as}"
+    );
+    let bad_type = reason("CREATE TABLE t (id numeric GENERATED ALWAYS AS IDENTITY);");
+    assert!(
+        bad_type.contains("identity column type must be smallint, integer, or bigint"),
+        "only integer types can back an identity column: {bad_type}"
+    );
+}
+
+#[test]
+fn replacing_a_function_may_not_change_its_return_type() {
+    let engine = setup_engine();
+    let reason = |sql: &str| {
+        let mut state = setup_state();
+        engine
+            .analyze(sql, &mut state)
+            .expect("the statement should analyze")
+            .into_iter()
+            .filter(|violation| violation.rule_id == "chain-conflict")
+            .map(|violation| violation.reason)
+            .next()
+            .unwrap_or_default()
+    };
+    let setup = "CREATE FUNCTION work(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;";
+
+    assert!(
+        reason(&format!(
+            "{setup}
+                 CREATE OR REPLACE FUNCTION work(integer) RETURNS text
+                     LANGUAGE sql AS $$ SELECT $1::text $$;"
+        ))
+        .contains("cannot change return type of existing function"),
+        "a replacement may not change the return type"
+    );
+    // The same signature with the same return type is the ordinary case.
+    assert_eq!(
+        reason(&format!(
+            "{setup}
+                 CREATE OR REPLACE FUNCTION work(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 + 1 $$;"
+        )),
+        ""
+    );
+}
+
+#[test]
+fn a_replacement_may_not_change_the_setof_flag() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION rows_out(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;
+                 CREATE OR REPLACE FUNCTION rows_out(integer) RETURNS SETOF integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+            &mut state,
+        )
+        .expect("the statements should analyze");
+    let reason = conflict_reason(
+        &engine,
+        &mut state,
+        "CREATE OR REPLACE FUNCTION rows_out(integer) RETURNS SETOF integer
+                 LANGUAGE sql AS $$ SELECT $1 $$;",
+    );
+    assert!(
+        reason.contains("cannot change return type of existing function"),
+        "`proretset` is its own catalog column, so a set change is a return \
+             type change: {reason}"
+    );
+}
+
+#[test]
+fn a_replacement_may_not_change_the_record_row_descriptor() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION named_row(integer, OUT total integer)
+                     RETURNS record LANGUAGE sql AS $$ SELECT $1, $1 $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    let reason = conflict_reason(
+        &engine,
+        &mut state,
+        "CREATE OR REPLACE FUNCTION named_row(integer, OUT total text)
+                 RETURNS record LANGUAGE sql AS $$ SELECT $1, $1::text $$;",
+    );
+    assert!(
+        reason.contains("row type defined by OUT parameters is different"),
+        "the OUT parameters are the row descriptor: {reason}"
+    );
+}
+
+#[test]
+fn a_replacement_may_not_rename_an_input_parameter() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION named_input(amount integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT amount $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    let reason = conflict_reason(
+        &engine,
+        &mut state,
+        "CREATE OR REPLACE FUNCTION named_input(total integer) RETURNS integer
+                 LANGUAGE sql AS $$ SELECT total $$;",
+    );
+    assert!(
+        reason.contains("cannot change name of input parameter \"amount\""),
+        "a named argument is part of the call syntax: {reason}"
+    );
+}
+
+#[test]
+fn a_replacement_may_give_an_unnamed_input_a_name() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION namable(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    engine
+        .analyze(
+            "CREATE OR REPLACE FUNCTION namable(amount integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT amount $$;",
+            &mut state,
+        )
+        .expect("naming a formerly unnamed parameter is allowed");
+    assert!(!state.evidence().iter().any(|record| record.code
+        == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnmodeledState));
+}
+
+#[test]
+fn a_replacement_may_not_remove_a_parameter_default() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION defaulted(a integer DEFAULT 5) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    let reason = conflict_reason(
+        &engine,
+        &mut state,
+        "CREATE OR REPLACE FUNCTION defaulted(a integer) RETURNS integer
+                 LANGUAGE sql AS $$ SELECT a $$;",
+    );
+    assert!(
+        reason.contains("cannot remove parameter defaults from existing function"),
+        "a call that relied on the default would stop resolving: {reason}"
+    );
+}
+
+#[test]
+fn a_procedure_replacement_may_not_gain_output_parameters() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 1 $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    let reason = conflict_reason(
+        &engine,
+        &mut state,
+        "CREATE OR REPLACE PROCEDURE reports(OUT total integer)
+                 LANGUAGE sql AS $$ SELECT 1 $$;",
+    );
+    assert!(
+        reason.contains("cannot change whether a procedure has output parameters"),
+        "a procedure's `prorettype` is `void` unless it declares output \
+             parameters: {reason}"
+    );
+}
+
+#[test]
+fn a_baseline_replacement_compares_canonical_type_spellings() {
+    // The catalog reports `format_type`'s spelling while a migration may
+    // write the alias, and `int` is not the same text as `integer`.
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    let id = object_id("public", "spelled(integer)");
+    cache.functions.insert(
+        id.clone(),
+        FunctionState {
+            return_type: "integer".into(),
+            ..FunctionState::with_inputs(id.clone(), RoutineKind::Function, vec!["integer".into()])
+        },
+    );
+    let mut state = AnalysisState::new(cache);
+    assert_eq!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION spelled(int) RETURNS int
+                     LANGUAGE sql AS $$ SELECT $1 + 1 $$;",
+        ),
+        "",
+        "a body-only replacement must not depend on how the type is spelled"
+    );
+    assert!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION spelled(int) RETURNS text
+                     LANGUAGE sql AS $$ SELECT $1::text $$;",
+        )
+        .contains("cannot change return type"),
+        "a genuinely different type must still be refused"
+    );
+}
+
+#[test]
+fn a_returns_table_routine_can_be_replaced_when_its_row_descriptor_holds() {
+    let engine = setup_engine();
+    let mut state = synced_table_routine(&[("id", "integer"), ("name", "text")]);
+    assert_eq!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION rows() RETURNS TABLE(id int, name text)
+                     LANGUAGE sql AS $$ SELECT 1, ''::text $$;",
+        ),
+        "",
+        "the descriptor holds however the migration spells its types"
+    );
+    assert!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION rows() RETURNS TABLE(id integer, name varchar)
+                     LANGUAGE sql AS $$ SELECT 1, ''::varchar $$;",
+        )
+        .contains("row type defined by OUT parameters is different"),
+        "the output types are the row descriptor, which cannot change"
+    );
+    assert!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION rows() RETURNS TABLE(id integer, label text)
+                     LANGUAGE sql AS $$ SELECT 1, ''::text $$;",
+        )
+        .contains("row type defined by OUT parameters is different"),
+        "the output names are part of a multi-column row descriptor"
+    );
+}
+
+#[test]
+fn a_single_output_parameter_is_the_return_type_rather_than_a_descriptor() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION one_out(OUT total integer) LANGUAGE sql AS $$ SELECT 1 $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    assert_eq!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION one_out(OUT amount int) LANGUAGE sql AS $$ SELECT 1 $$;",
+        ),
+        "",
+        "a single OUT parameter is `prorettype`, so its name is free"
+    );
+    assert!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION one_out(OUT amount bigint) LANGUAGE sql AS $$ SELECT 1 $$;",
+        )
+        .contains("cannot change return type of existing function"),
+        "changing the single output type changes `prorettype`"
+    );
+}
+
+#[test]
+fn a_procedure_without_output_parameters_can_be_replaced_unchanged() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 1 $$;",
+            &mut state,
+        )
+        .expect("the statement should analyze");
+    assert_eq!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 2 $$;",
+        ),
+        "",
+        "a procedure's `pg_get_function_result` is NULL, so `prorettype` is \
+             `void` on both sides"
+    );
+}
+
+#[test]
+fn an_aggregate_state_type_that_names_nothing_is_refused() {
+    // `pg_aggregate.c` resolves the state type against the catalog before it
+    // records anything, and the built-in type catalogue is complete, so an
+    // unscoped baseline proves the absence.
+    let engine = setup_engine();
+    let mut state = setup_state();
+    assert!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE AGGREGATE total(integer)
+                     (sfunc = my_transition, stype = no_such_type);",
+        )
+        .contains("type \"no_such_type\" does not exist"),
+        "a state type nobody has is refused the way PostgreSQL refuses it"
+    );
+}
+
+#[test]
+fn an_aggregate_support_function_is_not_declared_missing_from_the_catalog() {
+    // Synchronization never reads `pg_catalog`, so a built-in transition
+    // function such as `int4pl` is not in the modeled universe. Its absence
+    // there is not proof, so the statement must not be refused for it.
+    let engine = setup_engine();
+    let mut state = setup_state();
+    assert_eq!(
+        conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE AGGREGATE total(integer) (sfunc = int4pl, stype = integer);",
+        ),
+        "",
+        "a routine outside the synchronized scope cannot be proven missing"
+    );
+}
+
+#[test]
+fn a_transition_function_the_chain_dropped_is_not_a_name_in_use() {
+    // A tombstone is not a routine the aggregate can name, so the reference
+    // stays unverifiable instead of counting as resolved.
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION public.gone_transition(integer, integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+            &mut state,
+        )
+        .expect("the transition function should be created");
+    engine
+        .analyze(
+            "DROP FUNCTION public.gone_transition(integer, integer);",
+            &mut state,
+        )
+        .expect("the transition function should be dropped");
+    engine
+        .analyze(
+            "CREATE AGGREGATE public.total(integer)
+                     (sfunc = gone_transition, stype = integer);",
+            &mut state,
+        )
+        .expect("the aggregate should analyze");
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+}
+
+#[test]
+fn alter_procedure_options_are_applied_rather_than_dropped() {
+    use safe_migrate::_internal::model::function::{FunctionOverlay, SecurityMode};
+
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE PROCEDURE do_work() LANGUAGE sql SECURITY INVOKER AS $$ SELECT 1 $$;
+                 ALTER PROCEDURE do_work() SECURITY DEFINER;",
+            &mut state,
+        )
+        .expect("the statements should analyze");
+    assert!(
+        matches!(
+            state.local.functions.get(&object_id("public", "do_work()")),
+            Some(FunctionOverlay::Present(function)) if function.security == SecurityMode::Definer
+        ),
+        "ALTER PROCEDURE must apply the option it carries"
+    );
+}
+
+#[test]
+fn cascading_a_function_drop_covers_only_the_moved_name() {
+    let engine = setup_engine();
+    let state_after = |functions: &[&str], sql: &str| {
+        let mut cache = synced_cache();
+        cache.metadata.source_search_path = Some(vec!["public".to_string()]);
+        for ty in functions {
+            let id = object_id("public", &format!("f({ty})"));
+            cache.functions.insert(
+                id.clone(),
+                FunctionState {
+                    return_type: ty.to_string(),
+                    ..FunctionState::with_inputs(
+                        id.clone(),
+                        RoutineKind::Function,
+                        vec![ty.to_string()],
+                    )
+                },
+            );
+        }
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        engine.analyze(sql, &mut state).unwrap();
+        state
+    };
+    let view = object_id("public", "v");
+    let prefix = "CREATE TABLE t (a int);
+                      CREATE VIEW v AS SELECT a FROM t WHERE f(a + 1) > 0;";
+
+    // One overload survives, so the name-only reference may call it: the
+    // view is kept and the chain stops being exact.
+    let state = state_after(
+        &["integer", "text"],
+        &format!("{prefix} DROP FUNCTION f(integer) CASCADE;"),
+    );
+    assert!(
+        state.relation_is_present(&view),
+        "the view may call the surviving overload"
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+
+    // The statement covers every overload, so the view is definitely gone.
+    let state = state_after(
+        &["integer", "text"],
+        &format!("{prefix} DROP FUNCTION f(integer), f(text) CASCADE;"),
+    );
+    assert!(!state.relation_is_present(&view));
+    assert_eq!(state.local.confidence, Confidence::Exact);
+
+    // A lone overload resolves, so the view is dropped as before.
+    let state = state_after(
+        &["integer"],
+        &format!("{prefix} DROP FUNCTION f(integer) CASCADE;"),
+    );
+    assert!(!state.relation_is_present(&view));
+    assert_eq!(state.local.confidence, Confidence::Exact);
+}
+
+#[test]
+fn cascading_a_type_drop_removes_typed_tables_and_routines() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let tof = object_id("public", "tof");
+    engine
+        .analyze(
+            "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;
+                 CREATE FUNCTION uses_ct(ct) RETURNS ct AS 'SELECT $1' LANGUAGE sql;
+                 DROP TYPE ct CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !state.relation_is_present(&tof),
+        "a typed table is dropped whole by the cascade"
+    );
+    assert!(
+        !state.local.functions.iter().any(|(id, overlay)| {
+            matches!(overlay, FunctionOverlay::Present(_))
+                && DependencyGraph::split_routine_signature(id).1 == "uses_ct"
+        }),
+        "the routine naming the type in its signature goes with it"
+    );
+    let violations = engine
+        .analyze(
+            "CREATE TYPE ct AS (z int);
+                 CREATE TABLE tof OF ct;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(
+        violations
+            .iter()
+            .filter(|violation| violation.rule_id == "chain-conflict")
+            .count(),
+        0,
+        "both names must be free again: {violations:?}"
+    );
+}
+
+#[test]
+fn cascading_a_procedure_drop_applies_like_a_plain_drop() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let violations = engine
+        .analyze(
+            "CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
+                 DROP PROCEDURE p() CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "p()")),
+        Some(FunctionOverlay::Dropped)
+    ));
+    assert_eq!(
+        violations
+            .iter()
+            .filter(|violation| violation.rule_id == "chain-conflict")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn quoted_embedded_quote_type_resolves_in_function_signature() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            r#"CREATE TYPE public."a""b" AS ENUM ('value');
+                   CREATE FUNCTION accepts_embedded(value public."a""b")
+                   RETURNS public."a""b" LANGUAGE sql AS $$ SELECT value $$;"#,
+            &mut state,
+        )
+        .unwrap();
+
+    let Some(FunctionOverlay::Present(function)) = state
+            .local
+            .functions
+            .values()
+            .find(|function| {
+                matches!(function, FunctionOverlay::Present(function) if function.id.name.starts_with("accepts_embedded("))
+            })
+        else {
+            panic!("embedded-quote function missing");
+        };
+    assert_eq!(
+        function.arg_type_ids,
+        vec![Some(object_id("public", "a\"b"))]
+    );
+    assert_eq!(function.return_type_id, Some(object_id("public", "a\"b")));
+}
+
+#[test]
+fn rename_type_updates_cached_routine_signatures_and_undo_restores_them() {
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    let type_id = object_id("public", "mood");
+    cache.types.insert(
+        type_id.clone(),
+        TypeState {
+            id: type_id,
+            generation: 0,
+            kind: TypeKind::Enum {
+                variants: vec!["sad".into()],
+            },
+        },
+    );
+    let function_id = object_id("public", "accepts_mood(mood)");
+    cache.functions.insert(
+        function_id.clone(),
+        FunctionState {
+            return_type: "mood".into(),
+            ..FunctionState::with_inputs(
+                function_id.clone(),
+                safe_migrate::_internal::model::function::RoutineKind::Function,
+                vec!["mood".into()],
+            )
+        },
+    );
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+    engine
+        .analyze(
+            "BEGIN; ALTER TYPE mood RENAME TO emotion; ROLLBACK;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        state.local.functions.get(&function_id),
+        Some(FunctionOverlay::Present(function))
+            if function.arg_type_ids == vec![Some(object_id("public", "mood"))]
+                && function.return_type_id == Some(object_id("public", "mood"))
+    ));
+    assert!(
+        !state
+            .local
+            .functions
+            .contains_key(&object_id("public", "accepts_mood(emotion)"))
+    );
+}
+
+#[test]
+fn test_topology_function() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE FUNCTION fn(a int) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            &mut state,
+        )
+        .unwrap();
+
+    let id = ObjectId::new("public", "fn(integer)");
+    assert!(state.local.functions.contains_key(&id));
+}
+
+#[test]
+fn test_topology_procedure() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE PROCEDURE p(int) AS '...' LANGUAGE plpgsql;",
+            &mut state,
+        )
+        .unwrap();
+
+    let id = ObjectId::new("public", "p(integer)");
+    assert!(state.local.functions.contains_key(&id));
+}
+
+#[test]
+fn test_state_drop_function_if_exists() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    engine
+        .analyze("DROP FUNCTION IF EXISTS missing_func();", &mut state)
+        .unwrap();
+    assert_eq!(state.local.confidence, Confidence::Exact);
+}
+
+#[test]
+fn creating_a_new_function_taints_unmodeled_body_state() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+            &mut state,
+        )
+        .unwrap();
+
+    // FunctionState tracks identity and selected options, but not the
+    // SQL body/dependency graph represented by `AS`; retaining Exact here
+    // would overstate what later dependency checks can prove.
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "work()")),
+        Some(FunctionOverlay::Present(function))
+            if function.routine_kind
+                == RoutineKind::Function
+    ));
+}
+
+#[test]
+fn cached_aggregate_and_window_routines_reserve_the_shared_namespace() {
+    let engine = setup_engine();
+
+    for routine_kind in [RoutineKind::Aggregate, RoutineKind::Window] {
+        let mut cache = synced_cache();
+        let id = object_id("public", "work(integer)");
+        cache.functions.insert(
+            id.clone(),
+            FunctionState {
+                return_type: "integer".into(),
+                volatility: Volatility::Immutable,
+                language: "internal".into(),
+                ..FunctionState::with_inputs(id.clone(), routine_kind, vec!["integer".into()])
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        for sql in [
+            "CREATE FUNCTION work(integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+            "CREATE PROCEDURE work(integer) LANGUAGE sql AS $$ SELECT 1 $$;",
+        ] {
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+            }));
+            assert_eq!(state.local.confidence, Confidence::Exact);
+        }
+    }
+}
+
+#[test]
+fn aggregate_and_window_lifecycles_use_the_shared_routine_state() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE AGGREGATE total(integer) (
+                    SFUNC = int4pl,
+                    STYPE = integer,
+                    INITCOND = '0'
+                );
+                ALTER AGGREGATE total(integer) RENAME TO combined;
+                DROP AGGREGATE combined(integer);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(matches!(
+        state
+            .local
+            .functions
+            .get(&object_id("public", "combined(integer)")),
+        Some(FunctionOverlay::Dropped)
+    ));
+    assert_eq!(
+        state.local.confidence,
+        Confidence::Tainted,
+        "aggregate implementation details are intentionally not modeled"
+    );
+
+    engine
+        .analyze(
+            "CREATE FUNCTION ranked() RETURNS bigint
+                   AS 'window_row_number' LANGUAGE internal WINDOW;
+                 ALTER FUNCTION ranked() IMMUTABLE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "ranked()")),
+        Some(FunctionOverlay::Present(function))
+            if function.routine_kind == RoutineKind::Window
+                && function.volatility == Volatility::Immutable
+    ));
+    engine
+        .analyze("DROP FUNCTION ranked();", &mut state)
+        .unwrap();
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "ranked()")),
+        Some(FunctionOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn replacing_a_routine_cannot_change_function_window_or_aggregate_kind() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION work(integer) RETURNS integer
+                   LANGUAGE sql AS $$ SELECT $1 $$;",
+            &mut state,
+        )
+        .unwrap();
+
+    let window_conflict = engine
+        .analyze(
+            "CREATE OR REPLACE FUNCTION work(integer) RETURNS integer
+                   LANGUAGE sql WINDOW AS $$ SELECT $1 $$;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(window_conflict.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation.reason.contains("cannot change routine kind")
+    }));
+
+    let aggregate_conflict = engine
+        .analyze(
+            "CREATE OR REPLACE AGGREGATE work(integer) (
+                    SFUNC = int4pl,
+                    STYPE = integer
+                );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(aggregate_conflict.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation.reason.contains("cannot change routine kind")
+    }));
+}
+
+#[test]
+fn cached_aggregate_and_window_routines_accept_their_postgresql_commands() {
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    for (name, routine_kind) in [
+        ("total(integer)", RoutineKind::Aggregate),
+        ("ranked()", RoutineKind::Window),
+    ] {
+        let id = object_id("public", name);
+        cache.functions.insert(
+            id.clone(),
+            FunctionState {
+                return_type: "integer".into(),
+                language: "internal".into(),
+                ..FunctionState::with_inputs(
+                    id.clone(),
+                    routine_kind,
+                    if routine_kind == RoutineKind::Aggregate {
+                        vec!["integer".into()]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            },
+        );
+    }
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+    engine
+        .analyze(
+            "ALTER AGGREGATE total(integer) RENAME TO combined;
+                 ALTER FUNCTION ranked() IMMUTABLE;
+                 DROP AGGREGATE combined(integer);
+                 DROP FUNCTION ranked();",
+            &mut state,
+        )
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    assert!(matches!(
+        state
+            .local
+            .functions
+            .get(&object_id("public", "combined(integer)")),
+        Some(FunctionOverlay::Dropped)
+    ));
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "ranked()")),
+        Some(FunctionOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn test_state_drop_procedure_if_exists() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    engine
+        .analyze("DROP PROCEDURE IF EXISTS missing_proc();", &mut state)
+        .unwrap();
+    assert_eq!(state.local.confidence, Confidence::Exact);
+}
+
+#[test]
+fn guarded_routine_drop_still_rejects_the_wrong_routine_kind() {
+    let engine = setup_engine();
+    let routine_id = object_id("public", "work(integer)");
+
+    for (routine_kind, sql) in [
+        (
+            safe_migrate::_internal::model::function::RoutineKind::Function,
+            "DROP PROCEDURE IF EXISTS work(int);",
+        ),
+        (
+            safe_migrate::_internal::model::function::RoutineKind::Procedure,
+            "DROP FUNCTION IF EXISTS work(int);",
+        ),
+    ] {
+        let mut cache = crate::common::synced_cache();
+        cache.functions.insert(
+            routine_id.clone(),
+            FunctionState {
+                return_type: "void".into(),
+                ..FunctionState::with_inputs(
+                    routine_id.clone(),
+                    routine_kind,
+                    vec!["integer".into()],
+                )
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{sql} should reject the wrong routine kind"
+        );
+    }
+}
+
+#[test]
+fn routine_drop_lookup_outcomes_preserve_guarded_and_unknown_semantics() {
+    fn signature(schema: &str) -> FunctionSigFact {
+        FunctionSigFact {
+            name: QualifiedName::new(Some(Ident::new(schema, false)), Ident::new("work", false)),
+            params: vec!["integer".into()],
+        }
+    }
+
+    fn routine(kind: RoutineKind) -> FunctionState {
+        let id = object_id("public", "work(integer)");
+        FunctionState {
+            return_type: "void".into(),
+            ..FunctionState::with_inputs(id, kind, vec!["integer".into()])
+        }
+    }
+
+    let function_drop = |schema: &str, if_exists| {
+        Mutation::DropFunction(DropFunctionMutation {
+            signatures: vec![signature(schema)],
+            if_exists,
+            cascade: false,
+        })
+    };
+    let procedure_drop = |schema: &str, if_exists| {
+        Mutation::DropProcedure(DropProcedureMutation {
+            signatures: vec![signature(schema)],
+            if_exists,
+            cascade: false,
+        })
+    };
+    let aggregate_drop = |schema: &str, if_exists| {
+        Mutation::DropAggregate(DropAggregateMutation {
+            signatures: vec![signature(schema)],
+            if_exists,
+            cascade: false,
+        })
+    };
+
+    for (kind, drop) in [
+        (RoutineKind::Procedure, function_drop("public", true)),
+        (RoutineKind::Function, procedure_drop("public", true)),
+    ] {
+        let mut cache = synced_cache();
+        cache
+            .functions
+            .insert(object_id("public", "work(integer)"), routine(kind));
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        assert!(matches!(
+            state.apply(&drop, None),
+            MutationResult::Conflict { .. }
+        ));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    let mut wrong_kind_cache = synced_cache();
+    wrong_kind_cache.functions.insert(
+        object_id("public", "work(integer)"),
+        routine(RoutineKind::Function),
+    );
+    let mut wrong_kind_state =
+        crate::_internal::analysis::state::AnalysisState::new(wrong_kind_cache);
+    assert!(matches!(
+        wrong_kind_state.apply(&aggregate_drop("public", true), None),
+        MutationResult::Conflict { .. }
+    ));
+    assert_eq!(wrong_kind_state.local.confidence, Confidence::Exact);
+
+    for drop in [
+        function_drop("public", true),
+        procedure_drop("public", true),
+        aggregate_drop("public", true),
+    ] {
+        let mut state = setup_state();
+        assert_eq!(state.apply(&drop, None), MutationResult::NoOp);
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    for drop in [
+        function_drop("tenant", false),
+        procedure_drop("tenant", false),
+        aggregate_drop("tenant", false),
+    ] {
+        let mut cache = synced_cache();
+        cache.metadata.schemas = Some(vec!["public".into()]);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        assert_eq!(
+            state.apply(&drop, None),
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    let mut cache = synced_cache();
+    cache.metadata.schemas = Some(vec!["public".into()]);
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+    assert_eq!(
+        state.apply(&function_drop("tenant", true), None),
+        MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert_eq!(
+        state.apply(&aggregate_drop("tenant", true), None),
+        MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+}
+
+#[test]
+fn procedure_kind_and_lifecycle_are_enforced_within_the_chain() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE PROCEDURE work() LANGUAGE sql AS $$ SELECT 1 $$;",
+            &mut state,
+        )
+        .unwrap();
+    let id = object_id("public", "work()");
+    let Some(FunctionOverlay::Present(routine)) = state.local.functions.get(&id) else {
+        panic!("procedure missing");
+    };
+    assert_eq!(
+        routine.routine_kind,
+        safe_migrate::_internal::model::function::RoutineKind::Procedure
+    );
+
+    let wrong_kind = engine
+        .analyze("ALTER FUNCTION work() IMMUTABLE;", &mut state)
+        .unwrap();
+    assert!(
+        wrong_kind
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict")
+    );
+
+    engine
+        .analyze("DROP PROCEDURE work();", &mut state)
+        .unwrap();
+    let after_drop = engine
+        .analyze("ALTER PROCEDURE work() RENAME TO renamed_work;", &mut state)
+        .unwrap();
+    assert!(
+        after_drop
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict")
+    );
+}
+
+#[test]
+fn an_unknown_subscription_parameter_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    state.pg_version_num = Some(180_006);
+    let violations = engine
+        .analyze(
+            "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH (not_a_parameter = true);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict")
+    );
+}
+
+#[test]
+fn test_state_alter_function_updates_volatility_and_identity() {
+    use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
+
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            &mut state,
+        )
+        .unwrap();
+    engine
+        .analyze("ALTER FUNCTION f() IMMUTABLE;", &mut state)
+        .unwrap();
+
+    let Some(FunctionOverlay::Present(function)) =
+        state.local.functions.get(&object_id("public", "f()"))
+    else {
+        panic!("function should remain present after volatility change");
+    };
+    assert_eq!(function.volatility, Volatility::Immutable);
+
+    engine
+        .analyze("ALTER FUNCTION f() RENAME TO g;", &mut state)
+        .unwrap();
+    assert!(
+        !state
+            .local
+            .functions
+            .contains_key(&object_id("public", "f()"))
+    );
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "g()")),
+        Some(FunctionOverlay::Present(_))
+    ));
+}
+
+#[test]
+fn create_sequence_applies_all_catalog_parameters() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE UNLOGGED SEQUENCE public.parameterized_seq AS integer \
+                 INCREMENT BY -3 MINVALUE -99 MAXVALUE -3 START WITH -3 CACHE 7 CYCLE;",
+            &mut state,
+        )
+        .unwrap();
+
+    let id = object_id("public", "parameterized_seq");
+    let Some(SequenceOverlay::Present(sequence)) = state.local.sequences.get(&id) else {
+        panic!("sequence was not created");
+    };
+    assert_eq!(sequence.parameters.data_type, "integer");
+    assert_eq!(sequence.parameters.increment, -3);
+    assert_eq!(sequence.parameters.min_value, -99);
+    assert_eq!(sequence.parameters.max_value, -3);
+    assert_eq!(sequence.parameters.start_value, -3);
+    assert_eq!(sequence.parameters.cache_size, 7);
+    assert!(sequence.parameters.cycle);
+    assert_eq!(
+        sequence.parameters.persistence,
+        safe_migrate::_internal::model::sequence::SequencePersistence::Unlogged
+    );
+}
+
+#[test]
+fn test_drop_function_cascade_removes_dependent_trigger() {
+    use safe_migrate::_internal::model::function::FunctionOverlay;
+    use safe_migrate::_internal::model::trigger::TriggerOverlay;
+
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "
+                CREATE TABLE target (id integer);
+                CREATE FUNCTION compute_trigger() RETURNS trigger
+                    LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                CREATE TRIGGER compute_row AFTER INSERT ON target
+                    EXECUTE FUNCTION compute_trigger();
+                DROP FUNCTION compute_trigger() CASCADE;
+                ",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        state
+            .local
+            .functions
+            .get(&object_id("public", "compute_trigger()")),
+        Some(FunctionOverlay::Dropped)
+    ));
+    assert!(matches!(
+        state.local.triggers.values().next(),
+        Some(TriggerOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn test_variadic_function_drop_normalizes_array_alias() {
+    use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState};
+
+    let engine = setup_engine();
+    let function_id = object_id("public", "f_safe(integer[])");
+    let mut cache = synced_cache();
+    cache.functions.insert(
+        function_id.clone(),
+        FunctionState {
+            return_type: "integer".to_string(),
+            arg_type_ids: vec![None],
+            ..FunctionState::with_inputs(
+                function_id.clone(),
+                safe_migrate::_internal::model::function::RoutineKind::Function,
+                vec!["integer[]".to_string()],
+            )
+        },
+    );
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+    engine
+        .analyze("DROP FUNCTION f_safe(VARIADIC INT[]);", &mut state)
+        .unwrap();
+
+    assert!(matches!(
+        state.local.functions.get(&function_id),
+        Some(FunctionOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn routine_identity_ignores_type_spelling() {
+    for (first, second) in [
+        ("text", "pg_catalog.text"),
+        ("int", "pg_catalog.int4"),
+        ("varchar", "pg_catalog.varchar"),
+    ] {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+                .analyze(
+                    &format!(
+                        "CREATE FUNCTION probe(a {first}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION probe(a {second}) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains("already exists")
+            }),
+            "probe({first}) and probe({second}) are one routine: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn routine_identity_ignores_schema_qualification_of_a_user_type() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+            .analyze(
+                "CREATE SCHEMA sm_ident;
+                 CREATE TYPE sm_ident.mood AS ENUM ('sad');
+                 SET search_path TO sm_ident, public;
+                 CREATE FUNCTION probe(a mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION probe(a sm_ident.mood) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding.rule_id == "chain-conflict" && finding.reason.contains("already exists")
+        }),
+        "both spellings resolve to sm_ident.mood: {findings:?}"
+    );
+}
+
+#[test]
+fn distinct_custom_types_are_not_collapsed_into_one_signature() {
+    // An unresolved custom type renders to nothing, so without care these
+    // two different signatures would both become `probe()`.
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TYPE alpha_t AS ENUM ('a');
+                 CREATE TYPE beta_t AS ENUM ('b');
+                 CREATE FUNCTION probe(a alpha_t) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION probe(a beta_t) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "distinct argument types are distinct routines: {findings:?}"
+    );
+}

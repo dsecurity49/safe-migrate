@@ -5,6 +5,18 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.11.1 — 2026-10-20
+
+- The Markdown report shows how many checks did not run and collapses their
+  rules and remedies into one expandable table grouped by cause, instead of
+  repeating the same remedy for every rule. The terminal report groups them the
+  same way.
+- Aggregate overload resolution now follows PostgreSQL for variadic element
+  types, explicit `VARIADIC` arrays, and omitted trailing defaults.
+- Corrected generated constraint names, inherited foreign-key columns,
+  partition column matching, version-gated privilege and subscription behavior,
+  multirange names, and scoped routine dependency identities.
+
 ## v0.11.0 — 2026-10-19
 
 - Report JSON schema version 3: violation fields are dropped, rule titles move

@@ -132,7 +132,8 @@ against PostgreSQL 14 through 18; excluded fixtures and their reasons live in
 
 Rules must:
 
-- define behavior for `MutationResult::Skipped`;
+- define behavior for `MutationResult::NoOp`, `NotExecuted`, and `Unresolved`,
+  not only `Applied`;
 - distinguish conflicts from applied mutations;
 - infer operation and object kinds from the mutation;
 - avoid mutating analysis state;
@@ -147,7 +148,7 @@ Use the pinned Squawk source and grammar when changing AST extraction:
 
 1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
 2. inspect the resolved dependency source and grammar;
-3. add an exact fact assertion in `src/_internal/ast/visitor_tests.rs`;
+3. add an exact fact assertion in the matching `src/_internal/ast/visitor_tests/*.rs` module;
 4. implement extraction in `src/_internal/ast/visitor.rs` or expression
    conversion in `src/_internal/analysis/expr_visitor.rs`;
 5. test resolver, state, and rule effects when behavior crosses layers;
@@ -205,7 +206,7 @@ The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
 pull request.
 
-Cache V8 synchronizes every PostgreSQL routine kind, publications, redacted
+Cache V10 synchronizes every PostgreSQL routine kind, publications, redacted
 subscription metadata, and explicit catalog coverage. Never query or store
 `pg_subscription.subconninfo`.
 Changes to the cache model require serialization and inspection regressions,

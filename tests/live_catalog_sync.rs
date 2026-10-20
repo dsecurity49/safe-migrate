@@ -8,7 +8,7 @@ use safe_migrate::_internal::analysis::facts::{
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_MAGIC, CatalogFamily, DbCacheVersioned};
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{
@@ -1166,4 +1166,106 @@ fn live_connected_subscription_round_trip_is_redacted_and_exact() {
 
     cleanup(&mut subscriber);
     cleanup_publisher(&mut publisher);
+}
+
+#[test]
+#[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+fn scoped_dependency_identity_includes_routine_signature() {
+    let guard = crate::internal_tests::live_database_test_lock();
+    let (database_config, _, _) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for scoped dependency sync"),
+    );
+    let _cleanup = CatalogCleanup(database_config.clone());
+    let mut client = database_config
+        .connect(postgres::NoTls)
+        .expect("connect for scoped dependency sync");
+
+    let scope = "sm_v7_scope";
+    let outside = "sm_v7_outside";
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {scope} CASCADE;
+             DROP SCHEMA IF EXISTS {outside} CASCADE;
+             CREATE SCHEMA {scope};
+             CREATE SCHEMA {outside};
+             CREATE FUNCTION {scope}.f(value integer) RETURNS integer
+               LANGUAGE sql IMMUTABLE AS 'SELECT value';
+             CREATE VIEW {outside}.v AS SELECT {scope}.f(1) AS value;"
+        ))
+        .expect("seed scoped routine dependency");
+
+    let temp_dir = tempfile::tempdir().expect("create scoped dependency directory");
+    let cache_path = temp_dir.path().join("scoped.cache");
+    sync_cache(&cache_path, Some(&[scope.to_string()]), false)
+        .expect("sync scoped routine dependency");
+    let (cache, _) = decode_cache(&cache_path);
+
+    let scoped = ObjectId::new(scope, "f(integer)");
+    let external = ObjectId::new(outside, "v");
+    assert!(
+        cache.scoped_external_dependencies.iter().any(|edge| {
+            edge.family == CatalogFamily::Routines
+                && edge.scoped == scoped
+                && edge.external.as_ref() == Some(&external)
+        }),
+        "missing signed scoped routine edge: {:?}",
+        cache.scoped_external_dependencies
+    );
+
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA {outside} CASCADE;
+             DROP SCHEMA {scope} CASCADE;"
+        ))
+        .expect("remove scoped dependency fixtures");
+}
+
+#[test]
+#[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+fn scoped_table_without_external_dependents_stays_evaluated() {
+    let guard = crate::internal_tests::live_database_test_lock();
+    let (database_config, _, _) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for scoped table sync"),
+    );
+    let _cleanup = CatalogCleanup(database_config.clone());
+    let mut client = database_config
+        .connect(postgres::NoTls)
+        .expect("connect for scoped table sync");
+
+    let scope = "sm_v7_table_scope";
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {scope} CASCADE;
+             CREATE SCHEMA {scope};
+             CREATE TABLE {scope}.t (id integer PRIMARY KEY);"
+        ))
+        .expect("seed scoped table");
+
+    let temp_dir = tempfile::tempdir().expect("create scoped table directory");
+    let cache_path = temp_dir.path().join("scoped-table.cache");
+    sync_cache(&cache_path, Some(&[scope.to_string()]), false).expect("sync scoped table");
+    let (cache, _) = decode_cache(&cache_path);
+
+    let table = ObjectId::new(scope, "t");
+    assert!(
+        !cache
+            .scoped_external_dependencies
+            .iter()
+            .any(|edge| edge.family == CatalogFamily::Relations && edge.scoped == table),
+        "a table's own row type must not look like an external dependent: {:?}",
+        cache.scoped_external_dependencies
+    );
+    let state = AnalysisState::new(cache);
+    assert!(
+        !state.baseline_scoped_family_object(&table, CatalogFamily::Relations),
+        "a table without external dependents must stay evaluatable"
+    );
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {scope} CASCADE;"))
+        .expect("remove scoped table fixture");
 }
