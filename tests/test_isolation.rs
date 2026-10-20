@@ -49,7 +49,7 @@ mod test_isolation_tests {
     /// Production may read it; the guard is the single place that may.
     #[test]
     fn only_production_and_the_live_guard_read_database_url_from_the_environment() {
-        const ALLOWED: [&str; 2] = ["src/_internal/sync.rs", "src/_internal/test_support.rs"];
+        const ALLOWED: [&str; 2] = ["src/_internal/sync/mod.rs", "src/_internal/test_support.rs"];
 
         let offenders: Vec<String> = all_rust_sources()
             .into_iter()
