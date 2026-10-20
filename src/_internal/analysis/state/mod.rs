@@ -20,7 +20,7 @@ use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
-use crate::_internal::model::replication::SUBSCRIPTION_PARAMS;
+use crate::_internal::model::replication::{SUBSCRIPTION_PARAMS, SubscriptionValue};
 use crate::_internal::model::schema::SchemaOverlay;
 use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::trigger::TriggerOverlay;
@@ -364,4 +364,4 @@ mod pre_state_tests;
 #[cfg(test)]
 mod evidence_tests;
 
-pub(crate) use aggregate::AggregateCandidateResolution;
+pub(crate) use aggregate::{AggregateCallArgument, AggregateCandidateResolution};

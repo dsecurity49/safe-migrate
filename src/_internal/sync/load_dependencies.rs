@@ -188,6 +188,7 @@ pub(super) fn load_view_dependencies(
 pub(super) fn load_scoped_external_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
+    builtin_types: &BuiltinTypeCatalogue,
 ) -> Result<ScopedExternalDependencies> {
     let Some(schemas) = schema_values else {
         return Ok(ScopedExternalDependencies {
@@ -207,27 +208,33 @@ pub(super) fn load_scoped_external_dependencies(
             ref_side.relkind AS ref_relkind,
             ref_side.schema AS ref_schema,
             ref_side.name AS ref_name,
+            ref_side.args AS ref_args,
             dep_side.schema AS dep_schema,
             dep_side.name AS dep_name
         FROM pg_depend d
         CROSS JOIN LATERAL (
             SELECT 'r' AS family, c.relkind::text AS relkind,
-                   n.nspname AS schema, c.relname AS name
+                   n.nspname AS schema, c.relname AS name, NULL::text[] AS args
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE d.refclassid = 'pg_class'::regclass AND c.oid = d.refobjid
             UNION ALL
-            SELECT 't', NULL, n.nspname, t.typname
+            SELECT 't', NULL, n.nspname, t.typname, NULL::text[]
             FROM pg_type t
             JOIN pg_namespace n ON n.oid = t.typnamespace
             WHERE d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid
             UNION ALL
-            SELECT 'p', NULL, n.nspname, p.proname
+            SELECT 'p', NULL, n.nspname, p.proname,
+                   ARRAY(
+                       SELECT pg_catalog.format_type(t, NULL)
+                       FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                       ORDER BY n
+                   )::text[]
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid
             UNION ALL
-            SELECT 'o', NULL, n.nspname, o.oprname
+            SELECT 'o', NULL, n.nspname, o.oprname, NULL::text[]
             FROM pg_operator o
             JOIN pg_namespace n ON n.oid = o.oprnamespace
             WHERE d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid
@@ -256,6 +263,11 @@ pub(super) fn load_scoped_external_dependencies(
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE d.classid = 'pg_proc'::regclass AND p.oid = d.objid
+            UNION ALL
+            SELECT n.nspname, t.typname
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE d.classid = 'pg_type'::regclass AND t.oid = d.objid
         ) dep_side ON TRUE
         WHERE ref_side.schema = ANY($1)
           AND (
@@ -268,6 +280,10 @@ pub(super) fn load_scoped_external_dependencies(
               dep_side.schema NOT LIKE 'pg\_%' ESCAPE '\'
               AND dep_side.schema <> 'information_schema'
             )
+          )
+          AND (
+            d.deptype NOT IN ('i', 'a', 'P', 'S')
+            OR dep_side.schema IS NOT NULL
           )
     "#;
     let mut edges = Vec::new();
@@ -298,7 +314,26 @@ pub(super) fn load_scoped_external_dependencies(
         };
         let scoped = ObjectId::new(
             row.try_get::<_, String>("ref_schema")?,
-            row.try_get::<_, String>("ref_name")?,
+            if family == CatalogFamily::Routines {
+                let name: String = row.try_get("ref_name")?;
+                let raw_args: Vec<String> = row
+                    .try_get::<_, Option<Vec<String>>>("ref_args")?
+                    .unwrap_or_default();
+                let signature = raw_args
+                    .iter()
+                    .map(|argument| {
+                        crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                            argument,
+                            builtin_types,
+                        )
+                        .render()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{name}({signature})")
+            } else {
+                row.try_get::<_, String>("ref_name")?
+            },
         );
         let external_schema: Option<String> = row.try_get("dep_schema")?;
         edges.push(match external_schema {

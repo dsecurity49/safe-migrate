@@ -85,9 +85,9 @@ pub(crate) struct DbCache {
     /// True only when the synchronizer queried every membership grantor row.
     #[serde(default)]
     pub role_membership_grantors_complete: bool,
-    /// The cluster's bootstrap superuser (the role PG attacks implicit
-    /// superuser-issued role grants to, via `BOOTSTRAP_SUPERUSERID`). Absent
-    /// when a programmatic cache did not record it.
+    /// The cluster's bootstrap superuser (the role PostgreSQL 16+ attributes
+    /// implicit superuser-issued role grants to, via `BOOTSTRAP_SUPERUSERID`).
+    /// Absent when a programmatic cache did not record it.
     #[serde(default)]
     pub bootstrap_superuser: Option<String>,
     pub schemas: HashMap<String, SchemaState>,

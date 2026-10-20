@@ -625,8 +625,8 @@ fn append_markdown_not_evaluated(output: &mut String, not_evaluated: &[NotEvalua
     output.push_str("\n## Not evaluated\n\n");
     // The count stays visible; the repeated detail is one click away.
     output.push_str(&format!(
-        "<details>\n<summary>{total} {checks} {verb} not evaluated because the \
-required evidence was unavailable — expand for the rules and remedies.</summary>\n\n"
+        "<details>\n<summary>{total} {checks} {verb} not evaluated — expand for the \
+causes, rules, and remedies.</summary>\n\n"
     ));
     output.push_str("| Cause | Rules | Remedy |\n| --- | --- | --- |\n");
     for group in groups {

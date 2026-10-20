@@ -1208,6 +1208,80 @@ fn missing_foreign_key_source_column_is_a_conflict() {
 }
 
 #[test]
+fn create_table_foreign_keys_accept_inherited_source_columns() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TABLE target (id integer PRIMARY KEY);
+             CREATE TABLE base (parent_id integer);
+             CREATE TABLE child (FOREIGN KEY (parent_id) REFERENCES target(id))
+                INHERITS (base);
+             CREATE TABLE base_like (parent_id integer);
+             CREATE TABLE child_like (
+                LIKE base_like INCLUDING ALL,
+                FOREIGN KEY (parent_id) REFERENCES target(id)
+             );
+             CREATE TYPE address AS (parent_id integer);
+             CREATE TABLE child_of OF address (
+                FOREIGN KEY (parent_id) REFERENCES target(id)
+             );
+             CREATE TABLE parent_part (parent_id integer, id integer)
+                PARTITION BY RANGE (id);
+             CREATE TABLE child_part PARTITION OF parent_part (
+                FOREIGN KEY (parent_id) REFERENCES target(id)
+             ) FOR VALUES FROM (0) TO (10);",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    for table in ["child", "child_like", "child_of", "child_part"] {
+        assert!(
+            state.local.constraints.contains_key(&(
+                object_id("public", table),
+                format!("{table}_parent_id_fkey")
+            )),
+            "missing foreign key on {table}"
+        );
+    }
+}
+
+#[test]
+fn self_referencing_foreign_key_accepts_inherited_columns() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TABLE base (id integer);
+             CREATE TABLE child (
+                PRIMARY KEY (id),
+                FOREIGN KEY (id) REFERENCES child(id)
+             ) INHERITS (base);",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert!(
+        state
+            .local
+            .constraints
+            .contains_key(&(object_id("public", "child"), "child_id_fkey".to_string()))
+    );
+}
+
+#[test]
 fn create_table_records_inline_primary_key_and_table_unique_constraints() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -1239,6 +1313,61 @@ fn create_table_records_inline_primary_key_and_table_unique_constraints() {
         .expect("table unique constraint should be recorded");
     assert_eq!(unique.kind, ConstraintKind::Unique);
     assert!(unique.validated);
+}
+
+#[test]
+fn alter_table_generated_key_and_exclusion_names_use_columns() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE generated_names (email text, period int4range);
+             ALTER TABLE generated_names ADD UNIQUE (email);
+             ALTER TABLE generated_names
+                ADD EXCLUDE USING gist (period WITH &&);",
+            &mut state,
+        )
+        .unwrap();
+
+    let table = object_id("public", "generated_names");
+    for (name, kind) in [
+        ("generated_names_email_key", ConstraintKind::Unique),
+        ("generated_names_period_excl", ConstraintKind::Exclusion),
+    ] {
+        let constraint = state
+            .local
+            .constraints
+            .get(&(table.clone(), name.to_string()))
+            .unwrap_or_else(|| panic!("missing generated constraint {name}"));
+        assert_eq!(constraint.kind, kind);
+        assert_eq!(
+            constraint.backing_index.as_ref(),
+            Some(&object_id("public", name))
+        );
+    }
+}
+
+#[test]
+fn create_table_generated_exclusion_name_uses_columns() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE generated_exclusion (
+                period int4range,
+                EXCLUDE USING gist (period WITH &&)
+             );",
+            &mut state,
+        )
+        .unwrap();
+
+    let table = object_id("public", "generated_exclusion");
+    let constraint = state
+        .local
+        .constraints
+        .get(&(table, "generated_exclusion_period_excl".to_string()))
+        .expect("generated exclusion constraint should use its key columns");
+    assert_eq!(constraint.kind, ConstraintKind::Exclusion);
 }
 
 #[test]

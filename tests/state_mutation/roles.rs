@@ -1568,3 +1568,165 @@ fn role_grant_rejects_cycles_before_mutating_the_batch() {
         assert!(role.member_of.is_empty());
     }
 }
+
+#[test]
+fn maintain_grants_and_revokes_require_postgres_17() {
+    let engine = setup_engine();
+    let table = object_id("public", "maintain_table");
+    let grantee = object_id("", "app_user");
+
+    for (version, supported) in [(160_000, false), (170_000, true)] {
+        let mut cache = cache_with_table("public", "maintain_table", None);
+        cache.pg_version_num = Some(version);
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT MAINTAIN ON TABLE maintain_table TO app_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            !supported,
+            "GRANT MAINTAIN on PostgreSQL {version}"
+        );
+
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("maintain_table missing");
+        };
+        assert_eq!(
+            relation
+                .privileges
+                .has_privilege(&grantee, Privilege::Maintain),
+            supported
+        );
+
+        let violations = engine
+            .analyze(
+                "REVOKE MAINTAIN ON TABLE maintain_table FROM app_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            !supported,
+            "REVOKE MAINTAIN on PostgreSQL {version}"
+        );
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("maintain_table missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&grantee, Privilege::Maintain)
+        );
+    }
+}
+
+#[test]
+fn maintain_with_an_unknown_server_version_is_unresolved() {
+    let engine = setup_engine();
+    let mut cache = cache_with_table("public", "maintain_table", None);
+    cache.pg_version_num = None;
+    let mut state = AnalysisState::new(cache);
+
+    let violations = engine
+        .analyze(
+            "GRANT MAINTAIN ON TABLE maintain_table TO app_user;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict")
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+}
+
+#[test]
+fn role_membership_grantor_uses_bootstrap_from_postgres_16() {
+    let engine = setup_engine();
+    let member = object_id("", "member");
+    let parent = object_id("", "parent");
+
+    for (version, expected) in [(150_000, "admin"), (160_000, "bootstrap")] {
+        let mut cache = synced_cache();
+        cache.pg_version_num = Some(version);
+        cache.bootstrap_superuser = Some("bootstrap".into());
+        cache.metadata.source_role = Some("admin".into());
+        cache.metadata.source_session_role = Some("admin".into());
+        for name in ["admin", "bootstrap", "parent", "member"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: name == "admin" || name == "bootstrap",
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze("GRANT parent TO member;", &mut state)
+            .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+
+        let record = state
+            .local
+            .role_membership_grantors
+            .iter()
+            .find(|record| record.member == member && record.role == parent)
+            .unwrap();
+        assert_eq!(
+            record.grantor.name, expected,
+            "implicit role grantor on PostgreSQL {version}"
+        );
+    }
+}
+
+#[test]
+fn role_membership_grantor_is_unresolved_without_a_server_version() {
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    cache.pg_version_num = None;
+    cache.bootstrap_superuser = Some("bootstrap".into());
+    cache.metadata.source_role = Some("admin".into());
+    cache.metadata.source_session_role = Some("admin".into());
+    for name in ["admin", "bootstrap", "parent", "member"] {
+        let id = object_id("", name);
+        cache.roles.insert(
+            id.clone(),
+            RoleState {
+                id,
+                can_login: true,
+                is_superuser: name == "admin",
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+    }
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("GRANT parent TO member;", &mut state)
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert!(state.local.role_membership_grantors.is_empty());
+}

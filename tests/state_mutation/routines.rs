@@ -1347,7 +1347,7 @@ fn test_variadic_function_drop_normalizes_array_alias() {
 fn routine_identity_ignores_type_spelling() {
     for (first, second) in [
         ("text", "pg_catalog.text"),
-        ("int4", "pg_catalog.int"),
+        ("int", "pg_catalog.int4"),
         ("varchar", "pg_catalog.varchar"),
     ] {
         let engine = setup_engine();

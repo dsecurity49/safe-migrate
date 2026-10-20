@@ -356,9 +356,16 @@ impl AstVisitor {
         let arguments = match call.arg_list() {
             Some(args) if args.star_token().is_none() => args
                 .args()
-                .map(|arg| match arg.func_arg_expr() {
-                    Some(ast::FuncArgExpr::Expr(expr)) => Self::aggregate_argument(expr),
-                    _ => AggregateArgumentFact::Unknown,
+                .map(|arg| {
+                    let argument = match arg.func_arg_expr() {
+                        Some(ast::FuncArgExpr::Expr(expr)) => Self::aggregate_argument(expr),
+                        _ => AggregateArgumentFact::Unknown,
+                    };
+                    if arg.variadic_token().is_some() {
+                        AggregateArgumentFact::Variadic(Box::new(argument))
+                    } else {
+                        argument
+                    }
                 })
                 .collect(),
             _ => Vec::new(),

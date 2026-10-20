@@ -47,25 +47,36 @@ enum AggregateCandidateKind {
     Other,
 }
 
-/// A written argument typed as far as the model can resolve it.
+/// A written argument typed as far as the model can resolve it. `identity` is
+/// `None` when the argument is untyped; `variadic` records the explicit
+/// PostgreSQL `VARIADIC` keyword, which changes which declared type applies.
 struct CandidateArg {
-    identity: crate::_internal::model::data_type::TypeIdentity,
+    identity: Option<crate::_internal::model::data_type::TypeIdentity>,
+    variadic: bool,
 }
 
 impl CandidateArg {
-    fn new(typed: &str, catalogue: &BuiltinTypeCatalogue) -> Self {
-        let syntax = ParsedDataType::parse(typed, catalogue);
-        Self {
-            identity: crate::_internal::model::data_type::TypeIdentity::from_syntax(&syntax),
-        }
+    fn new(typed: Option<&str>, variadic: bool, catalogue: &BuiltinTypeCatalogue) -> Self {
+        let identity = typed.map(|typed| {
+            let syntax = ParsedDataType::parse(typed, catalogue);
+            crate::_internal::model::data_type::TypeIdentity::from_syntax(&syntax)
+        });
+        Self { identity, variadic }
     }
+}
+
+/// One written argument of an aggregate-named call, after the resolver has
+/// substituted a column's type.
+pub(crate) struct AggregateCallArgument {
+    pub(crate) type_name: Option<String>,
+    pub(crate) variadic: bool,
 }
 
 /// Whether a modeled routine can take a call with these argument types, and
 /// how closely. `None` leaves the built-in aggregate of the name alone.
 fn routine_match(
     routine: &crate::_internal::model::function::FunctionState,
-    known: &[Option<CandidateArg>],
+    known: &[CandidateArg],
     catalogue: &BuiltinTypeCatalogue,
     casts: &CastCatalogue,
 ) -> Option<CandidateMatch> {
@@ -73,48 +84,79 @@ fn routine_match(
 
     let declared = routine.arg_types.len();
     // Defaults let a call omit trailing inputs; a variadic parameter swallows
-    // the rest.
-    let variadic = routine
+    // the rest. Input positions are what `arg_types` indexes.
+    let variadic_index = routine
         .parameters
         .iter()
-        .any(|parameter| parameter.mode == ParameterMode::Variadic);
+        .filter(|parameter| parameter.mode.is_input())
+        .position(|parameter| parameter.mode == ParameterMode::Variadic);
+    let variadic = variadic_index.is_some();
+    let fixed = variadic_index.unwrap_or(declared);
     let minimum = declared
         .saturating_sub(routine.default_count as usize)
         .saturating_sub(usize::from(variadic));
-    if variadic {
-        if known.len() < minimum {
-            return None;
-        }
-    } else if known.len() < minimum || known.len() > declared {
+    if known.len() < minimum || (!variadic && known.len() > declared) {
         return None;
     }
 
+    // `VARIADIC ARRAY[...]` passes the array itself and must be the last
+    // argument, exactly where the variadic parameter starts. Without the
+    // keyword, every argument there is one element of the variadic array.
+    let marked: Vec<usize> = known
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.variadic)
+        .map(|(index, _)| index)
+        .collect();
+    if marked.len() > 1 {
+        return None;
+    }
+    let marker = marked.first().copied();
+    if let Some(marker) = marker
+        && (!variadic || marker + 1 != known.len() || marker != fixed || known.len() != declared)
+    {
+        return None;
+    }
+    let element_type = if variadic {
+        routine
+            .arg_types
+            .get(fixed)?
+            .strip_suffix("[]")
+            .map(str::to_owned)?
+    } else {
+        String::new()
+    };
+
     let mut exact = true;
     for (index, argument) in known.iter().enumerate() {
-        // Past the declared list only a variadic tail parameter applies.
-        let declared_type = if index < declared {
-            &routine.arg_types[index]
+        let declared_type = if !variadic || index < fixed {
+            routine.arg_types.get(index)?
+        } else if marker == Some(index) {
+            routine.arg_types.get(fixed)?
         } else {
-            routine.arg_types.last()?
+            &element_type
         };
-        let declared = CandidateArg::new(declared_type, catalogue);
-        let Some(argument) = argument else {
+        let declared = CandidateArg::new(Some(declared_type), false, catalogue);
+        let Some(argument_identity) = argument.identity.as_ref() else {
             exact = false;
             continue;
         };
-        if argument.identity == declared.identity {
+        let Some(declared_identity) = declared.identity.as_ref() else {
+            exact = false;
+            continue;
+        };
+        if argument_identity == declared_identity {
             continue;
         }
         exact = false;
         // A type the model could not resolve could still be coercible.
-        if argument.identity.is_unknown() || declared.identity.is_unknown() {
+        if argument_identity.is_unknown() || declared_identity.is_unknown() {
             continue;
         }
-        if !casts.coerces_implicitly(&argument.identity.render(), &declared.identity.render()) {
+        if !casts.coerces_implicitly(&argument_identity.render(), &declared_identity.render()) {
             return None;
         }
     }
-    let exact = exact && !variadic && known.len() == declared;
     Some(if exact {
         CandidateMatch::Exact
     } else {
@@ -126,33 +168,37 @@ fn routine_match(
 /// types, and how closely. A polymorphic parameter accepts anything.
 fn builtin_aggregate_match(
     signature: &[crate::_internal::model::aggregate::AggregateArg],
-    known: &[Option<CandidateArg>],
+    known: &[CandidateArg],
     catalogue: &BuiltinTypeCatalogue,
     casts: &CastCatalogue,
 ) -> Option<CandidateMatch> {
     use crate::_internal::model::aggregate::AggregateArg;
 
-    if signature.len() != known.len() {
+    if signature.len() != known.len() || known.iter().any(|argument| argument.variadic) {
         return None;
     }
     let mut exact = true;
     for (argument, declared) in known.iter().zip(signature) {
-        let Some(argument) = argument else {
+        let Some(argument_identity) = argument.identity.as_ref() else {
             exact = false;
             continue;
         };
         let AggregateArg::Type(spelling) = declared else {
             continue;
         };
-        let declared = CandidateArg::new(spelling, catalogue);
-        if argument.identity == declared.identity {
+        let declared = CandidateArg::new(Some(spelling), false, catalogue);
+        let Some(declared_identity) = declared.identity.as_ref() else {
+            exact = false;
+            continue;
+        };
+        if argument_identity == declared_identity {
             continue;
         }
         exact = false;
-        if argument.identity.is_unknown() || declared.identity.is_unknown() {
+        if argument_identity.is_unknown() || declared_identity.is_unknown() {
             continue;
         }
-        if !casts.coerces_implicitly(&argument.identity.render(), &declared.identity.render()) {
+        if !casts.coerces_implicitly(&argument_identity.render(), &declared_identity.render()) {
             return None;
         }
     }
@@ -170,19 +216,17 @@ impl AnalysisState {
     pub(crate) fn resolve_aggregate_candidate(
         &self,
         name: &str,
-        arguments: &[Option<String>],
+        arguments: &[AggregateCallArgument],
     ) -> AggregateCandidateResolution {
         use crate::_internal::model::function::RoutineKind;
         use AggregateCandidateKind::{Aggregate, Other, Scalar};
 
         let catalogue = self.builtin_types();
         let casts = self.casts();
-        let known: Vec<Option<CandidateArg>> = arguments
+        let known: Vec<CandidateArg> = arguments
             .iter()
             .map(|argument| {
-                argument
-                    .as_ref()
-                    .map(|typed| CandidateArg::new(typed, catalogue))
+                CandidateArg::new(argument.type_name.as_deref(), argument.variadic, catalogue)
             })
             .collect();
 
@@ -311,5 +355,125 @@ impl AnalysisState {
             catalog_shadowed,
             schemas,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::_internal::ast::identifiers::ObjectId;
+    use crate::_internal::model::function::{FunctionState, ParameterMode, RoutineKind};
+
+    fn routine(arg_types: &[&str]) -> FunctionState {
+        FunctionState::with_inputs(
+            ObjectId::new("public", "sum"),
+            RoutineKind::Function,
+            arg_types.iter().map(|ty| (*ty).to_string()).collect(),
+        )
+    }
+
+    fn variadic_routine(arg_types: &[&str]) -> FunctionState {
+        let mut routine = routine(arg_types);
+        let last = routine.parameters.len() - 1;
+        routine.parameters[last].mode = ParameterMode::Variadic;
+        routine
+    }
+
+    fn match_arguments(
+        routine: &FunctionState,
+        arguments: &[(&str, bool)],
+        catalogue: &BuiltinTypeCatalogue,
+        casts: &CastCatalogue,
+    ) -> Option<CandidateMatch> {
+        let known: Vec<CandidateArg> = arguments
+            .iter()
+            .map(|(ty, variadic)| CandidateArg::new(Some(ty), *variadic, catalogue))
+            .collect();
+        routine_match(routine, &known, catalogue, casts)
+    }
+
+    #[test]
+    fn variadic_scalar_arguments_use_the_element_type() {
+        let routine = variadic_routine(&["integer[]"]);
+        let catalogue = BuiltinTypeCatalogue::fallback();
+        let casts = CastCatalogue::fallback();
+
+        assert_eq!(
+            match_arguments(&routine, &[("integer", false)], &catalogue, &casts),
+            Some(CandidateMatch::Exact)
+        );
+        assert_eq!(
+            match_arguments(
+                &routine,
+                &[("integer", false), ("integer", false)],
+                &catalogue,
+                &casts
+            ),
+            Some(CandidateMatch::Exact)
+        );
+    }
+
+    #[test]
+    fn an_array_argument_needs_the_variadic_keyword() {
+        let routine = variadic_routine(&["integer[]"]);
+        let catalogue = BuiltinTypeCatalogue::fallback();
+        let casts = CastCatalogue::fallback();
+
+        assert_eq!(
+            match_arguments(&routine, &[("integer[]", false)], &catalogue, &casts),
+            None
+        );
+        assert_eq!(
+            match_arguments(&routine, &[("integer[]", true)], &catalogue, &casts),
+            Some(CandidateMatch::Exact)
+        );
+    }
+
+    #[test]
+    fn omitted_trailing_defaults_still_match_exactly() {
+        let mut routine = routine(&["integer", "integer"]);
+        routine.default_count = 1;
+        let catalogue = BuiltinTypeCatalogue::fallback();
+        let casts = CastCatalogue::fallback();
+
+        assert_eq!(
+            match_arguments(&routine, &[("integer", false)], &catalogue, &casts),
+            Some(CandidateMatch::Exact)
+        );
+    }
+
+    #[test]
+    fn the_variadic_keyword_must_be_last_and_at_the_variadic_parameter() {
+        let routine = variadic_routine(&["text", "integer[]"]);
+        let catalogue = BuiltinTypeCatalogue::fallback();
+        let casts = CastCatalogue::fallback();
+
+        assert_eq!(
+            match_arguments(
+                &routine,
+                &[("text", false), ("integer[]", true)],
+                &catalogue,
+                &casts
+            ),
+            Some(CandidateMatch::Exact)
+        );
+        assert_eq!(
+            match_arguments(
+                &routine,
+                &[("text", true), ("integer[]", false)],
+                &catalogue,
+                &casts
+            ),
+            None
+        );
+        assert_eq!(
+            match_arguments(
+                &routine,
+                &[("text", false), ("integer[]", true), ("integer", false)],
+                &catalogue,
+                &casts
+            ),
+            None
+        );
     }
 }

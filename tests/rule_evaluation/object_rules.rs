@@ -1255,6 +1255,41 @@ fn a_shadowing_routine_decides_whether_an_aggregate_name_conflicts() {
 }
 
 #[test]
+fn variadic_scalar_overloads_shadow_built_in_aggregates() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // `public.sum(VARIADIC int[])` takes either scalar elements or an explicit
+    // `VARIADIC` array. Both calls are scalar, so PostgreSQL accepts the check
+    // option instead of refusing the view as an aggregate.
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_variadic (a int, b int);
+             CREATE FUNCTION public.sum(VARIADIC int[]) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW variadic_scalar AS SELECT a, sum(b) AS s FROM base_variadic WITH CHECK OPTION;
+             CREATE VIEW variadic_array AS SELECT a, sum(VARIADIC NULL::int[]) AS s FROM base_variadic WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the variadic scalar overload is not an aggregate: {v:?}"
+    );
+    for name in ["variadic_scalar", "variadic_array"] {
+        let relation = state
+            .get_relation(&object_id("public", name))
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+            "{name} is scalar and updatable: {relation:?}"
+        );
+    }
+}
+
+#[test]
 fn the_built_in_aggregate_beats_a_same_signature_routine_searched_after_it() {
     let engine = setup_engine();
     let mut state = setup_state();

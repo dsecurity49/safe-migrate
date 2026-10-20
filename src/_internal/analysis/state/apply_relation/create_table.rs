@@ -713,23 +713,18 @@ impl AnalysisState {
                     create.id, column
                 ));
             }
-            if let Some(column) = fk.from_columns.iter().find(|name| {
-                !create
-                    .columns
-                    .iter()
-                    .any(|candidate| candidate.name == **name)
-            }) {
+            if let Some(column) = fk
+                .from_columns
+                .iter()
+                .find(|name| !column_names.contains(*name))
+            {
                 return MutationResult::conflict(format!(
                     "foreign key column '{}' does not exist on relation '{}'",
                     column, create.id
                 ));
             }
             let target_columns: HashSet<String> = if fk.to_table == create.id {
-                create
-                    .columns
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect()
+                column_names.iter().cloned().collect()
             } else {
                 if let Err(result) = self.ensure_relation_target(
                     &fk.to_table,
@@ -865,47 +860,60 @@ impl AnalysisState {
                                 state.ty.clone(),
                             )
                         })
-                })
-                .collect();
-            let target_types: Vec<Option<(Option<ObjectId>, Option<String>)>> =
-                if fk.to_table == create.id {
-                    referenced_columns
-                        .iter()
-                        .map(|column| {
-                            create
-                                .columns
+                        .or_else(|| {
+                            inherited_columns
                                 .iter()
                                 .find(|candidate| candidate.name == *column)
-                                .map(|state| {
-                                    (
-                                        state
-                                            .ty
-                                            .as_deref()
-                                            .and_then(|raw| self.resolve_type_reference(raw)),
-                                        state.ty.clone(),
-                                    )
-                                })
+                                .map(|state| (state.type_id.clone(), state.data_type.clone()))
                         })
-                        .collect()
-                } else {
-                    self.local
-                        .relations
-                        .get(&fk.to_table)
-                        .and_then(|overlay| match overlay {
-                            RelationOverlay::Present(parent) => Some(
-                                referenced_columns
+                })
+                .collect();
+            let target_types: Vec<Option<(Option<ObjectId>, Option<String>)>> = if fk.to_table
+                == create.id
+            {
+                referenced_columns
+                    .iter()
+                    .map(|column| {
+                        create
+                            .columns
+                            .iter()
+                            .find(|candidate| candidate.name == *column)
+                            .map(|state| {
+                                (
+                                    state
+                                        .ty
+                                        .as_deref()
+                                        .and_then(|raw| self.resolve_type_reference(raw)),
+                                    state.ty.clone(),
+                                )
+                            })
+                            .or_else(|| {
+                                inherited_columns
                                     .iter()
-                                    .map(|column| {
-                                        parent.get_column(column).map(|state| {
-                                            (state.type_id.clone(), state.data_type.clone())
-                                        })
+                                    .find(|candidate| candidate.name == *column)
+                                    .map(|state| (state.type_id.clone(), state.data_type.clone()))
+                            })
+                    })
+                    .collect()
+            } else {
+                self.local
+                    .relations
+                    .get(&fk.to_table)
+                    .and_then(|overlay| match overlay {
+                        RelationOverlay::Present(parent) => Some(
+                            referenced_columns
+                                .iter()
+                                .map(|column| {
+                                    parent.get_column(column).map(|state| {
+                                        (state.type_id.clone(), state.data_type.clone())
                                     })
-                                    .collect(),
-                            ),
-                            RelationOverlay::Dropped => None,
-                        })
-                        .unwrap_or_default()
-                };
+                                })
+                                .collect(),
+                        ),
+                        RelationOverlay::Dropped => None,
+                    })
+                    .unwrap_or_default()
+            };
             let mut type_evidence_unknown = false;
             let type_mismatch =
                 source_types
@@ -1162,7 +1170,7 @@ impl AnalysisState {
                     } => (
                         ConstraintKind::Check,
                         constraint_name,
-                        name_hint.as_deref(),
+                        name_hint.clone(),
                         "check",
                         Some(definition.as_str()),
                         columns,
@@ -1175,7 +1183,7 @@ impl AnalysisState {
                     } => (
                         ConstraintKind::Exclusion,
                         constraint_name,
-                        None,
+                        (*columns_complete).then(|| columns.join("_")),
                         "excl",
                         None,
                         columns,
@@ -1188,7 +1196,7 @@ impl AnalysisState {
                     self.next_generated_relation_name_avoiding(
                         &create.id.schema,
                         &create.id.name,
-                        name_hint,
+                        name_hint.as_deref(),
                         label,
                         &reserved_index_ids,
                     )
@@ -1197,7 +1205,7 @@ impl AnalysisState {
                     self.next_generated_constraint_name_avoiding(
                         &create.id,
                         &create.id.name,
-                        name_hint,
+                        name_hint.as_deref(),
                         label,
                         &reserved_constraint_names,
                     )

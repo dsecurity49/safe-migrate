@@ -608,18 +608,31 @@ impl AnalysisState {
                 child_id, parent_id
             ));
         }
-        for (parent_column, child_column) in parent.columns.iter().zip(&child.columns) {
-            if parent_column.name != child_column.name {
+        for parent_column in &parent.columns {
+            let Some(child_column) = child
+                .columns
+                .iter()
+                .find(|column| column.name == parent_column.name)
+            else {
                 return Err(format!(
-                    "partition column '{}' does not match parent column '{}' in position",
-                    child_column.name, parent_column.name
+                    "partition '{}' does not have parent column '{}'",
+                    child_id, parent_column.name
                 ));
-            }
+            };
             let type_matches = match (&parent_column.type_id, &child_column.type_id) {
                 (Some(parent_type), Some(child_type)) => parent_type == child_type,
                 _ => match (&parent_column.data_type, &child_column.data_type) {
                     (Some(parent_type), Some(child_type)) => {
-                        parent_type.trim().eq_ignore_ascii_case(child_type.trim())
+                        let parent = crate::_internal::model::data_type::TypeIdentity::from_syntax(
+                            &ParsedDataType::parse(parent_type, self.builtin_types()),
+                        );
+                        let child = crate::_internal::model::data_type::TypeIdentity::from_syntax(
+                            &ParsedDataType::parse(child_type, self.builtin_types()),
+                        );
+                        if parent.is_unknown() || child.is_unknown() {
+                            return Ok(false);
+                        }
+                        parent == child
                     }
                     _ => return Ok(false),
                 },

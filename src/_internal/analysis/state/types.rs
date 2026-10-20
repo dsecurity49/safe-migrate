@@ -141,15 +141,28 @@ impl AnalysisState {
         ObjectId::new(&element.schema, format!("{}[]", element.name))
     }
 
-    /// The multirange companion PostgreSQL creates for a range type, named
-    /// after it with the identifier limit applied exactly like the server.
+    /// PostgreSQL replaces the first `range` with `multirange`, otherwise
+    /// appends `_multirange`, then clips the result at 63 bytes.
     pub(crate) fn multirange_companion_id(range: &ObjectId) -> ObjectId {
+        const MAX_BYTES: usize = 63;
         const SUFFIX: &str = "_multirange";
-        let mut end = range.name.len().min(63 - SUFFIX.len());
-        while end > 0 && !range.name.is_char_boundary(end) {
-            end -= 1;
+        let mut name = if let Some(index) = range.name.find("range") {
+            format!("{}multi{}", &range.name[..index], &range.name[index..])
+        } else {
+            let mut end = range.name.len().min(MAX_BYTES - SUFFIX.len());
+            while end > 0 && !range.name.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{}", &range.name[..end], SUFFIX)
+        };
+        if name.len() > MAX_BYTES {
+            let mut end = MAX_BYTES;
+            while end > 0 && !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            name.truncate(end);
         }
-        ObjectId::new(&range.schema, format!("{}{}", &range.name[..end], SUFFIX))
+        ObjectId::new(&range.schema, name)
     }
 
     /// Whether a resolved type reference names `id` or its array form.

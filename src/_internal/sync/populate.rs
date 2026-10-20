@@ -192,16 +192,15 @@ pub(super) fn populate_cache_from_client(
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
     // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
-    cache.view_object_dependencies = load_view_object_dependencies(
-        client,
-        &schema_values,
-        &cache
-            .builtin_types
-            .clone()
-            .unwrap_or_else(BuiltinTypeCatalogue::fallback),
-    )?;
+    let builtin_types = cache
+        .builtin_types
+        .clone()
+        .unwrap_or_else(BuiltinTypeCatalogue::fallback);
+    cache.view_object_dependencies =
+        load_view_object_dependencies(client, &schema_values, &builtin_types)?;
     coverage.record(CatalogFamily::Dependencies);
-    let scoped_external = load_scoped_external_dependencies(client, &schema_values)?;
+    let scoped_external =
+        load_scoped_external_dependencies(client, &schema_values, &builtin_types)?;
     cache.scoped_external_dependencies = scoped_external.edges;
     cache.external_referencing_schemas = scoped_external.external_schemas;
     // All scope-boundary queries above completed inside the same repeatable

@@ -1157,6 +1157,9 @@ pub(crate) enum SelectOutputFact {
 pub(crate) enum AggregateArgumentFact {
     Column(String),
     Typed(String),
+    /// The written argument carries PostgreSQL's `VARIADIC` keyword, so it is
+    /// matched against the variadic parameter's array type, not its element.
+    Variadic(Box<AggregateArgumentFact>),
     Unknown,
 }
 

@@ -1253,6 +1253,75 @@ fn partition_attachment_validates_catalog_and_tracks_generated_objects() {
 }
 
 #[test]
+fn partition_columns_match_by_name_not_position() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TABLE parent (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE child (b text, a integer);
+             ALTER TABLE parent ATTACH PARTITION child
+                FOR VALUES FROM (0) TO (10);",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert!(state.local.graph.edges().iter().any(|edge| {
+        edge.referenced == object_id("public", "parent")
+            && edge.dependent == object_id("public", "child")
+            && matches!(edge.kind, DependencyKind::PartitionOf)
+    }));
+}
+
+#[test]
+fn partition_attachment_accepts_builtin_type_aliases() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    for (index, (parent_type, child_type, from, to)) in [
+        ("integer", "int", "0", "10"),
+        ("varchar", "character varying", "'a'", "'z'"),
+        (
+            "timestamptz",
+            "timestamp with time zone",
+            "'2020-01-01'",
+            "'2021-01-01'",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let findings = engine
+            .analyze(
+                &format!(
+                    "CREATE TABLE parent_{index} (a {parent_type}) PARTITION BY RANGE (a);
+                     CREATE TABLE child_{index} (a {child_type});
+                     ALTER TABLE parent_{index} ATTACH PARTITION child_{index}
+                        FOR VALUES FROM ({from}) TO ({to});"
+                ),
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{parent_type}/{child_type}: {findings:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.referenced == object_id("public", &format!("parent_{index}"))
+                && edge.dependent == object_id("public", &format!("child_{index}"))
+                && matches!(edge.kind, DependencyKind::PartitionOf)
+        }));
+    }
+}
+
+#[test]
 fn partition_attachment_rejects_incompatible_columns_checks_and_triggers() {
     let engine = setup_engine();
     let mut state = setup_state();

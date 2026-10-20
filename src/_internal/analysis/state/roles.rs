@@ -2,10 +2,11 @@ use super::*;
 
 impl AnalysisState {
     pub(super) fn resolve_grant_privileges(
-        &self,
+        &mut self,
         spec: &crate::_internal::analysis::facts::PrivilegeSpec,
-    ) -> HashSet<Privilege> {
-        let supports_maintain = self.pg_version().satisfies(|version| version >= 170_000);
+    ) -> Result<HashSet<Privilege>, MutationResult> {
+        let version = self.pg_version();
+        let supports_maintain = version.satisfies(|version| version >= 170_000);
         match spec {
             crate::_internal::analysis::facts::PrivilegeSpec::All => {
                 let mut privileges = [
@@ -21,41 +22,56 @@ impl AnalysisState {
                 .collect::<HashSet<_>>();
                 if supports_maintain {
                     privileges.insert(Privilege::Maintain);
+                } else if version.num().is_none() {
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 }
-                privileges
+                Ok(privileges)
             }
-            crate::_internal::analysis::facts::PrivilegeSpec::List(list) => list
-                .iter()
-                .filter_map(|p| match p {
-                    crate::_internal::analysis::facts::PrivilegeFact::Select => {
-                        Some(Privilege::Select)
+            crate::_internal::analysis::facts::PrivilegeSpec::List(list) => {
+                let mut privileges = HashSet::new();
+                for privilege in list {
+                    match privilege {
+                        crate::_internal::analysis::facts::PrivilegeFact::Select => {
+                            privileges.insert(Privilege::Select);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::Insert => {
+                            privileges.insert(Privilege::Insert);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::Update => {
+                            privileges.insert(Privilege::Update);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::Delete => {
+                            privileges.insert(Privilege::Delete);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::Truncate => {
+                            privileges.insert(Privilege::Truncate);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::References => {
+                            privileges.insert(Privilege::References);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::Trigger => {
+                            privileges.insert(Privilege::Trigger);
+                        }
+                        crate::_internal::analysis::facts::PrivilegeFact::Maintain => {
+                            match version.num() {
+                                Some(version) if version < 170_000 => {
+                                    return Err(MutationResult::conflict(
+                                        "privilege MAINTAIN requires PostgreSQL 17+".to_string(),
+                                    ));
+                                }
+                                Some(_) => {
+                                    privileges.insert(Privilege::Maintain);
+                                }
+                                None => {
+                                    return Err(self.unresolved(EvidenceCode::UnsupportedSemantics));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    crate::_internal::analysis::facts::PrivilegeFact::Insert => {
-                        Some(Privilege::Insert)
-                    }
-                    crate::_internal::analysis::facts::PrivilegeFact::Update => {
-                        Some(Privilege::Update)
-                    }
-                    crate::_internal::analysis::facts::PrivilegeFact::Delete => {
-                        Some(Privilege::Delete)
-                    }
-                    crate::_internal::analysis::facts::PrivilegeFact::Truncate => {
-                        Some(Privilege::Truncate)
-                    }
-                    crate::_internal::analysis::facts::PrivilegeFact::References => {
-                        Some(Privilege::References)
-                    }
-                    crate::_internal::analysis::facts::PrivilegeFact::Trigger => {
-                        Some(Privilege::Trigger)
-                    }
-                    crate::_internal::analysis::facts::PrivilegeFact::Maintain
-                        if supports_maintain =>
-                    {
-                        Some(Privilege::Maintain)
-                    }
-                    _ => None,
-                })
-                .collect(),
+                }
+                Ok(privileges)
+            }
         }
     }
 
@@ -241,14 +257,13 @@ impl AnalysisState {
             })
     }
 
-    /// Identity attributed to a role-membership grantor.  Role grants differ
-    /// from object grants: PostgreSQL 18 routes an implicit grantor through
-    /// `BOOTSTRAP_SUPERUSERID` when the session user is a superuser, so a
-    /// superuser session records the *bootstrap* role instead of the session
-    /// role.  An explicit `GRANTED BY` always wins; otherwise a known
-    /// superuser maps to the cached bootstrap name (falling back to the
-    /// session identity when that is unknown), and any other role uses
-    /// itself.  `None` means the attribution cannot be resolved statically.
+    /// Identity attributed to a role-membership grantor. Role grants differ
+    /// from object grants: PostgreSQL 16 and later route an implicit grantor
+    /// through `BOOTSTRAP_SUPERUSERID` when the session user is a superuser,
+    /// so a superuser session records the *bootstrap* role instead of the
+    /// session role. An explicit `GRANTED BY` always wins; otherwise a known
+    /// superuser maps to the cached bootstrap name, and any other role uses
+    /// itself. `None` means the attribution cannot be resolved statically.
     pub(super) fn role_membership_grantor(
         &self,
         granted_by: Option<&crate::_internal::analysis::facts::RoleFact>,
@@ -269,10 +284,15 @@ impl AnalysisState {
                         if role.is_superuser
                 );
                 if is_superuser {
-                    self.local
-                        .bootstrap_superuser
-                        .as_ref()
-                        .map(|name| ObjectId::new("", name.clone()))
+                    match self.pg_version().num() {
+                        Some(version) if version >= 160_000 => self
+                            .local
+                            .bootstrap_superuser
+                            .as_ref()
+                            .map(|name| ObjectId::new("", name.clone())),
+                        Some(_) => Some(current),
+                        None => None,
+                    }
                 } else {
                     Some(current)
                 }

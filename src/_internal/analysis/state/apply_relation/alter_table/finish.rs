@@ -556,13 +556,14 @@ impl AnalysisState {
                         .clone()
                         .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
                         .unwrap_or_else(|| {
-                            self.next_generated_constraint_name_avoiding(
-                                &alter.id,
+                            self.next_generated_relation_name_avoiding(
+                                &alter.id.schema,
                                 &alter.id.name,
-                                None,
+                                Some(&columns.join("_")),
                                 "key",
                                 &HashSet::new(),
                             )
+                            .name
                         });
                     let backing_index = Some(ObjectId::new(&alter.id.schema, &constraint_name));
                     if let Some(index) = using_index {
@@ -614,13 +615,14 @@ impl AnalysisState {
                         .clone()
                         .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
                         .unwrap_or_else(|| {
-                            self.next_generated_constraint_name_avoiding(
-                                &alter.id,
+                            self.next_generated_relation_name_avoiding(
+                                &alter.id.schema,
                                 &alter.id.name,
                                 None,
                                 "pkey",
                                 &HashSet::new(),
                             )
+                            .name
                         });
                     let backing_index = Some(ObjectId::new(&alter.id.schema, &constraint_name));
                     if let Some(index) = using_index {
@@ -679,13 +681,15 @@ impl AnalysisState {
                     columns_complete,
                 } => {
                     let constraint_name = constraint_name.clone().unwrap_or_else(|| {
-                        self.next_generated_constraint_name_avoiding(
-                            &alter.id,
+                        let name2 = (*columns_complete).then(|| columns.join("_"));
+                        self.next_generated_relation_name_avoiding(
+                            &alter.id.schema,
                             &alter.id.name,
-                            None,
+                            name2.as_deref(),
                             "excl",
                             &HashSet::new(),
                         )
+                        .name
                     });
                     let backing_index = ObjectId::new(&alter.id.schema, &constraint_name);
                     if self.relation_namespace_is_taken(&backing_index) {

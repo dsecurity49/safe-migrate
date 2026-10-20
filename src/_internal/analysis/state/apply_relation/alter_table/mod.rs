@@ -482,16 +482,20 @@ impl AnalysisState {
                 }
             }
             AlterTableActionMutation::AddExcludeConstraint {
-                constraint_name, ..
+                constraint_name,
+                columns,
+                columns_complete,
             } => {
                 let name = constraint_name.clone().unwrap_or_else(|| {
-                    self.next_generated_constraint_name_avoiding(
-                        &alter.id,
+                    let name2 = (*columns_complete).then(|| columns.join("_"));
+                    self.next_generated_relation_name_avoiding(
+                        &alter.id.schema,
                         &alter.id.name,
-                        None,
+                        name2.as_deref(),
                         "excl",
                         &HashSet::new(),
                     )
+                    .name
                 });
                 if self
                     .local
@@ -556,20 +560,19 @@ impl AnalysisState {
                     .clone()
                     .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
                     .unwrap_or_else(|| {
-                        self.next_generated_constraint_name_avoiding(
-                            &alter.id,
+                        let primary = matches!(
+                            &alter.action,
+                            AlterTableActionMutation::AddPrimaryKeyConstraint { .. }
+                        );
+                        let name2 = (!primary).then(|| columns.join("_"));
+                        self.next_generated_relation_name_avoiding(
+                            &alter.id.schema,
                             &alter.id.name,
-                            None,
-                            if matches!(
-                                &alter.action,
-                                AlterTableActionMutation::AddPrimaryKeyConstraint { .. }
-                            ) {
-                                "pkey"
-                            } else {
-                                "key"
-                            },
+                            name2.as_deref(),
+                            if primary { "pkey" } else { "key" },
                             &HashSet::new(),
                         )
+                        .name
                     });
                 if self
                     .local

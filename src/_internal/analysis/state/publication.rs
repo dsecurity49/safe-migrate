@@ -318,11 +318,28 @@ impl AnalysisState {
         Self::postgres_boolean(value).is_some()
     }
 
+    /// Whether `value` is a whole value `defGetBoolean` accepts. Unlike
+    /// `parse_bool`, it does not trim or accept prefixes.
+    fn def_get_boolean(value: &str) -> Option<bool> {
+        match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => Some(true),
+            "0" | "false" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
     pub(super) fn subscription_boolean_option(
         params: Option<&[crate::_internal::analysis::facts::AttributeFact]>,
         name: &str,
     ) -> Option<bool> {
-        Self::subscription_option(params, name).and_then(Self::postgres_boolean)
+        let option = params?
+            .iter()
+            .rev()
+            .find(|param| param.name.eq_ignore_ascii_case(name))?;
+        match option.value.as_deref() {
+            Some(value) => Self::def_get_boolean(value),
+            None => Some(true),
+        }
     }
 
     /// Checks every subscription parameter against the server that will run it:
@@ -346,8 +363,8 @@ impl AnalysisState {
                     option.name
                 )));
             };
-            if param.boolean
-                && Self::postgres_boolean(option.value.as_deref().unwrap_or("true")).is_none()
+            if param.value == SubscriptionValue::Boolean
+                && Self::def_get_boolean(option.value.as_deref().unwrap_or("true")).is_none()
             {
                 return Err(MutationResult::conflict(format!(
                     "subscription option '{}' requires a PostgreSQL boolean value",
@@ -367,6 +384,22 @@ impl AnalysisState {
                     option.name,
                     pg_version_label(since)
                 )));
+            }
+            if param.value == SubscriptionValue::Streaming {
+                let value = option.value.as_deref().unwrap_or("true");
+                if value.eq_ignore_ascii_case("parallel") {
+                    if version_num < 160_000 {
+                        return Err(MutationResult::conflict(format!(
+                            "subscription option '{}' requires PostgreSQL 16 for \"parallel\"",
+                            option.name
+                        )));
+                    }
+                } else if Self::def_get_boolean(value).is_none() {
+                    return Err(MutationResult::conflict(format!(
+                        "subscription option '{}' requires a PostgreSQL boolean value or \"parallel\"",
+                        option.name
+                    )));
+                }
             }
         }
         Ok(())

@@ -485,6 +485,8 @@ mod tests {
         let markdown = Reporter::markdown_outcome(&outcome, &skipped);
         assert!(markdown.contains("## Not evaluated"));
         assert!(markdown.contains("3 checks were not evaluated"));
+        assert!(markdown.contains("expand for the causes, rules, and remedies"));
+        assert!(!markdown.contains("required evidence was unavailable"));
         assert!(markdown.contains("<details>"));
         assert!(markdown.contains("</details>"));
         assert!(markdown.contains("| Cause | Rules | Remedy |"));

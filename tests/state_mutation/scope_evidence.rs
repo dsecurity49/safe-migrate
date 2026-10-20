@@ -990,11 +990,11 @@ fn subscription_publisher_operations_taint_and_slot_drops_obey_transaction_rules
 #[test]
 fn subscription_options_are_gated_on_the_server_version() {
     let engine = setup_engine();
-    // The release that introduced each gated parameter, checked against a
-    // server one major version below it.
+    // Parameter introductions, plus the PostgreSQL 16 value gate for streaming.
     for (since, parameter) in [
         (140_000, "binary = true"),
-        (140_000, "streaming = parallel"),
+        (140_000, "streaming = true"),
+        (160_000, "streaming = parallel"),
         (150_000, "two_phase = true"),
         (150_000, "disable_on_error = true"),
         (160_000, "password_required = true"),
@@ -1025,6 +1025,41 @@ fn subscription_options_are_gated_on_the_server_version() {
                 .iter()
                 .any(|violation| violation.rule_id == "chain-conflict"),
             "{parameter} must be accepted from {since}"
+        );
+    }
+}
+
+#[test]
+fn subscription_boolean_options_require_def_get_boolean_values() {
+    let engine = setup_engine();
+    for (version, parameter) in [
+        (180_006, "connect = yes"),
+        (180_006, "enabled = t"),
+        (180_006, "binary = yes"),
+        (180_006, "streaming = yes"),
+        (150_000, "streaming = yes"),
+        (180_006, "binary = ' true '"),
+        (180_006, "connect = false, enabled"),
+    ] {
+        let mut state = setup_state();
+        state.pg_version_num = Some(version);
+        let sql = format!(
+            "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH ({parameter});"
+        );
+        let violations = engine.analyze(&sql, &mut state).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{parameter} at {version} must be rejected"
+        );
+        assert!(
+            !matches!(
+                state.local.subscriptions.get("s"),
+                Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(_))
+            ),
+            "{parameter} at {version} must not create a subscription"
         );
     }
 }
@@ -1084,9 +1119,9 @@ fn subscription_options_enforce_postgresql_slot_and_publication_invariants() {
                 "CREATE SUBSCRIPTION boolean_options
                    CONNECTION 'host=publisher.invalid'
                    PUBLICATION p
-                   WITH (connect=of, enabled=fals, create_slot=fa, copy_data=f, binary=tru, slot_name=NONE);
+                   WITH (connect=OFF, enabled=FALSE, create_slot=off, copy_data=0, binary=1, slot_name=NONE);
                  BEGIN;
-                 ALTER SUBSCRIPTION boolean_options SET PUBLICATION p2 WITH (refresh=of);
+                 ALTER SUBSCRIPTION boolean_options SET PUBLICATION p2 WITH (refresh=OFF);
                  ROLLBACK;",
                 &mut boolean_state,
             )

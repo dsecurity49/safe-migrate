@@ -903,6 +903,29 @@ fn create_view_records_unqualified_aggregate_candidates() {
 }
 
 #[test]
+fn create_view_marks_explicit_variadic_aggregate_arguments() {
+    let StatementFact::CreateView {
+        aggregate_candidates,
+        ..
+    } = parse_and_extract_statement(
+        "CREATE VIEW v AS SELECT a, sum(VARIADIC NULL::int[]) AS s FROM t WITH CHECK OPTION;",
+    )
+    .expect("view fact")
+    else {
+        panic!("expected CreateView");
+    };
+    assert_eq!(
+        aggregate_candidates,
+        vec![AggregateCandidateFact {
+            name: "sum".to_string(),
+            arguments: vec![AggregateArgumentFact::Variadic(Box::new(
+                AggregateArgumentFact::Typed("int[]".to_string())
+            ))],
+        }]
+    );
+}
+
+#[test]
 fn create_view_ignores_calls_inside_nested_queries() {
     // A nested query's calls belong to that query, not the view, so an
     // aggregate, a window function or an unplaceable call inside one never

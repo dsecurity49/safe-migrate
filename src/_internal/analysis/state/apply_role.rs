@@ -276,7 +276,10 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
         }
-        let privileges = self.resolve_grant_privileges(&grant.privileges);
+        let privileges = match self.resolve_grant_privileges(&grant.privileges) {
+            Ok(privileges) => privileges,
+            Err(result) => return result,
+        };
         match &grant.target {
             ResolvedGrantTarget::Tables(ids) => {
                 let grantor = self.grantor_identity(grant.granted_by.as_ref());
@@ -386,7 +389,7 @@ impl AnalysisState {
                         }
                     }
                 }
-                // Role memberships attribute implicit superuser grants to
+                // PostgreSQL 16+ attributes implicit superuser role grants to
                 // the bootstrap superuser, unlike object privileges.
                 let grantor = self.role_membership_grantor(grant.granted_by.as_ref());
                 if let Some(grantor) = grantor.as_ref() {
@@ -689,7 +692,10 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
         }
-        let privileges = self.resolve_grant_privileges(&revoke.privileges);
+        let privileges = match self.resolve_grant_privileges(&revoke.privileges) {
+            Ok(privileges) => privileges,
+            Err(result) => return result,
+        };
         match &revoke.target {
             ResolvedGrantTarget::Tables(ids) => {
                 let grantor = self.grantor_identity(revoke.granted_by.as_ref());

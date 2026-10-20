@@ -851,6 +851,28 @@ fn cascading_a_schema_drop_removes_type_dependents_outside_it() {
 }
 
 #[test]
+fn multirange_companion_uses_postgresql_naming_rules() {
+    for (source, expected) in [
+        ("floatrange", "floatmultirange"),
+        ("span_t", "span_t_multirange"),
+        ("range", "multirange"),
+        ("myrangeother", "mymultirangeother"),
+        ("RANGE", "RANGE_multirange"),
+    ] {
+        let companion = AnalysisState::multirange_companion_id(&object_id("public", source));
+        assert_eq!(companion.name, expected, "{source}");
+    }
+
+    let ranged = format!("{}range", "a".repeat(54));
+    let companion = AnalysisState::multirange_companion_id(&object_id("public", &ranged));
+    assert_eq!(companion.name, format!("{}multirang", "a".repeat(54)));
+
+    let plain = "b".repeat(60);
+    let companion = AnalysisState::multirange_companion_id(&object_id("public", &plain));
+    assert_eq!(companion.name, format!("{}_multirange", "b".repeat(52)));
+}
+
+#[test]
 fn a_ranges_multirange_companion_blocks_and_cascades_with_it() {
     let engine = setup_engine();
     let sub = object_id("public", "sub_t");
