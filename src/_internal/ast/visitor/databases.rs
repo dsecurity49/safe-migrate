@@ -9,7 +9,9 @@ impl AstVisitor {
                 crate::_internal::analysis::facts::DatabaseOptionValue::Default
             } else {
                 crate::_internal::analysis::facts::DatabaseOptionValue::Literal(
-                    literal.map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()),
+                    literal
+                        .and_then(|l| l.decoded_value())
+                        .map(|text| text.into_text()),
                 )
             }
         };

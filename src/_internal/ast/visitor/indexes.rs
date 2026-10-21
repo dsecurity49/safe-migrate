@@ -162,7 +162,7 @@ impl AstVisitor {
             // not an expression.
             let collate = match item.expr() {
                 Some(ast::Expr::Collate(collate)) => Some(collate),
-                _ => item.collate(),
+                _ => None,
             };
             let mut expression = match item.expr() {
                 Some(ast::Expr::Collate(collate)) => collate.expr(),

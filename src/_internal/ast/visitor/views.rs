@@ -81,6 +81,7 @@ impl AstVisitor {
             select_projection_complete: select_source.is_some() && projection_was_complete,
             select_outputs,
             select_source,
+            select_source_name: outcome.select_source_name,
             routines: Self::extract_view_routines(node.syntax()),
             cast_types: Self::extract_view_cast_types(node.syntax()),
         })
@@ -147,12 +148,20 @@ impl AstVisitor {
             .and_then(|clause| clause.target_list())
             .map(|list| list.targets().collect::<Vec<_>>())
             .unwrap_or_default();
+        let source = Self::single_source_relation(select);
+        let source_name = source.as_ref().ok().cloned();
         let mut aggregate = false;
         let mut window = false;
         let mut unknown_call = false;
         let mut aggregate_candidates: Vec<AggregateCandidateFact> = Vec::new();
         for target in targets.iter() {
-            for call in Self::target_list_calls(target) {
+            for (call, nested) in Self::target_list_calls(target) {
+                if nested
+                    && (call.over_clause().is_some()
+                        || !Self::aggregate_uses_outer(target, &call, source_name.as_deref()))
+                {
+                    continue;
+                }
                 if call.over_clause().is_some() {
                     window = true;
                 } else if Self::is_pg_catalog_aggregate(&call) {
@@ -167,20 +176,20 @@ impl AstVisitor {
                 }
             }
         }
-        let structural = match Self::single_source_relation(select) {
+        let structural = match &source {
             Ok(whole_row) => {
                 // With `check_cols`, PostgreSQL requires at least one updatable
                 // column: a star, or a reference to a user column of the base
                 // relation.
                 if targets.iter().any(|target| {
-                    target.star_token().is_some() || Self::is_column_reference(target, &whole_row)
+                    target.star_token().is_some() || Self::is_column_reference(target, whole_row)
                 }) {
                     V::Updatable
                 } else {
                     V::NotUpdatable(R::NoUpdatableColumns)
                 }
             }
-            Err(reason) => V::NotUpdatable(reason),
+            Err(reason) => V::NotUpdatable(*reason),
         };
         // The reading that ignores the unqualified calls still honours an
         // explicit aggregate, which no path can redirect.
@@ -205,18 +214,7 @@ impl AstVisitor {
             with_aggregates,
             without_aggregates,
             aggregate_candidates,
-        }
-    }
-
-    pub(super) fn unwrap_parens(mut expr: ast::Expr) -> ast::Expr {
-        loop {
-            match expr {
-                ast::Expr::ParenExpr(paren) => match paren.expr() {
-                    Some(inner) => expr = inner,
-                    None => return ast::Expr::ParenExpr(paren),
-                },
-                other => return other,
-            }
+            select_source_name: source_name,
         }
     }
 
@@ -227,7 +225,7 @@ impl AstVisitor {
         let Some(expr) = target.expr() else {
             return false;
         };
-        let name = match Self::unwrap_parens(expr) {
+        let name = match expr.unparen() {
             ast::Expr::NameRef(name) => name.syntax().first_token(),
             // `t.a` and `t.*` address the base relation's columns; PostgreSQL
             // spells a qualified reference this way.
@@ -293,17 +291,18 @@ impl AstVisitor {
         )
     }
 
-    /// Every call a target's expression makes, but not calls inside a nested
-    /// query: a subquery, `EXISTS`, `ANY`/`ALL` or `ARRAY` carries its own
-    /// `SELECT`, whose aggregates and windows belong to it, not the view.
-    pub(super) fn target_list_calls(target: &ast::Target) -> Vec<ast::CallExpr> {
+    /// Every call a target's expression makes, tagged with whether it sits
+    /// inside a nested query. A local nested call belongs to that query; an
+    /// aggregate-named call there is only promoted to the view when its
+    /// argument consumes the view's source relation.
+    pub(super) fn target_list_calls(target: &ast::Target) -> Vec<(ast::CallExpr, bool)> {
         let boundary = target.syntax();
         target
             .syntax()
             .descendants()
             .filter_map(ast::CallExpr::cast)
-            .filter(|call| {
-                !call
+            .map(|call| {
+                let nested = call
                     .syntax()
                     .ancestors()
                     .skip(1)
@@ -318,23 +317,133 @@ impl AstVisitor {
                                 | SyntaxKind::VALUES
                                 | SyntaxKind::TABLE
                         )
-                    })
+                    });
+                (call, nested)
             })
             .collect()
+    }
+
+    /// Whether a nested aggregate-named call takes an argument from the view's
+    /// source relation. PostgreSQL treats that as an aggregate at the view's
+    /// query level; a local subquery aggregate does not disqualify the view.
+    fn aggregate_uses_outer(
+        target: &ast::Target,
+        call: &ast::CallExpr,
+        source_name: Option<&str>,
+    ) -> bool {
+        let Some(source_name) = source_name else {
+            return false;
+        };
+        let Some(qualified) = call.expr().and_then(Self::expr_to_qualified_name) else {
+            return false;
+        };
+        if qualified
+            .schema
+            .as_ref()
+            .is_some_and(|schema| schema.resolve() != "pg_catalog")
+        {
+            return false;
+        }
+        if !Self::is_aggregate_name(&qualified.name.resolve()) {
+            return false;
+        }
+        if Self::nested_query_binds(target, call, source_name) {
+            return false;
+        }
+        call.arg_list().is_some_and(|args| {
+            args.args().any(|arg| {
+                let argument = match arg.func_arg_expr() {
+                    Some(ast::FuncArgExpr::Expr(expr)) => Self::aggregate_argument(expr),
+                    _ => return false,
+                };
+                Self::argument_uses_outer(&argument, source_name)
+            })
+        })
+    }
+
+    fn argument_uses_outer(argument: &AggregateArgumentFact, source_name: &str) -> bool {
+        match argument {
+            AggregateArgumentFact::Field { base, .. } => match base.as_ref() {
+                AggregateArgumentFact::Column(name) => name == source_name,
+                base => Self::argument_uses_outer(base, source_name),
+            },
+            AggregateArgumentFact::Variadic(inner) => Self::argument_uses_outer(inner, source_name),
+            AggregateArgumentFact::Column(_)
+            | AggregateArgumentFact::Typed(_)
+            | AggregateArgumentFact::Unknown => false,
+        }
+    }
+
+    /// Whether any query between `call` and its target declares a range
+    /// variable named `name`, which hides the view's source.
+    fn nested_query_binds(target: &ast::Target, call: &ast::CallExpr, name: &str) -> bool {
+        let boundary = target.syntax();
+        call.syntax()
+            .ancestors()
+            .skip(1)
+            .take_while(|node| node != boundary)
+            .filter_map(ast::Select::cast)
+            .filter_map(|select| select.from_clause())
+            .any(|from| Self::from_clause_binds(&from, name))
+    }
+
+    fn from_clause_binds(from: &ast::FromClause, name: &str) -> bool {
+        from.items()
+            .any(|item| Self::from_list_item_binds(&item, name))
+    }
+
+    fn from_list_item_binds(item: &ast::FromListItem, name: &str) -> bool {
+        match item {
+            ast::FromListItem::JoinExpr(join) => {
+                join.from_list_item()
+                    .is_some_and(|item| Self::from_list_item_binds(&item, name))
+                    || join
+                        .join()
+                        .and_then(|join| join.from_list_item())
+                        .is_some_and(|item| Self::from_list_item_binds(&item, name))
+            }
+            ast::FromListItem::FromItem(item) => match item {
+                ast::FromItem::RelationFromItem(relation) => {
+                    let alias = relation.alias();
+                    Self::from_alias_binds(alias.as_ref(), name)
+                        || (alias.is_none()
+                            && relation
+                                .relation_name_ref()
+                                .and_then(|name| name.path_ref())
+                                .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                                .is_some_and(|relation| relation.name.resolve() == name))
+                }
+                ast::FromItem::ParenFromItem(paren) => {
+                    let alias = paren.alias();
+                    Self::from_alias_binds(alias.as_ref(), name)
+                        || (alias.is_none()
+                            && paren
+                                .paren_expr()
+                                .and_then(|expr| expr.from_list_item())
+                                .is_some_and(|item| Self::from_list_item_binds(&item, name)))
+                }
+                item => Self::from_alias_binds(item.alias().as_ref(), name),
+            },
+        }
+    }
+
+    fn from_alias_binds(alias: Option<&ast::FromAlias>, name: &str) -> bool {
+        alias
+            .and_then(|alias| alias.name())
+            .and_then(|name| name.ident_token())
+            .is_some_and(|token| Self::resolve_identifier_token(token.text()) == name)
     }
 
     /// Whether a call spells `pg_catalog.<aggregate>`, which no search path can
     /// redirect to another schema.
     pub(super) fn is_pg_catalog_aggregate(call: &ast::CallExpr) -> bool {
-        let Some(callee) = call.expr() else {
+        let Some(qualified) = call.expr().and_then(Self::expr_to_qualified_name) else {
             return false;
         };
-        let text = callee.syntax().text().to_string();
-        let Some((schema, name)) = text.rsplit_once('.') else {
-            return false;
-        };
-        Self::resolve_identifier_token(schema) == "pg_catalog"
-            && Self::is_aggregate_name(&Self::resolve_identifier_token(name))
+        qualified
+            .schema
+            .is_some_and(|schema| schema.resolve() == "pg_catalog")
+            && Self::is_aggregate_name(&qualified.name.resolve())
     }
 
     /// Candidate facts for an unqualified call that spells a built-in
@@ -342,19 +451,41 @@ impl AstVisitor {
     pub(super) fn unqualified_aggregate_candidate(
         call: &ast::CallExpr,
     ) -> Option<AggregateCandidateFact> {
-        let callee = call.expr()?;
-        let text = callee.syntax().text().to_string();
-        if text.contains('.') {
+        let qualified = Self::expr_to_qualified_name(call.expr()?)?;
+        if qualified.schema.is_some() {
             return None;
         }
-        let name = Self::resolve_identifier_token(&text);
+        let name = qualified.name.resolve();
         if !Self::is_aggregate_name(&name) {
             return None;
         }
         // `count(*)` is a star form with no arguments; a named-notation
         // argument pins a type the visitor cannot see.
-        let arguments = match call.arg_list() {
-            Some(args) if args.star_token().is_none() => args
+        let args = call.arg_list();
+        let star = args
+            .as_ref()
+            .is_some_and(|args| args.star_token().is_some());
+        let aggregate_only_clause = if args.as_ref().is_some_and(|args| {
+            matches!(
+                args.all_or_distinct(),
+                Some(ast::AllOrDistinct::Distinct(_))
+            )
+        }) {
+            Some(AggregateOnlyClauseFact::Distinct)
+        } else if call.filter_clause().is_some() {
+            Some(AggregateOnlyClauseFact::Filter)
+        } else if args
+            .as_ref()
+            .is_some_and(|args| args.args().any(|arg| arg.order_by_clause().is_some()))
+        {
+            Some(AggregateOnlyClauseFact::OrderBy)
+        } else if call.within_clause().is_some() {
+            Some(AggregateOnlyClauseFact::WithinGroup)
+        } else {
+            None
+        };
+        let arguments = match args {
+            Some(args) if !star => args
                 .args()
                 .map(|arg| {
                     let argument = match arg.func_arg_expr() {
@@ -370,14 +501,19 @@ impl AstVisitor {
                 .collect(),
             _ => Vec::new(),
         };
-        Some(AggregateCandidateFact { name, arguments })
+        Some(AggregateCandidateFact {
+            name,
+            star,
+            aggregate_only_clause,
+            arguments,
+        })
     }
 
     /// One argument of a candidate call, typed as far as the visitor can see
     /// without the schema.
     pub(super) fn aggregate_argument(expr: ast::Expr) -> AggregateArgumentFact {
         use AggregateArgumentFact as A;
-        match Self::unwrap_parens(expr) {
+        match expr.unparen() {
             // A cast is the type it converts to.
             ast::Expr::CastExpr(cast) => cast
                 .ty()
@@ -386,15 +522,21 @@ impl AstVisitor {
             ast::Expr::NameRef(name) => A::Column(Self::resolve_identifier_token(
                 name.syntax().text().to_string(),
             )),
-            // `t.amount` addresses the base relation's column; `t.*` does not.
-            ast::Expr::FieldExpr(field) if field.star_token().is_none() => field
-                .field()
-                .map(|name| {
-                    A::Column(Self::resolve_identifier_token(
-                        name.syntax().text().to_string(),
-                    ))
-                })
-                .unwrap_or(A::Unknown),
+            // `t.amount` keeps both parts: the base may name the view's source
+            // relation or a composite-typed column. `t.*` is not a value.
+            ast::Expr::FieldExpr(field) if field.star_token().is_none() => {
+                let Some(field_name) = field.field() else {
+                    return A::Unknown;
+                };
+                let base = field
+                    .base()
+                    .map(Self::aggregate_argument)
+                    .unwrap_or(A::Unknown);
+                A::Field {
+                    base: Box::new(base),
+                    field: Self::resolve_identifier_token(field_name.syntax().text().to_string()),
+                }
+            }
             _ => A::Unknown,
         }
     }
@@ -407,8 +549,19 @@ impl AstVisitor {
     pub(super) fn qualified_name_from_type(
         cast_type: &ast::Type,
     ) -> Option<crate::_internal::analysis::facts::CastTypeReferenceFact> {
-        let text = cast_type.syntax().text().to_string();
-        let name = Self::routine_name_from_text(text.split('(').next().unwrap_or(&text))?;
+        let mut ty = cast_type.clone();
+        let mut array_dimensions = 0;
+        while let ast::Type::ArrayType(array) = ty {
+            array_dimensions += 1;
+            ty = array.ty()?;
+        }
+        let mut name = Self::path_ref_to_qualified_name(&ty.path_ref()?)?;
+        if array_dimensions > 0 {
+            name.name = Ident::new(
+                format!("{}{}", name.name.text, "[]".repeat(array_dimensions)),
+                name.name.quoted,
+            );
+        }
         Some(crate::_internal::analysis::facts::CastTypeReferenceFact { name })
     }
 
@@ -445,8 +598,7 @@ impl AstVisitor {
             let Some(expr) = call.expr() else {
                 continue;
             };
-            let Some(qualified) = Self::routine_name_from_text(&expr.syntax().text().to_string())
-            else {
+            let Some(qualified) = Self::expr_to_qualified_name(expr) else {
                 continue;
             };
             // Argument types are stated only for plain column references,
@@ -471,31 +623,6 @@ impl AstVisitor {
             }
         }
         references
-    }
-
-    /// The qualified name a function call names, written as `name` or
-    /// `schema.name`.
-    pub(super) fn routine_name_from_text(text: &str) -> Option<QualifiedName> {
-        let (schema, name) = match text.split_once('.') {
-            Some((schema, name)) => (Some(schema), name),
-            None => (None, text),
-        };
-        let part = |raw: &str| {
-            let is_quoted = raw.len() > 1 && raw.starts_with('"') && raw.ends_with('"');
-            Ident::new(
-                if is_quoted {
-                    &raw[1..raw.len() - 1]
-                } else {
-                    raw
-                }
-                .to_string(),
-                is_quoted,
-            )
-        };
-        Some(QualifiedName::new(
-            schema.map(part),
-            part(name.trim_end_matches('(').trim()),
-        ))
     }
 
     /// The source relation and target list of a query that selects from a

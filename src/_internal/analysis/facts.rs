@@ -230,6 +230,8 @@ pub(crate) enum StatementFact {
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
+        /// The base relation's alias, or its name when no alias is written.
+        select_source_name: Option<String>,
         routines: Vec<RoutineReferenceFact>,
         cast_types: Vec<CastTypeReferenceFact>,
     },
@@ -1155,12 +1157,39 @@ pub(crate) enum SelectOutputFact {
 /// visitor can see. `Unknown` matches any overload, like a bare literal.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AggregateArgumentFact {
+    /// A bare column reference on the view's source relation.
     Column(String),
+    /// A field selection, keeping the base so the resolver can distinguish a
+    /// source-qualified column from a field of a composite column.
+    Field {
+        base: Box<AggregateArgumentFact>,
+        field: String,
+    },
     Typed(String),
     /// The written argument carries PostgreSQL's `VARIADIC` keyword, so it is
     /// matched against the variadic parameter's array type, not its element.
     Variadic(Box<AggregateArgumentFact>),
     Unknown,
+}
+
+/// A clause PostgreSQL accepts only on an aggregate call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateOnlyClauseFact {
+    Distinct,
+    Filter,
+    OrderBy,
+    WithinGroup,
+}
+
+impl AggregateOnlyClauseFact {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Distinct => "DISTINCT",
+            Self::Filter => "FILTER",
+            Self::OrderBy => "ORDER BY",
+            Self::WithinGroup => "WITHIN GROUP",
+        }
+    }
 }
 
 /// An unqualified call whose written name is a built-in aggregate. A
@@ -1169,7 +1198,34 @@ pub(crate) enum AggregateArgumentFact {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateCandidateFact {
     pub name: String,
+    /// `count(*)`-style star form, which only an aggregate can accept.
+    pub star: bool,
+    /// A modifier PostgreSQL accepts only on an aggregate.
+    pub aggregate_only_clause: Option<AggregateOnlyClauseFact>,
     pub arguments: Vec<AggregateArgumentFact>,
+}
+
+impl AggregateCandidateFact {
+    pub(crate) fn requires_aggregate(&self) -> bool {
+        self.star || self.aggregate_only_clause.is_some()
+    }
+
+    pub(crate) fn invalid_call_message(&self) -> String {
+        if self.star {
+            return format!(
+                "{}(*) specified, but {} is not an aggregate function",
+                self.name, self.name
+            );
+        }
+        match self.aggregate_only_clause {
+            Some(clause) => format!(
+                "{} specified, but {} is not an aggregate function",
+                clause.label(),
+                self.name
+            ),
+            None => format!("{} is not an aggregate function", self.name),
+        }
+    }
 }
 
 /// Whether PostgreSQL's `view_query_is_auto_updatable(query, true)` would

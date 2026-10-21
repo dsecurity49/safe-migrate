@@ -5,6 +5,16 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## Unreleased
+
+- Upgraded the pinned Squawk parser stack from 2.65.0 to 2.70.0, raising the
+  minimum supported Rust version to 1.99.
+- View analysis now rejects `count(*)` and aggregate-only clauses (`DISTINCT`,
+  `FILTER`, `ORDER BY`, `WITHIN GROUP`) that resolve to a scalar routine,
+  follows domain and composite-field types, and recognizes correlated outer
+  aggregates. Quoted `"serial"` is treated as an ordinary type, not a serial
+  column.
+
 ## v0.11.1 — 2026-10-20
 
 - The Markdown report shows how many checks did not run and collapses their

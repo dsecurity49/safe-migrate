@@ -18,7 +18,7 @@ PostgreSQL 14–18 are supported.
 
 ## Install
 
-Requires Rust 1.94 or newer.
+Requires Rust 1.99 or newer.
 
 With Rust installed:
 

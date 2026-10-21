@@ -1,11 +1,11 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::IndexStatisticsColumn;
 use crate::_internal::analysis::facts::{
-    AggregateArgumentFact, AggregateCandidateFact, AlterIndexActionFact, AlterTableActionFact,
-    AlterTypeActionFact, AlterTypeFact, ColumnFact, CreateTypeFact, FkFact, LikePropertiesFact,
-    LikeSourceFact, LockModeFact, PersistenceFact, ReindexTargetKindFact, RelationTargetFact,
-    ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact, TableConstraintFact,
-    TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+    AggregateArgumentFact, AggregateCandidateFact, AggregateOnlyClauseFact, AlterIndexActionFact,
+    AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact, CreateTypeFact, FkFact,
+    LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact, ReindexTargetKindFact,
+    RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
+    TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
@@ -113,6 +113,8 @@ struct ViewUpdatabilityOutcome {
     /// The verdict when none of them is.
     without_aggregates: crate::_internal::analysis::facts::ViewUpdatabilityFact,
     aggregate_candidates: Vec<AggregateCandidateFact>,
+    /// The base relation's alias, or its name when no alias is written.
+    select_source_name: Option<String>,
 }
 
 impl ViewUpdatabilityOutcome {
@@ -122,6 +124,7 @@ impl ViewUpdatabilityOutcome {
             with_aggregates: verdict,
             without_aggregates: verdict,
             aggregate_candidates: Vec::new(),
+            select_source_name: None,
         }
     }
 }
@@ -164,41 +167,10 @@ impl AstVisitor {
     }
 
     fn resolve_string_literal(literal: &ast::Literal) -> Option<String> {
-        let token = literal.syntax().first_token()?;
-        let raw = token.text();
-        let mut decoded = String::new();
-        match token.kind() {
-            SyntaxKind::STRING => {
-                squawk_syntax::unescape::decode_plain_string(
-                    squawk_syntax::quote::strip_quotes(raw)?,
-                    &mut decoded,
-                );
-            }
-            SyntaxKind::ESC_STRING => {
-                squawk_syntax::unescape::decode_esc_string(
-                    squawk_syntax::quote::strip_prefixed_quotes(raw, ['e', 'E'])?,
-                    &mut decoded,
-                );
-            }
-            SyntaxKind::NATIONAL_STRING => {
-                squawk_syntax::unescape::decode_plain_string(
-                    squawk_syntax::quote::strip_prefixed_quotes(raw, ['n', 'N'])?,
-                    &mut decoded,
-                );
-            }
-            SyntaxKind::UNICODE_ESC_STRING => {
-                squawk_syntax::unescape::decode_unicode_esc_string(
-                    squawk_syntax::quote::strip_unicode_esc_prefix(raw)?,
-                    '\\',
-                    &mut decoded,
-                );
-            }
-            SyntaxKind::DOLLAR_QUOTED_STRING => {
-                decoded.push_str(squawk_syntax::quote::strip_dollar_quotes(raw)?);
-            }
-            _ => return None,
+        if !literal.is_string() {
+            return None;
         }
-        Some(decoded)
+        Some(literal.decoded_value()?.into_text())
     }
 
     fn resolve_name(n: PathSegment) -> String {

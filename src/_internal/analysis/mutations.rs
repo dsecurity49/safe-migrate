@@ -546,6 +546,9 @@ pub(crate) struct CreateView {
     /// Whether the query is automatically updatable, which `check_option`
     /// requires.
     pub updatability: ViewUpdatabilityFact,
+    /// An aggregate-only call form that PostgreSQL resolves to a scalar
+    /// routine, which makes the view statement itself invalid.
+    pub invalid_aggregate: Option<String>,
 }
 
 /// A view's output column. The type is only known when the projection is a

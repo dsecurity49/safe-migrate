@@ -28,6 +28,15 @@ const CLASSIFIED: &[(&str, Handling)] = &[
     ("AlterSequence", Handling::AllActionsApplied),
     ("AlterServer", Handling::Unmodelled),
     ("AlterTypeAttributeActionList", Handling::Unmodelled),
+    // PL/pgSQL bodies are opaque, so their internal statements are never read.
+    ("PlpgsqlExpr", Handling::Unmodelled),
+    ("PlpgsqlForCursorStmt", Handling::Unmodelled),
+    ("PlpgsqlForDynStmt", Handling::Unmodelled),
+    ("PlpgsqlForEachStmt", Handling::Unmodelled),
+    ("PlpgsqlForIStmt", Handling::Unmodelled),
+    ("PlpgsqlForQueryStmt", Handling::Unmodelled),
+    ("PlpgsqlRaiseStmt", Handling::Unmodelled),
+    ("PlpgsqlUsingClause", Handling::Unmodelled),
     // Declarations, where a repeated element is part of one object rather
     // than a sequence of transitions.
     ("AddColumn", Handling::AllActionsApplied),
@@ -46,7 +55,7 @@ const CLASSIFIED: &[(&str, Handling)] = &[
 /// The `squawk-syntax` version this build is locked to. The census describes
 /// the grammar that this build actually compiles, so the resolved package —
 /// not a copy found on disk — is the source of truth.
-const PINNED_SQUAWK_VERSION: &str = "2.65.0";
+const PINNED_SQUAWK_VERSION: &str = "2.70.0";
 
 /// The pinned `squawk-syntax` grammar, whose list-bearing productions this
 /// build must classify.

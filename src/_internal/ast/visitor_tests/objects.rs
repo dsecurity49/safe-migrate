@@ -871,6 +871,8 @@ fn create_view_records_unqualified_aggregate_candidates() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            star: false,
+            aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Column("b".to_string())],
         }]
     );
@@ -918,6 +920,8 @@ fn create_view_marks_explicit_variadic_aggregate_arguments() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            star: false,
+            aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Variadic(Box::new(
                 AggregateArgumentFact::Typed("int[]".to_string())
             ))],
@@ -942,15 +946,145 @@ fn create_view_ignores_calls_inside_nested_queries() {
         "CREATE VIEW v AS SELECT a, (SELECT sum(o.amount) FROM o WHERE o.id = t.id) AS total FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, (SELECT row_number() OVER () FROM o) AS r FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, (SELECT upper(o.x) FROM o) AS u FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM o AS t) AS s FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM t) AS s FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, EXISTS (SELECT sum(o.amount) FROM o) AS e FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, a = ANY (SELECT sum(o.amount) FROM o) AS m FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, ARRAY(SELECT sum(o.amount) FROM o) AS y FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, a IN (SELECT sum(o.amount) FROM o) AS i FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM (SELECT 1 AS b) AS t) AS s FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM o JOIN (SELECT 1 AS b) AS t ON true) AS s FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT (SELECT sum(t.b)) FROM (SELECT 1 AS b) AS t) AS s FROM t WITH CHECK OPTION;",
     ] {
         let (updatability, candidates) = facts(sql);
         assert_eq!(updatability, ViewUpdatabilityFact::Updatable, "{sql}");
         assert!(candidates.is_empty(), "{sql}");
     }
+}
+
+#[test]
+fn create_view_promotes_a_correlated_aggregate_to_the_outer_query() {
+    let StatementFact::CreateView {
+        updatability,
+        updatability_without_aggregates,
+        aggregate_candidates,
+        ..
+    } = parse_and_extract_statement(
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b)) AS s FROM t AS t WITH CHECK OPTION;",
+    )
+    .expect("view fact")
+    else {
+        panic!("expected CreateView");
+    };
+    assert_eq!(
+        aggregate_candidates,
+        vec![AggregateCandidateFact {
+            name: "sum".to_string(),
+            star: false,
+            aggregate_only_clause: None,
+            arguments: vec![AggregateArgumentFact::Field {
+                base: Box::new(AggregateArgumentFact::Column("t".to_string())),
+                field: "b".to_string(),
+            }],
+        }]
+    );
+    assert_eq!(
+        updatability,
+        ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+    );
+    assert_eq!(
+        updatability_without_aggregates,
+        ViewUpdatabilityFact::Updatable
+    );
+}
+
+#[test]
+fn create_view_promotes_a_correlated_aggregate_through_nested_query_levels() {
+    let StatementFact::CreateView {
+        updatability,
+        aggregate_candidates,
+        ..
+    } = parse_and_extract_statement(
+        "CREATE VIEW v AS SELECT a, (SELECT (SELECT sum(t.b)) FROM o) AS s FROM t WITH CHECK OPTION;",
+    )
+    .expect("view fact")
+    else {
+        panic!("expected CreateView");
+    };
+    assert_eq!(aggregate_candidates.len(), 1);
+    assert_eq!(
+        updatability,
+        ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+    );
+}
+
+#[test]
+fn create_view_records_aggregate_only_call_forms() {
+    let candidate = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+        StatementFact::CreateView {
+            aggregate_candidates,
+            ..
+        } => aggregate_candidates.into_iter().next().expect("candidate"),
+        other => panic!("expected CreateView, got {other:?}"),
+    };
+    let star = candidate("CREATE VIEW v AS SELECT count(*) AS n FROM t WITH CHECK OPTION;");
+    assert!(star.star);
+    assert_eq!(star.aggregate_only_clause, None);
+    assert!(star.arguments.is_empty());
+
+    for (sql, clause) in [
+        (
+            "CREATE VIEW v AS SELECT sum(DISTINCT b) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::Distinct,
+        ),
+        (
+            "CREATE VIEW v AS SELECT sum(b) FILTER (WHERE b > 0) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::Filter,
+        ),
+        (
+            "CREATE VIEW v AS SELECT sum(b ORDER BY b) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::OrderBy,
+        ),
+        (
+            "CREATE VIEW v AS SELECT sum(b) WITHIN GROUP (ORDER BY b) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::WithinGroup,
+        ),
+    ] {
+        assert_eq!(candidate(sql).aggregate_only_clause, Some(clause));
+    }
+}
+
+#[test]
+fn create_view_keeps_composite_field_bases() {
+    let candidate = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+        StatementFact::CreateView {
+            aggregate_candidates,
+            ..
+        } => aggregate_candidates.into_iter().next().expect("candidate"),
+        other => panic!("expected CreateView, got {other:?}"),
+    };
+    assert_eq!(
+        candidate("CREATE VIEW v AS SELECT sum((p).y) AS s FROM t WITH CHECK OPTION;").arguments,
+        vec![AggregateArgumentFact::Field {
+            base: Box::new(AggregateArgumentFact::Column("p".to_string())),
+            field: "y".to_string(),
+        }]
+    );
+    assert_eq!(
+        candidate("CREATE VIEW v AS SELECT sum(t.a) AS s FROM t WITH CHECK OPTION;").arguments,
+        vec![AggregateArgumentFact::Field {
+            base: Box::new(AggregateArgumentFact::Column("t".to_string())),
+            field: "a".to_string(),
+        }]
+    );
+    assert_eq!(
+        candidate("CREATE VIEW v AS SELECT sum(make_pair().y) AS s FROM t WITH CHECK OPTION;")
+            .arguments,
+        vec![AggregateArgumentFact::Field {
+            base: Box::new(AggregateArgumentFact::Unknown),
+            field: "y".to_string(),
+        }]
+    );
 }
 
 #[test]

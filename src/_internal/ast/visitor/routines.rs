@@ -93,9 +93,8 @@ impl AstVisitor {
         match opt {
             ast::FuncOption::LanguageFuncOption(f) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Language(
-                    f.language_ref()
-                        .and_then(|lr| lr.ident_token())
-                        .map(|t| Self::resolve_identifier_token(t.text()))
+                    f.language_name()
+                        .map(|language| language.name)
                         .unwrap_or_default(),
                 )
             }

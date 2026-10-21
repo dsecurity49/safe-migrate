@@ -67,6 +67,7 @@ impl Resolver {
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
+        select_source_name: Option<&str>,
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
@@ -88,13 +89,20 @@ impl Resolver {
                 verdict
             }
         };
-        let updatability = Self::resolve_view_aggregates(
+        let (updatability, invalid_aggregate) = match Self::resolve_view_aggregates(
             downgrade(updatability),
             downgrade(updatability_without_aggregates),
             aggregate_candidates,
             source.as_ref(),
+            select_source_name,
             state,
-        );
+        ) {
+            Ok(updatability) => (updatability, None),
+            Err(message) => (
+                crate::_internal::analysis::facts::ViewUpdatabilityFact::Unknown,
+                Some(message),
+            ),
+        };
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -107,6 +115,7 @@ impl Resolver {
             projection_complete,
             options: options.to_vec(),
             updatability,
+            invalid_aggregate,
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
         })
@@ -120,8 +129,9 @@ impl Resolver {
         without_aggregates: ViewUpdatabilityFact,
         candidates: &[AggregateCandidateFact],
         source: Option<&ObjectId>,
+        source_name: Option<&str>,
         state: &AnalysisState,
-    ) -> ViewUpdatabilityFact {
+    ) -> Result<ViewUpdatabilityFact, String> {
         use crate::_internal::analysis::state::AggregateCandidateResolution as Resolution;
         let mut uncertain = false;
         for candidate in candidates {
@@ -135,50 +145,81 @@ impl Resolver {
                         variadic = true;
                         argument = inner.as_ref();
                     }
-                    let type_name = match argument {
-                        AggregateArgumentFact::Column(column) => {
-                            Self::source_column_type(source, column, state)
-                        }
-                        AggregateArgumentFact::Typed(typed) => Some(typed.clone()),
-                        AggregateArgumentFact::Variadic(_) | AggregateArgumentFact::Unknown => None,
-                    };
                     AggregateCallArgument {
-                        type_name,
+                        type_name: Self::aggregate_argument_type(
+                            argument,
+                            source,
+                            source_name,
+                            state,
+                        ),
                         variadic,
                     }
                 })
                 .collect::<Vec<_>>();
             match state.resolve_aggregate_candidate(&candidate.name, &arguments) {
-                Resolution::Aggregate => return with_aggregates,
+                Resolution::Aggregate => return Ok(with_aggregates),
+                Resolution::Scalar if candidate.requires_aggregate() => {
+                    return Err(candidate.invalid_call_message());
+                }
                 Resolution::Scalar => {}
                 Resolution::Uncertain => uncertain = true,
             }
         }
         if uncertain {
             match without_aggregates {
-                ViewUpdatabilityFact::Updatable
-                | ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::NoUpdatableColumns) => {
-                    ViewUpdatabilityFact::Unknown
-                }
-                other => other,
+                // A scalar call leaves the view updatable, but the shadowing
+                // routine is unsettled; only that reading becomes unknown.
+                ViewUpdatabilityFact::Updatable => Ok(ViewUpdatabilityFact::Unknown),
+                // A refusal that does not depend on the call survives.
+                other => Ok(other),
             }
         } else {
-            without_aggregates
+            Ok(without_aggregates)
+        }
+    }
+
+    /// The type an aggregate argument has on the view's single base relation,
+    /// following source-qualified and composite fields.
+    fn aggregate_argument_type(
+        argument: &AggregateArgumentFact,
+        source: Option<&ObjectId>,
+        source_name: Option<&str>,
+        state: &AnalysisState,
+    ) -> Option<String> {
+        use AggregateArgumentFact as Argument;
+        match argument {
+            Argument::Column(column) => Self::source_column_type(source, column, state),
+            Argument::Field { base, field } => {
+                if let Argument::Column(name) = base.as_ref()
+                    && source_name == Some(name.as_str())
+                {
+                    return Self::source_column_type(source, field, state);
+                }
+                let base_type = Self::aggregate_argument_type(base, source, source_name, state)?;
+                state.composite_field_type(&base_type, field)
+            }
+            Argument::Typed(typed) => Some(typed.clone()),
+            Argument::Variadic(inner) => {
+                Self::aggregate_argument_type(inner, source, source_name, state)
+            }
+            Argument::Unknown => None,
         }
     }
 
     /// The type a column-reference argument has on the view's single base
-    /// relation; an argument from anywhere else stays untyped.
+    /// relation; an argument from anywhere else stays untyped. Domains are
+    /// reduced to their base type so overload matching sees the real identity.
     fn source_column_type(
         source: Option<&ObjectId>,
         column: &str,
         state: &AnalysisState,
     ) -> Option<String> {
         let columns = state.relation_column_types(source?)?;
-        columns
+        let data_type = columns
             .into_iter()
             .find(|entry| entry.0 == column)
-            .and_then(|entry| entry.1)
+            .and_then(|entry| entry.1)?;
+        Some(state.domain_base_type(&data_type).unwrap_or(data_type))
     }
 
     /// Project a view's output list, taking types from the source relation

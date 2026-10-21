@@ -55,6 +55,25 @@ fn test_create_table_with_columns() {
 }
 
 #[test]
+fn serial_detection_uses_the_typed_type_name() {
+    use crate::_internal::analysis::facts::ColumnGeneration;
+    for (sql, expected) in [
+        ("CREATE TABLE items (id serial);", ColumnGeneration::Serial),
+        ("CREATE TABLE items (id SERIAL);", ColumnGeneration::Serial),
+        (
+            "CREATE TABLE items (id \"serial\");",
+            ColumnGeneration::Ordinary,
+        ),
+    ] {
+        let facts = parse_and_extract_statement(sql).expect("table fact");
+        let StatementFact::CreateTable { columns, .. } = facts else {
+            panic!("expected table")
+        };
+        assert_eq!(columns[0].generation, expected, "{sql}");
+    }
+}
+
+#[test]
 fn create_table_identity_column_is_non_null() {
     let fact = parse_and_extract_statement(
         "CREATE TABLE events (id bigint GENERATED ALWAYS AS IDENTITY);",

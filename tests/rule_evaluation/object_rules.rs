@@ -1210,6 +1210,179 @@ fn view_check_option_requires_an_auto_updatable_query() {
 }
 
 #[test]
+fn aggregate_only_call_forms_reject_a_scalar_shadow() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_forms (a int, b int);
+             CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             CREATE FUNCTION public.count() RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW distinct_form AS SELECT a, sum(DISTINCT b) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW filter_form AS SELECT a, sum(b) FILTER (WHERE b > 0) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW order_form AS SELECT a, sum(b ORDER BY b) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW within_form AS SELECT a, sum(b) WITHIN GROUP (ORDER BY b) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW star_form AS SELECT a, count(*) AS n FROM base_forms;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 5, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .all(|reason| reason.contains("is not an aggregate function")),
+        "each call form rejects the scalar shadow: {reasons:?}"
+    );
+    for name in [
+        "distinct_form",
+        "filter_form",
+        "order_form",
+        "within_form",
+        "star_form",
+    ] {
+        assert!(
+            state.get_relation(&object_id("public", name)).is_none(),
+            "{name} must not be created"
+        );
+    }
+}
+
+#[test]
+fn domain_arguments_use_their_base_type() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE DOMAIN d AS int;
+             CREATE DOMAIN d2 AS d;
+             CREATE TABLE base_domain (a int, b d2);
+             CREATE FUNCTION public.sum(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW domain_aggregate AS SELECT a, sum(b) AS s FROM base_domain WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("aggregate functions"),
+        "the domain resolves to int, so the built-in aggregate wins: {reasons:?}"
+    );
+}
+
+#[test]
+fn composite_field_types_come_from_the_composite_column() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TYPE pair_text AS (x int, y text);
+             CREATE TABLE base_composite (a int, y int, p pair_text);
+             CREATE FUNCTION public.sum(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW composite_text AS SELECT a, sum((p).y) AS s FROM base_composite WITH CHECK OPTION;
+             CREATE TYPE pair_int AS (x int, y int);
+             CREATE TABLE base_composite_int (a int, y text, p pair_int);
+             CREATE VIEW composite_int AS SELECT a, sum((p).y) AS s FROM base_composite_int WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(
+        reasons.len(),
+        1,
+        "only the integer field is an aggregate: {reasons:?}"
+    );
+    assert!(
+        reasons[0].contains("aggregate functions"),
+        "the integer composite field selects the built-in sum: {reasons:?}"
+    );
+}
+
+#[test]
+fn correlated_outer_aggregates_conflict_but_local_nested_aggregates_do_not() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_correlated (a int, b int);
+             CREATE TABLE other_correlated (id int, amount int);
+             CREATE VIEW outer_aggregate AS SELECT a, (SELECT sum(t.b)) AS s FROM base_correlated AS t WITH CHECK OPTION;
+             CREATE VIEW local_aggregate AS SELECT a, (SELECT sum(o.amount) FROM other_correlated AS o WHERE o.id = t.a) AS s FROM base_correlated AS t WITH CHECK OPTION;
+             CREATE VIEW correlated_where AS SELECT a, (SELECT sum(t.b) FROM other_correlated AS o WHERE o.id = t.a) AS s FROM base_correlated AS t WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .all(|reason| reason.contains("aggregate functions")),
+        "the two outer-column aggregates refuse the check option: {reasons:?}"
+    );
+    assert!(
+        state
+            .get_relation(&object_id("public", "local_aggregate"))
+            .is_some(),
+        "the local subquery aggregate leaves the view updatable"
+    );
+}
+
+#[test]
+fn definite_refusal_survives_aggregate_uncertainty() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE public.base_uncertain (b int);
+             CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             SET search_path = \"$user\", public, pg_catalog;
+             CREATE VIEW public.view_uncertain AS SELECT sum(b) AS s FROM public.base_uncertain WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("no updatable columns"),
+        "the refusal survives the unresolved search path: {reasons:?}"
+    );
+}
+
+#[test]
 fn a_shadowing_routine_decides_whether_an_aggregate_name_conflicts() {
     let engine = setup_engine();
     let mut state = setup_state();
