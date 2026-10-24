@@ -805,7 +805,15 @@ pub(crate) struct DropProcedureFact {
 pub(crate) struct CreateAggregateFact {
     pub name: QualifiedName,
     pub or_replace: bool,
+    /// Every input parameter in declaration order: ordinary arguments first,
+    /// then any `ORDER BY` arguments.
     pub params: Vec<ParamFact>,
+    /// `pg_aggregate.aggkind`, decided by an `ORDER BY` clause and the
+    /// `HYPOTHETICAL` attribute.
+    pub kind: crate::_internal::model::aggregate::AggregateKind,
+    /// `pg_aggregate.aggnumdirectargs`: how many of `params` are ordinary
+    /// arguments rather than `ORDER BY` inputs.
+    pub direct_count: usize,
     /// The `CREATE AGGREGATE` attribute list, which carries the transition
     /// functions, the state type, and the initial condition.
     pub definition: Vec<AggregateOptionFact>,
@@ -1192,17 +1200,61 @@ impl AggregateOnlyClauseFact {
     }
 }
 
+/// A column reference inside an aggregate argument, with its written
+/// qualifier when one was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AggregateReferenceFact {
+    pub qualifier: Option<String>,
+    pub name: String,
+}
+
+/// One range-variable binding in a nested query's `FROM` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateBindingFact {
+    pub alias: String,
+    /// The relation named by the binding, or `None` for a subquery or table
+    /// function whose columns the visitor cannot see.
+    pub relation: Option<QualifiedName>,
+}
+
+/// One query level between a nested call and the view's target list.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateScopeFact {
+    pub bindings: Vec<AggregateBindingFact>,
+    /// A `FROM` item whose columns are unknown, so an unqualified reference
+    /// cannot be assumed local.
+    pub unknown: bool,
+}
+
 /// An unqualified call whose written name is a built-in aggregate. A
 /// same-named overload of matching argument types keeps it from being that
 /// aggregate, so the resolver places it against the routine search path.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateCandidateFact {
     pub name: String,
+    /// The call was written as `pg_catalog.name`, so no search-path routine
+    /// can take it back.
+    pub explicit: bool,
     /// `count(*)`-style star form, which only an aggregate can accept.
     pub star: bool,
     /// A modifier PostgreSQL accepts only on an aggregate.
     pub aggregate_only_clause: Option<AggregateOnlyClauseFact>,
     pub arguments: Vec<AggregateArgumentFact>,
+    /// The `ORDER BY` inputs of a `WITHIN GROUP` call, which PostgreSQL matches
+    /// against the aggregate's ordered arguments.
+    pub within_group: Vec<AggregateArgumentFact>,
+    /// Whether the call sits inside a nested query. A top-level call is always
+    /// at the view's own query level.
+    pub nested: bool,
+    /// Column references in the call arguments, including references under
+    /// operators and casts.
+    pub references: Vec<AggregateReferenceFact>,
+    /// Query levels between a nested call and the view's target list, innermost
+    /// first.
+    pub scopes: Vec<AggregateScopeFact>,
+    /// An argument contains a subquery whose own scope the visitor does not
+    /// model.
+    pub contains_subquery: bool,
 }
 
 impl AggregateCandidateFact {

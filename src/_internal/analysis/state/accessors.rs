@@ -234,21 +234,37 @@ impl AnalysisState {
         self.refresh_role_sensitive_search_path();
     }
 
+    /// Columns of a present relation, preserving their resolved type identity.
+    pub(crate) fn relation_columns(
+        &self,
+        id: &ObjectId,
+    ) -> Option<&[crate::_internal::model::column::Column]> {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) => Some(&relation.columns),
+            _ => None,
+        }
+    }
+
+    /// Whether a present relation's column list is complete enough to decide
+    /// whether a name resolves inside it.
+    pub(crate) fn relation_columns_complete(&self, id: &ObjectId) -> bool {
+        matches!(
+            self.local.relations.get(id),
+            Some(RelationOverlay::Present(relation)) if relation.columns_complete
+        )
+    }
+
     /// Column names and types of a present relation, for view projection.
     pub(crate) fn relation_column_types(
         &self,
         id: &ObjectId,
     ) -> Option<Vec<(String, Option<String>)>> {
-        match self.local.relations.get(id) {
-            Some(RelationOverlay::Present(relation)) => Some(
-                relation
-                    .columns
-                    .iter()
-                    .map(|column| (column.name.clone(), column.data_type.clone()))
-                    .collect(),
-            ),
-            _ => None,
-        }
+        self.relation_columns(id).map(|columns| {
+            columns
+                .iter()
+                .map(|column| (column.name.clone(), column.data_type.clone()))
+                .collect()
+        })
     }
 
     /// Whether the index backs an exclusion constraint, which PostgreSQL

@@ -686,6 +686,8 @@ pub(crate) struct CreateAggregateMutation {
     pub id: ObjectId,
     pub or_replace: bool,
     pub params: Vec<crate::_internal::analysis::facts::ParamFact>,
+    pub kind: crate::_internal::model::aggregate::AggregateKind,
+    pub direct_count: usize,
     /// The attribute list the parser retained, kept so the applied state can
     /// record what it does and does not model.
     pub definition: Vec<crate::_internal::analysis::facts::AggregateOptionFact>,

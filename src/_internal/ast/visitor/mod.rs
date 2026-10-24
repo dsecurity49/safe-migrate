@@ -1,11 +1,12 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::IndexStatisticsColumn;
 use crate::_internal::analysis::facts::{
-    AggregateArgumentFact, AggregateCandidateFact, AggregateOnlyClauseFact, AlterIndexActionFact,
-    AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact, CreateTypeFact, FkFact,
-    LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact, ReindexTargetKindFact,
-    RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
-    TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+    AggregateArgumentFact, AggregateBindingFact, AggregateCandidateFact, AggregateOnlyClauseFact,
+    AggregateReferenceFact, AggregateScopeFact, AlterIndexActionFact, AlterTableActionFact,
+    AlterTypeActionFact, AlterTypeFact, ColumnFact, CreateTypeFact, FkFact, LikePropertiesFact,
+    LikeSourceFact, LockModeFact, PersistenceFact, ReindexTargetKindFact, RelationTargetFact,
+    ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact, TableConstraintFact,
+    TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};

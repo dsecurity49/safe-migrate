@@ -177,9 +177,14 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
                RETURNS integer LANGUAGE sql IMMUTABLE
                AS 'SELECT COALESCE(state, 0) + value';
              CREATE AGGREGATE {SCHEMA}.total(integer) (
-               SFUNC = {SCHEMA}.add_values,
-               STYPE = integer,
-               INITCOND = '0'
+                SFUNC = {SCHEMA}.add_values,
+                STYPE = integer,
+                INITCOND = '0'
+             );
+             CREATE AGGREGATE {SCHEMA}.pctl(double precision ORDER BY double precision) (
+                SFUNC = float8pl,
+                STYPE = double precision,
+                FINALFUNC = float8pl
              );
              CREATE DOMAIN {SCHEMA}.positive_score AS integer CHECK (VALUE > 0);
              CREATE TYPE {SCHEMA}.mood AS ENUM ('calm', 'anxious');
@@ -625,6 +630,22 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert!(cache.functions.contains_key(
         &safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "with_out(integer)")
     ));
+    let ordered_aggregate = cache
+        .functions
+        .get(&ObjectId::new(
+            SCHEMA,
+            "pctl(double precision,double precision)",
+        ))
+        .expect("synchronized ordered-set aggregate");
+    assert_eq!(ordered_aggregate.routine_kind, RoutineKind::Aggregate);
+    let ordered_metadata = ordered_aggregate
+        .aggregate
+        .expect("ordered-set aggregate metadata");
+    assert_eq!(
+        ordered_metadata.kind,
+        safe_migrate::_internal::model::aggregate::AggregateKind::OrderedSet
+    );
+    assert_eq!(ordered_metadata.direct_count, 1);
     for (name, kind, args, result, volatility, language) in [
         (
             "with_out(integer)",
@@ -940,6 +961,7 @@ fn live_routine_and_replication_mutations_match_postgresql() {
         "record_value_renamed(integer)",
         "add_values(integer,integer)",
         "total_renamed(integer)",
+        "pctl(double precision,double precision)",
         "win_rank()",
     ] {
         assert_routine_matches(&state, &altered, &ObjectId::new(SCHEMA, name));

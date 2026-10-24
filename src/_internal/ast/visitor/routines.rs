@@ -467,13 +467,45 @@ impl AstVisitor {
     pub(super) fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
         let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
         let attributes = Self::extract_attribute_list(node.attribute_list());
-        let params = if let Some(params) = node.param_list() {
-            params
+        let hypothetical = attributes.iter().any(|attribute| {
+            attribute.name.eq_ignore_ascii_case("hypothetical")
+                && !matches!(
+                    attribute
+                        .value
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "false" | "f" | "0"
+                )
+        });
+        let (params, kind, direct_count) = if let Some(params) = node.param_list() {
+            let direct = params
                 .params()
                 .map(|param| Self::extract_param(&param))
-                .collect()
+                .collect::<Vec<_>>();
+            let ordered = params
+                .aggregate_order_by()
+                .into_iter()
+                .flat_map(|order_by| order_by.params())
+                .map(|param| Self::extract_param(&param))
+                .collect::<Vec<_>>();
+            let kind = if ordered.is_empty() {
+                crate::_internal::model::aggregate::AggregateKind::Normal
+            } else if hypothetical {
+                crate::_internal::model::aggregate::AggregateKind::Hypothetical
+            } else {
+                crate::_internal::model::aggregate::AggregateKind::OrderedSet
+            };
+            let direct_count = direct.len();
+            (
+                direct.into_iter().chain(ordered).collect(),
+                kind,
+                direct_count,
+            )
         } else {
-            attributes
+            let params = attributes
                 .iter()
                 .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
                 .filter(|attribute| {
@@ -495,13 +527,21 @@ impl AstVisitor {
                         default: None,
                     }]
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let direct_count = params.len();
+            (
+                params,
+                crate::_internal::model::aggregate::AggregateKind::Normal,
+                direct_count,
+            )
         };
         Some(StatementFact::CreateAggregate(
             crate::_internal::analysis::facts::CreateAggregateFact {
                 name,
                 or_replace: node.or_replace().is_some(),
                 params,
+                kind,
+                direct_count,
                 // The parser keeps the transition functions, state type, and
                 // initial condition as attribute options. Recording them keeps
                 // the definition honest about what it knows, so the state's

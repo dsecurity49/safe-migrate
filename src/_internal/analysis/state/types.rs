@@ -145,9 +145,13 @@ impl AnalysisState {
     }
 
     /// The type of a field on a modeled composite type, following a domain
-    /// over that composite type. An unknown field or non-composite type
-    /// returns `None`.
-    pub(crate) fn composite_field_type(&self, raw: &str, field: &str) -> Option<String> {
+    /// over that composite type. The field keeps its resolved identity so
+    /// routine matching can distinguish same-named types in different schemas.
+    pub(crate) fn composite_field_type(
+        &self,
+        raw: &str,
+        field: &str,
+    ) -> Option<(String, Option<ObjectId>)> {
         let base = self
             .domain_base_type(raw)
             .unwrap_or_else(|| raw.to_string());
@@ -159,11 +163,10 @@ impl AnalysisState {
         else {
             return None;
         };
-        let data_type = fields
+        fields
             .iter()
             .find(|entry| entry.name == field)
-            .map(|entry| entry.data_type.clone())?;
-        Some(self.domain_base_type(&data_type).unwrap_or(data_type))
+            .map(|entry| (entry.data_type.clone(), entry.data_type_id.clone()))
     }
 
     pub(super) fn type_reference_name(id: &ObjectId, qualified: bool) -> String {

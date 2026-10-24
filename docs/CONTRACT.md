@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.11.1's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.11.2's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -49,7 +49,7 @@ object counts. Treat that output as infrastructure metadata.
 | `--markdown` | One deterministic Markdown report, with source locations when available. |
 
 Diagnostics always use standard error. JSON, Markdown, and interactive output
-are mutually exclusive; conflicts exit `1`. Both lint commands support JSON.
+are mutually exclusive; conflicts exit `2`. Both lint commands support JSON.
 
 ## JSON report
 
@@ -164,8 +164,8 @@ Schema 3 is a breaking change from schema 2: `not_evaluated` is new, and
 | Exit | Meaning |
 | --- | --- |
 | `0` | Analysis completed without Tier 1. |
-| `1` | Invocation, configuration, I/O, cache, parser, or internal failure. |
-| `2` | Analysis completed with Tier 1. |
+| `1` | Configuration, I/O, cache, parser, or internal failure. |
+| `2` | Analysis completed with Tier 1, or a CLI usage error. |
 
 Human, JSON, and Markdown modes must use the same exit-status policy. An
 unevaluated Tier 1-capable check caps the verdict at `CAUTIOUS`; it does not
@@ -222,8 +222,8 @@ The principal precision boundaries are:
 | Unsupported DDL | Parser-valid but unmodeled semantics are opaque and `Tainted`, never exact no-ops. This includes unsupported copying/inheritance forms, CTAS lifecycle actions, unsupported role attributes, and unmodeled database, type, view, materialized-view, domain, or aggregate details. |
 | Partitions | Synchronized predicates retain catalog evidence. Local retained-CHECK synthesis reproduces PostgreSQL-exact constraints for multi-column RANGE (including `MINVALUE`/`MAXVALUE` sentinels), LIST values (including `NULL`), boolean, and mixed-varchar bounds, and for default partitions; HASH partitions form no retained check. Expression keys and missing ancestor predicates remain `Tainted`. |
 | Indexes | Synchronized complex-index dependencies support exact cleanup. Locally parsed complex indexes do not claim that precision. CTAS `WITH NO DATA` and expression indexes remain available to safety rules. |
-| Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized only with a versioned baseline. |
-| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. `CREATE OR REPLACE` is checked against PostgreSQL's identity rules — return type and `SETOF`, the `RETURNS record` row descriptor, an already-named input parameter, and the default count. Comparing the *type* of a retained default needs a parse tree only the server can type, so that case is `Tainted`. An aggregate's definition is retained and its state type is resolved; its support functions are not resolved yet, and the definition is `Tainted`. |
+| Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized with an observed or explicitly assumed version. |
+| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. `CREATE OR REPLACE` is checked against PostgreSQL's identity rules — return type and `SETOF`, the `RETURNS record` row descriptor, an already-named input parameter, and the default count. Comparing the *type* of a retained default needs a parse tree only the server can type, so that case is `Tainted`. An aggregate's definition is retained and its state type and support-function names are resolved; their signatures and the aggregate's operator set are not modeled, so the definition is `Tainted`. |
 | Publications | Sync is database-wide. Table edits without `ONLY` are `Tainted` until effective partition scope is proven. |
 | Subscriptions | Only non-secret fields are cached; connection targets are `Redacted`. Connected create, refresh, and drop operations are `Tainted` because they depend on remote state. |
 
@@ -241,13 +241,14 @@ reports at most once per input file.
 
 ## Failure behavior
 
-These conditions exit `1` instead of producing a clean report:
+CLI usage errors, including unknown flags, missing arguments, and conflicting
+output modes, exit `2`. These conditions exit `1` instead of producing a clean
+report:
 
 - SQL parse failure;
 - unreadable input;
 - invalid configuration;
 - corrupt or incompatible cache;
-- unsupported command-line combinations;
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
@@ -259,7 +260,9 @@ Encrypted mode requires `cache_encryption = true` and a valid
 `sync`. V10 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V9 and unheadered caches are rejected with resync guidance.
+V1–V9 and unheadered caches are rejected with resync guidance. V10 remains
+pre-1.0: a cache written by an earlier release may be rejected after a layout
+change, so rerun `sync`.
 
 ### GitHub Action
 

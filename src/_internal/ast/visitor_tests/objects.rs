@@ -430,6 +430,11 @@ fn aggregate_commands_extract_shared_routine_identities() {
     assert_eq!(create.name.name.resolve(), "total");
     assert_eq!(create.params.len(), 1);
     assert_eq!(create.params[0].ty, "integer");
+    assert_eq!(
+        create.kind,
+        crate::_internal::model::aggregate::AggregateKind::Normal
+    );
+    assert_eq!(create.direct_count, 1);
 
     let alter = parse_and_extract_statement(
         "ALTER AGGREGATE \"Analytics\".Total(integer) RENAME TO \"Combined\";",
@@ -485,6 +490,53 @@ fn aggregate_commands_extract_shared_routine_identities() {
     };
     assert_eq!(legacy.params.len(), 1);
     assert_eq!(legacy.params[0].ty, "integer");
+    assert_eq!(
+        legacy.kind,
+        crate::_internal::model::aggregate::AggregateKind::Normal
+    );
+    assert_eq!(legacy.direct_count, 1);
+}
+
+#[test]
+fn create_aggregate_records_ordered_and_hypothetical_kinds() {
+    let ordered = parse_and_extract_statement(
+        "CREATE AGGREGATE my_percentile(double precision ORDER BY double precision) (
+                SFUNC = ordered_set_transition,
+                STYPE = internal,
+                FINALFUNC = percentile_final
+            );",
+    )
+    .expect("ordered-set create aggregate fact");
+    let StatementFact::CreateAggregate(ordered) = ordered else {
+        panic!("expected create aggregate fact");
+    };
+    assert_eq!(
+        ordered.kind,
+        crate::_internal::model::aggregate::AggregateKind::OrderedSet
+    );
+    assert_eq!(ordered.direct_count, 1);
+    assert_eq!(ordered.params.len(), 2);
+    assert_eq!(ordered.params[0].ty, "double precision");
+    assert_eq!(ordered.params[1].ty, "double precision");
+
+    let hypothetical = parse_and_extract_statement(
+        "CREATE AGGREGATE my_rank(VARIADIC \"any\" ORDER BY VARIADIC \"any\") (
+                SFUNC = ordered_set_transition,
+                STYPE = internal,
+                FINALFUNC = rank_final,
+                HYPOTHETICAL
+            );",
+    )
+    .expect("hypothetical create aggregate fact");
+    let StatementFact::CreateAggregate(hypothetical) = hypothetical else {
+        panic!("expected create aggregate fact");
+    };
+    assert_eq!(
+        hypothetical.kind,
+        crate::_internal::model::aggregate::AggregateKind::Hypothetical
+    );
+    assert_eq!(hypothetical.direct_count, 1);
+    assert_eq!(hypothetical.params.len(), 2);
 }
 
 #[test]
@@ -871,9 +923,18 @@ fn create_view_records_unqualified_aggregate_candidates() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            explicit: false,
             star: false,
             aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Column("b".to_string())],
+            within_group: Vec::new(),
+            nested: false,
+            references: vec![AggregateReferenceFact {
+                qualifier: None,
+                name: "b".to_string(),
+            }],
+            scopes: Vec::new(),
+            contains_subquery: false,
         }]
     );
     assert_eq!(
@@ -920,11 +981,17 @@ fn create_view_marks_explicit_variadic_aggregate_arguments() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            explicit: false,
             star: false,
             aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Variadic(Box::new(
                 AggregateArgumentFact::Typed("int[]".to_string())
             ))],
+            within_group: Vec::new(),
+            nested: false,
+            references: Vec::new(),
+            scopes: Vec::new(),
+            contains_subquery: false,
         }]
     );
 }
@@ -980,12 +1047,24 @@ fn create_view_promotes_a_correlated_aggregate_to_the_outer_query() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            explicit: false,
             star: false,
             aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Field {
                 base: Box::new(AggregateArgumentFact::Column("t".to_string())),
                 field: "b".to_string(),
             }],
+            within_group: Vec::new(),
+            nested: true,
+            references: vec![AggregateReferenceFact {
+                qualifier: Some("t".to_string()),
+                name: "b".to_string(),
+            }],
+            scopes: vec![AggregateScopeFact {
+                bindings: Vec::new(),
+                unknown: false,
+            }],
+            contains_subquery: false,
         }]
     );
     assert_eq!(
@@ -1052,6 +1131,21 @@ fn create_view_records_aggregate_only_call_forms() {
     ] {
         assert_eq!(candidate(sql).aggregate_only_clause, Some(clause));
     }
+
+    let ordered = candidate(
+        "CREATE VIEW v AS SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY b) AS p FROM t WITH CHECK OPTION;",
+    );
+    assert_eq!(
+        ordered.within_group,
+        vec![AggregateArgumentFact::Column("b".to_string())]
+    );
+    assert_eq!(
+        ordered.references,
+        vec![AggregateReferenceFact {
+            qualifier: None,
+            name: "b".to_string(),
+        }]
+    );
 }
 
 #[test]

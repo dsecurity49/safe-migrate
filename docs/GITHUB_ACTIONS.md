@@ -74,7 +74,11 @@ Then run **Refresh safe-migrate baseline** once from the Actions tab. Do this
 before making the PR workflow a required check.
 
 The generated schedule refreshes twice each week, away from the top of the
-hour. Adjust it to match your schema-change rate and runner availability.
+hour, when the selected branch is the repository default branch. GitHub runs
+schedules only from the default branch. If you selected another base branch,
+either change the selected branch or allow the baseline environment to deploy
+from that branch and trigger a manual refresh there. Adjust the schedule to
+match your schema-change rate and runner availability.
 
 ## Day-to-day behavior
 
@@ -186,14 +190,16 @@ timeout defaults may change outside the migration pipeline.
 
 GitHub caches are recoverable build data rather than durable storage. They may
 expire after seven days without access or be evicted under storage pressure.
-The schedule replenishes the cache; manual dispatch is the bootstrap and
-recovery path. GitHub may disable schedules in inactive public repositories
-after 60 days.
+For the default branch, the schedule replenishes the cache; manual dispatch is
+the bootstrap and recovery path. GitHub may disable schedules in inactive
+public repositories after 60 days.
 
 ## Forks and contributor trust
 
-Fork and Dependabot PRs do not receive repository secrets. They may download
-the encrypted cache but cannot decrypt it, so the baseline-aware check fails.
+Fork and Dependabot PRs do not receive repository secrets. In the default
+encrypted-cache mode, the Action fails its baseline preflight because
+`SAFE_MIGRATE_CACHE_KEY` is unavailable; it does not download or decrypt the
+cache.
 
 Public repositories should document one fallback:
 
@@ -252,13 +258,16 @@ format, encryption namespace, restore, and trusted save lifecycle.
 
 | Output | Meaning |
 | --- | --- |
-| `json-report` | JSON report path; empty for sync-only runs |
-| `markdown-report` | Markdown report path; empty for sync-only runs |
+| `json-report` | JSON report path; empty for successful sync-only runs |
+| `markdown-report` | Markdown report path; empty for successful sync-only runs |
 | `diagnostic-log` | Diagnostic log path |
 | `exit-code` | `0` completed, `1` operational failure, `2` blocking finding |
 | `cache-path` | Resolved cache path |
 | `baseline-source` | `synced`, `github-cache`, `explicit-file`, or `unavailable` |
 | `sync-status` | `not-requested`, `refreshed`, or `failed` |
+
+A failed sync-only run writes operational-error JSON and Markdown reports so
+the failure is visible.
 
 ## Reviewed configuration
 
@@ -276,7 +285,7 @@ base commit:
     sparse-checkout: safe-migrate.toml
     persist-credentials: false
 
-- uses: dsecurity49/safe-migrate@v0.11.1
+- uses: dsecurity49/safe-migrate@v0.11.2
   env:
     SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
   with:

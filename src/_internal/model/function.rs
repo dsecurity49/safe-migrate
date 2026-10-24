@@ -103,6 +103,8 @@ pub(crate) struct FunctionState {
     /// for a range type. The type owns them: dropping the type drops them, and
     /// PostgreSQL refuses to drop them while the type exists.
     pub internal_type_owner: Option<ObjectId>,
+    /// `pg_aggregate` facts. `None` for every non-aggregate routine.
+    pub aggregate: Option<crate::_internal::model::aggregate::AggregateMetadata>,
 }
 
 impl FunctionState {
@@ -123,6 +125,9 @@ impl FunctionState {
                 ty: ty.clone(),
             })
             .collect();
+        let aggregate = (routine_kind == RoutineKind::Aggregate).then(|| {
+            crate::_internal::model::aggregate::AggregateMetadata::normal(arg_types.len())
+        });
         Self {
             id,
             routine_kind,
@@ -137,6 +142,7 @@ impl FunctionState {
             language: "sql".to_string(),
             security: SecurityMode::Invoker,
             internal_type_owner: None,
+            aggregate,
         }
     }
 }

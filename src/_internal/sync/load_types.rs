@@ -36,7 +36,9 @@ pub(super) fn load_casts(
 pub(super) fn load_aggregates(
     client: &mut impl GenericClient,
 ) -> Result<crate::_internal::model::aggregate::AggregateCatalogue> {
-    use crate::_internal::model::aggregate::{AggregateArg, AggregateCatalogue};
+    use crate::_internal::model::aggregate::{
+        AggregateArg, AggregateCatalogue, AggregateKind, AggregateSignature,
+    };
 
     let rows = client
         .query(
@@ -44,6 +46,9 @@ pub(super) fn load_aggregates(
             SELECT
                 p.oid AS oid,
                 p.proname AS name,
+                g.aggkind::text AS kind,
+                CASE WHEN g.aggkind = 'n' THEN p.pronargs::int
+                     ELSE g.aggnumdirectargs::int END AS direct,
                 a.ord AS ord,
                 pg_catalog.format_type(a.argtype, NULL) AS arg,
                 (t.typcategory = 'P') AS polymorphic
@@ -52,18 +57,30 @@ pub(super) fn load_aggregates(
             JOIN pg_catalog.pg_aggregate g ON g.aggfnoid = p.oid
             LEFT JOIN LATERAL unnest(p.proargtypes) WITH ORDINALITY AS a(argtype, ord) ON true
             LEFT JOIN pg_catalog.pg_type t ON t.oid = a.argtype
-            WHERE n.nspname = 'pg_catalog' AND g.aggkind = 'n'
+            WHERE n.nspname = 'pg_catalog'
             ORDER BY p.oid, a.ord
             ",
             &[],
         )
         .context("Failed to load built-in aggregates")?;
 
-    let mut entries: Vec<(String, Vec<AggregateArg>)> = Vec::new();
-    let mut current: Option<(u32, String, Vec<AggregateArg>)> = None;
+    struct Current {
+        oid: u32,
+        name: String,
+        kind: AggregateKind,
+        direct: usize,
+        arguments: Vec<AggregateArg>,
+    }
+
+    let mut entries: Vec<(String, AggregateSignature)> = Vec::new();
+    let mut current: Option<Current> = None;
     for row in rows {
         let oid: u32 = row.try_get("oid").context("aggregate oid")?;
         let name: String = row.try_get("name").context("aggregate name")?;
+        let kind: String = row.try_get("kind").context("aggregate kind")?;
+        let kind = AggregateKind::from_catalog(&kind)
+            .with_context(|| format!("unknown aggregate kind '{kind}' for {name}"))?;
+        let direct: i32 = row.try_get("direct").context("aggregate direct count")?;
         let argument = match row
             .try_get::<_, Option<String>>("arg")
             .context("aggregate argument")?
@@ -79,22 +96,33 @@ pub(super) fn load_aggregates(
             }
             Some(spelling) => Some(AggregateArg::Type(spelling)),
         };
-        if let Some((current_oid, _, arguments)) = current.as_mut()
-            && *current_oid == oid
+        if let Some(current) = current.as_mut()
+            && current.oid == oid
         {
             if let Some(argument) = argument {
-                arguments.push(argument);
+                current.arguments.push(argument);
             }
             continue;
         }
-        if let Some((_, finished, arguments)) =
-            current.replace((oid, name, argument.into_iter().collect()))
-        {
-            entries.push((finished, arguments));
+        if let Some(finished) = current.take() {
+            entries.push((
+                finished.name,
+                AggregateSignature::new(finished.kind, finished.direct, finished.arguments),
+            ));
         }
+        current = Some(Current {
+            oid,
+            name,
+            kind,
+            direct: usize::try_from(direct).context("aggregate direct count")?,
+            arguments: argument.into_iter().collect(),
+        });
     }
-    if let Some((_, name, arguments)) = current {
-        entries.push((name, arguments));
+    if let Some(finished) = current {
+        entries.push((
+            finished.name,
+            AggregateSignature::new(finished.kind, finished.direct, finished.arguments),
+        ));
     }
 
     Ok(AggregateCatalogue::new(entries))
@@ -111,6 +139,7 @@ pub(super) fn load_builtin_types(
                 t.typname,
                 pg_catalog.format_type(t.oid, NULL) AS canonical,
                 t.typcategory::text AS category,
+                t.typispreferred,
                 t.typlen,
                 t.typarray,
                 t.typmodout <> 0 AS accepts_typmod
@@ -139,6 +168,9 @@ pub(super) fn load_builtin_types(
                     .try_get("canonical")
                     .context("built-in type canonical name")?,
                 category: TypeCategory::from_catalog(&category),
+                preferred: row
+                    .try_get("typispreferred")
+                    .context("built-in type preferred flag")?,
                 fixed_bits: (typlen > 0).then(|| i32::from(typlen) * 8),
                 array_oid: match row
                     .try_get::<_, u32>("typarray")
