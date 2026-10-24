@@ -18,7 +18,7 @@ PostgreSQL 14–18 are supported.
 
 ## Install
 
-Requires Rust 1.94 or newer.
+Requires Rust 1.99 or newer.
 
 With Rust installed:
 
@@ -31,7 +31,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.11.1'
+VERSION='v0.11.2'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```

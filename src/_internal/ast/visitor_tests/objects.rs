@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn create_database_preserves_numeric_option_literals() {
+    let fact = parse_and_extract_statement("CREATE DATABASE app CONNECTION LIMIT 10;")
+        .expect("create database fact");
+    let StatementFact::CreateDatabase(database) = fact else {
+        panic!("expected create database fact");
+    };
+    assert_eq!(database.name, "app");
+    assert_eq!(
+        database.options,
+        [DatabaseOptionFact::ConnectionLimit(
+            DatabaseOptionValue::Literal(Some("10".into()))
+        )]
+    );
+}
+
+#[test]
 fn expression_column_rename_preserves_functions_literals_and_unicode() {
     use crate::_internal::analysis::expr_visitor::ExprVisitor;
     assert_eq!(
@@ -430,6 +446,11 @@ fn aggregate_commands_extract_shared_routine_identities() {
     assert_eq!(create.name.name.resolve(), "total");
     assert_eq!(create.params.len(), 1);
     assert_eq!(create.params[0].ty, "integer");
+    assert_eq!(
+        create.kind,
+        crate::_internal::model::aggregate::AggregateKind::Normal
+    );
+    assert_eq!(create.direct_count, 1);
 
     let alter = parse_and_extract_statement(
         "ALTER AGGREGATE \"Analytics\".Total(integer) RENAME TO \"Combined\";",
@@ -472,6 +493,15 @@ fn aggregate_commands_extract_shared_routine_identities() {
         ["double precision", "numeric", "text"]
     );
 
+    let variadic = parse_and_extract_statement(
+        "DROP AGGREGATE my_rank(VARIADIC \"any\" ORDER BY VARIADIC \"any\");",
+    )
+    .expect("variadic ordered-set aggregate fact");
+    let StatementFact::DropAggregate(variadic) = variadic else {
+        panic!("expected variadic ordered-set aggregate fact");
+    };
+    assert_eq!(variadic.signatures[0].params.len(), 1);
+
     let legacy = parse_and_extract_statement(
         "CREATE AGGREGATE legacy_total (
                 BASETYPE = integer,
@@ -485,6 +515,53 @@ fn aggregate_commands_extract_shared_routine_identities() {
     };
     assert_eq!(legacy.params.len(), 1);
     assert_eq!(legacy.params[0].ty, "integer");
+    assert_eq!(
+        legacy.kind,
+        crate::_internal::model::aggregate::AggregateKind::Normal
+    );
+    assert_eq!(legacy.direct_count, 1);
+}
+
+#[test]
+fn create_aggregate_records_ordered_and_hypothetical_kinds() {
+    let ordered = parse_and_extract_statement(
+        "CREATE AGGREGATE my_percentile(double precision ORDER BY double precision) (
+                SFUNC = ordered_set_transition,
+                STYPE = internal,
+                FINALFUNC = percentile_final
+            );",
+    )
+    .expect("ordered-set create aggregate fact");
+    let StatementFact::CreateAggregate(ordered) = ordered else {
+        panic!("expected create aggregate fact");
+    };
+    assert_eq!(
+        ordered.kind,
+        crate::_internal::model::aggregate::AggregateKind::OrderedSet
+    );
+    assert_eq!(ordered.direct_count, 1);
+    assert_eq!(ordered.params.len(), 2);
+    assert_eq!(ordered.params[0].ty, "double precision");
+    assert_eq!(ordered.params[1].ty, "double precision");
+
+    let hypothetical = parse_and_extract_statement(
+        "CREATE AGGREGATE my_rank(VARIADIC \"any\" ORDER BY VARIADIC \"any\") (
+                SFUNC = ordered_set_transition,
+                STYPE = internal,
+                FINALFUNC = rank_final,
+                HYPOTHETICAL
+            );",
+    )
+    .expect("hypothetical create aggregate fact");
+    let StatementFact::CreateAggregate(hypothetical) = hypothetical else {
+        panic!("expected create aggregate fact");
+    };
+    assert_eq!(
+        hypothetical.kind,
+        crate::_internal::model::aggregate::AggregateKind::Hypothetical
+    );
+    assert_eq!(hypothetical.direct_count, 1);
+    assert_eq!(hypothetical.params.len(), 1);
 }
 
 #[test]
@@ -871,7 +948,18 @@ fn create_view_records_unqualified_aggregate_candidates() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            explicit: false,
+            star: false,
+            aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Column("b".to_string())],
+            within_group: Vec::new(),
+            nested: false,
+            references: vec![AggregateReferenceFact {
+                qualifier: None,
+                name: "b".to_string(),
+            }],
+            scopes: Vec::new(),
+            contains_subquery: false,
         }]
     );
     assert_eq!(
@@ -918,9 +1006,17 @@ fn create_view_marks_explicit_variadic_aggregate_arguments() {
         aggregate_candidates,
         vec![AggregateCandidateFact {
             name: "sum".to_string(),
+            explicit: false,
+            star: false,
+            aggregate_only_clause: None,
             arguments: vec![AggregateArgumentFact::Variadic(Box::new(
                 AggregateArgumentFact::Typed("int[]".to_string())
             ))],
+            within_group: Vec::new(),
+            nested: false,
+            references: Vec::new(),
+            scopes: Vec::new(),
+            contains_subquery: false,
         }]
     );
 }
@@ -942,15 +1038,172 @@ fn create_view_ignores_calls_inside_nested_queries() {
         "CREATE VIEW v AS SELECT a, (SELECT sum(o.amount) FROM o WHERE o.id = t.id) AS total FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, (SELECT row_number() OVER () FROM o) AS r FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, (SELECT upper(o.x) FROM o) AS u FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM o AS t) AS s FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM t) AS s FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, EXISTS (SELECT sum(o.amount) FROM o) AS e FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, a = ANY (SELECT sum(o.amount) FROM o) AS m FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, ARRAY(SELECT sum(o.amount) FROM o) AS y FROM t WITH CHECK OPTION;",
         "CREATE VIEW v AS SELECT a, a IN (SELECT sum(o.amount) FROM o) AS i FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM (SELECT 1 AS b) AS t) AS s FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b) FROM o JOIN (SELECT 1 AS b) AS t ON true) AS s FROM t WITH CHECK OPTION;",
+        "CREATE VIEW v AS SELECT a, (SELECT (SELECT sum(t.b)) FROM (SELECT 1 AS b) AS t) AS s FROM t WITH CHECK OPTION;",
     ] {
         let (updatability, candidates) = facts(sql);
         assert_eq!(updatability, ViewUpdatabilityFact::Updatable, "{sql}");
         assert!(candidates.is_empty(), "{sql}");
     }
+}
+
+#[test]
+fn create_view_promotes_a_correlated_aggregate_to_the_outer_query() {
+    let StatementFact::CreateView {
+        updatability,
+        updatability_without_aggregates,
+        aggregate_candidates,
+        ..
+    } = parse_and_extract_statement(
+        "CREATE VIEW v AS SELECT a, (SELECT sum(t.b)) AS s FROM t AS t WITH CHECK OPTION;",
+    )
+    .expect("view fact")
+    else {
+        panic!("expected CreateView");
+    };
+    assert_eq!(
+        aggregate_candidates,
+        vec![AggregateCandidateFact {
+            name: "sum".to_string(),
+            explicit: false,
+            star: false,
+            aggregate_only_clause: None,
+            arguments: vec![AggregateArgumentFact::Field {
+                base: Box::new(AggregateArgumentFact::Column("t".to_string())),
+                field: "b".to_string(),
+            }],
+            within_group: Vec::new(),
+            nested: true,
+            references: vec![AggregateReferenceFact {
+                qualifier: Some("t".to_string()),
+                name: "b".to_string(),
+            }],
+            scopes: vec![AggregateScopeFact {
+                bindings: Vec::new(),
+                unknown: false,
+            }],
+            contains_subquery: false,
+        }]
+    );
+    assert_eq!(
+        updatability,
+        ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+    );
+    assert_eq!(
+        updatability_without_aggregates,
+        ViewUpdatabilityFact::Updatable
+    );
+}
+
+#[test]
+fn create_view_promotes_a_correlated_aggregate_through_nested_query_levels() {
+    let StatementFact::CreateView {
+        updatability,
+        aggregate_candidates,
+        ..
+    } = parse_and_extract_statement(
+        "CREATE VIEW v AS SELECT a, (SELECT (SELECT sum(t.b)) FROM o) AS s FROM t WITH CHECK OPTION;",
+    )
+    .expect("view fact")
+    else {
+        panic!("expected CreateView");
+    };
+    assert_eq!(aggregate_candidates.len(), 1);
+    assert_eq!(
+        updatability,
+        ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::Aggregate)
+    );
+}
+
+#[test]
+fn create_view_records_aggregate_only_call_forms() {
+    let candidate = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+        StatementFact::CreateView {
+            aggregate_candidates,
+            ..
+        } => aggregate_candidates.into_iter().next().expect("candidate"),
+        other => panic!("expected CreateView, got {other:?}"),
+    };
+    let star = candidate("CREATE VIEW v AS SELECT count(*) AS n FROM t WITH CHECK OPTION;");
+    assert!(star.star);
+    assert_eq!(star.aggregate_only_clause, None);
+    assert!(star.arguments.is_empty());
+
+    for (sql, clause) in [
+        (
+            "CREATE VIEW v AS SELECT sum(DISTINCT b) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::Distinct,
+        ),
+        (
+            "CREATE VIEW v AS SELECT sum(b) FILTER (WHERE b > 0) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::Filter,
+        ),
+        (
+            "CREATE VIEW v AS SELECT sum(b ORDER BY b) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::OrderBy,
+        ),
+        (
+            "CREATE VIEW v AS SELECT sum(b) WITHIN GROUP (ORDER BY b) AS s FROM t WITH CHECK OPTION;",
+            AggregateOnlyClauseFact::WithinGroup,
+        ),
+    ] {
+        assert_eq!(candidate(sql).aggregate_only_clause, Some(clause));
+    }
+
+    let ordered = candidate(
+        "CREATE VIEW v AS SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY b) AS p FROM t WITH CHECK OPTION;",
+    );
+    assert_eq!(
+        ordered.within_group,
+        vec![AggregateArgumentFact::Column("b".to_string())]
+    );
+    assert_eq!(
+        ordered.references,
+        vec![AggregateReferenceFact {
+            qualifier: None,
+            name: "b".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn create_view_keeps_composite_field_bases() {
+    let candidate = |sql: &str| match parse_and_extract_statement(sql).expect("view fact") {
+        StatementFact::CreateView {
+            aggregate_candidates,
+            ..
+        } => aggregate_candidates.into_iter().next().expect("candidate"),
+        other => panic!("expected CreateView, got {other:?}"),
+    };
+    assert_eq!(
+        candidate("CREATE VIEW v AS SELECT sum((p).y) AS s FROM t WITH CHECK OPTION;").arguments,
+        vec![AggregateArgumentFact::Field {
+            base: Box::new(AggregateArgumentFact::Column("p".to_string())),
+            field: "y".to_string(),
+        }]
+    );
+    assert_eq!(
+        candidate("CREATE VIEW v AS SELECT sum(t.a) AS s FROM t WITH CHECK OPTION;").arguments,
+        vec![AggregateArgumentFact::Field {
+            base: Box::new(AggregateArgumentFact::Column("t".to_string())),
+            field: "a".to_string(),
+        }]
+    );
+    assert_eq!(
+        candidate("CREATE VIEW v AS SELECT sum(make_pair().y) AS s FROM t WITH CHECK OPTION;")
+            .arguments,
+        vec![AggregateArgumentFact::Field {
+            base: Box::new(AggregateArgumentFact::Unknown),
+            field: "y".to_string(),
+        }]
+    );
 }
 
 #[test]

@@ -40,8 +40,9 @@ entry_count="$(psql "$DATABASE_URL" -X -A -t -c "
 
 use super::builtin_type::{BuiltinType, BuiltinTypeCatalogue, TypeCategory};
 
-/// \`(typname, canonical, category, fixed_bits, accepts_typmod)\`.
-const TYPES: &[(&str, &str, TypeCategory, Option<i32>, bool)] = &[
+/// \`(typname, canonical, category, preferred, fixed_bits, accepts_typmod)\`.
+#[allow(clippy::type_complexity)]
+const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
 HEADER
 
   # Pin the path at the connection level so `format_type` does not schema-
@@ -51,6 +52,7 @@ HEADER
       t.typname,
       pg_catalog.format_type(t.oid, NULL),
       t.typcategory::text,
+      t.typispreferred::text,
       CASE WHEN t.typlen > 0 THEN (t.typlen * 8)::text ELSE '' END,
       (t.typmodout <> 0)::text
     FROM pg_catalog.pg_type t
@@ -76,13 +78,14 @@ for line in sys.stdin:
     line = line.rstrip("\n")
     if not line:
         continue
-    typname, canonical, category, typlen, typmod = line.split("|")
+    typname, canonical, category, preferred, typlen, typmod = line.split("|")
+    preferred = "true" if preferred in ("t", "true") else "false"
     fixed = "None" if not typlen else f"Some({typlen})"
     typmod = "true" if typmod == "t" else "false"
     print(
         f"    ({rust_string(typname)}, {rust_string(canonical)}, "
         f"TypeCategory::{CATEGORY.get(category, chr(85)+chr(110)+chr(107)+chr(110)+chr(111)+chr(119)+chr(110))}, "
-        f"{fixed}, {typmod}),"
+        f"{preferred}, {fixed}, {typmod}),"
     )
 '
 
@@ -93,15 +96,20 @@ pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
     BuiltinTypeCatalogue::new(
         TYPES
             .iter()
-            .map(|(typname, canonical, category, fixed_bits, accepts_typmod)| BuiltinType {
-                oid: None,
-                typname: (*typname).to_string(),
-                canonical: (*canonical).to_string(),
-                category: *category,
-                fixed_bits: *fixed_bits,
-                array_oid: None,
-                accepts_typmod: *accepts_typmod,
-            })
+            .map(
+                |(typname, canonical, category, preferred, fixed_bits, accepts_typmod)| {
+                    BuiltinType {
+                        oid: None,
+                        typname: (*typname).to_string(),
+                        canonical: (*canonical).to_string(),
+                        category: *category,
+                        preferred: *preferred,
+                        fixed_bits: *fixed_bits,
+                        array_oid: None,
+                        accepts_typmod: *accepts_typmod,
+                    }
+                },
+            )
             .collect(),
     )
 }
@@ -144,7 +152,7 @@ mod tests {
             "timestamptz", "interval", "bool", "bytea", "json", "uuid",
         ] {
             assert!(
-                TYPES.iter().any(|(name, _, _, _, _)| *name == typname),
+                TYPES.iter().any(|(name, ..)| *name == typname),
                 "{typname} must survive into the fallback snapshot"
             );
         }

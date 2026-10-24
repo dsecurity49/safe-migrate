@@ -507,6 +507,7 @@ impl AnalysisState {
                 volatility,
                 language,
                 security,
+                aggregate: None,
             }),
         );
         MutationResult::Applied
@@ -876,6 +877,7 @@ impl AnalysisState {
                 volatility,
                 language,
                 security,
+                aggregate: None,
             }),
         );
         MutationResult::Applied
@@ -1163,6 +1165,10 @@ impl AnalysisState {
                 volatility: Volatility::Volatile,
                 language: "internal".to_string(),
                 security: SecurityMode::Invoker,
+                aggregate: Some(crate::_internal::model::aggregate::AggregateMetadata::new(
+                    aggregate.kind,
+                    aggregate.direct_count,
+                )),
             }),
         );
         MutationResult::Applied

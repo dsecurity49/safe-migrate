@@ -1210,6 +1210,578 @@ fn view_check_option_requires_an_auto_updatable_query() {
 }
 
 #[test]
+fn aggregate_only_call_forms_reject_a_scalar_shadow() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_forms (a int, b int);
+             CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             CREATE FUNCTION public.count() RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW distinct_form AS SELECT a, sum(DISTINCT b) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW filter_form AS SELECT a, sum(b) FILTER (WHERE b > 0) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW order_form AS SELECT a, sum(b ORDER BY b) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW within_form AS SELECT a, sum(b) WITHIN GROUP (ORDER BY b) AS s FROM base_forms WITH CHECK OPTION;
+             CREATE VIEW star_form AS SELECT a, count(*) AS n FROM base_forms;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 5, "{reasons:?}");
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|reason| reason.contains("is not an aggregate function"))
+            .count(),
+        4,
+        "the non-WITHIN forms reject the scalar shadow: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|reason| reason
+            == &"Migration chain conflict: function sum(int) WITHIN GROUP (ORDER BY int) does not exist"),
+        "WITHIN GROUP has no matching sum overload: {reasons:?}"
+    );
+    for name in [
+        "distinct_form",
+        "filter_form",
+        "order_form",
+        "within_form",
+        "star_form",
+    ] {
+        assert!(
+            state.get_relation(&object_id("public", name)).is_none(),
+            "{name} must not be created"
+        );
+    }
+}
+
+#[test]
+fn ordered_set_aggregates_use_their_within_group_signatures() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_ordered (a int, b int);
+             SET search_path = public, pg_catalog;
+             CREATE VIEW ordered_cont AS SELECT a, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY b) AS p FROM base_ordered WITH CHECK OPTION;
+             CREATE VIEW ordered_mode AS SELECT a, mode() WITHIN GROUP (ORDER BY b) AS m FROM base_ordered WITH CHECK OPTION;
+             CREATE VIEW ordered_rank AS SELECT a, rank(1::int) WITHIN GROUP (ORDER BY b) AS r FROM base_ordered WITH CHECK OPTION;
+             CREATE VIEW ordered_wrong AS SELECT a, percentile_cont(0.5::double precision) WITHIN GROUP (ORDER BY b::text) AS p FROM base_ordered WITH CHECK OPTION;
+             CREATE VIEW ordered_missing AS SELECT a, percentile_cont(0.5::double precision) AS p FROM base_ordered WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 5, "{reasons:?}");
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|reason| reason.contains("aggregate functions"))
+            .count(),
+        3,
+        "the three valid ordered-set calls stay aggregates: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|reason| reason.contains(
+            "function percentile_cont(double precision) WITHIN GROUP (ORDER BY text) does not exist"
+        )),
+        "the ordered argument type is checked: {reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason
+                .contains("function percentile_cont(double precision) does not exist")),
+        "an ordered-set aggregate needs WITHIN GROUP: {reasons:?}"
+    );
+    for name in [
+        "ordered_cont",
+        "ordered_mode",
+        "ordered_rank",
+        "ordered_wrong",
+        "ordered_missing",
+    ] {
+        assert!(
+            state.get_relation(&object_id("public", name)).is_none(),
+            "{name} must not be created"
+        );
+    }
+}
+
+#[test]
+fn a_local_ordered_set_aggregate_resolves_within_group() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_local_ordered (a int, b double precision);
+             CREATE FUNCTION public.local_transition(double precision, double precision)
+                 RETURNS double precision LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             CREATE AGGREGATE public.percentile_cont(double precision ORDER BY double precision) (
+                 SFUNC = local_transition,
+                 STYPE = double precision,
+                 FINALFUNC = local_transition
+             );
+             SET search_path = public, pg_catalog;
+             CREATE VIEW local_ordered AS
+                 SELECT a, percentile_cont(0.5::double precision) WITHIN GROUP (ORDER BY b) AS p
+                 FROM base_local_ordered WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("aggregate functions"),
+        "the local ordered-set aggregate resolves the WITHIN GROUP call: {reasons:?}"
+    );
+    assert!(
+        state
+            .get_relation(&object_id("public", "local_ordered"))
+            .is_none(),
+        "the view must be refused for using an aggregate"
+    );
+}
+
+#[test]
+fn a_scalar_overload_cannot_take_a_within_group_call() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_ordered_shadow (a int, b int);
+             CREATE FUNCTION public.percentile_cont(double precision) RETURNS double precision LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW ordered_scalar_shadow AS SELECT a, percentile_cont(0.5::double precision) WITHIN GROUP (ORDER BY b) AS p FROM base_ordered_shadow WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("aggregate functions"),
+        "the ordered-set aggregate still wins: {reasons:?}"
+    );
+    assert!(
+        state
+            .get_relation(&object_id("public", "ordered_scalar_shadow"))
+            .is_none(),
+        "the view must be refused"
+    );
+}
+
+#[test]
+fn domain_arguments_use_their_base_type() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE DOMAIN d AS int;
+             CREATE DOMAIN d2 AS d;
+             CREATE TABLE base_domain (a int, b d2);
+             CREATE FUNCTION public.sum(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW domain_aggregate AS SELECT a, sum(b) AS s FROM base_domain WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("aggregate functions"),
+        "the domain resolves to int, so the built-in aggregate wins: {reasons:?}"
+    );
+}
+
+#[test]
+fn an_exact_domain_overload_shadows_the_built_in_aggregate() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // PostgreSQL checks exact input identities before reducing domains, so the
+    // domain overload wins even though `sum(integer)` is an exact base match.
+    let v = engine
+        .analyze(
+            "CREATE DOMAIN public.amount AS int;
+             CREATE TABLE base_domain_exact (a int, b public.amount);
+             CREATE FUNCTION public.sum(public.amount) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW domain_exact AS SELECT a, sum(b) AS s FROM base_domain_exact WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the exact domain overload is scalar: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "domain_exact"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+        "the scalar call leaves the view updatable: {relation:?}"
+    );
+}
+
+#[test]
+fn local_container_types_leave_unmatched_aggregates_uncertain() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // A user-defined implicit cast can make these calls valid, and the synced
+    // cast catalogue does not include casts outside pg_catalog.
+    let v = engine
+        .analyze(
+            "CREATE TYPE public.mood AS ENUM ('low', 'high');
+             CREATE TYPE public.pair AS (x int);
+             CREATE TYPE public.floatrange AS RANGE (subtype = float8);
+             CREATE TABLE base_container (a int, e public.mood, c public.pair, r public.floatrange);
+             SET search_path = public, pg_catalog;
+             CREATE VIEW enum_sum AS SELECT a, sum(e) AS s FROM base_container WITH CHECK OPTION;
+             CREATE VIEW composite_sum AS SELECT a, sum(c) AS s FROM base_container WITH CHECK OPTION;
+             CREATE VIEW range_sum AS SELECT a, sum(r) AS s FROM base_container WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the local container types leave the calls uncertain: {v:?}"
+    );
+    for name in ["enum_sum", "composite_sum", "range_sum"] {
+        let relation = state
+            .get_relation(&object_id("public", name))
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                    if r.view_updatability == ViewUpdatability::Unknown),
+            "{name} leaves updatability unknown: {relation:?}"
+        );
+    }
+}
+
+#[test]
+fn a_user_base_type_argument_leaves_the_aggregate_uncertain() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // User-defined casts are not in the synced pg_catalog cast catalogue, so
+    // an unmatched user base type cannot be rejected as a missing function.
+    let v = engine
+        .analyze(
+            "CREATE TYPE public.custom (INPUT = int4in, OUTPUT = int4out);
+             CREATE TABLE base_custom (a int, b public.custom);
+             SET search_path = public, pg_catalog;
+             CREATE VIEW custom_sum AS SELECT a, sum(b) AS s FROM base_custom WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the user base type leaves the call uncertain: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "custom_sum"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Unknown),
+        "the unresolved aggregate leaves updatability unknown: {relation:?}"
+    );
+}
+
+#[test]
+fn a_preferred_coercion_wins_a_tied_aggregate_candidate() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // Both candidates accept `int` by implicit cast. `float8` is the preferred
+    // numeric type, so the scalar overload wins over the numeric aggregate.
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_preferred (a int, b int);
+             CREATE FUNCTION public.bool_and(float8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             CREATE AGGREGATE public.bool_and(numeric) (SFUNC = numeric_add, STYPE = numeric);
+             SET search_path = public, pg_catalog;
+             CREATE VIEW preferred_scalar AS SELECT a, bool_and(b) AS s FROM base_preferred WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the preferred scalar overload is not an aggregate: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "preferred_scalar"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+        "the scalar call leaves the view updatable: {relation:?}"
+    );
+}
+
+#[test]
+fn the_candidate_with_more_exact_arguments_wins() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // After reducing the domain to `int`, the scalar candidate has one exact
+    // argument and the aggregate candidate has none. PostgreSQL keeps the
+    // scalar, so the check option is accepted.
+    let v = engine
+        .analyze(
+            "CREATE DOMAIN public.amount_exact AS int;
+             CREATE TABLE base_exact_count (a int, b public.amount_exact, c int);
+             CREATE FUNCTION public.add3(bigint, bigint, bigint) RETURNS bigint LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2 + $3';
+             CREATE FUNCTION public.string_agg(int, bigint) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT ''x''';
+             CREATE AGGREGATE public.string_agg(bigint, bigint) (SFUNC = public.add3, STYPE = bigint);
+             SET search_path = public, pg_catalog;
+             CREATE VIEW exact_count AS SELECT a, string_agg(b, c) AS s FROM base_exact_count WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the scalar candidate has more exact arguments: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "exact_count"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+        "the scalar call leaves the view updatable: {relation:?}"
+    );
+}
+
+#[test]
+fn composite_field_types_come_from_the_composite_column() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TYPE pair_text AS (x int, y text);
+             CREATE TABLE base_composite (a int, y int, p pair_text);
+             CREATE FUNCTION public.sum(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             SET search_path = public, pg_catalog;
+             CREATE VIEW composite_text AS SELECT a, sum((p).y) AS s FROM base_composite WITH CHECK OPTION;
+             CREATE TYPE pair_int AS (x int, y int);
+             CREATE TABLE base_composite_int (a int, y text, p pair_int);
+             CREATE VIEW composite_int AS SELECT a, sum((p).y) AS s FROM base_composite_int WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(
+        reasons.len(),
+        1,
+        "only the integer field is an aggregate: {reasons:?}"
+    );
+    assert!(
+        reasons[0].contains("aggregate functions"),
+        "the integer composite field selects the built-in sum: {reasons:?}"
+    );
+}
+
+#[test]
+fn a_composite_field_of_an_inner_column_stays_local() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TYPE pair_inner AS (x int, y int);
+             CREATE TABLE base_inner_field (a int, y int);
+             CREATE TABLE other_inner_field (id int, p pair_inner);
+             CREATE VIEW inner_field AS SELECT a, (SELECT sum(((o.p).y)::int) FROM other_inner_field AS o WHERE o.id = base_inner_field.a) AS s FROM base_inner_field WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the inner composite field is not an outer column: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "inner_field"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+        "the local nested aggregate leaves the view updatable: {relation:?}"
+    );
+}
+
+#[test]
+fn correlated_outer_aggregates_conflict_but_local_nested_aggregates_do_not() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_correlated (a int, b int);
+             CREATE TABLE other_correlated (id int, amount int);
+             CREATE VIEW outer_aggregate AS SELECT a, (SELECT sum(t.b)) AS s FROM base_correlated AS t WITH CHECK OPTION;
+             CREATE VIEW local_aggregate AS SELECT a, (SELECT sum(o.amount) FROM other_correlated AS o WHERE o.id = t.a) AS s FROM base_correlated AS t WITH CHECK OPTION;
+             CREATE VIEW correlated_where AS SELECT a, (SELECT sum(t.b) FROM other_correlated AS o WHERE o.id = t.a) AS s FROM base_correlated AS t WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .all(|reason| reason.contains("aggregate functions")),
+        "the two outer-column aggregates refuse the check option: {reasons:?}"
+    );
+    assert!(
+        state
+            .get_relation(&object_id("public", "local_aggregate"))
+            .is_some(),
+        "the local subquery aggregate leaves the view updatable"
+    );
+}
+
+#[test]
+fn correlated_aggregate_arguments_are_found_through_expressions_and_scopes() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_outer_expr (a int, b int);
+             CREATE TABLE other_outer_expr (id int, amount int);
+             CREATE VIEW unqualified_no_from AS SELECT a, (SELECT sum(b)) AS s FROM base_outer_expr WITH CHECK OPTION;
+             CREATE VIEW unqualified_inner_from AS SELECT a, (SELECT sum(b) FROM other_outer_expr WHERE other_outer_expr.id = base_outer_expr.a) AS s FROM base_outer_expr WITH CHECK OPTION;
+             CREATE VIEW qualified_expression AS SELECT a, (SELECT sum(base_outer_expr.b + 1)) AS s FROM base_outer_expr WITH CHECK OPTION;
+             CREATE VIEW qualified_cast AS SELECT a, (SELECT sum(base_outer_expr.b::int)) AS s FROM base_outer_expr WITH CHECK OPTION;
+             CREATE VIEW explicit_expression AS SELECT a, (SELECT pg_catalog.sum(base_outer_expr.b + 1)) AS s FROM base_outer_expr WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 5, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .all(|reason| reason.contains("aggregate functions")),
+        "every outer reference is an aggregate at the view level: {reasons:?}"
+    );
+}
+
+#[test]
+fn an_unqualified_inner_column_keeps_a_nested_aggregate_local() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE base_inner_scope (a int, b int);
+             CREATE TABLE other_inner_scope (id int, b int);
+             CREATE VIEW local_unqualified AS SELECT a, (SELECT sum(b) FROM other_inner_scope WHERE other_inner_scope.id = base_inner_scope.a) AS s FROM base_inner_scope WITH CHECK OPTION;
+             CREATE VIEW local_explicit AS SELECT a, (SELECT pg_catalog.sum(b) FROM other_inner_scope WHERE other_inner_scope.id = base_inner_scope.a) AS s FROM base_inner_scope WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the inner column resolves locally: {v:?}"
+    );
+    for name in ["local_unqualified", "local_explicit"] {
+        let relation = state
+            .get_relation(&object_id("public", name))
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                    if r.view_updatability == ViewUpdatability::Updatable),
+            "the local nested aggregate leaves {name} updatable: {relation:?}"
+        );
+    }
+}
+
+#[test]
+fn definite_refusal_survives_aggregate_uncertainty() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TABLE public.base_uncertain (b int);
+             CREATE FUNCTION public.sum(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             SET search_path = \"$user\", public, pg_catalog;
+             CREATE VIEW public.view_uncertain AS SELECT sum(b) AS s FROM public.base_uncertain WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    let reasons: Vec<&str> = v
+        .iter()
+        .filter(|v| v.rule_id == "chain-conflict")
+        .map(|v| v.reason.as_str())
+        .collect();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("no updatable columns"),
+        "the refusal survives the unresolved search path: {reasons:?}"
+    );
+}
+
+#[test]
 fn a_shadowing_routine_decides_whether_an_aggregate_name_conflicts() {
     let engine = setup_engine();
     let mut state = setup_state();

@@ -546,6 +546,9 @@ pub(crate) struct CreateView {
     /// Whether the query is automatically updatable, which `check_option`
     /// requires.
     pub updatability: ViewUpdatabilityFact,
+    /// An aggregate-only call form that PostgreSQL resolves to a scalar
+    /// routine, which makes the view statement itself invalid.
+    pub invalid_aggregate: Option<String>,
 }
 
 /// A view's output column. The type is only known when the projection is a
@@ -683,6 +686,8 @@ pub(crate) struct CreateAggregateMutation {
     pub id: ObjectId,
     pub or_replace: bool,
     pub params: Vec<crate::_internal::analysis::facts::ParamFact>,
+    pub kind: crate::_internal::model::aggregate::AggregateKind,
+    pub direct_count: usize,
     /// The attribute list the parser retained, kept so the applied state can
     /// record what it does and does not model.
     pub definition: Vec<crate::_internal::analysis::facts::AggregateOptionFact>,

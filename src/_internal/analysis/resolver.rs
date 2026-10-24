@@ -342,6 +342,7 @@ impl Resolver {
                 select_outputs,
                 select_projection_complete,
                 select_source,
+                select_source_name,
                 routines,
                 cast_types,
             } => {
@@ -357,6 +358,7 @@ impl Resolver {
                     select_outputs,
                     *select_projection_complete,
                     select_source.as_ref(),
+                    select_source_name.as_deref(),
                     routines,
                     cast_types,
                     state,

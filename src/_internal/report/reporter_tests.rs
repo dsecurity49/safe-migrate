@@ -686,16 +686,32 @@ mod tests {
             assert_ne!(rule.title, rule.id, "a title must not be the id");
         }
 
-        let findings = vec![ReportFinding {
-            violation: make_violation("require-concurrent-drop-index", ViolationTier::Tier2, "x"),
-            location: None,
-            certainty: Certainty::Exact,
-            statement_index: None,
-        }];
+        let findings = vec![
+            ReportFinding {
+                violation: make_violation(
+                    "require-concurrent-drop-index",
+                    ViolationTier::Tier2,
+                    "x",
+                ),
+                location: None,
+                certainty: Certainty::Exact,
+                statement_index: None,
+            },
+            ReportFinding {
+                violation: make_violation("inline-suppression-disabled", ViolationTier::Tier1, "x"),
+                location: None,
+                certainty: Certainty::Exact,
+                statement_index: None,
+            },
+        ];
         let report = Reporter::json_report_with_locations(&findings, &Confidence::Exact, &[]);
         assert_eq!(
             report["rules"]["require-concurrent-drop-index"],
             "Require concurrent drop index"
+        );
+        assert_eq!(
+            report["rules"]["inline-suppression-disabled"],
+            "Inline suppression disabled"
         );
     }
 }

@@ -5,6 +5,28 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.11.2 — 2026-10-24
+
+- Upgraded the pinned Squawk parser stack from 2.65.0 to 2.70.0, raising the
+  minimum supported Rust version to 1.99.
+- The cache layout now carries aggregate kind and direct-argument metadata.
+  Re-run `safe-migrate sync`; a cache written before this layout is rejected
+  rather than misread.
+- View analysis now rejects `count(*)` and aggregate-only clauses (`DISTINCT`,
+  `FILTER`, `ORDER BY`, `WITHIN GROUP`) that resolve to a scalar routine,
+  follows domain and composite-field types, and recognizes correlated outer
+  aggregates through expressions and nested query scopes. Aggregate resolution
+  applies PostgreSQL's exact, domain-exact, and preferred-type steps, fails
+  closed for unknown types, and matches ordered-set and hypothetical
+  `WITHIN GROUP` calls against their direct and ordered signatures. The same
+  matching applies to user aggregates: synchronization and `CREATE AGGREGATE`
+  record `pg_aggregate.aggkind` and the direct-argument count. Quoted
+  `"serial"` is treated as an ordinary type, not a serial column.
+- The built-in type and aggregate fallbacks were regenerated from PostgreSQL
+  18.6, including preferred-type flags and ordered-set aggregate signatures.
+- JSON reports now include the `inline-suppression-disabled` rule title, so
+  every emitted rule id is labeled in the top-level `rules` map.
+
 ## v0.11.1 — 2026-10-20
 
 - The Markdown report shows how many checks did not run and collapses their

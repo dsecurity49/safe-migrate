@@ -456,6 +456,7 @@ impl AstVisitor {
                 .find(|t| t.kind() != SyntaxKind::WHITESPACE)
         })?;
         let name = Self::resolve_identifier_token(name_token.text());
+        let is_serial = Self::is_serial_type(col.ty());
         let ty = col.ty().map(|t| t.syntax().text().to_string());
         let generated_as = Self::column_constraints(col).find_map(|constraint| {
             let ColumnConstraint::GeneratedConstraint(generated) = constraint else {
@@ -504,7 +505,7 @@ impl AstVisitor {
                 None
             }
         });
-        let generation = if Self::is_serial_type(ty.as_deref()) {
+        let generation = if is_serial {
             crate::_internal::analysis::facts::ColumnGeneration::Serial
         } else if let Some(ast::GeneratedAs::GeneratedIdentity(identity)) = &generated_as {
             match identity.generated_when() {
@@ -564,15 +565,20 @@ impl AstVisitor {
         })
     }
 
-    pub(super) fn is_serial_type(ty: Option<&str>) -> bool {
-        ty.map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .is_some_and(|ty| {
-                matches!(
-                    ty.as_str(),
-                    "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
-                )
-            })
+    /// PostgreSQL's serial pseudo-types are unquoted path types. A quoted
+    /// `"serial"` is an ordinary user type, not a serial column.
+    pub(super) fn is_serial_type(ty: Option<ast::Type>) -> bool {
+        let Some(segment) = ty
+            .and_then(|ty| ty.path_ref())
+            .and_then(|path| path.unqualified_segment())
+        else {
+            return false;
+        };
+        !segment.is_quoted()
+            && matches!(
+                segment.text().to_ascii_lowercase().as_str(),
+                "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
+            )
     }
 
     pub(super) fn extract_table_constraint_fact(
@@ -627,7 +633,7 @@ impl AstVisitor {
                     .constraint_exclusion_list()
                     .map(|list| {
                         list.constraint_exclusions()
-                            .filter_map(|item| item.expr())
+                            .filter_map(|item| item.partition_item()?.expr())
                             .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
                             .map(Self::expr_columns_with_completeness)
                             .inspect(|(_, complete)| columns_complete &= *complete)
@@ -760,8 +766,7 @@ impl AstVisitor {
         };
         let mut keys = Vec::new();
         for item in list.partition_items() {
-            if item.collate().is_some()
-                || item.op_class_ref().is_some()
+            if item.op_class_ref().is_some()
                 || item.attribute_list().is_some()
                 || item.nulls_order().is_some()
             {

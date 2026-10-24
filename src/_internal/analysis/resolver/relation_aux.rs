@@ -2,9 +2,9 @@ use super::Resolver;
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::ViewUpdatabilityFact;
 use crate::_internal::analysis::facts::{
-    AggregateArgumentFact, AggregateCandidateFact, AlterIndexActionFact,
-    AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact,
-    SelectOutputFact, StatisticsTarget,
+    AggregateArgumentFact, AggregateCandidateFact, AggregateReferenceFact, AggregateScopeFact,
+    AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
+    ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
 };
 use crate::_internal::analysis::mutations::{
     AlterIndexActionMutation, AlterIndexMutation, AlterViewFamily, CreateIndex,
@@ -18,6 +18,12 @@ use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use crate::_internal::model::relation::RelationKind;
+
+enum AggregateCorrelation {
+    Outer,
+    Local,
+    Unknown,
+}
 use crate::_internal::model::relation::ViewUpdatabilityReason;
 
 impl Resolver {
@@ -67,6 +73,7 @@ impl Resolver {
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
+        select_source_name: Option<&str>,
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
@@ -88,13 +95,20 @@ impl Resolver {
                 verdict
             }
         };
-        let updatability = Self::resolve_view_aggregates(
+        let (updatability, invalid_aggregate) = match Self::resolve_view_aggregates(
             downgrade(updatability),
             downgrade(updatability_without_aggregates),
             aggregate_candidates,
             source.as_ref(),
+            select_source_name,
             state,
-        );
+        ) {
+            Ok(updatability) => (updatability, None),
+            Err(message) => (
+                crate::_internal::analysis::facts::ViewUpdatabilityFact::Unknown,
+                Some(message),
+            ),
+        };
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -107,6 +121,7 @@ impl Resolver {
             projection_complete,
             options: options.to_vec(),
             updatability,
+            invalid_aggregate,
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
         })
@@ -120,65 +135,237 @@ impl Resolver {
         without_aggregates: ViewUpdatabilityFact,
         candidates: &[AggregateCandidateFact],
         source: Option<&ObjectId>,
+        source_name: Option<&str>,
         state: &AnalysisState,
-    ) -> ViewUpdatabilityFact {
+    ) -> Result<ViewUpdatabilityFact, String> {
         use crate::_internal::analysis::state::AggregateCandidateResolution as Resolution;
         let mut uncertain = false;
         for candidate in candidates {
-            let arguments = candidate
-                .arguments
-                .iter()
-                .map(|argument| {
-                    let mut variadic = false;
-                    let mut argument = argument;
-                    while let AggregateArgumentFact::Variadic(inner) = argument {
-                        variadic = true;
-                        argument = inner.as_ref();
+            if candidate.nested {
+                match Self::aggregate_correlation(candidate, source, source_name, state) {
+                    AggregateCorrelation::Local => continue,
+                    AggregateCorrelation::Unknown => {
+                        uncertain = true;
+                        continue;
                     }
-                    let type_name = match argument {
-                        AggregateArgumentFact::Column(column) => {
-                            Self::source_column_type(source, column, state)
-                        }
-                        AggregateArgumentFact::Typed(typed) => Some(typed.clone()),
-                        AggregateArgumentFact::Variadic(_) | AggregateArgumentFact::Unknown => None,
-                    };
-                    AggregateCallArgument {
-                        type_name,
-                        variadic,
-                    }
-                })
-                .collect::<Vec<_>>();
-            match state.resolve_aggregate_candidate(&candidate.name, &arguments) {
-                Resolution::Aggregate => return with_aggregates,
+                    AggregateCorrelation::Outer => {}
+                }
+            }
+            let arguments =
+                Self::aggregate_call_arguments(&candidate.arguments, source, source_name, state);
+            let within_group =
+                Self::aggregate_call_arguments(&candidate.within_group, source, source_name, state);
+            match state.resolve_aggregate_candidate(
+                &candidate.name,
+                &arguments,
+                &within_group,
+                candidate.aggregate_only_clause
+                    == Some(
+                        crate::_internal::analysis::facts::AggregateOnlyClauseFact::WithinGroup,
+                    ),
+                candidate.explicit,
+            ) {
+                Resolution::Aggregate => return Ok(with_aggregates),
+                Resolution::Scalar if candidate.requires_aggregate() => {
+                    return Err(candidate.invalid_call_message());
+                }
                 Resolution::Scalar => {}
+                Resolution::Invalid(message) => return Err(message),
                 Resolution::Uncertain => uncertain = true,
             }
         }
         if uncertain {
             match without_aggregates {
-                ViewUpdatabilityFact::Updatable
-                | ViewUpdatabilityFact::NotUpdatable(ViewUpdatabilityReason::NoUpdatableColumns) => {
-                    ViewUpdatabilityFact::Unknown
-                }
-                other => other,
+                // A scalar call leaves the view updatable, but the shadowing
+                // routine is unsettled; only that reading becomes unknown.
+                ViewUpdatabilityFact::Updatable => Ok(ViewUpdatabilityFact::Unknown),
+                // A refusal that does not depend on the call survives.
+                other => Ok(other),
             }
         } else {
-            without_aggregates
+            Ok(without_aggregates)
+        }
+    }
+
+    fn aggregate_call_arguments(
+        arguments: &[AggregateArgumentFact],
+        source: Option<&ObjectId>,
+        source_name: Option<&str>,
+        state: &AnalysisState,
+    ) -> Vec<AggregateCallArgument> {
+        arguments
+            .iter()
+            .map(|argument| {
+                let mut variadic = false;
+                let mut argument = argument;
+                while let AggregateArgumentFact::Variadic(inner) = argument {
+                    variadic = true;
+                    argument = inner.as_ref();
+                }
+                let (type_name, type_id) =
+                    match Self::aggregate_argument_type(argument, source, source_name, state) {
+                        Some((type_name, type_id)) => (Some(type_name), type_id),
+                        None => (None, None),
+                    };
+                AggregateCallArgument {
+                    type_name,
+                    type_id,
+                    variadic,
+                }
+            })
+            .collect()
+    }
+
+    fn aggregate_correlation(
+        candidate: &AggregateCandidateFact,
+        source: Option<&ObjectId>,
+        source_name: Option<&str>,
+        state: &AnalysisState,
+    ) -> AggregateCorrelation {
+        if candidate.contains_subquery {
+            return AggregateCorrelation::Unknown;
+        }
+        if candidate.references.is_empty() {
+            return AggregateCorrelation::Local;
+        }
+        let mut unknown = false;
+        for reference in &candidate.references {
+            match Self::reference_correlation(
+                reference,
+                &candidate.scopes,
+                source,
+                source_name,
+                state,
+            ) {
+                AggregateCorrelation::Outer => return AggregateCorrelation::Outer,
+                AggregateCorrelation::Unknown => unknown = true,
+                AggregateCorrelation::Local => {}
+            }
+        }
+        if unknown {
+            AggregateCorrelation::Unknown
+        } else {
+            AggregateCorrelation::Local
+        }
+    }
+
+    fn reference_correlation(
+        reference: &AggregateReferenceFact,
+        scopes: &[AggregateScopeFact],
+        source: Option<&ObjectId>,
+        source_name: Option<&str>,
+        state: &AnalysisState,
+    ) -> AggregateCorrelation {
+        if let Some(qualifier) = &reference.qualifier {
+            for scope in scopes {
+                if scope
+                    .bindings
+                    .iter()
+                    .any(|binding| &binding.alias == qualifier)
+                {
+                    return AggregateCorrelation::Local;
+                }
+            }
+            if source_name != Some(qualifier.as_str()) {
+                // A composite column can also be written as `p.field`; if `p`
+                // is not a source column this belongs to another relation.
+                return Self::source_reference(source, qualifier, state);
+            }
+            return Self::source_reference(source, &reference.name, state);
+        }
+
+        for scope in scopes {
+            let mut scope_unknown = scope.unknown;
+            for binding in &scope.bindings {
+                let Some(relation) = &binding.relation else {
+                    scope_unknown = true;
+                    continue;
+                };
+                let id = Self::resolve_relation_lookup_name(relation, state);
+                match state.relation_columns(&id) {
+                    Some(columns) if state.relation_columns_complete(&id) => {
+                        if columns.iter().any(|column| column.name == reference.name) {
+                            return AggregateCorrelation::Local;
+                        }
+                    }
+                    _ => scope_unknown = true,
+                }
+            }
+            if scope_unknown {
+                return AggregateCorrelation::Unknown;
+            }
+        }
+        Self::source_reference(source, &reference.name, state)
+    }
+
+    fn source_reference(
+        source: Option<&ObjectId>,
+        name: &str,
+        state: &AnalysisState,
+    ) -> AggregateCorrelation {
+        let Some(source) = source else {
+            return AggregateCorrelation::Local;
+        };
+        if !state.relation_columns_complete(source) {
+            return AggregateCorrelation::Unknown;
+        }
+        match state.relation_columns(source) {
+            Some(columns) if columns.iter().any(|column| column.name == name) => {
+                AggregateCorrelation::Outer
+            }
+            Some(_) => AggregateCorrelation::Local,
+            None => AggregateCorrelation::Unknown,
+        }
+    }
+
+    /// The type an aggregate argument has on the view's single base relation,
+    /// following source-qualified and composite fields.
+    fn aggregate_argument_type(
+        argument: &AggregateArgumentFact,
+        source: Option<&ObjectId>,
+        source_name: Option<&str>,
+        state: &AnalysisState,
+    ) -> Option<(String, Option<ObjectId>)> {
+        use AggregateArgumentFact as Argument;
+        match argument {
+            Argument::Column(column) => Self::source_column_type(source, column, state),
+            Argument::Field { base, field } => {
+                if let Argument::Column(name) = base.as_ref()
+                    && source_name == Some(name.as_str())
+                {
+                    return Self::source_column_type(source, field, state);
+                }
+                let (base_type, _) =
+                    Self::aggregate_argument_type(base, source, source_name, state)?;
+                state.composite_field_type(&base_type, field)
+            }
+            Argument::Typed(typed) => Some((typed.clone(), state.resolve_type_reference(typed))),
+            Argument::Variadic(inner) => {
+                Self::aggregate_argument_type(inner, source, source_name, state)
+            }
+            Argument::Unknown => None,
         }
     }
 
     /// The type a column-reference argument has on the view's single base
-    /// relation; an argument from anywhere else stays untyped.
+    /// relation; an argument from anywhere else stays untyped. Domains keep
+    /// their identity here because exact-match resolution prefers them over
+    /// their base type.
     fn source_column_type(
         source: Option<&ObjectId>,
         column: &str,
         state: &AnalysisState,
-    ) -> Option<String> {
-        let columns = state.relation_column_types(source?)?;
-        columns
-            .into_iter()
-            .find(|entry| entry.0 == column)
-            .and_then(|entry| entry.1)
+    ) -> Option<(String, Option<ObjectId>)> {
+        state
+            .relation_columns(source?)?
+            .iter()
+            .find(|entry| entry.name == column)
+            .and_then(|entry| {
+                entry
+                    .data_type
+                    .clone()
+                    .map(|data_type| (data_type, entry.type_id.clone()))
+            })
     }
 
     /// Project a view's output list, taking types from the source relation

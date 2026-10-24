@@ -93,9 +93,8 @@ impl AstVisitor {
         match opt {
             ast::FuncOption::LanguageFuncOption(f) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Language(
-                    f.language_ref()
-                        .and_then(|lr| lr.ident_token())
-                        .map(|t| Self::resolve_identifier_token(t.text()))
+                    f.language_name()
+                        .map(|language| language.name)
                         .unwrap_or_default(),
                 )
             }
@@ -441,14 +440,20 @@ impl AstVisitor {
     pub(super) fn extract_signature_params(params: Option<ast::ParamList>) -> Vec<String> {
         params
             .map(|params| {
-                params
-                    .params()
-                    .chain(
-                        params
-                            .aggregate_order_by()
-                            .into_iter()
-                            .flat_map(|order_by| order_by.params()),
-                    )
+                let direct = params.params().collect::<Vec<_>>();
+                let ordered = params
+                    .aggregate_order_by()
+                    .into_iter()
+                    .flat_map(|order_by| order_by.params())
+                    .collect::<Vec<_>>();
+                let ordered = if Self::folds_ordered_variadic(&direct, &ordered) {
+                    Vec::new()
+                } else {
+                    ordered
+                };
+                direct
+                    .into_iter()
+                    .chain(ordered)
                     .filter_map(|param| {
                         if matches!(param.mode(), Some(ast::ParamMode::ParamOut(_))) {
                             return None;
@@ -465,16 +470,75 @@ impl AstVisitor {
             .unwrap_or_default()
     }
 
+    fn folds_ordered_variadic(
+        direct: &[squawk_syntax::ast::Param],
+        ordered: &[squawk_syntax::ast::Param],
+    ) -> bool {
+        let Some(last_direct) = direct.last() else {
+            return false;
+        };
+        if !matches!(last_direct.mode(), Some(ast::ParamMode::ParamVariadic(_)))
+            || ordered.len() != 1
+            || !matches!(ordered[0].mode(), Some(ast::ParamMode::ParamVariadic(_)))
+        {
+            return false;
+        }
+        last_direct
+            .func_type()
+            .map(|ty| ty.syntax().text().to_string())
+            == ordered[0]
+                .func_type()
+                .map(|ty| ty.syntax().text().to_string())
+    }
+
     pub(super) fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
         let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
         let attributes = Self::extract_attribute_list(node.attribute_list());
-        let params = if let Some(params) = node.param_list() {
-            params
-                .params()
-                .map(|param| Self::extract_param(&param))
-                .collect()
+        let hypothetical = attributes.iter().any(|attribute| {
+            attribute.name.eq_ignore_ascii_case("hypothetical")
+                && !matches!(
+                    attribute
+                        .value
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "false" | "f" | "0"
+                )
+        });
+        let (params, kind, direct_count) = if let Some(params) = node.param_list() {
+            let direct_params = params.params().collect::<Vec<_>>();
+            let ordered_params = params
+                .aggregate_order_by()
+                .into_iter()
+                .flat_map(|order_by| order_by.params())
+                .collect::<Vec<_>>();
+            let fold_ordered = Self::folds_ordered_variadic(&direct_params, &ordered_params);
+            let direct = direct_params
+                .iter()
+                .map(Self::extract_param)
+                .collect::<Vec<_>>();
+            let ordered = ordered_params
+                .iter()
+                .map(Self::extract_param)
+                .collect::<Vec<_>>();
+            let kind = if ordered.is_empty() {
+                crate::_internal::model::aggregate::AggregateKind::Normal
+            } else if hypothetical {
+                crate::_internal::model::aggregate::AggregateKind::Hypothetical
+            } else {
+                crate::_internal::model::aggregate::AggregateKind::OrderedSet
+            };
+            let direct_count = direct.len();
+            let params = if fold_ordered {
+                direct
+            } else {
+                direct.into_iter().chain(ordered).collect()
+            };
+            (params, kind, direct_count)
         } else {
-            attributes
+            let params = attributes
                 .iter()
                 .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
                 .filter(|attribute| {
@@ -496,13 +560,21 @@ impl AstVisitor {
                         default: None,
                     }]
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let direct_count = params.len();
+            (
+                params,
+                crate::_internal::model::aggregate::AggregateKind::Normal,
+                direct_count,
+            )
         };
         Some(StatementFact::CreateAggregate(
             crate::_internal::analysis::facts::CreateAggregateFact {
                 name,
                 or_replace: node.or_replace().is_some(),
                 params,
+                kind,
+                direct_count,
                 // The parser keeps the transition functions, state type, and
                 // initial condition as attribute options. Recording them keeps
                 // the definition honest about what it knows, so the state's

@@ -156,8 +156,7 @@ impl AnalysisState {
         }?;
         let mut columns = Vec::new();
         for item in partition.partition_item_list()?.partition_items() {
-            if item.collate().is_some()
-                || item.op_class_ref().is_some()
+            if item.op_class_ref().is_some()
                 || item.attribute_list().is_some()
                 || item.nulls_order().is_some()
             {

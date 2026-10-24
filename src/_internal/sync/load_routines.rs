@@ -32,6 +32,11 @@ pub(super) fn load_routines(
             pg_catalog.pg_get_function_result(p.oid) AS return_type,
             p.provolatile::text AS volatility,
             p.prokind::text AS routine_kind,
+            g.aggkind::text AS aggregate_kind,
+            CASE
+                WHEN g.aggkind = 'n' THEN p.pronargs::int4
+                ELSE g.aggnumdirectargs::int4
+            END AS aggregate_direct_count,
             l.lanname AS language,
             p.prosecdef AS security_definer,
             owner_ns.nspname AS internal_owner_schema,
@@ -39,6 +44,7 @@ pub(super) fn load_routines(
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
+        LEFT JOIN pg_aggregate g ON g.aggfnoid = p.oid
         LEFT JOIN LATERAL (
             SELECT d.refobjid AS owner_oid
             FROM pg_depend d
@@ -129,6 +135,31 @@ pub(super) fn load_routines(
                 arg_types,
                 "the input signature must be the parameter list restricted to inputs"
             );
+            let aggregate = match routine_kind {
+                crate::_internal::model::function::RoutineKind::Aggregate => {
+                    let kind_code = row
+                        .try_get::<_, Option<String>>("aggregate_kind")
+                        .context("aggregate kind")?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "aggregate {id} has no pg_aggregate row; catalog is inconsistent"
+                            )
+                        })?;
+                    let kind = crate::_internal::model::aggregate::AggregateKind::from_catalog(
+                        &kind_code,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("unknown aggregate kind {kind_code}"))?;
+                    let direct_count = row
+                        .try_get::<_, Option<i32>>("aggregate_direct_count")
+                        .context("aggregate direct argument count")?
+                        .ok_or_else(|| anyhow::anyhow!("aggregate {id} has no direct argument count"))?;
+                    Some(crate::_internal::model::aggregate::AggregateMetadata::new(
+                        kind,
+                        direct_count.max(0) as usize,
+                    ))
+                }
+                _ => None,
+            };
             Ok((
                 id.clone(),
                 crate::_internal::model::function::FunctionState {
@@ -174,6 +205,7 @@ pub(super) fn load_routines(
                         (Some(schema), Some(name)) => Some(ObjectId::new(schema, name)),
                         _ => None,
                     },
+                    aggregate,
                 },
             ))
         })

@@ -107,6 +107,68 @@ impl AnalysisState {
         })
     }
 
+    /// The base type of a modeled domain, following chains of domains. An
+    /// unresolved or non-domain reference returns `None`.
+    pub(crate) fn domain_base_type(&self, raw: &str) -> Option<String> {
+        let mut current = self.resolve_type_reference(raw)?;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                return None;
+            }
+            let Some(TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Domain {
+                        base_type,
+                        base_type_id,
+                    },
+                ..
+            })) = self.local.types.get(&current)
+            else {
+                return None;
+            };
+            let Some(base_type_id) = base_type_id else {
+                return Some(base_type.clone());
+            };
+            if matches!(
+                self.local.types.get(base_type_id),
+                Some(TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { .. },
+                    ..
+                }))
+            ) {
+                current = base_type_id.clone();
+            } else {
+                return Some(base_type.clone());
+            }
+        }
+    }
+
+    /// The type of a field on a modeled composite type, following a domain
+    /// over that composite type. The field keeps its resolved identity so
+    /// routine matching can distinguish same-named types in different schemas.
+    pub(crate) fn composite_field_type(
+        &self,
+        raw: &str,
+        field: &str,
+    ) -> Option<(String, Option<ObjectId>)> {
+        let base = self
+            .domain_base_type(raw)
+            .unwrap_or_else(|| raw.to_string());
+        let id = self.resolve_type_reference(&base)?;
+        let Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Composite { fields },
+            ..
+        })) = self.local.types.get(&id)
+        else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|entry| entry.name == field)
+            .map(|entry| (entry.data_type.clone(), entry.data_type_id.clone()))
+    }
+
     pub(super) fn type_reference_name(id: &ObjectId, qualified: bool) -> String {
         let quote = |identifier: &str| {
             let unquoted = identifier

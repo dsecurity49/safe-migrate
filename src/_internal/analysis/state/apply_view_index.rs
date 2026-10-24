@@ -663,6 +663,9 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_view(&mut self, create: &CreateView) -> MutationResult {
+        if let Some(message) = &create.invalid_aggregate {
+            return MutationResult::conflict(message.clone());
+        }
         if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }

@@ -1,9 +1,9 @@
 [package]
 name = "safe-migrate"
-version = "0.11.1"
+version = "0.11.2"
 edition = "2024"
 autotests = false
-rust-version = "1.94"
+rust-version = "1.99"
 description = "Check PostgreSQL migrations against a synchronized database baseline"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dsecurity49/safe-migrate"
@@ -21,10 +21,10 @@ keywords = ["postgres", "migration", "linter", "ast", "database"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
-squawk-syntax = "=2.65.0"
-squawk-lexer  = "=2.65.0"
-squawk-parser = "=2.65.0"
-squawk-linter = "=2.65.0"
+squawk-syntax = "=2.70.0"
+squawk-lexer  = "=2.70.0"
+squawk-parser = "=2.70.0"
+squawk-linter = "=2.70.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

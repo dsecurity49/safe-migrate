@@ -467,6 +467,21 @@ mod atomic_write_tests {
     }
 
     #[test]
+    #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+    fn synced_builtin_aggregates_match_the_fallback() {
+        let guard = crate::_internal::test_support::LiveDatabaseGuard::acquire();
+        let Some(url) = guard.url() else {
+            return;
+        };
+        let mut client = connect_database(&url).expect("connect for aggregate parity");
+        let synced = load_aggregates(&mut client).expect("load built-in aggregates");
+        assert_eq!(
+            synced,
+            crate::_internal::model::aggregate::AggregateCatalogue::fallback()
+        );
+    }
+
+    #[test]
     fn production_cache_writer_atomically_replaces_and_decodes() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_path = temp_dir.path().join("baseline.cache");

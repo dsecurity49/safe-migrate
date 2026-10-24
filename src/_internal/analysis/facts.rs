@@ -230,6 +230,8 @@ pub(crate) enum StatementFact {
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
+        /// The base relation's alias, or its name when no alias is written.
+        select_source_name: Option<String>,
         routines: Vec<RoutineReferenceFact>,
         cast_types: Vec<CastTypeReferenceFact>,
     },
@@ -803,7 +805,15 @@ pub(crate) struct DropProcedureFact {
 pub(crate) struct CreateAggregateFact {
     pub name: QualifiedName,
     pub or_replace: bool,
+    /// Every input parameter in declaration order: ordinary arguments first,
+    /// then any `ORDER BY` arguments.
     pub params: Vec<ParamFact>,
+    /// `pg_aggregate.aggkind`, decided by an `ORDER BY` clause and the
+    /// `HYPOTHETICAL` attribute.
+    pub kind: crate::_internal::model::aggregate::AggregateKind,
+    /// `pg_aggregate.aggnumdirectargs`: how many of `params` are ordinary
+    /// arguments rather than `ORDER BY` inputs.
+    pub direct_count: usize,
     /// The `CREATE AGGREGATE` attribute list, which carries the transition
     /// functions, the state type, and the initial condition.
     pub definition: Vec<AggregateOptionFact>,
@@ -1155,12 +1165,65 @@ pub(crate) enum SelectOutputFact {
 /// visitor can see. `Unknown` matches any overload, like a bare literal.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AggregateArgumentFact {
+    /// A bare column reference on the view's source relation.
     Column(String),
+    /// A field selection, keeping the base so the resolver can distinguish a
+    /// source-qualified column from a field of a composite column.
+    Field {
+        base: Box<AggregateArgumentFact>,
+        field: String,
+    },
     Typed(String),
     /// The written argument carries PostgreSQL's `VARIADIC` keyword, so it is
     /// matched against the variadic parameter's array type, not its element.
     Variadic(Box<AggregateArgumentFact>),
     Unknown,
+}
+
+/// A clause PostgreSQL accepts only on an aggregate call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateOnlyClauseFact {
+    Distinct,
+    Filter,
+    OrderBy,
+    WithinGroup,
+}
+
+impl AggregateOnlyClauseFact {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Distinct => "DISTINCT",
+            Self::Filter => "FILTER",
+            Self::OrderBy => "ORDER BY",
+            Self::WithinGroup => "WITHIN GROUP",
+        }
+    }
+}
+
+/// A column reference inside an aggregate argument, with its written
+/// qualifier when one was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AggregateReferenceFact {
+    pub qualifier: Option<String>,
+    pub name: String,
+}
+
+/// One range-variable binding in a nested query's `FROM` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateBindingFact {
+    pub alias: String,
+    /// The relation named by the binding, or `None` for a subquery or table
+    /// function whose columns the visitor cannot see.
+    pub relation: Option<QualifiedName>,
+}
+
+/// One query level between a nested call and the view's target list.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateScopeFact {
+    pub bindings: Vec<AggregateBindingFact>,
+    /// A `FROM` item whose columns are unknown, so an unqualified reference
+    /// cannot be assumed local.
+    pub unknown: bool,
 }
 
 /// An unqualified call whose written name is a built-in aggregate. A
@@ -1169,7 +1232,52 @@ pub(crate) enum AggregateArgumentFact {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateCandidateFact {
     pub name: String,
+    /// The call was written as `pg_catalog.name`, so no search-path routine
+    /// can take it back.
+    pub explicit: bool,
+    /// `count(*)`-style star form, which only an aggregate can accept.
+    pub star: bool,
+    /// A modifier PostgreSQL accepts only on an aggregate.
+    pub aggregate_only_clause: Option<AggregateOnlyClauseFact>,
     pub arguments: Vec<AggregateArgumentFact>,
+    /// The `ORDER BY` inputs of a `WITHIN GROUP` call, which PostgreSQL matches
+    /// against the aggregate's ordered arguments.
+    pub within_group: Vec<AggregateArgumentFact>,
+    /// Whether the call sits inside a nested query. A top-level call is always
+    /// at the view's own query level.
+    pub nested: bool,
+    /// Column references in the call arguments, including references under
+    /// operators and casts.
+    pub references: Vec<AggregateReferenceFact>,
+    /// Query levels between a nested call and the view's target list, innermost
+    /// first.
+    pub scopes: Vec<AggregateScopeFact>,
+    /// An argument contains a subquery whose own scope the visitor does not
+    /// model.
+    pub contains_subquery: bool,
+}
+
+impl AggregateCandidateFact {
+    pub(crate) fn requires_aggregate(&self) -> bool {
+        self.star || self.aggregate_only_clause.is_some()
+    }
+
+    pub(crate) fn invalid_call_message(&self) -> String {
+        if self.star {
+            return format!(
+                "{}(*) specified, but {} is not an aggregate function",
+                self.name, self.name
+            );
+        }
+        match self.aggregate_only_clause {
+            Some(clause) => format!(
+                "{} specified, but {} is not an aggregate function",
+                clause.label(),
+                self.name
+            ),
+            None => format!("{} is not an aggregate function", self.name),
+        }
+    }
 }
 
 /// Whether PostgreSQL's `view_query_is_auto_updatable(query, true)` would

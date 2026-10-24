@@ -8,9 +8,15 @@ impl AstVisitor {
             if default {
                 crate::_internal::analysis::facts::DatabaseOptionValue::Default
             } else {
-                crate::_internal::analysis::facts::DatabaseOptionValue::Literal(
-                    literal.map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()),
-                )
+                crate::_internal::analysis::facts::DatabaseOptionValue::Literal(literal.and_then(
+                    |literal| {
+                        if literal.is_string() {
+                            literal.decoded_value().map(|text| text.into_text())
+                        } else {
+                            Some(literal.syntax().text().to_string())
+                        }
+                    },
+                ))
             }
         };
 

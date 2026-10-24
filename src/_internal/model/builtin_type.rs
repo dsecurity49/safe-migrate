@@ -72,6 +72,8 @@ pub(crate) struct BuiltinType {
     /// the form that names the type rather than one that round-trips a typmod.
     pub canonical: String,
     pub category: TypeCategory,
+    /// `pg_type.typispreferred`: the preferred type in its category.
+    pub preferred: bool,
     /// `pg_type.typlen` in bits, for fixed-width types only.
     pub fixed_bits: Option<i32>,
     /// `pg_type.typarray`, absent when the type has no array or when the
@@ -219,6 +221,7 @@ mod tests {
             typname: typname.to_string(),
             canonical: canonical.to_string(),
             category,
+            preferred: false,
             fixed_bits: None,
             accepts_typmod: false,
         }

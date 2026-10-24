@@ -346,6 +346,10 @@ const SECONDARY_RULES: &[SecondaryRule] = &[
         id: "require-concurrent-drop-index",
         title: "Require concurrent drop index",
     },
+    SecondaryRule {
+        id: "inline-suppression-disabled",
+        title: "Inline suppression disabled",
+    },
 ];
 
 /// The user-facing title of any rule id a report may carry.

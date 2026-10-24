@@ -161,9 +161,7 @@ impl AstVisitor {
                             if_not_exists: add.if_not_exists().is_some(),
                             not_null,
                             default,
-                            generation: if Self::is_serial_type(
-                                add.ty().map(|ty| ty.syntax().text().to_string()).as_deref(),
-                            ) {
+                            generation: if Self::is_serial_type(add.ty()) {
                                 crate::_internal::analysis::facts::ColumnGeneration::Serial
                             } else {
                                 generation
@@ -564,20 +562,10 @@ impl AstVisitor {
                     actions.push(AlterTableActionFact::EnableReplicaTrigger { trigger_name });
                 }
                 _ => {
-                    let txt = action.syntax().text().to_string().to_lowercase();
-
-                    if txt.contains("set storage") {
-                        // A storage clause belongs to the typed ALTER COLUMN
-                        // option path. If Squawk does not expose that child,
-                        // preserve conservative handling instead of guessing
-                        // its target or mode from source text.
-                        unsupported_action = true;
-                    } else {
-                        // Parser-accepted actions that are not represented in
-                        // our fact model must take the engine's explicit
-                        // opaque path instead of becoming an exact no-op.
-                        unsupported_action = true;
-                    }
+                    // Parser-accepted actions that are not represented in our
+                    // fact model must take the engine's explicit opaque path
+                    // instead of becoming an exact no-op.
+                    unsupported_action = true;
                 }
             }
         }
@@ -887,7 +875,7 @@ impl AstVisitor {
                     .constraint_exclusion_list()
                     .map(|list| {
                         list.constraint_exclusions()
-                            .filter_map(|item| item.expr())
+                            .filter_map(|item| item.partition_item()?.expr())
                             .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
                             .map(Self::expr_columns_with_completeness)
                             .inspect(|(_, complete)| columns_complete &= *complete)

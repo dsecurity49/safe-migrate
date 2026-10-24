@@ -10,7 +10,11 @@ install_dir="$test_tmp/install"
 output="$test_tmp/output"
 command_dir="$test_tmp/commands"
 mkdir "$command_dir"
-ln -s "$(command -v uname)" "$command_dir/uname"
+uname_path=$(command -v uname)
+printf_path=$(dirname "$uname_path")/printf
+ln -s "$uname_path" "$command_dir/uname"
+# `/bin/sh` is not required to provide printf as a builtin.
+ln -s "$printf_path" "$command_dir/printf"
 
 PATH="$command_dir" \
   /bin/sh "$repo_root/install.sh" \
@@ -42,9 +46,13 @@ cp "$archive_root/safe-migrate" "$archive_root/safe-migrate.exe"
 mock_dir="$test_tmp/mock-commands"
 mkdir "$mock_dir"
 for command_name in \
-  uname tar gzip unzip sed head grep mktemp cp chmod mkdir mv rm cut tr cat find sha256sum
+  uname tar gzip unzip sed head grep mktemp cp chmod mkdir mv rm cut tr cat find sha256sum printf
 do
-  ln -s "$(command -v "$command_name")" "$mock_dir/$command_name"
+  case "$command_name" in
+    printf) command_path="$printf_path" ;;
+    *) command_path=$(command -v "$command_name") ;;
+  esac
+  ln -s "$command_path" "$mock_dir/$command_name"
 done
 
 mock_curl="$mock_dir/curl"

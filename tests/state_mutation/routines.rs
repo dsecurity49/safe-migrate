@@ -902,6 +902,36 @@ fn aggregate_and_window_lifecycles_use_the_shared_routine_state() {
 }
 
 #[test]
+fn create_aggregate_records_ordered_set_metadata() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE AGGREGATE public.pctl(double precision ORDER BY double precision) (
+                    SFUNC = int8pl,
+                    STYPE = double precision,
+                    FINALFUNC = int8pl
+                );",
+            &mut state,
+        )
+        .expect("the ordered-set aggregate should analyze");
+
+    let Some(FunctionOverlay::Present(aggregate)) = state.local.functions.get(&object_id(
+        "public",
+        "pctl(double precision,double precision)",
+    )) else {
+        panic!("the aggregate should be present");
+    };
+    let metadata = aggregate.aggregate.expect("aggregate metadata");
+    assert_eq!(
+        metadata.kind,
+        safe_migrate::_internal::model::aggregate::AggregateKind::OrderedSet
+    );
+    assert_eq!(metadata.direct_count, 1);
+}
+
+#[test]
 fn replacing_a_routine_cannot_change_function_window_or_aggregate_kind() {
     let engine = setup_engine();
     let mut state = setup_state();

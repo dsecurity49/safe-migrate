@@ -3,9 +3,10 @@
 #
 # Usage:  DATABASE_URL=postgres://... scripts/regenerate-aggregate-fallback.sh
 #
-# Normal aggregates (`pg_aggregate.aggkind = 'n'`) are recorded by their input
-# argument types; a polymorphic parameter becomes `*`. The generated file is
-# committed, so review the diff when the supported PostgreSQL range changes.
+# Every aggregate records its `pg_aggregate.aggkind` and direct-argument count,
+# so ordered-set and hypothetical calls can be matched against the same input
+# list PostgreSQL uses. A polymorphic parameter becomes `*`. The generated file
+# is committed, so review the diff when the supported PostgreSQL range changes.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -18,6 +19,9 @@ fi
 server_version="$(psql "$DATABASE_URL" -X -A -t -c 'SHOW server_version;')"
 rows="$(psql "$DATABASE_URL" -X -A -t -F '|' -c "
   SELECT p.proname,
+         g.aggkind,
+         CASE WHEN g.aggkind = 'n' THEN p.pronargs::int
+              ELSE g.aggnumdirectargs::int END,
          COALESCE(string_agg(
              CASE WHEN t.typcategory = 'P' THEN '*'
                   ELSE pg_catalog.format_type(a.argtype, NULL) END,
@@ -27,9 +31,9 @@ rows="$(psql "$DATABASE_URL" -X -A -t -F '|' -c "
   JOIN pg_catalog.pg_aggregate g ON g.aggfnoid = p.oid
   LEFT JOIN LATERAL unnest(p.proargtypes) WITH ORDINALITY AS a(argtype, ord) ON true
   LEFT JOIN pg_catalog.pg_type t ON t.oid = a.argtype
-  WHERE n.nspname = 'pg_catalog' AND g.aggkind = 'n'
-  GROUP BY p.oid, p.proname
-  ORDER BY p.proname, 2;")"
+  WHERE n.nspname = 'pg_catalog'
+  GROUP BY p.oid, p.proname, g.aggkind, g.aggnumdirectargs, p.pronargs
+  ORDER BY p.oid, 4;")"
 entry_count="$(printf '%s\n' "$rows" | grep -c . || true)"
 
 {
@@ -42,20 +46,27 @@ entry_count="$(printf '%s\n' "$rows" | grep -c . || true)"
 //! Snapshot of PostgreSQL ${server_version} (${entry_count} signatures), used only on
 //! the \`--no-cache\` path. A synced baseline supersedes it.
 
-use super::aggregate::{AggregateArg, AggregateCatalogue};
+use super::aggregate::{AggregateArg, AggregateCatalogue, AggregateKind, AggregateSignature};
 
-/// \`(name, parameters)\`; \`*\` marks a polymorphic parameter.
-const SIGNATURES: &[(&str, &[&str])] = &[
+/// \`(name, kind, direct arguments, all parameters)\`; \`*\` marks a polymorphic
+/// parameter.
+const SIGNATURES: &[(&str, AggregateKind, usize, &[&str])] = &[
 HEADER
 
-  while IFS='|' read -r name args; do
+  while IFS='|' read -r name kind direct args; do
     [ -n "$name" ] || continue
+    case "$kind" in
+      n) kind_name=AggregateKind::Normal ;;
+      o) kind_name=AggregateKind::OrderedSet ;;
+      h) kind_name=AggregateKind::Hypothetical ;;
+      *) echo "unknown aggkind '$kind' for $name" >&2; exit 1 ;;
+    esac
     if [ -z "$args" ]; then
-      printf '    ("%s", &[]),\n' "$name"
+      printf '    ("%s", %s, %s, &[]),\n' "$name" "$kind_name" "$direct"
       continue
     fi
     IFS=',' read -ra parts <<<"$args"
-    printf '    ("%s", &[' "$name"
+    printf '    ("%s", %s, %s, &[' "$name" "$kind_name" "$direct"
     for part in "${parts[@]}"; do
       printf '"%s", ' "$part"
     done
@@ -69,7 +80,7 @@ pub(crate) fn catalogue() -> AggregateCatalogue {
     AggregateCatalogue::new(
         SIGNATURES
             .iter()
-            .map(|(name, parameters)| {
+            .map(|(name, kind, direct_count, parameters)| {
                 let arguments = parameters
                     .iter()
                     .map(|parameter| {
@@ -80,7 +91,10 @@ pub(crate) fn catalogue() -> AggregateCatalogue {
                         }
                     })
                     .collect();
-                ((*name).to_string(), arguments)
+                (
+                    (*name).to_string(),
+                    AggregateSignature::new(*kind, *direct_count, arguments),
+                )
             })
             .collect(),
     )
