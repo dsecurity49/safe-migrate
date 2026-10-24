@@ -607,6 +607,9 @@ impl AnalysisState {
                                 known.category,
                                 crate::_internal::model::builtin_type::TypeCategory::User
                                     | crate::_internal::model::builtin_type::TypeCategory::Unknown
+                                    | crate::_internal::model::builtin_type::TypeCategory::Enum
+                                    | crate::_internal::model::builtin_type::TypeCategory::Composite
+                                    | crate::_internal::model::builtin_type::TypeCategory::Range
                             ))
                     }
                     _ => false,

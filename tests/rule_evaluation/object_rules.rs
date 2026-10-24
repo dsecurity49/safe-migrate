@@ -1457,38 +1457,40 @@ fn an_exact_domain_overload_shadows_the_built_in_aggregate() {
 }
 
 #[test]
-fn an_unknown_enum_argument_is_not_an_aggregate_match() {
+fn local_container_types_leave_unmatched_aggregates_uncertain() {
     let engine = setup_engine();
     let mut state = setup_state();
 
-    // PostgreSQL has no implicit cast from an enum to any `sum` input, so the
-    // view is invalid rather than merely uncertain.
+    // A user-defined implicit cast can make these calls valid, and the synced
+    // cast catalogue does not include casts outside pg_catalog.
     let v = engine
         .analyze(
             "CREATE TYPE public.mood AS ENUM ('low', 'high');
-             CREATE TABLE base_enum (a int, b public.mood);
+             CREATE TYPE public.pair AS (x int);
+             CREATE TYPE public.floatrange AS RANGE (subtype = float8);
+             CREATE TABLE base_container (a int, e public.mood, c public.pair, r public.floatrange);
              SET search_path = public, pg_catalog;
-             CREATE VIEW enum_sum AS SELECT a, sum(b) AS s FROM base_enum WITH CHECK OPTION;",
+             CREATE VIEW enum_sum AS SELECT a, sum(e) AS s FROM base_container WITH CHECK OPTION;
+             CREATE VIEW composite_sum AS SELECT a, sum(c) AS s FROM base_container WITH CHECK OPTION;
+             CREATE VIEW range_sum AS SELECT a, sum(r) AS s FROM base_container WITH CHECK OPTION;",
             &mut state,
         )
         .unwrap();
 
-    let reasons: Vec<&str> = v
-        .iter()
-        .filter(|v| v.rule_id == "chain-conflict")
-        .map(|v| v.reason.as_str())
-        .collect();
-    assert_eq!(reasons.len(), 1, "{reasons:?}");
     assert!(
-        reasons[0].contains("function sum(public.mood) does not exist"),
-        "the call is rejected with the missing signature: {reasons:?}"
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the local container types leave the calls uncertain: {v:?}"
     );
-    assert!(
-        state
-            .get_relation(&object_id("public", "enum_sum"))
-            .is_none(),
-        "the rejected view leaves no relation behind"
-    );
+    for name in ["enum_sum", "composite_sum", "range_sum"] {
+        let relation = state
+            .get_relation(&object_id("public", name))
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                    if r.view_updatability == ViewUpdatability::Unknown),
+            "{name} leaves updatability unknown: {relation:?}"
+        );
+    }
 }
 
 #[test]
