@@ -440,14 +440,20 @@ impl AstVisitor {
     pub(super) fn extract_signature_params(params: Option<ast::ParamList>) -> Vec<String> {
         params
             .map(|params| {
-                params
-                    .params()
-                    .chain(
-                        params
-                            .aggregate_order_by()
-                            .into_iter()
-                            .flat_map(|order_by| order_by.params()),
-                    )
+                let direct = params.params().collect::<Vec<_>>();
+                let ordered = params
+                    .aggregate_order_by()
+                    .into_iter()
+                    .flat_map(|order_by| order_by.params())
+                    .collect::<Vec<_>>();
+                let ordered = if Self::folds_ordered_variadic(&direct, &ordered) {
+                    Vec::new()
+                } else {
+                    ordered
+                };
+                direct
+                    .into_iter()
+                    .chain(ordered)
                     .filter_map(|param| {
                         if matches!(param.mode(), Some(ast::ParamMode::ParamOut(_))) {
                             return None;
@@ -462,6 +468,27 @@ impl AstVisitor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn folds_ordered_variadic(
+        direct: &[squawk_syntax::ast::Param],
+        ordered: &[squawk_syntax::ast::Param],
+    ) -> bool {
+        let Some(last_direct) = direct.last() else {
+            return false;
+        };
+        if !matches!(last_direct.mode(), Some(ast::ParamMode::ParamVariadic(_)))
+            || ordered.len() != 1
+            || !matches!(ordered[0].mode(), Some(ast::ParamMode::ParamVariadic(_)))
+        {
+            return false;
+        }
+        last_direct
+            .func_type()
+            .map(|ty| ty.syntax().text().to_string())
+            == ordered[0]
+                .func_type()
+                .map(|ty| ty.syntax().text().to_string())
     }
 
     pub(super) fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
@@ -481,15 +508,20 @@ impl AstVisitor {
                 )
         });
         let (params, kind, direct_count) = if let Some(params) = node.param_list() {
-            let direct = params
-                .params()
-                .map(|param| Self::extract_param(&param))
-                .collect::<Vec<_>>();
-            let ordered = params
+            let direct_params = params.params().collect::<Vec<_>>();
+            let ordered_params = params
                 .aggregate_order_by()
                 .into_iter()
                 .flat_map(|order_by| order_by.params())
-                .map(|param| Self::extract_param(&param))
+                .collect::<Vec<_>>();
+            let fold_ordered = Self::folds_ordered_variadic(&direct_params, &ordered_params);
+            let direct = direct_params
+                .iter()
+                .map(Self::extract_param)
+                .collect::<Vec<_>>();
+            let ordered = ordered_params
+                .iter()
+                .map(Self::extract_param)
                 .collect::<Vec<_>>();
             let kind = if ordered.is_empty() {
                 crate::_internal::model::aggregate::AggregateKind::Normal
@@ -499,11 +531,12 @@ impl AstVisitor {
                 crate::_internal::model::aggregate::AggregateKind::OrderedSet
             };
             let direct_count = direct.len();
-            (
-                direct.into_iter().chain(ordered).collect(),
-                kind,
-                direct_count,
-            )
+            let params = if fold_ordered {
+                direct
+            } else {
+                direct.into_iter().chain(ordered).collect()
+            };
+            (params, kind, direct_count)
         } else {
             let params = attributes
                 .iter()

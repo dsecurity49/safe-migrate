@@ -551,20 +551,13 @@ impl AstVisitor {
             };
             field_names.push(field_name.syntax().clone());
             let name = Self::resolve_identifier_token(field_name.syntax().text().to_string());
-            match field.base() {
-                Some(ast::Expr::NameRef(base)) => {
-                    field_bases.push(base.syntax().clone());
-                    let qualifier =
-                        Self::resolve_identifier_token(base.syntax().text().to_string());
-                    references.push(AggregateReferenceFact {
-                        qualifier: Some(qualifier),
-                        name,
-                    });
-                }
-                _ => references.push(AggregateReferenceFact {
-                    qualifier: None,
+            if let Some(ast::Expr::NameRef(base)) = field.base() {
+                field_bases.push(base.syntax().clone());
+                let qualifier = Self::resolve_identifier_token(base.syntax().text().to_string());
+                references.push(AggregateReferenceFact {
+                    qualifier: Some(qualifier),
                     name,
-                }),
+                });
             }
         }
         for node in root.descendants() {

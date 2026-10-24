@@ -1492,6 +1492,37 @@ fn an_unknown_enum_argument_is_not_an_aggregate_match() {
 }
 
 #[test]
+fn a_user_base_type_argument_leaves_the_aggregate_uncertain() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    // User-defined casts are not in the synced pg_catalog cast catalogue, so
+    // an unmatched user base type cannot be rejected as a missing function.
+    let v = engine
+        .analyze(
+            "CREATE TYPE public.custom (INPUT = int4in, OUTPUT = int4out);
+             CREATE TABLE base_custom (a int, b public.custom);
+             SET search_path = public, pg_catalog;
+             CREATE VIEW custom_sum AS SELECT a, sum(b) AS s FROM base_custom WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the user base type leaves the call uncertain: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "custom_sum"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Unknown),
+        "the unresolved aggregate leaves updatability unknown: {relation:?}"
+    );
+}
+
+#[test]
 fn a_preferred_coercion_wins_a_tied_aggregate_candidate() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -1590,6 +1621,35 @@ fn composite_field_types_come_from_the_composite_column() {
     assert!(
         reasons[0].contains("aggregate functions"),
         "the integer composite field selects the built-in sum: {reasons:?}"
+    );
+}
+
+#[test]
+fn a_composite_field_of_an_inner_column_stays_local() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let v = engine
+        .analyze(
+            "CREATE TYPE pair_inner AS (x int, y int);
+             CREATE TABLE base_inner_field (a int, y int);
+             CREATE TABLE other_inner_field (id int, p pair_inner);
+             CREATE VIEW inner_field AS SELECT a, (SELECT sum(((o.p).y)::int) FROM other_inner_field AS o WHERE o.id = base_inner_field.a) AS s FROM base_inner_field WITH CHECK OPTION;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "the inner composite field is not an outer column: {v:?}"
+    );
+    let relation = state
+        .get_relation(&object_id("public", "inner_field"))
+        .expect("view must exist");
+    assert!(
+        matches!(relation, RelationOverlay::Present(r)
+                if r.view_updatability == ViewUpdatability::Updatable),
+        "the local nested aggregate leaves the view updatable: {relation:?}"
     );
 }
 

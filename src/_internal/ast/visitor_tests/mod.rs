@@ -2,10 +2,10 @@ use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
     AggregateArgumentFact, AggregateCandidateFact, AggregateOnlyClauseFact, AggregateReferenceFact,
     AggregateScopeFact, AlterDatabaseAction, AlterPublicationActionFact,
-    AlterSubscriptionActionFact, AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact,
-    PublicationScope, ResetSettingTarget, RetTypeFact, SearchPathTarget, StatementFact,
-    SubscriptionPublicationMode, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-    TypeCreationKind, ViewUpdatabilityFact,
+    AlterSubscriptionActionFact, AlterTableActionFact, AlterTypeActionFact, DatabaseOptionFact,
+    DatabaseOptionValue, PublicationObjectFact, PublicationScope, ResetSettingTarget, RetTypeFact,
+    SearchPathTarget, StatementFact, SubscriptionPublicationMode, TableConstraintFact,
+    TimeoutSetting, TimeoutSettingValue, TypeCreationKind, ViewUpdatabilityFact,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 use crate::_internal::ast::visitor::AstVisitor;

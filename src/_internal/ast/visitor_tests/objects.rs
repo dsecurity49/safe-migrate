@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn create_database_preserves_numeric_option_literals() {
+    let fact = parse_and_extract_statement("CREATE DATABASE app CONNECTION LIMIT 10;")
+        .expect("create database fact");
+    let StatementFact::CreateDatabase(database) = fact else {
+        panic!("expected create database fact");
+    };
+    assert_eq!(database.name, "app");
+    assert_eq!(
+        database.options,
+        [DatabaseOptionFact::ConnectionLimit(
+            DatabaseOptionValue::Literal(Some("10".into()))
+        )]
+    );
+}
+
+#[test]
 fn expression_column_rename_preserves_functions_literals_and_unicode() {
     use crate::_internal::analysis::expr_visitor::ExprVisitor;
     assert_eq!(
@@ -477,6 +493,15 @@ fn aggregate_commands_extract_shared_routine_identities() {
         ["double precision", "numeric", "text"]
     );
 
+    let variadic = parse_and_extract_statement(
+        "DROP AGGREGATE my_rank(VARIADIC \"any\" ORDER BY VARIADIC \"any\");",
+    )
+    .expect("variadic ordered-set aggregate fact");
+    let StatementFact::DropAggregate(variadic) = variadic else {
+        panic!("expected variadic ordered-set aggregate fact");
+    };
+    assert_eq!(variadic.signatures[0].params.len(), 1);
+
     let legacy = parse_and_extract_statement(
         "CREATE AGGREGATE legacy_total (
                 BASETYPE = integer,
@@ -536,7 +561,7 @@ fn create_aggregate_records_ordered_and_hypothetical_kinds() {
         crate::_internal::model::aggregate::AggregateKind::Hypothetical
     );
     assert_eq!(hypothetical.direct_count, 1);
-    assert_eq!(hypothetical.params.len(), 2);
+    assert_eq!(hypothetical.params.len(), 1);
 }
 
 #[test]

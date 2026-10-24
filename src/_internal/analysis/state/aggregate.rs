@@ -594,10 +594,23 @@ impl AnalysisState {
             .iter()
             .map(|argument| CandidateArg::from_call_argument(argument, &resolver))
             .collect();
-        let arguments_complete = known
-            .iter()
-            .chain(&within_known)
-            .all(|argument| matches!(argument.ty, CallType::Known(_)));
+        // Local User/Unknown types may have casts outside pg_catalog, so an
+        // unmatched call is not proof that the function is missing.
+        let arguments_complete =
+            known
+                .iter()
+                .chain(&within_known)
+                .all(|argument| match &argument.ty {
+                    CallType::Known(known) => {
+                        !(known.id.is_some()
+                            && matches!(
+                                known.category,
+                                crate::_internal::model::builtin_type::TypeCategory::User
+                                    | crate::_internal::model::builtin_type::TypeCategory::Unknown
+                            ))
+                    }
+                    _ => false,
+                });
 
         let ordinal = self.routine_ordinal();
         let mut declarations_complete = true;
