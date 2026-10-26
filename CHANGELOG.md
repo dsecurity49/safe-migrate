@@ -12,16 +12,10 @@ notes are available on the
 - The cache layout now carries aggregate kind and direct-argument metadata.
   Re-run `safe-migrate sync`; a cache written before this layout is rejected
   rather than misread.
-- View analysis now rejects `count(*)` and aggregate-only clauses (`DISTINCT`,
-  `FILTER`, `ORDER BY`, `WITHIN GROUP`) that resolve to a scalar routine,
-  follows domain and composite-field types, and recognizes correlated outer
-  aggregates through expressions and nested query scopes. Aggregate resolution
-  applies PostgreSQL's exact, domain-exact, and preferred-type steps, fails
-  closed for unknown types, and matches ordered-set and hypothetical
-  `WITHIN GROUP` calls against their direct and ordered signatures. The same
-  matching applies to user aggregates: synchronization and `CREATE AGGREGATE`
-  record `pg_aggregate.aggkind` and the direct-argument count. Quoted
-  `"serial"` is treated as an ordinary type, not a serial column.
+- View analysis rejects `count(*)` and aggregate-only clauses that resolve to a
+  scalar routine; aggregate overload resolution matches PostgreSQL, including
+  ordered-set, hypothetical, and user-defined aggregates. Quoted `"serial"` is
+  an ordinary type.
 - The built-in type and aggregate fallbacks were regenerated from PostgreSQL
   18.6, including preferred-type flags and ordered-set aggregate signatures.
 - JSON reports now include the `inline-suppression-disabled` rule title, so
