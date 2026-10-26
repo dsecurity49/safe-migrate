@@ -37,7 +37,7 @@ owo-colors = "4"
 terminal_size = "0.3"
 comfy-table = "7"
 bincode = { package = "bincode-next", version = "2.1", features = ["serde"] }
-zstd = "0.13"
+zstd = "0.14"
 crossterm = "0.27.0"
 tempfile = "3.10"
 chacha20poly1305 = { version = "0.11", features = ["getrandom", "zeroize"] }
