@@ -1,6 +1,7 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
+use crate::_internal::model::extension::{ExtensionMemberKind, ExtensionState};
 use crate::_internal::model::function::FunctionState;
 use crate::_internal::model::relation::{RelationKind, RelationState};
 use crate::_internal::model::replication::{PublicationState, SubscriptionState};
@@ -109,6 +110,9 @@ pub(crate) struct DbCache {
     /// The built-in `pg_catalog` aggregate signatures. `None` when unsynchronized.
     pub aggregates: Option<crate::_internal::model::aggregate::AggregateCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
+    /// PostgreSQL extensions, keyed by extension name. Extensions are
+    /// database-global, unlike every schema-scoped catalog family.
+    pub extensions: HashMap<String, ExtensionState>,
     pub dependencies: Vec<ViewDependencyCache>,
     /// Dependencies from a view to a routine or type, which the relation
     /// dependency rows cannot express.
@@ -136,12 +140,11 @@ pub(crate) struct DbCache {
 // this: bincode carries no field names, so bytes are laid out exactly as the
 // current definitions describe. The header encodes the same number, and the
 // magic must stay one digit wide or the fixed-size prefix read breaks.
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 11;
 
-/// Current durable cache header. V10 is unreleased, so its layout is still
-/// being shaped within the version that introduced it; caches anyone holds are
-/// V9 or older, which this header already rejects with resync guidance.
-pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE10";
+/// Current durable cache header. V11 adds extension membership and the full
+/// type/domain/sequence state introduced by Batch 3.
+pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE11";
 
 // The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
 // must stay the same width as the version grows. Two version digits fit.
@@ -165,13 +168,14 @@ pub(crate) enum DbCacheVersioned {
     V8(Box<DbCache>),
     V9(Box<DbCache>),
     V10(Box<DbCache>),
+    V11(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
     /// The variant this build writes. Naming it in one place keeps a format
     /// bump from silently leaving a writer or a fixture on a stale layout.
     pub(crate) fn current(cache: DbCache) -> Self {
-        DbCacheVersioned::V10(Box::new(cache))
+        DbCacheVersioned::V11(Box::new(cache))
     }
 
     pub(crate) fn format_version(&self) -> u32 {
@@ -186,6 +190,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V8(_) => 8,
             DbCacheVersioned::V9(_) => 9,
             DbCacheVersioned::V10(_) => 10,
+            DbCacheVersioned::V11(_) => 11,
         }
     }
 
@@ -199,11 +204,12 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V6(_)
             | DbCacheVersioned::V7(_)
             | DbCacheVersioned::V8(_)
-            | DbCacheVersioned::V9(_) => Err(
+            | DbCacheVersioned::V9(_)
+            | DbCacheVersioned::V10(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V10(c) => {
+            DbCacheVersioned::V11(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -246,6 +252,7 @@ impl DbCache {
             casts: None,
             aggregates: None,
             sequences: HashMap::new(),
+            extensions: HashMap::new(),
             dependencies: Vec::new(),
             view_object_dependencies: Vec::new(),
             scoped_external_dependencies: Vec::new(),
@@ -716,11 +723,208 @@ impl DbCache {
         for (id, ty) in &self.types {
             validate_id("type cache identity", id, true)?;
             validate_id("type embedded identity", &ty.id, true)?;
+            validate_role_ref("type owner identity", &ty.owner)?;
             if id != &ty.id {
                 return Err(format!(
                     "type cache key '{}' disagrees with embedded identity '{}'",
                     id, ty.id
                 ));
+            }
+            match &ty.kind {
+                TypeKind::Domain {
+                    base_type,
+                    collation,
+                    default_text,
+                    not_null_constraint,
+                    constraints,
+                    ..
+                } => {
+                    if base_type.trim().is_empty() {
+                        return Err(format!("domain '{}' has an empty base type", id));
+                    }
+                    if collation
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        return Err(format!("domain '{}' has an empty collation", id));
+                    }
+                    if default_text
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        return Err(format!("domain '{}' has an empty default", id));
+                    }
+                    if not_null_constraint
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "domain '{}' has an empty NOT NULL constraint name",
+                            id
+                        ));
+                    }
+                    if constraints.keys().any(|name| name.trim().is_empty()) {
+                        return Err(format!("domain '{}' has an empty constraint name", id));
+                    }
+                }
+                TypeKind::Composite { fields } => {
+                    let mut names = HashSet::new();
+                    for field in fields {
+                        if field.name.trim().is_empty() || !names.insert(&field.name) {
+                            return Err(format!(
+                                "composite type '{}' has an empty or duplicate field name",
+                                id
+                            ));
+                        }
+                        if field.data_type.trim().is_empty() {
+                            return Err(format!(
+                                "composite type '{}' field '{}' has an empty data type",
+                                id, field.name
+                            ));
+                        }
+                        if field
+                            .collation
+                            .as_ref()
+                            .is_some_and(|value| value.trim().is_empty())
+                        {
+                            return Err(format!(
+                                "composite type '{}' field '{}' has an empty collation",
+                                id, field.name
+                            ));
+                        }
+                    }
+                }
+                TypeKind::Range {
+                    subtype,
+                    multirange,
+                    collation,
+                    opclass,
+                    canonical,
+                    subtype_diff,
+                    ..
+                } => {
+                    if subtype
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        return Err(format!("range type '{}' has an empty subtype", id));
+                    }
+                    if multirange
+                        .as_ref()
+                        .is_some_and(|value| value.inferred_schema)
+                    {
+                        return Err(format!(
+                            "range type '{}' has an inferred multirange identity",
+                            id
+                        ));
+                    }
+                    if collation
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        return Err(format!("range type '{}' has an empty collation", id));
+                    }
+                    for (label, value) in [
+                        ("opclass", opclass.as_deref()),
+                        ("canonical function", canonical.as_deref()),
+                        ("subtype_diff function", subtype_diff.as_deref()),
+                    ] {
+                        if value.is_some_and(|value| value.trim().is_empty()) {
+                            return Err(format!("range type '{}' has an empty {label}", id));
+                        }
+                    }
+                }
+                TypeKind::Multirange { range } => {
+                    if range.as_ref().is_some_and(|value| value.inferred_schema) {
+                        return Err(format!(
+                            "multirange type '{}' has an inferred range identity",
+                            id
+                        ));
+                    }
+                }
+                TypeKind::Enum { variants } => {
+                    let mut seen = HashSet::new();
+                    if variants.iter().any(|label| !seen.insert(label)) {
+                        return Err(format!("enum type '{}' contains duplicate labels", id));
+                    }
+                }
+                TypeKind::Base { options, .. } => {
+                    for (label, value) in [
+                        ("input function", options.input.as_deref()),
+                        ("output function", options.output.as_deref()),
+                        ("receive function", options.receive.as_deref()),
+                        ("send function", options.send.as_deref()),
+                        ("typmod_in function", options.typmod_in.as_deref()),
+                        ("typmod_out function", options.typmod_out.as_deref()),
+                        ("analyze function", options.analyze.as_deref()),
+                        ("subscript function", options.subscript.as_deref()),
+                        ("alignment", options.alignment.as_deref()),
+                        ("storage", options.storage.as_deref()),
+                        ("like type", options.like.as_deref()),
+                        ("category", options.category.as_deref()),
+                        ("default", options.default.as_deref()),
+                        ("element type", options.element.as_deref()),
+                        ("delimiter", options.delimiter.as_deref()),
+                    ] {
+                        if value.is_some_and(|value| value.trim().is_empty()) {
+                            return Err(format!("base type '{}' has an empty {label}", id));
+                        }
+                    }
+                }
+            }
+        }
+        for (name, extension) in &self.extensions {
+            if name.is_empty() || extension.name.is_empty() {
+                return Err("extension cache contains an empty identity".to_string());
+            }
+            if name != &extension.name {
+                return Err(format!(
+                    "extension cache key '{}' disagrees with embedded identity '{}'",
+                    name, extension.name
+                ));
+            }
+            if extension
+                .schema
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
+            {
+                return Err(format!("extension '{}' has an empty schema identity", name));
+            }
+            if extension
+                .version
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
+            {
+                return Err(format!("extension '{}' has an empty version", name));
+            }
+            validate_role_ref("extension owner identity", &extension.owner)?;
+            for member in &extension.members {
+                validate_id("extension member identity", &member.id, false)?;
+                if let ExtensionMemberKind::Unmodeled(class) = &member.kind
+                    && class.is_empty()
+                {
+                    return Err(format!(
+                        "extension '{}' has a member with an empty catalog class",
+                        name
+                    ));
+                }
+            }
+            for config in &extension.config_tables {
+                validate_id(
+                    "extension configuration table identity",
+                    &config.table,
+                    true,
+                )?;
+                if config
+                    .condition
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty())
+                {
+                    return Err(format!(
+                        "extension '{}' configuration table has an empty condition",
+                        name
+                    ));
+                }
             }
         }
         for (id, role) in &self.roles {

@@ -363,6 +363,406 @@ fn test_topology_type_and_domain() {
     ));
 }
 
+fn domain_state(pg_version_num: Option<u32>) -> AnalysisState {
+    let mut cache = synced_cache();
+    cache.pg_version_num = pg_version_num;
+    AnalysisState::new(cache)
+}
+
+fn domain_kind(state: &AnalysisState, schema: &str, name: &str) -> TypeKind {
+    let Some(TypeOverlay::Present(TypeState { kind, .. })) =
+        state.local.types.get(&object_id(schema, name))
+    else {
+        panic!("domain {schema}.{name} missing");
+    };
+    kind.clone()
+}
+
+#[test]
+fn create_domain_models_collation_default_checks_and_not_null() {
+    let engine = setup_engine();
+    let mut state = domain_state(Some(180_000));
+    engine
+        .analyze(
+            "CREATE DOMAIN bounded AS text COLLATE \"C\" DEFAULT 'x' NOT NULL
+                 CONSTRAINT positive CHECK (VALUE <> '') NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    let TypeKind::Domain {
+        base_type,
+        collation,
+        collation_id,
+        default_text,
+        not_null,
+        not_null_constraint,
+        constraints,
+        ..
+    } = domain_kind(&state, "public", "bounded")
+    else {
+        panic!("expected domain");
+    };
+    assert_eq!(base_type, "text");
+    assert_eq!(collation.as_deref(), Some("C"));
+    assert_eq!(collation_id, Some(object_id("pg_catalog", "C")));
+    assert_eq!(default_text.as_deref(), Some("'x'"));
+    assert!(not_null);
+    assert_eq!(not_null_constraint.as_deref(), Some("bounded_not_null"));
+    let check = constraints.get("positive").expect("positive check");
+    assert_eq!(check.expression_text.as_deref(), Some("VALUE <> ''"));
+    assert!(!check.validated);
+}
+
+#[test]
+fn domain_generated_names_avoid_table_and_domain_constraints_in_the_schema() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE holder (id integer CONSTRAINT d_check CHECK (id > 0));
+             CREATE DOMAIN d AS integer CHECK (VALUE > 0);
+             CREATE DOMAIN e AS integer CONSTRAINT e_check CHECK (VALUE > 0) CHECK (VALUE < 10);
+             CREATE SCHEMA other;
+             CREATE DOMAIN other.d AS integer CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    let TypeKind::Domain { constraints, .. } = domain_kind(&state, "public", "d") else {
+        panic!("expected domain d");
+    };
+    assert!(constraints.contains_key("d_check1"));
+    let TypeKind::Domain { constraints, .. } = domain_kind(&state, "public", "e") else {
+        panic!("expected domain e");
+    };
+    assert!(constraints.contains_key("e_check"));
+    assert!(constraints.contains_key("e_check1"));
+    let TypeKind::Domain { constraints, .. } = domain_kind(&state, "other", "d") else {
+        panic!("expected other.d");
+    };
+    assert!(constraints.contains_key("d_check"));
+}
+
+#[test]
+fn explicit_domain_constraint_names_are_local_to_their_domain() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE holder (id integer CONSTRAINT shared CHECK (id > 0));
+             CREATE DOMAIN a AS integer CONSTRAINT shared CHECK (VALUE > 0);
+             CREATE DOMAIN b AS integer CONSTRAINT shared CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    for domain in ["a", "b"] {
+        let TypeKind::Domain { constraints, .. } = domain_kind(&state, "public", domain) else {
+            panic!("expected domain {domain}");
+        };
+        assert!(constraints.contains_key("shared"));
+    }
+}
+
+#[test]
+fn duplicate_domain_constraints_conflict_without_mutating_state() {
+    let engine = setup_engine();
+    for sql in [
+        "CREATE DOMAIN d AS integer CONSTRAINT c CHECK (VALUE > 0) CONSTRAINT c CHECK (VALUE < 10);",
+        "CREATE DOMAIN d AS integer CONSTRAINT c CHECK (VALUE > 0) CONSTRAINT c NOT NULL;",
+        "CREATE DOMAIN d AS integer NOT NULL NOT NULL;",
+        "CREATE DOMAIN d AS integer NOT NULL NULL;",
+        "CREATE DOMAIN d AS integer NULL NOT NULL;",
+    ] {
+        let mut state = setup_state();
+        let violations = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{sql}"
+        );
+        assert!(
+            state.local.types.is_empty(),
+            "conflicting CREATE DOMAIN must not create state: {sql}"
+        );
+    }
+    let mut state = setup_state();
+    engine
+        .analyze("CREATE DOMAIN d AS integer NULL NULL;", &mut state)
+        .unwrap();
+    assert!(matches!(
+        domain_kind(&state, "public", "d"),
+        TypeKind::Domain {
+            not_null: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn domain_default_null_clears_and_repeated_defaults_are_noops() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer DEFAULT 1;
+             ALTER DOMAIN d SET DEFAULT NULL;",
+            &mut state,
+        )
+        .unwrap();
+    let TypeKind::Domain {
+        default,
+        default_text,
+        ..
+    } = domain_kind(&state, "public", "d")
+    else {
+        panic!("expected domain");
+    };
+    assert!(default.is_none());
+    assert!(default_text.is_none());
+    engine
+        .analyze(
+            "ALTER DOMAIN d SET DEFAULT 2;
+             ALTER DOMAIN d SET DEFAULT 2;
+             ALTER DOMAIN d DROP DEFAULT;
+             ALTER DOMAIN d DROP DEFAULT;",
+            &mut state,
+        )
+        .unwrap();
+    let TypeKind::Domain {
+        default,
+        default_text,
+        ..
+    } = domain_kind(&state, "public", "d")
+    else {
+        panic!("expected domain");
+    };
+    assert!(default.is_none());
+    assert!(default_text.is_none());
+}
+
+#[test]
+fn domain_not_null_names_follow_postgres_18_and_survive_idempotent_actions() {
+    let engine = setup_engine();
+    let mut state = domain_state(Some(180_000));
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer;
+             ALTER DOMAIN d SET NOT NULL;
+             ALTER DOMAIN d SET NOT NULL;
+             ALTER DOMAIN d ADD CONSTRAINT ignored NOT NULL;
+             ALTER DOMAIN d RENAME CONSTRAINT d_not_null TO nn;
+             ALTER DOMAIN d DROP CONSTRAINT nn;
+             ALTER DOMAIN d DROP NOT NULL;",
+            &mut state,
+        )
+        .unwrap();
+    let TypeKind::Domain {
+        not_null,
+        not_null_constraint,
+        ..
+    } = domain_kind(&state, "public", "d")
+    else {
+        panic!("expected domain");
+    };
+    assert!(!not_null);
+    assert!(not_null_constraint.is_none());
+
+    let violations = engine
+        .analyze(
+            "ALTER DOMAIN d SET NOT NULL; ALTER DOMAIN d VALIDATE CONSTRAINT d_not_null;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation.reason.contains("is not a check constraint")),
+        "{violations:#?}"
+    );
+}
+
+#[test]
+fn domain_validation_and_rename_update_check_state() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer CONSTRAINT c CHECK (VALUE > 0) NOT VALID;
+             ALTER DOMAIN d VALIDATE CONSTRAINT c;
+             ALTER DOMAIN d VALIDATE CONSTRAINT c;
+             ALTER DOMAIN d RENAME CONSTRAINT c TO renamed;
+             ALTER DOMAIN d DROP CONSTRAINT IF EXISTS missing;",
+            &mut state,
+        )
+        .unwrap();
+    let TypeKind::Domain { constraints, .. } = domain_kind(&state, "public", "d") else {
+        panic!("expected domain");
+    };
+    assert!(!constraints.contains_key("c"));
+    assert!(constraints.get("renamed").expect("renamed check").validated);
+    for sql in [
+        "ALTER DOMAIN d DROP CONSTRAINT missing;",
+        "ALTER DOMAIN d VALIDATE CONSTRAINT missing;",
+    ] {
+        let violations = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn domain_collation_is_inherited_from_arrays_and_rejected_for_non_collatable_bases() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN text_domain AS text;
+             CREATE DOMAIN text_array_domain AS text[];
+             CREATE DOMAIN int_domain AS integer;",
+            &mut state,
+        )
+        .unwrap();
+    for domain in ["text_domain", "text_array_domain"] {
+        let TypeKind::Domain {
+            collation,
+            collation_id,
+            ..
+        } = domain_kind(&state, "public", domain)
+        else {
+            panic!("expected domain {domain}");
+        };
+        assert_eq!(collation.as_deref(), Some("default"));
+        assert_eq!(collation_id, Some(object_id("pg_catalog", "default")));
+    }
+    let TypeKind::Domain {
+        collation,
+        collation_id,
+        ..
+    } = domain_kind(&state, "public", "int_domain")
+    else {
+        panic!("expected domain");
+    };
+    assert!(collation.is_none());
+    assert!(collation_id.is_none());
+    let violations = engine
+        .analyze(
+            "CREATE DOMAIN invalid AS integer COLLATE \"C\";",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict")
+    );
+}
+
+#[test]
+fn domain_validation_conflicts_when_a_container_stores_the_domain() {
+    let engine = setup_engine();
+    for setup in [
+        "CREATE DOMAIN d AS integer; CREATE TABLE t (c d[]);",
+        "CREATE DOMAIN d AS integer; CREATE TYPE comp AS (c d); CREATE TABLE t (c comp);",
+        "CREATE DOMAIN d AS integer; CREATE TYPE r AS RANGE (subtype = d); CREATE TABLE t (c r);",
+    ] {
+        let mut state = setup_state();
+        engine.analyze(setup, &mut state).unwrap();
+        let violations = engine
+            .analyze(
+                "ALTER DOMAIN d ADD CONSTRAINT c CHECK (VALUE > 0);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains("uses it")
+            }),
+            "{setup}: {violations:#?}"
+        );
+        let TypeKind::Domain { constraints, .. } = domain_kind(&state, "public", "d") else {
+            panic!("expected domain");
+        };
+        assert!(constraints.is_empty());
+
+        engine
+            .analyze(
+                "ALTER DOMAIN d ADD CONSTRAINT pending CHECK (VALUE > 0) NOT VALID;",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze("ALTER DOMAIN d VALIDATE CONSTRAINT pending;", &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{setup}: {violations:#?}"
+        );
+        let violations = engine
+            .analyze("ALTER DOMAIN d SET NOT NULL;", &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{setup}: {violations:#?}"
+        );
+    }
+}
+
+#[test]
+fn nested_domain_columns_are_scanned_without_a_container_conflict() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer;
+             CREATE DOMAIN e AS d;
+             CREATE TABLE t (c e);",
+            &mut state,
+        )
+        .unwrap();
+    let violations = engine
+        .analyze(
+            "ALTER DOMAIN d ADD CONSTRAINT c CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "{violations:#?}"
+    );
+}
+
+#[test]
+fn domain_rename_and_set_schema_move_the_type() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE SCHEMA app;
+             CREATE DOMAIN d AS integer;
+             ALTER DOMAIN d RENAME TO e;
+             ALTER DOMAIN e SET SCHEMA app;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(!state.local.types.contains_key(&object_id("public", "d")));
+    assert!(!state.local.types.contains_key(&object_id("public", "e")));
+    assert!(matches!(
+        state.local.types.get(&object_id("app", "e")),
+        Some(TypeOverlay::Present(_))
+    ));
+}
+
 #[test]
 fn test_enum_add_value_preserves_postgres_ordering() {
     let engine = setup_engine();
@@ -373,6 +773,7 @@ fn test_enum_add_value_preserves_postgres_ordering() {
         TypeState {
             id: id.clone(),
             generation: 0,
+            owner: object_id("", "postgres"),
             kind: TypeKind::Enum {
                 variants: vec!["first".into(), "last".into()],
             },
@@ -893,15 +1294,30 @@ fn a_ranges_multirange_companion_blocks_and_cascades_with_it() {
                 TypeKind::Range {
                     subtype: Some("sub_t".to_string()),
                     subtype_id: Some(sub.clone()),
+                    multirange: Some(companion.clone()),
+                    collation: None,
+                    collation_id: None,
+                    opclass: None,
+                    opclass_id: None,
+                    canonical: None,
+                    canonical_id: None,
+                    subtype_diff: None,
+                    subtype_diff_id: None,
                 },
             ),
-            (companion.clone(), TypeKind::Multirange),
+            (
+                companion.clone(),
+                TypeKind::Multirange {
+                    range: Some(range.clone()),
+                },
+            ),
         ] {
             cache.types.insert(
                 id.clone(),
                 TypeState {
                     id: id.clone(),
                     generation: 0,
+                    owner: object_id("", "postgres"),
                     kind,
                 },
             );
@@ -1242,6 +1658,7 @@ fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
             TypeState {
                 id,
                 generation: 0,
+                owner: object_id("", "postgres"),
                 kind: TypeKind::Enum {
                     variants: vec!["old".into(), format!("{schema}_only")],
                 },
@@ -1297,6 +1714,7 @@ fn enum_value_rename_expands_user_search_path_from_v4_role_provenance() {
             TypeState {
                 id,
                 generation: 0,
+                owner: object_id("", "postgres"),
                 kind: TypeKind::Enum {
                     variants: vec!["old".into()],
                 },
@@ -1342,6 +1760,7 @@ fn enum_value_rename_skips_dropped_type_tombstones_in_the_search_path() {
             TypeState {
                 id,
                 generation: 0,
+                owner: object_id("", "postgres"),
                 kind: TypeKind::Enum {
                     variants: vec!["old".into(), format!("{schema}_only")],
                 },
@@ -1404,6 +1823,7 @@ fn enum_value_rename_reports_postgres_conflicts_without_mutating_state() {
             TypeState {
                 id: id.clone(),
                 generation: 0,
+                owner: object_id("", "postgres"),
                 kind: TypeKind::Enum {
                     variants: vec!["old".into(), "existing".into()],
                 },
@@ -1420,6 +1840,7 @@ fn enum_value_rename_reports_postgres_conflicts_without_mutating_state() {
             Some(&TypeOverlay::Present(TypeState {
                 id: id.clone(),
                 generation: 0,
+                owner: object_id("", "postgres"),
                 kind: TypeKind::Enum {
                     variants: vec!["old".into(), "existing".into()]
                 }

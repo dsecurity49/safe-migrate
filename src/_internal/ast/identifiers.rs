@@ -89,6 +89,18 @@ impl PartialEq for ObjectId {
 
 impl Eq for ObjectId {}
 
+impl PartialOrd for ObjectId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ObjectId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp_identity(other)
+    }
+}
+
 impl ObjectId {
     /// Total order over identity, for use inside ordered collections.
     pub(crate) fn cmp_identity(&self, other: &Self) -> std::cmp::Ordering {

@@ -5,6 +5,17 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.12.0 — 2026-10-27
+
+- Domains are modeled end to end: `CREATE`/`ALTER`/`DROP DOMAIN`, defaults,
+  `NOT NULL`, collation, and named or generated constraints. Destructive column
+  changes are reported when a relation's domain constraint still protects it.
+- Sequences track runtime values, so `ALTER SEQUENCE` bound changes report a
+  certain conflict, taint when a cached runtime may have advanced, and
+  `TRUNCATE ... RESTART IDENTITY` is treated as unmodeled runtime state.
+- Cache V11 adds domain, sequence-runtime, and extension catalog state. Re-run
+  `safe-migrate sync`; older caches are rejected rather than misread.
+
 ## v0.11.2 — 2026-10-24
 
 - Upgraded the pinned Squawk parser stack from 2.65.0 to 2.70.0, raising the

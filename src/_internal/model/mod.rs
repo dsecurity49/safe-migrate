@@ -8,6 +8,7 @@ pub(crate) mod collation;
 pub(crate) mod column;
 pub(crate) mod constraint;
 pub(crate) mod data_type;
+pub(crate) mod extension;
 pub(crate) mod function;
 pub(crate) mod index;
 pub(crate) mod opclass;

@@ -333,10 +333,7 @@ pub(crate) enum StatementFact {
     },
     CreateType(CreateTypeFact),
     AlterType(AlterTypeFact),
-    CreateDomain {
-        name: QualifiedName,
-        base_type: String,
-    },
+    CreateDomain(CreateDomainFact),
     AlterDomain {
         name: QualifiedName,
         action: Option<AlterDomainActionFact>,
@@ -1327,18 +1324,65 @@ pub(crate) enum TableConstraintFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateDomainFact {
+    pub name: QualifiedName,
+    pub base_type: String,
+    pub collation: Option<WrittenName>,
+    pub default: Option<DomainDefaultFact>,
+    pub constraints: Vec<DomainConstraintFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DomainDefaultFact {
+    pub expression: ExprIr,
+    pub text: String,
+    /// PostgreSQL folds a bare `NULL` (including casts of it) into "no
+    /// default", so the fact keeps that distinction out of the expression.
+    pub is_null: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DomainCheckFact {
+    pub name: Option<String>,
+    pub expression: ExprIr,
+    pub expression_text: String,
+    pub definition: String,
+    pub not_valid: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DomainConstraintFact {
+    Check(DomainCheckFact),
+    NotNull { name: Option<String> },
+    Null,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterDomainActionFact {
-    AddConstraint,
-    DropConstraint,
+    AddConstraint(DomainConstraintFact),
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
     DropDefault,
     DropNotNull,
-    OwnerChange,
-    RenameConstraint,
-    RenameTo,
-    SetDefault,
+    OwnerChange(RoleFact),
+    RenameConstraint {
+        old_name: String,
+        new_name: String,
+    },
+    RenameTo {
+        new_name: Ident,
+    },
+    SetDefault(DomainDefaultFact),
     SetNotNull,
-    SetSchema,
-    ValidateConstraint,
+    SetSchema {
+        new_schema: String,
+    },
+    ValidateConstraint {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

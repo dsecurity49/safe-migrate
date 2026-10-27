@@ -14,6 +14,7 @@ pub(crate) struct NamespaceSnapshot {
     pub types: HashMap<ObjectId, TypeOverlay>,
     pub functions: HashMap<ObjectId, crate::_internal::model::function::FunctionOverlay>,
     pub sequences: HashMap<ObjectId, SequenceOverlay>,
+    pub extensions: HashMap<String, crate::_internal::model::extension::ExtensionOverlay>,
     pub publications: HashMap<String, crate::_internal::model::replication::PublicationOverlay>,
     pub triggers: HashMap<ObjectId, crate::_internal::model::trigger::TriggerOverlay>,
     pub constraints:
@@ -32,6 +33,7 @@ pub(crate) struct NamespaceSnapshot {
     pub session_search_path_template: Vec<String>,
 }
 
+#[allow(clippy::large_enum_variant)] // Undo entries stay allocation-free in the hot state path.
 #[derive(Debug, Clone)]
 pub(crate) enum StateChange {
     SchemaSnapshot {
@@ -50,6 +52,11 @@ pub(crate) enum StateChange {
     SequenceSnapshot {
         id: ObjectId,
         previous: Option<SequenceOverlay>,
+    },
+    #[allow(dead_code)] // Consumed by extension transitions.
+    ExtensionSnapshot {
+        name: String,
+        previous: Option<crate::_internal::model::extension::ExtensionOverlay>,
     },
     SearchPathSnapshot {
         previous: Vec<SearchPathEntry>,

@@ -724,7 +724,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 10);
+    assert_eq!(report["format_version"], 11);
     assert_eq!(report["encrypted"], false);
     assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
     assert!(report["coverage"]["families"].is_array());

@@ -2,31 +2,165 @@ use super::*;
 
 impl AstVisitor {
     pub(super) fn extract_create_domain(node: &CreateDomain) -> Option<StatementFact> {
-        // Domain constraints and collations affect every column using the
-        // domain, but are not represented in TypeState.  Do not claim an
-        // exact domain when either catalog-visible property is present.
-        if node.domain_qualifiers().next().is_some() {
-            return None;
-        }
         let path = node.domain()?.path()?;
         let base_type = node
             .ty()
             .map(|t| t.syntax().text().to_string())
             .unwrap_or_else(|| "<domain>".to_string());
-        Some(StatementFact::CreateDomain {
-            name: Self::path_to_qualified_name(&path)?,
-            base_type,
+        let mut collation = None;
+        let mut default = None;
+        let mut constraints = Vec::new();
+        for qualifier in node.domain_qualifiers() {
+            match qualifier {
+                ast::DomainQualifier::Collate(collate) => {
+                    if collation.is_some() {
+                        return None;
+                    }
+                    collation = Some(Self::index_item_written_name(Some(collate), |collate| {
+                        collate.collation_ref()?.path_ref()
+                    })?);
+                }
+                ast::DomainQualifier::Constraint(constraint) => match constraint {
+                    ast::Constraint::CheckConstraint(check) => {
+                        constraints.push(
+                            crate::_internal::analysis::facts::DomainConstraintFact::Check(
+                                Self::domain_check_fact(&check)?,
+                            ),
+                        );
+                    }
+                    ast::Constraint::DefaultConstraint(default_constraint) => {
+                        if default.is_some() {
+                            return None;
+                        }
+                        default = Some(Self::domain_default_fact(default_constraint.expr()?));
+                    }
+                    ast::Constraint::NotNullConstraint(not_null_constraint) => {
+                        constraints.push(
+                            crate::_internal::analysis::facts::DomainConstraintFact::NotNull {
+                                name: Self::domain_constraint_name(
+                                    not_null_constraint.constraint_name_clause(),
+                                ),
+                            },
+                        );
+                    }
+                    ast::Constraint::NullConstraint(_) => {
+                        constraints
+                            .push(crate::_internal::analysis::facts::DomainConstraintFact::Null);
+                    }
+                    _ => return None,
+                },
+            }
+        }
+        Some(StatementFact::CreateDomain(
+            crate::_internal::analysis::facts::CreateDomainFact {
+                name: Self::path_to_qualified_name(&path)?,
+                base_type,
+                collation,
+                default,
+                constraints,
+            },
+        ))
+    }
+
+    fn domain_constraint_name(clause: Option<ast::ConstraintNameClause>) -> Option<String> {
+        clause
+            .and_then(|clause| clause.constraint_name())
+            .and_then(|name| Self::constraint_name_text(&name))
+    }
+
+    fn constraint_name_text(name: &ast::ConstraintName) -> Option<String> {
+        name.ident_token()
+            .or_else(|| {
+                name.syntax()
+                    .descendants_with_tokens()
+                    .filter_map(|element| element.into_token())
+                    .find(|token| token.kind() != squawk_syntax::SyntaxKind::WHITESPACE)
+            })
+            .map(|token| Self::resolve_identifier_token(token.text()))
+    }
+
+    fn constraint_name_ref_text(name: &ast::ConstraintNameRef) -> Option<String> {
+        name.path_ref()?
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .find(|token| token.kind() != squawk_syntax::SyntaxKind::WHITESPACE)
+            .map(|token| Self::resolve_identifier_token(token.text()))
+    }
+
+    fn domain_check_fact(
+        check: &ast::CheckConstraint,
+    ) -> Option<crate::_internal::analysis::facts::DomainCheckFact> {
+        let expr = check.expr()?;
+        let expression_text = expr.syntax().text().to_string();
+        let not_valid = check
+            .constraint_options()
+            .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
+        Some(crate::_internal::analysis::facts::DomainCheckFact {
+            name: Self::domain_constraint_name(check.constraint_name_clause()),
+            expression: crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+            definition: expression_text.clone(),
+            expression_text,
+            not_valid,
         })
+    }
+
+    fn domain_default_fact(
+        expr: ast::Expr,
+    ) -> crate::_internal::analysis::facts::DomainDefaultFact {
+        let text = expr.syntax().text().to_string();
+        let expression = crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr);
+        let is_null = Self::domain_expression_is_null(&expression);
+        crate::_internal::analysis::facts::DomainDefaultFact {
+            expression,
+            text,
+            is_null,
+        }
+    }
+
+    fn domain_expression_is_null(expression: &ExprIr) -> bool {
+        match expression {
+            ExprIr::Literal(value) => value.trim().eq_ignore_ascii_case("null"),
+            ExprIr::Cast { expr, .. } | ExprIr::UnaryOp { expr, .. } => {
+                Self::domain_expression_is_null(expr)
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn extract_alter_domain(node: &AlterDomain) -> Option<StatementFact> {
         let path = node.domain_ref()?.path_ref()?;
-        let action = node.action().map(|a| match a {
-            squawk_syntax::ast::AlterDomainAction::AddConstraint(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::AddConstraint
+        let action = match node.action()? {
+            squawk_syntax::ast::AlterDomainAction::AddConstraint(add) => {
+                let constraint = match add.constraint()? {
+                    ast::Constraint::CheckConstraint(check) => {
+                        crate::_internal::analysis::facts::DomainConstraintFact::Check(
+                            Self::domain_check_fact(&check)?,
+                        )
+                    }
+                    ast::Constraint::NotNullConstraint(not_null) => {
+                        crate::_internal::analysis::facts::DomainConstraintFact::NotNull {
+                            name: Self::domain_constraint_name(not_null.constraint_name_clause()),
+                        }
+                    }
+                    _ => return None,
+                };
+                crate::_internal::analysis::facts::AlterDomainActionFact::AddConstraint(constraint)
             }
-            squawk_syntax::ast::AlterDomainAction::DropConstraint(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::DropConstraint
+            squawk_syntax::ast::AlterDomainAction::DomainRenameTo(rename) => {
+                let path = rename.domain()?.path()?;
+                let name = Self::path_to_qualified_name(&path)?;
+                crate::_internal::analysis::facts::AlterDomainActionFact::RenameTo {
+                    new_name: name.name,
+                }
+            }
+            squawk_syntax::ast::AlterDomainAction::DropConstraint(drop) => {
+                let name = Self::constraint_name_ref_text(&drop.constraint_name_ref()?)?;
+                crate::_internal::analysis::facts::AlterDomainActionFact::DropConstraint {
+                    name,
+                    if_exists: drop.if_exists().is_some(),
+                    cascade: Self::is_cascade(drop.drop_behavior()),
+                }
             }
             squawk_syntax::ast::AlterDomainAction::DropDefault(_) => {
                 crate::_internal::analysis::facts::AlterDomainActionFact::DropDefault
@@ -34,31 +168,43 @@ impl AstVisitor {
             squawk_syntax::ast::AlterDomainAction::DropNotNull(_) => {
                 crate::_internal::analysis::facts::AlterDomainActionFact::DropNotNull
             }
-            squawk_syntax::ast::AlterDomainAction::OwnerTo(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::OwnerChange
+            squawk_syntax::ast::AlterDomainAction::OwnerTo(owner) => {
+                crate::_internal::analysis::facts::AlterDomainActionFact::OwnerChange(
+                    Self::extract_role(&owner.role_ref()?),
+                )
             }
-            squawk_syntax::ast::AlterDomainAction::RenameConstraint(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::RenameConstraint
+            squawk_syntax::ast::AlterDomainAction::RenameConstraint(rename) => {
+                let old = Self::constraint_name_ref_text(&rename.constraint_name_ref()?)?;
+                let new = Self::constraint_name_text(&rename.constraint_name()?)?;
+                crate::_internal::analysis::facts::AlterDomainActionFact::RenameConstraint {
+                    old_name: old,
+                    new_name: new,
+                }
             }
-            squawk_syntax::ast::AlterDomainAction::DomainRenameTo(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::RenameTo
-            }
-            squawk_syntax::ast::AlterDomainAction::SetDefault(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::SetDefault
+            squawk_syntax::ast::AlterDomainAction::SetDefault(set) => {
+                crate::_internal::analysis::facts::AlterDomainActionFact::SetDefault(
+                    Self::domain_default_fact(set.expr()?),
+                )
             }
             squawk_syntax::ast::AlterDomainAction::SetNotNull(_) => {
                 crate::_internal::analysis::facts::AlterDomainActionFact::SetNotNull
             }
-            squawk_syntax::ast::AlterDomainAction::SetSchema(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::SetSchema
+            squawk_syntax::ast::AlterDomainAction::SetSchema(set) => {
+                let schema = set.schema_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterDomainActionFact::SetSchema {
+                    new_schema: Self::resolve_identifier_token(schema.text()),
+                }
             }
-            squawk_syntax::ast::AlterDomainAction::ValidateConstraint(_) => {
-                crate::_internal::analysis::facts::AlterDomainActionFact::ValidateConstraint
+            squawk_syntax::ast::AlterDomainAction::ValidateConstraint(validate) => {
+                let name = Self::constraint_name_ref_text(&validate.constraint_name_ref()?)?;
+                crate::_internal::analysis::facts::AlterDomainActionFact::ValidateConstraint {
+                    name,
+                }
             }
-        });
+        };
         Some(StatementFact::AlterDomain {
             name: Self::path_ref_to_qualified_name(&path)?,
-            action,
+            action: Some(action),
         })
     }
 

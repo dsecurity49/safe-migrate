@@ -35,6 +35,7 @@ pub(super) fn load_schemas(
 pub(super) fn load_sequences(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
+    pg_version_num: u32,
 ) -> Result<std::collections::HashMap<ObjectId, crate::_internal::model::sequence::SequenceState>> {
     // Keep a sequence when either side of OWNED BY is in the requested
     // scope. A sequence can live in a different schema from its owning
@@ -84,7 +85,8 @@ pub(super) fn load_sequences(
              q.seqmax AS sequence_max,
              q.seqcache AS sequence_cache,
              q.seqcycle AS sequence_cycle,
-             s.relpersistence::text AS sequence_persistence
+             s.relpersistence::text AS sequence_persistence,
+             pg_catalog.has_sequence_privilege(s.oid, 'SELECT') AS can_read_runtime
          FROM pg_class s
          JOIN pg_namespace n ON n.oid = s.relnamespace
          JOIN pg_sequence q ON q.seqrelid = s.oid
@@ -109,61 +111,113 @@ pub(super) fn load_sequences(
     let rows = client
         .query(&query, &[schema_values])
         .context("Failed to load sequences and ownership from pg_class/pg_depend")?;
-    rows.into_iter()
-        .map(|row| {
-            let id = ObjectId::new(
-                row.try_get::<_, String>(0).context("sequence schema")?,
-                row.try_get::<_, String>(1).context("sequence name")?,
-            );
-            let owner = relation_owner_id(row.try_get::<_, String>(2).context("sequence owner")?);
-            let table_schema: Option<String> =
-                row.try_get(3).context("sequence owner table schema")?;
-            let table_name: Option<String> = row.try_get(4).context("sequence owner table name")?;
-            let column_name: Option<String> =
-                row.try_get(5).context("sequence owner column name")?;
-            let dependency_type: Option<String> =
-                row.try_get(6).context("sequence dependency type")?;
-            let has_nextval_default: bool =
-                row.try_get(7).context("sequence-backed default marker")?;
-            let owned_by = table_schema
-                .zip(table_name)
-                .zip(column_name)
-                .map(|((schema, table), column)| (ObjectId::new(schema, table), column));
-            let kind = sequence_kind_from_pg(dependency_type.as_deref(), has_nextval_default)
-                .with_context(|| format!("sequence '{}' dependency kind", id))?;
-            let persistence: String = row
-                .try_get("sequence_persistence")
-                .context("sequence persistence")?;
-            let persistence = match persistence.as_str() {
-                "p" => crate::_internal::model::sequence::SequencePersistence::Permanent,
-                "t" => crate::_internal::model::sequence::SequencePersistence::Temporary,
-                "u" => crate::_internal::model::sequence::SequencePersistence::Unlogged,
-                other => anyhow::bail!("unsupported sequence persistence code '{other}'"),
-            };
-            Ok((
-                id.clone(),
-                crate::_internal::model::sequence::SequenceState {
-                    id,
-                    owner,
-                    owned_by,
-                    kind,
-                    parameters: crate::_internal::model::sequence::SequenceParameters {
-                        data_type: row
-                            .try_get("sequence_data_type")
-                            .context("sequence data type")?,
-                        start_value: row.try_get("sequence_start").context("sequence start")?,
-                        increment: row
-                            .try_get("sequence_increment")
-                            .context("sequence increment")?,
-                        min_value: row.try_get("sequence_min").context("sequence minimum")?,
-                        max_value: row.try_get("sequence_max").context("sequence maximum")?,
-                        cache_size: row.try_get("sequence_cache").context("sequence cache")?,
-                        cycle: row.try_get("sequence_cycle").context("sequence cycle")?,
-                        persistence,
-                    },
-                    generation: 0,
+    let mut sequences = std::collections::HashMap::new();
+    for row in rows {
+        let id = ObjectId::new(
+            row.try_get::<_, String>("sequence_schema")
+                .context("sequence schema")?,
+            row.try_get::<_, String>("sequence_name")
+                .context("sequence name")?,
+        );
+        let owner = relation_owner_id(
+            row.try_get::<_, String>("owner_name")
+                .context("sequence owner")?,
+        );
+        let table_schema: Option<String> = row
+            .try_get("table_schema")
+            .context("sequence owner table schema")?;
+        let table_name: Option<String> = row
+            .try_get("table_name")
+            .context("sequence owner table name")?;
+        let column_name: Option<String> = row
+            .try_get("column_name")
+            .context("sequence owner column name")?;
+        let dependency_type: Option<String> = row
+            .try_get("dependency_type")
+            .context("sequence dependency type")?;
+        let has_nextval_default: bool = row
+            .try_get("has_nextval_default")
+            .context("sequence-backed default marker")?;
+        let owned_by = table_schema
+            .zip(table_name)
+            .zip(column_name)
+            .map(|((schema, table), column)| (ObjectId::new(schema, table), column));
+        let kind = sequence_kind_from_pg(dependency_type.as_deref(), has_nextval_default)
+            .with_context(|| format!("sequence '{}' dependency kind", id))?;
+        let persistence: String = row
+            .try_get("sequence_persistence")
+            .context("sequence persistence")?;
+        let persistence = match persistence.as_str() {
+            "p" => crate::_internal::model::sequence::SequencePersistence::Permanent,
+            "t" => crate::_internal::model::sequence::SequencePersistence::Temporary,
+            "u" => crate::_internal::model::sequence::SequencePersistence::Unlogged,
+            other => anyhow::bail!("unsupported sequence persistence code '{other}'"),
+        };
+        let can_read_runtime: bool = row
+            .try_get("can_read_runtime")
+            .context("sequence runtime read privilege")?;
+        let runtime = if can_read_runtime {
+            load_sequence_runtime(client, &id, pg_version_num)?
+        } else {
+            crate::_internal::model::sequence::SequenceRuntime::unknown()
+        };
+        sequences.insert(
+            id.clone(),
+            crate::_internal::model::sequence::SequenceState {
+                id,
+                owner,
+                owned_by,
+                kind,
+                parameters: crate::_internal::model::sequence::SequenceParameters {
+                    data_type: row
+                        .try_get("sequence_data_type")
+                        .context("sequence data type")?,
+                    start_value: row.try_get("sequence_start").context("sequence start")?,
+                    increment: row
+                        .try_get("sequence_increment")
+                        .context("sequence increment")?,
+                    min_value: row.try_get("sequence_min").context("sequence minimum")?,
+                    max_value: row.try_get("sequence_max").context("sequence maximum")?,
+                    cache_size: row.try_get("sequence_cache").context("sequence cache")?,
+                    cycle: row.try_get("sequence_cycle").context("sequence cycle")?,
+                    persistence,
                 },
-            ))
-        })
-        .collect()
+                runtime,
+                runtime_exact: false,
+                generation: 0,
+            },
+        );
+    }
+    Ok(sequences)
+}
+
+fn load_sequence_runtime(
+    client: &mut impl GenericClient,
+    id: &ObjectId,
+    pg_version_num: u32,
+) -> Result<crate::_internal::model::sequence::SequenceRuntime> {
+    let relation = format!("{}.{}", quote_ident(&id.schema), quote_ident(&id.name));
+    let row = if pg_version_num >= 180_000 {
+        client
+            .query_one(
+                "SELECT last_value, is_called FROM pg_catalog.pg_get_sequence_data($1::text::regclass)",
+                &[&relation],
+            )
+            .context("Failed to read sequence runtime data")?
+    } else {
+        client
+            .query_one(
+                &format!("SELECT last_value, is_called FROM {relation}"),
+                &[],
+            )
+            .context("Failed to read sequence runtime data")?
+    };
+    Ok(crate::_internal::model::sequence::SequenceRuntime {
+        last_value: Some(row.try_get("last_value").context("sequence last value")?),
+        is_called: Some(row.try_get("is_called").context("sequence is_called")?),
+    })
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }

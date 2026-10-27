@@ -1,7 +1,8 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
-    AttributeFact, LockModeFact, ResetSettingTarget, SearchPathTarget, TableConstraintFact,
-    TimeoutSetting, TimeoutSettingValue, ViewUpdatabilityFact,
+    AttributeFact, DomainConstraintFact, DomainDefaultFact, LockModeFact, ResetSettingTarget,
+    SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+    ViewUpdatabilityFact,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
@@ -410,6 +411,9 @@ pub(crate) struct DropSequenceMutation {
 pub(crate) struct CreateDomainMutation {
     pub id: ObjectId,
     pub base_type: String,
+    pub collation: Option<WrittenName>,
+    pub default: Option<DomainDefaultFact>,
+    pub constraints: Vec<DomainConstraintFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -10,9 +10,9 @@
 
 use super::builtin_type::{BuiltinType, BuiltinTypeCatalogue, TypeCategory};
 
-/// `(typname, canonical, category, preferred, fixed_bits, accepts_typmod)`.
+/// `(typname, canonical, category, preferred, fixed_bits, accepts_typmod, collatable)`.
 #[allow(clippy::type_complexity)]
-const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
+const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool, bool)] = &[
     (
         "aclitem",
         "aclitem",
@@ -20,14 +20,24 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(128),
         false,
+        false,
     ),
-    ("bit", "bit", TypeCategory::BitString, false, None, false),
+    (
+        "bit",
+        "bit",
+        TypeCategory::BitString,
+        false,
+        None,
+        true,
+        false,
+    ),
     (
         "bool",
         "boolean",
         TypeCategory::Boolean,
         true,
         Some(8),
+        false,
         false,
     ),
     (
@@ -37,6 +47,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(256),
         false,
+        false,
     ),
     (
         "bpchar",
@@ -44,9 +55,18 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::String,
         false,
         None,
+        true,
+        true,
+    ),
+    (
+        "bytea",
+        "bytea",
+        TypeCategory::User,
+        false,
+        None,
+        false,
         false,
     ),
-    ("bytea", "bytea", TypeCategory::User, false, None, false),
     (
         "char",
         "\"char\"",
@@ -54,15 +74,33 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(8),
         false,
+        false,
     ),
-    ("cid", "cid", TypeCategory::User, false, Some(32), false),
-    ("cidr", "cidr", TypeCategory::Network, false, None, false),
+    (
+        "cid",
+        "cid",
+        TypeCategory::User,
+        false,
+        Some(32),
+        false,
+        false,
+    ),
+    (
+        "cidr",
+        "cidr",
+        TypeCategory::Network,
+        false,
+        None,
+        false,
+        false,
+    ),
     (
         "circle",
         "circle",
         TypeCategory::Geometric,
         false,
         Some(192),
+        false,
         false,
     ),
     (
@@ -72,6 +110,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "datemultirange",
@@ -80,6 +119,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "daterange",
@@ -87,6 +127,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Range,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -96,6 +137,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "float8",
@@ -103,6 +145,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         true,
         Some(64),
+        false,
         false,
     ),
     (
@@ -112,14 +155,24 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
-    ("inet", "inet", TypeCategory::Network, true, None, false),
+    (
+        "inet",
+        "inet",
+        TypeCategory::Network,
+        true,
+        None,
+        false,
+        false,
+    ),
     (
         "int2",
         "smallint",
         TypeCategory::Numeric,
         false,
         Some(16),
+        false,
         false,
     ),
     (
@@ -129,6 +182,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "int4multirange",
@@ -137,6 +191,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "int4range",
@@ -144,6 +199,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Range,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -153,6 +209,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(64),
         false,
+        false,
     ),
     (
         "int8multirange",
@@ -161,6 +218,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "int8range",
@@ -168,6 +226,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Range,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -176,16 +235,34 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Timespan,
         true,
         Some(128),
+        true,
         false,
     ),
-    ("json", "json", TypeCategory::User, false, None, false),
-    ("jsonb", "jsonb", TypeCategory::User, false, None, false),
+    (
+        "json",
+        "json",
+        TypeCategory::User,
+        false,
+        None,
+        false,
+        false,
+    ),
+    (
+        "jsonb",
+        "jsonb",
+        TypeCategory::User,
+        false,
+        None,
+        false,
+        false,
+    ),
     (
         "jsonpath",
         "jsonpath",
         TypeCategory::User,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -195,6 +272,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(192),
         false,
+        false,
     ),
     (
         "lseg",
@@ -202,6 +280,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Geometric,
         false,
         Some(256),
+        false,
         false,
     ),
     (
@@ -211,6 +290,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(48),
         false,
+        false,
     ),
     (
         "macaddr8",
@@ -219,6 +299,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(64),
         false,
+        false,
     ),
     (
         "money",
@@ -226,6 +307,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         Some(64),
+        false,
         false,
     ),
     (
@@ -235,6 +317,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(512),
         false,
+        true,
     ),
     (
         "numeric",
@@ -242,6 +325,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         None,
+        true,
         false,
     ),
     (
@@ -251,6 +335,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "numrange",
@@ -259,9 +344,26 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
-    ("oid", "oid", TypeCategory::Numeric, true, Some(32), false),
-    ("path", "path", TypeCategory::Geometric, false, None, false),
+    (
+        "oid",
+        "oid",
+        TypeCategory::Numeric,
+        true,
+        Some(32),
+        false,
+        false,
+    ),
+    (
+        "path",
+        "path",
+        TypeCategory::Geometric,
+        false,
+        None,
+        false,
+        false,
+    ),
     (
         "pg_brin_bloom_summary",
         "pg_brin_bloom_summary",
@@ -269,6 +371,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        true,
     ),
     (
         "pg_brin_minmax_multi_summary",
@@ -277,6 +380,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        true,
     ),
     (
         "pg_dependencies",
@@ -285,6 +389,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        true,
     ),
     (
         "pg_lsn",
@@ -293,6 +398,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(64),
         false,
+        false,
     ),
     (
         "pg_mcv_list",
@@ -301,6 +407,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        true,
     ),
     (
         "pg_ndistinct",
@@ -309,6 +416,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        true,
     ),
     (
         "pg_node_tree",
@@ -317,6 +425,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        true,
     ),
     (
         "pg_snapshot",
@@ -324,6 +433,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::User,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -333,6 +443,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(128),
         false,
+        false,
     ),
     (
         "polygon",
@@ -341,6 +452,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "refcursor",
@@ -349,6 +461,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "regclass",
@@ -356,6 +469,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         Some(32),
+        false,
         false,
     ),
     (
@@ -365,6 +479,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "regconfig",
@@ -372,6 +487,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         Some(32),
+        false,
         false,
     ),
     (
@@ -381,6 +497,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "regnamespace",
@@ -388,6 +505,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         Some(32),
+        false,
         false,
     ),
     (
@@ -397,6 +515,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "regoperator",
@@ -404,6 +523,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         Some(32),
+        false,
         false,
     ),
     (
@@ -413,6 +533,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "regprocedure",
@@ -420,6 +541,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::Numeric,
         false,
         Some(32),
+        false,
         false,
     ),
     (
@@ -429,6 +551,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
     (
         "regtype",
@@ -437,15 +560,33 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         Some(32),
         false,
+        false,
     ),
-    ("text", "text", TypeCategory::String, true, None, false),
-    ("tid", "tid", TypeCategory::User, false, Some(48), false),
+    (
+        "text",
+        "text",
+        TypeCategory::String,
+        true,
+        None,
+        false,
+        true,
+    ),
+    (
+        "tid",
+        "tid",
+        TypeCategory::User,
+        false,
+        Some(48),
+        false,
+        false,
+    ),
     (
         "time",
         "time without time zone",
         TypeCategory::DateTime,
         false,
         Some(64),
+        true,
         false,
     ),
     (
@@ -454,6 +595,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::DateTime,
         false,
         Some(64),
+        true,
         false,
     ),
     (
@@ -462,6 +604,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::DateTime,
         true,
         Some(64),
+        true,
         false,
     ),
     (
@@ -470,6 +613,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::DateTime,
         false,
         Some(96),
+        true,
         false,
     ),
     (
@@ -479,14 +623,24 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
-    ("tsquery", "tsquery", TypeCategory::User, false, None, false),
+    (
+        "tsquery",
+        "tsquery",
+        TypeCategory::User,
+        false,
+        None,
+        false,
+        false,
+    ),
     (
         "tsrange",
         "tsrange",
         TypeCategory::Range,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -496,6 +650,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "tstzrange",
@@ -504,6 +659,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
     (
         "tsvector",
@@ -511,6 +667,7 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::User,
         false,
         None,
+        false,
         false,
     ),
     (
@@ -520,14 +677,24 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         false,
         None,
         false,
+        false,
     ),
-    ("uuid", "uuid", TypeCategory::User, false, Some(128), false),
+    (
+        "uuid",
+        "uuid",
+        TypeCategory::User,
+        false,
+        Some(128),
+        false,
+        false,
+    ),
     (
         "varbit",
         "bit varying",
         TypeCategory::BitString,
         true,
         None,
+        true,
         false,
     ),
     (
@@ -536,11 +703,28 @@ const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
         TypeCategory::String,
         false,
         None,
+        true,
+        true,
+    ),
+    (
+        "xid",
+        "xid",
+        TypeCategory::User,
+        false,
+        Some(32),
+        false,
         false,
     ),
-    ("xid", "xid", TypeCategory::User, false, Some(32), false),
-    ("xid8", "xid8", TypeCategory::User, false, Some(64), false),
-    ("xml", "xml", TypeCategory::User, false, None, false),
+    (
+        "xid8",
+        "xid8",
+        TypeCategory::User,
+        false,
+        Some(64),
+        false,
+        false,
+    ),
+    ("xml", "xml", TypeCategory::User, false, None, false, false),
 ];
 
 pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
@@ -548,7 +732,15 @@ pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
         TYPES
             .iter()
             .map(
-                |(typname, canonical, category, preferred, fixed_bits, accepts_typmod)| {
+                |(
+                    typname,
+                    canonical,
+                    category,
+                    preferred,
+                    fixed_bits,
+                    accepts_typmod,
+                    collatable,
+                )| {
                     BuiltinType {
                         oid: None,
                         typname: (*typname).to_string(),
@@ -558,6 +750,7 @@ pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
                         fixed_bits: *fixed_bits,
                         array_oid: None,
                         accepts_typmod: *accepts_typmod,
+                        collatable: *collatable,
                     }
                 },
             )
@@ -593,6 +786,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_snapshot_records_collatability_and_typmod_support() {
+        let text = TYPES
+            .iter()
+            .find(|entry| entry.0 == "text")
+            .expect("text must be present");
+        assert!(text.6, "text carries a collation");
+        let varchar = TYPES
+            .iter()
+            .find(|entry| entry.0 == "varchar")
+            .expect("varchar must be present");
+        assert!(varchar.5, "varchar accepts a typmod");
+        assert!(varchar.6, "varchar carries a collation");
+        let int4 = TYPES
+            .iter()
+            .find(|entry| entry.0 == "int4")
+            .expect("int4 must be present");
+        assert!(!int4.6, "int4 is not collatable");
     }
 
     #[test]

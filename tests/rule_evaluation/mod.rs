@@ -8,7 +8,8 @@ use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState, R
 use safe_migrate::_internal::model::relation::{
     Persistence, RelationKind, RelationState, ViewUpdatability,
 };
-use safe_migrate::_internal::report::violations::ViolationTier;
+use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
+use safe_migrate::_internal::report::violations::{ObjectKind, ViolationTier};
 use safe_migrate::api::{Certainty, Config, RuleConfig};
 
 mod object_rules;

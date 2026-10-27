@@ -29,6 +29,7 @@ impl AnalysisState {
                     types: self.local.types.clone(),
                     functions: self.local.functions.clone(),
                     sequences: self.local.sequences.clone(),
+                    extensions: self.local.extensions.clone(),
                     publications: self.local.publications.clone(),
                     triggers: self.local.triggers.clone(),
                     constraints: self.local.constraints.clone(),
@@ -65,6 +66,16 @@ impl AnalysisState {
             frame.undo_log.push(StateChange::SequenceSnapshot {
                 id: id.clone(),
                 previous,
+            });
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by extension transitions.
+    pub(super) fn snapshot_extension(&mut self, name: &str) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::ExtensionSnapshot {
+                name: name.to_string(),
+                previous: self.local.extensions.get(name).cloned(),
             });
         }
     }

@@ -21,6 +21,15 @@ impl Resolver {
                 subtype_id: subtype
                     .as_deref()
                     .and_then(|subtype| state.resolve_type_reference(subtype)),
+                multirange: None,
+                collation: None,
+                collation_id: None,
+                opclass: None,
+                opclass_id: None,
+                canonical: None,
+                canonical_id: None,
+                subtype_diff: None,
+                subtype_diff_id: None,
             },
             TypeCreationKind::Composite { fields } => TypeKind::Composite {
                 fields: fields
@@ -30,12 +39,18 @@ impl Resolver {
                             name: field.name.clone(),
                             data_type: field.data_type.clone(),
                             data_type_id: state.resolve_type_reference(&field.data_type),
+                            collation: None,
+                            collation_id: None,
                         },
                     )
                     .collect(),
             },
             TypeCreationKind::Base { element } => TypeKind::Base {
-                element: element.clone(),
+                shell: false,
+                options: crate::_internal::model::types::BaseTypeOptions {
+                    element: element.clone(),
+                    ..Default::default()
+                },
             },
         };
         Mutation::CreateType(CreateTypeMutation {
@@ -88,13 +103,15 @@ impl Resolver {
     }
 
     pub(super) fn resolve_create_domain(
-        name: &QualifiedName,
-        base_type: &str,
+        create: &crate::_internal::analysis::facts::CreateDomainFact,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::CreateDomain(CreateDomainMutation {
-            id: Self::resolve_creation_name(name, state),
-            base_type: base_type.to_string(),
+            id: Self::resolve_creation_name(&create.name, state),
+            base_type: create.base_type.clone(),
+            collation: create.collation.clone(),
+            default: create.default.clone(),
+            constraints: create.constraints.clone(),
         })
     }
 
@@ -103,10 +120,25 @@ impl Resolver {
         action: &Option<AlterDomainActionFact>,
         state: &AnalysisState,
     ) -> Mutation {
-        Mutation::AlterDomain(AlterDomainMutation {
-            id: Self::resolve_type_lookup_name(name, state),
-            action: action.clone(),
-        })
+        let id = Self::resolve_type_lookup_name(name, state);
+        let Some(action) = action else {
+            return Mutation::AlterDomain(AlterDomainMutation { id, action: None });
+        };
+        match action {
+            AlterDomainActionFact::RenameTo { new_name } => {
+                let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
+                new_id.inferred_schema = id.inferred_schema;
+                Mutation::RenameType(Rename { old_id: id, new_id })
+            }
+            AlterDomainActionFact::SetSchema { new_schema } => Mutation::RenameType(Rename {
+                old_id: id.clone(),
+                new_id: ObjectId::new(new_schema, &id.name),
+            }),
+            action => Mutation::AlterDomain(AlterDomainMutation {
+                id,
+                action: Some(action.clone()),
+            }),
+        }
     }
 
     pub(super) fn resolve_drop_domain(

@@ -527,8 +527,8 @@ impl Resolver {
             StatementFact::AlterType(alter_type) => {
                 mutations.extend(Self::resolve_alter_type(alter_type, state));
             }
-            StatementFact::CreateDomain { name, base_type } => {
-                mutations.push(Self::resolve_create_domain(name, base_type, state));
+            StatementFact::CreateDomain(create) => {
+                mutations.push(Self::resolve_create_domain(create, state));
             }
             StatementFact::AlterDomain { name, action } => {
                 mutations.push(Self::resolve_alter_domain(name, action, state));

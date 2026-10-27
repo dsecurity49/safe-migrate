@@ -24,12 +24,14 @@ impl CollationCatalogue {
     }
 
     fn lookup(&self, schema: &str, name: &str) -> Option<ResolvedName> {
-        self.entries
-            .get(&ResolvedName {
-                schema: schema.to_string(),
-                name: name.to_string(),
-            })
-            .cloned()
+        let identity = ResolvedName {
+            schema: schema.to_string(),
+            name: name.to_string(),
+        };
+        self.entries.get(&identity).cloned().or_else(|| {
+            (schema == "pg_catalog" && matches!(name, "C" | "POSIX" | "default"))
+                .then_some(identity)
+        })
     }
 
     /// The collation a written name denotes, as PostgreSQL's lookup resolves it.

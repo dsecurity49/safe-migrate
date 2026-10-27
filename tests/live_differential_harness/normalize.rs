@@ -151,11 +151,14 @@ pub(super) fn normalize_column_storage(
                 TypeKind::Domain {
                     base_type,
                     base_type_id,
+                    ..
                 } => {
                     data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
                     continue;
                 }
-                TypeKind::Composite { .. } | TypeKind::Range { .. } | TypeKind::Multirange => {
+                TypeKind::Composite { .. }
+                | TypeKind::Range { .. }
+                | TypeKind::Multirange { .. } => {
                     return Some("EXTENDED".into());
                 }
                 TypeKind::Enum { .. } => return Some("PLAIN".into()),
@@ -299,7 +302,7 @@ pub(super) fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Base { .. } => NormalizedType::Base,
         TypeKind::Composite { .. } => NormalizedType::Composite,
         TypeKind::Range { .. } => NormalizedType::Range,
-        TypeKind::Multirange => NormalizedType::Multirange,
+        TypeKind::Multirange { .. } => NormalizedType::Multirange,
     }
 }
 

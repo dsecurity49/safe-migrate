@@ -99,6 +99,149 @@ fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
     assert!(!v2.iter().any(|v| v.rule_id == "blocking-constraint"));
 }
 
+fn domain_rule_state(column_type: &str, relation_rows: u64) -> AnalysisState {
+    let mut cache = crate::common::synced_cache();
+    let domain = object_id("public", "d");
+    cache.types.insert(
+        domain.clone(),
+        TypeState {
+            id: domain.clone(),
+            generation: 0,
+            owner: ObjectId::new("", "postgres"),
+            kind: TypeKind::Domain {
+                base_type: "integer".into(),
+                base_type_id: None,
+                collation: None,
+                collation_id: None,
+                default: None,
+                default_text: None,
+                not_null: false,
+                not_null_constraint: None,
+                constraints: Default::default(),
+            },
+        },
+    );
+    let table = object_id("public", "t");
+    let mut relation = RelationState::new(
+        table.clone(),
+        ObjectId::new("public", "postgres"),
+        0,
+        Some(relation_rows),
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    relation.columns.push(Column {
+        name: "value".into(),
+        data_type: Some(column_type.into()),
+        type_id: Some(object_id("public", column_type)),
+        is_nullable: true,
+        default: None,
+        avg_width: None,
+        default_expr_text: None,
+        type_modifier: None,
+        storage: None,
+        compression: None,
+        statistics_target: None,
+        options: Default::default(),
+        generated: None,
+    });
+    cache.insert_baseline(table, relation);
+    AnalysisState::new(cache)
+}
+
+#[test]
+fn domain_validation_uses_relations_that_store_the_domain() {
+    let engine = setup_engine();
+    let mut state = domain_rule_state("d", 500_000);
+    let violations = engine
+        .analyze(
+            "ALTER DOMAIN d ADD CONSTRAINT c CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations.iter().any(|violation| {
+            violation.rule_id == "blocking-constraint"
+                && violation.object_kind == ObjectKind::Domain
+                && violation.tier == ViolationTier::Tier1
+        }),
+        "{violations:#?}"
+    );
+
+    let violations = engine
+        .analyze(
+            "ALTER DOMAIN d ADD CONSTRAINT c2 CHECK (VALUE > 0) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint")
+    );
+
+    let violations = engine
+        .analyze("ALTER DOMAIN d VALIDATE CONSTRAINT c2;", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint")
+    );
+
+    let violations = engine
+        .analyze("ALTER DOMAIN d SET NOT NULL;", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint")
+    );
+}
+
+#[test]
+fn domain_validation_estimates_nested_domain_columns() {
+    let engine = setup_engine();
+    let mut state = domain_rule_state("e", 500_000);
+    let nested = object_id("public", "e");
+    state.local.types.insert(
+        nested.clone(),
+        TypeOverlay::Present(TypeState {
+            id: nested.clone(),
+            generation: 1,
+            owner: ObjectId::new("", "postgres"),
+            kind: TypeKind::Domain {
+                base_type: "d".into(),
+                base_type_id: Some(object_id("public", "d")),
+                collation: None,
+                collation_id: None,
+                default: None,
+                default_text: None,
+                not_null: false,
+                not_null_constraint: None,
+                constraints: Default::default(),
+            },
+        }),
+    );
+    let table = object_id("public", "t");
+    let Some(RelationOverlay::Present(relation)) = state.local.relations.get_mut(&table) else {
+        panic!("baseline relation missing");
+    };
+    relation.columns[0].type_id = Some(nested);
+    let violations = engine
+        .analyze(
+            "ALTER DOMAIN d ADD CONSTRAINT c CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint")
+    );
+}
+
 #[test]
 fn test_rule_blocking_constraint_pk_and_unique() {
     let engine = setup_engine();

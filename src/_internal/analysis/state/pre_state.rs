@@ -46,6 +46,7 @@ impl AnalysisState {
             publications,
             subscriptions,
             sequences,
+            extensions,
             types,
             indexes,
             baseline_foreign_keys,
@@ -87,6 +88,14 @@ impl AnalysisState {
             SequenceOverlay::Present(state) => Some(state),
             SequenceOverlay::Dropped => None,
         });
+        sync_present_map(
+            extensions,
+            &self.local.extensions,
+            |overlay| match overlay {
+                crate::_internal::model::extension::ExtensionOverlay::Present(state) => Some(state),
+                crate::_internal::model::extension::ExtensionOverlay::Dropped => None,
+            },
+        );
         sync_present_map(types, &self.local.types, |overlay| match overlay {
             TypeOverlay::Present(state) => Some(state),
             TypeOverlay::Dropped => None,

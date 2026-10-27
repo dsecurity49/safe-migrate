@@ -227,7 +227,8 @@ impl AnalysisState {
                             }
                         }
                     }
-                    TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange => {}
+                    TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange { .. } => {
+                    }
                 }
             }
             if !grew {

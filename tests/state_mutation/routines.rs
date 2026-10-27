@@ -709,6 +709,7 @@ fn rename_type_updates_cached_routine_signatures_and_undo_restores_them() {
         TypeState {
             id: type_id,
             generation: 0,
+            owner: object_id("", "postgres"),
             kind: TypeKind::Enum {
                 variants: vec!["sad".into()],
             },
