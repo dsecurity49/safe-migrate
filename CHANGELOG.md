@@ -18,6 +18,10 @@ notes are available on the
   order, and a dependent outside the extension blocks the drop until `CASCADE`.
   Dropping an extension-owned member directly is reported, and schema renames
   remap extension membership and collation references.
+- Range creation automatically produces the companion multirange type, explicit
+  bidirectional links, and internal constructors. Independent multirange renames
+  preserve companion links, composite attribute changes synchronize typed tables,
+  and base/shell type options are fully represented in state.
 - Cache V11 adds domain, sequence-runtime, and extension catalog state. Re-run
   `safe-migrate sync`; older caches are rejected rather than misread.
 

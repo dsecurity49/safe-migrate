@@ -257,32 +257,114 @@ impl AstVisitor {
                     .composite_field_list()?
                     .composite_field_defs()
                     .map(|field| {
+                        let collation = field.collate().and_then(|collate| {
+                            collate
+                                .collation_ref()
+                                .and_then(|c| c.path_ref())
+                                .map(|p| p.syntax().text().to_string().trim().to_string())
+                        });
+                        let name = field
+                            .name()
+                            .map(|n| {
+                                Self::resolve_identifier_token(n.syntax().text().to_string().trim())
+                            })
+                            .unwrap_or_default();
                         Some(crate::_internal::analysis::facts::CompositeFieldFact {
-                            name: Self::resolve_identifier_token(
-                                field.name()?.ident_token()?.text(),
-                            ),
+                            name,
                             data_type: field.ty()?.syntax().text().to_string(),
+                            collation,
                         })
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // A range type is defined by its subtype and a base type by its
-            // element; both arrive as attributes on the same list.
-            ast::CreateTypeKind::RangeType(range) => TypeCreationKind::Range {
-                subtype: Self::type_attribute(
-                    Self::extract_attribute_list(range.attribute_list()),
-                    "subtype",
-                ),
-            },
-            ast::CreateTypeKind::BaseType(base) => TypeCreationKind::Base {
-                element: Self::type_attribute(
-                    Self::extract_attribute_list(base.attribute_list()),
-                    "element",
-                ),
-            },
+            // A range type is defined by its subtype, optional multirange name,
+            // collation, opclass, canonical, and subtype_diff.
+            ast::CreateTypeKind::RangeType(range) => {
+                let attrs = Self::extract_attribute_list(range.attribute_list());
+                let multirange_type_name = attrs
+                    .iter()
+                    .find(|attribute| attribute.name.eq_ignore_ascii_case("multirange_type_name"))
+                    .and_then(|attribute| attribute.value.as_deref())
+                    .map(|val| {
+                        if let Some((schema, name)) = val.split_once('.') {
+                            QualifiedName::new(
+                                Some(Self::identifier_from_name(schema.trim(), false)),
+                                Self::identifier_from_name(name.trim(), false),
+                            )
+                        } else {
+                            QualifiedName::new(None, Self::identifier_from_name(val.trim(), false))
+                        }
+                    });
+                TypeCreationKind::Range {
+                    subtype: Self::type_attribute(attrs.clone(), "subtype"),
+                    multirange_type_name,
+                    collation: Self::type_attribute(attrs.clone(), "collation"),
+                    opclass: Self::type_attribute(attrs.clone(), "subtype_opclass"),
+                    canonical: Self::type_attribute(attrs.clone(), "canonical"),
+                    subtype_diff: Self::type_attribute(attrs, "subtype_diff"),
+                }
+            }
+            ast::CreateTypeKind::BaseType(base) => {
+                let attrs = Self::extract_attribute_list(base.attribute_list());
+                TypeCreationKind::Base {
+                    options: Self::extract_base_type_options(&attrs),
+                }
+            }
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
+    }
+
+    pub(super) fn extract_base_type_options(
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> crate::_internal::model::types::BaseTypeOptions {
+        let attr = |name: &str| {
+            attributes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(name))
+                .and_then(|a| a.value.clone())
+        };
+        let attr_bool = |name: &str| {
+            attributes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(name))
+                .map(|a| {
+                    a.value
+                        .as_deref()
+                        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                        .unwrap_or(true)
+                })
+        };
+        let internallength = attr("internallength").map(|len_str| {
+            if len_str.eq_ignore_ascii_case("variable") {
+                crate::_internal::model::types::BaseTypeLength::Variable
+            } else if let Ok(fixed) = len_str.parse::<i16>() {
+                crate::_internal::model::types::BaseTypeLength::Fixed(fixed)
+            } else {
+                crate::_internal::model::types::BaseTypeLength::Variable
+            }
+        });
+        crate::_internal::model::types::BaseTypeOptions {
+            input: attr("input"),
+            output: attr("output"),
+            receive: attr("receive"),
+            send: attr("send"),
+            typmod_in: attr("typmod_in"),
+            typmod_out: attr("typmod_out"),
+            analyze: attr("analyze"),
+            subscript: attr("subscript"),
+            internallength,
+            passed_by_value: attr_bool("passedbyvalue"),
+            alignment: attr("alignment"),
+            storage: attr("storage"),
+            like: attr("like"),
+            category: attr("category"),
+            preferred: attr_bool("preferred"),
+            default: attr("default"),
+            element: attr("element"),
+            delimiter: attr("delimiter"),
+            collatable: attr_bool("collatable"),
+        }
     }
 
     /// The named type an attribute list declares, if it names one.
@@ -349,11 +431,83 @@ impl AstVisitor {
                     new_value: literals.get(1)?.clone(),
                 });
             }
-            // PostgreSQL also accepts attribute changes, OWNER changes, and
-            // type options.  Those facts are not represented in the state
-            // model; returning an empty action list would turn them into a
-            // silent no-op, so route them through UnsupportedStatement.
-            _ => return None,
+            ast::AlterTypeAction::OwnerTo(owner_to) => {
+                let role = owner_to.role_ref()?;
+                actions.push(AlterTypeActionFact::OwnerTo {
+                    new_owner: Self::extract_role(&role),
+                });
+            }
+            ast::AlterTypeAction::RenameAttribute(rename_attr) => {
+                let old_field = rename_attr
+                    .composite_field_ref()?
+                    .syntax()
+                    .text()
+                    .to_string();
+                let new_field = rename_attr.composite_field()?.syntax().text().to_string();
+                actions.push(AlterTypeActionFact::RenameAttribute {
+                    old_name: Self::identifier_from_name(old_field.trim(), false),
+                    new_name: Self::identifier_from_name(new_field.trim(), false),
+                });
+            }
+            ast::AlterTypeAction::SetOptions(set_options) => {
+                let attrs = Self::extract_attribute_list(set_options.attribute_list());
+                actions.push(AlterTypeActionFact::SetOptions {
+                    options: Self::extract_base_type_options(&attrs),
+                });
+            }
+            ast::AlterTypeAction::AlterTypeAttributeActionList(list) => {
+                for action in list.actions() {
+                    match action {
+                        ast::AlterTypeAttributeAction::AddAttribute(add) => {
+                            let field_syntax = add.composite_field()?.syntax().text().to_string();
+                            let name = Self::identifier_from_name(field_syntax.trim(), false);
+                            let data_type = add.ty()?.syntax().text().to_string();
+                            let collation = add.collate().and_then(|collate| {
+                                collate
+                                    .collation_ref()
+                                    .and_then(|c| c.path_ref())
+                                    .map(|p| p.syntax().text().to_string().trim().to_string())
+                            });
+                            actions.push(AlterTypeActionFact::AddAttribute {
+                                name,
+                                data_type,
+                                collation,
+                            });
+                        }
+                        ast::AlterTypeAttributeAction::DropAttribute(drop) => {
+                            let field_syntax =
+                                drop.composite_field_ref()?.syntax().text().to_string();
+                            let name = Self::identifier_from_name(field_syntax.trim(), false);
+                            let if_exists = drop.if_exists().is_some();
+                            let cascade = Self::is_cascade(drop.drop_behavior());
+                            actions.push(AlterTypeActionFact::DropAttribute {
+                                name,
+                                if_exists,
+                                cascade,
+                            });
+                        }
+                        ast::AlterTypeAttributeAction::AlterAttribute(alter) => {
+                            let field_syntax =
+                                alter.composite_field_ref()?.syntax().text().to_string();
+                            let name = Self::identifier_from_name(field_syntax.trim(), false);
+                            let data_type = alter.ty()?.syntax().text().to_string();
+                            let collation = alter.collate().and_then(|collate| {
+                                collate
+                                    .collation_ref()
+                                    .and_then(|c| c.path_ref())
+                                    .map(|p| p.syntax().text().to_string().trim().to_string())
+                            });
+                            let cascade = Self::is_cascade(alter.drop_behavior());
+                            actions.push(AlterTypeActionFact::AlterAttributeType {
+                                name,
+                                data_type,
+                                collation,
+                                cascade,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         Some(StatementFact::AlterType(AlterTypeFact { name, actions }))

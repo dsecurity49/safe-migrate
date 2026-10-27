@@ -183,10 +183,20 @@ impl AnalysisState {
         loop {
             let mut grew = false;
             for victim in dropped.clone() {
-                if self.type_is_range(&victim) {
-                    let companion = Self::multirange_companion_id(&victim);
-                    if self.type_is_present(&companion) && dropped.insert(companion) {
-                        grew = true;
+                if let Some(TypeOverlay::Present(state)) = self.local.types.get(&victim) {
+                    if let TypeKind::Range {
+                        multirange: Some(ref mr),
+                        ..
+                    } = state.kind
+                    {
+                        if self.type_is_present(mr) && dropped.insert(mr.clone()) {
+                            grew = true;
+                        }
+                    } else if self.type_is_range(&victim) {
+                        let companion = Self::multirange_companion_id(&victim);
+                        if self.type_is_present(&companion) && dropped.insert(companion) {
+                            grew = true;
+                        }
                     }
                 }
             }
@@ -210,8 +220,23 @@ impl AnalysisState {
                             grew = true;
                         }
                     }
-                    TypeKind::Range { subtype_id, .. } => {
+                    TypeKind::Range {
+                        subtype_id,
+                        multirange,
+                        ..
+                    } => {
                         if Self::type_reference_matches_victims(subtype_id.as_ref(), &dropped) {
+                            dropped.insert(id.clone());
+                            if let Some(ref mr) = multirange {
+                                dropped.insert(mr.clone());
+                            }
+                            grew = true;
+                        }
+                    }
+                    TypeKind::Multirange { range } => {
+                        if let Some(ref r) = range
+                            && dropped.contains(r)
+                        {
                             dropped.insert(id);
                             grew = true;
                         }
@@ -227,8 +252,16 @@ impl AnalysisState {
                             }
                         }
                     }
-                    TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange { .. } => {
+                    TypeKind::Base { options, .. } => {
+                        if let Some(ref elem) = options.element {
+                            let elem_id = ObjectId::new(&id.schema, elem);
+                            if dropped.contains(&elem_id) {
+                                dropped.insert(id);
+                                grew = true;
+                            }
+                        }
                     }
+                    TypeKind::Enum { .. } => {}
                 }
             }
             if !grew {

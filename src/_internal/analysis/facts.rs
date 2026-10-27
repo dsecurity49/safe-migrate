@@ -83,16 +83,31 @@ pub(crate) enum ResetSettingTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeCreationKind {
-    Enum { variants: Vec<String> },
-    Range { subtype: Option<String> },
-    Composite { fields: Vec<CompositeFieldFact> },
-    Base { element: Option<String> },
+    Enum {
+        variants: Vec<String>,
+    },
+    Range {
+        subtype: Option<String>,
+        multirange_type_name: Option<QualifiedName>,
+        collation: Option<String>,
+        opclass: Option<String>,
+        canonical: Option<String>,
+        subtype_diff: Option<String>,
+    },
+    Composite {
+        fields: Vec<CompositeFieldFact>,
+    },
+    Base {
+        options: crate::_internal::model::types::BaseTypeOptions,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompositeFieldFact {
     pub name: String,
     pub data_type: String,
+    #[serde(default)]
+    pub collation: Option<String>,
 }
 
 /// A routine a view calls.
@@ -621,6 +636,7 @@ pub(crate) struct AlterTypeFact {
     pub actions: Vec<AlterTypeActionFact>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTypeActionFact {
     RenameTo {
@@ -628,6 +644,9 @@ pub(crate) enum AlterTypeActionFact {
     },
     SetSchema {
         new_schema: String,
+    },
+    OwnerTo {
+        new_owner: RoleFact,
     },
     AddValue {
         new_value: String,
@@ -637,6 +656,29 @@ pub(crate) enum AlterTypeActionFact {
     RenameValue {
         old_value: String,
         new_value: String,
+    },
+    AddAttribute {
+        name: Ident,
+        data_type: String,
+        collation: Option<String>,
+    },
+    DropAttribute {
+        name: Ident,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterAttributeType {
+        name: Ident,
+        data_type: String,
+        collation: Option<String>,
+        cascade: bool,
+    },
+    RenameAttribute {
+        old_name: Ident,
+        new_name: Ident,
+    },
+    SetOptions {
+        options: crate::_internal::model::types::BaseTypeOptions,
     },
 }
 

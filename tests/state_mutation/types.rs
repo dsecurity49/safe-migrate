@@ -1921,3 +1921,180 @@ fn test_state_alter_column_types() {
         panic!("relation should be present");
     }
 }
+
+#[test]
+fn range_creation_produces_companion_constructors_and_cast() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE TYPE score_span AS RANGE (subtype = integer);",
+            &mut state,
+        )
+        .unwrap();
+
+    let range_id = object_id("public", "score_span");
+    let mr_id = object_id("public", "score_span_multirange");
+
+    // Both range and multirange companion are present
+    assert!(state.local.types.contains_key(&range_id));
+    assert!(state.local.types.contains_key(&mr_id));
+
+    if let Some(TypeOverlay::Present(r_state)) = state.local.types.get(&range_id) {
+        if let TypeKind::Range { multirange, .. } = &r_state.kind {
+            assert_eq!(multirange.as_ref(), Some(&mr_id));
+        } else {
+            panic!("expected Range type kind");
+        }
+    } else {
+        panic!("score_span should be present");
+    }
+
+    if let Some(TypeOverlay::Present(mr_state)) = state.local.types.get(&mr_id) {
+        if let TypeKind::Multirange { range } = &mr_state.kind {
+            assert_eq!(range.as_ref(), Some(&range_id));
+        } else {
+            panic!("expected Multirange type kind");
+        }
+    } else {
+        panic!("score_span_multirange should be present");
+    }
+
+    // Constructors are present in functions map with internal_type_owner
+    let r_ctor2 = object_id("public", "score_span(integer,integer)");
+    let r_ctor3 = object_id("public", "score_span(integer,integer,text)");
+    let mr_ctor0 = object_id("public", "score_span_multirange()");
+    let mr_ctor1 = object_id("public", "score_span_multirange(score_span)");
+    let mr_ctor2 = object_id("public", "score_span_multirange(VARIADIC score_span[])");
+
+    assert!(state.local.functions.contains_key(&r_ctor2));
+    assert!(state.local.functions.contains_key(&r_ctor3));
+    assert!(state.local.functions.contains_key(&mr_ctor0));
+    assert!(state.local.functions.contains_key(&mr_ctor1));
+    assert!(state.local.functions.contains_key(&mr_ctor2));
+
+    // Direct drop of internal constructor is rejected
+    let violations = engine
+        .analyze(
+            "DROP FUNCTION public.score_span(integer, integer);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+}
+
+#[test]
+fn explicit_multirange_name_is_respected_and_independent_rename_updates_links() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE TYPE custom_r AS RANGE (subtype = integer, multirange_type_name = custom_mr);",
+            &mut state,
+        )
+        .unwrap();
+
+    let range_id = object_id("public", "custom_r");
+    let mr_id = object_id("public", "custom_mr");
+
+    assert!(state.local.types.contains_key(&range_id));
+    assert!(state.local.types.contains_key(&mr_id));
+
+    // Rename the multirange independently
+    engine
+        .analyze(
+            "ALTER TYPE custom_mr RENAME TO custom_mr_renamed;",
+            &mut state,
+        )
+        .unwrap();
+
+    let mr_renamed_id = object_id("public", "custom_mr_renamed");
+    assert!(!state.local.types.contains_key(&mr_id));
+    assert!(state.local.types.contains_key(&mr_renamed_id));
+
+    // Check that range's multirange link was updated
+    if let Some(TypeOverlay::Present(r_state)) = state.local.types.get(&range_id) {
+        if let TypeKind::Range { multirange, .. } = &r_state.kind {
+            assert_eq!(multirange.as_ref(), Some(&mr_renamed_id));
+        } else {
+            panic!("expected Range type kind");
+        }
+    }
+
+    // Cascade drop of range drops the independently renamed multirange companion too!
+    engine
+        .analyze("DROP TYPE custom_r CASCADE;", &mut state)
+        .unwrap();
+    assert!(matches!(
+        state.local.types.get(&range_id),
+        Some(TypeOverlay::Dropped)
+    ));
+    assert!(matches!(
+        state.local.types.get(&mr_renamed_id),
+        Some(TypeOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn composite_attribute_alterations_synchronize_typed_tables() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE TYPE item_t AS (a integer, b text);
+             CREATE TABLE typed_items OF item_t;
+             ALTER TYPE item_t ADD ATTRIBUTE c boolean;
+             ALTER TYPE item_t RENAME ATTRIBUTE b TO b_renamed;
+             ALTER TYPE item_t DROP ATTRIBUTE a CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+
+    let table_id = object_id("public", "typed_items");
+    let RelationOverlay::Present(tbl) = state.local.relations.get(&table_id).unwrap() else {
+        panic!("typed_items should be present");
+    };
+
+    assert!(!tbl.has_column("a"));
+    assert!(tbl.has_column("b_renamed"));
+    assert!(tbl.has_column("c"));
+
+    let col_b = tbl.get_column("b_renamed").unwrap();
+    assert_eq!(col_b.data_type.as_deref(), Some("text"));
+    let col_c = tbl.get_column("c").unwrap();
+    assert_eq!(col_c.data_type.as_deref(), Some("boolean"));
+}
+
+#[test]
+fn base_type_shell_completion_and_options_work() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE TYPE widget_t (INPUT = widget_in, OUTPUT = widget_out, INTERNALLENGTH = 16, PASSEDBYVALUE);",
+            &mut state,
+        )
+        .unwrap();
+
+    let widget_id = object_id("public", "widget_t");
+    let Some(TypeOverlay::Present(type_state)) = state.local.types.get(&widget_id) else {
+        panic!("widget_t should be present");
+    };
+
+    if let TypeKind::Base { options, shell } = &type_state.kind {
+        assert!(!shell);
+        assert_eq!(options.input.as_deref(), Some("widget_in"));
+        assert_eq!(options.output.as_deref(), Some("widget_out"));
+        assert_eq!(
+            options.internallength,
+            Some(crate::_internal::model::types::BaseTypeLength::Fixed(16))
+        );
+        assert_eq!(options.passed_by_value, Some(true));
+    } else {
+        panic!("expected Base type kind");
+    }
+}

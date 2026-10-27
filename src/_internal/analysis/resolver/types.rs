@@ -12,50 +12,121 @@ use crate::_internal::model::types::TypeKind;
 
 impl Resolver {
     pub(super) fn resolve_create_type(fact: &CreateTypeFact, state: &AnalysisState) -> Mutation {
+        let mut multirange_name = None;
         let kind = match &fact.kind {
             TypeCreationKind::Enum { variants } => TypeKind::Enum {
                 variants: variants.clone(),
             },
-            TypeCreationKind::Range { subtype } => TypeKind::Range {
-                subtype: subtype.clone(),
-                subtype_id: subtype
+            TypeCreationKind::Range {
+                subtype,
+                multirange_type_name,
+                collation,
+                opclass,
+                canonical,
+                subtype_diff,
+            } => {
+                if let Some(mr_name) = multirange_type_name {
+                    multirange_name = Some(Self::resolve_creation_name(mr_name, state));
+                }
+                let collation_id = collation.as_deref().and_then(|written| {
+                    let w = if let Some((s, n)) = written.split_once('.') {
+                        crate::_internal::model::index::WrittenName {
+                            schema: Some(s.to_string()),
+                            name: n.to_string(),
+                        }
+                    } else {
+                        crate::_internal::model::index::WrittenName {
+                            schema: None,
+                            name: written.to_string(),
+                        }
+                    };
+                    state
+                        .local
+                        .collations
+                        .resolve(&w, &state.local.search_path)
+                        .map(|c| ObjectId::new(c.schema, c.name))
+                });
+                let opclass_id = opclass.as_deref().and_then(|written| {
+                    let w = if let Some((s, n)) = written.split_once('.') {
+                        crate::_internal::model::index::WrittenName {
+                            schema: Some(s.to_string()),
+                            name: n.to_string(),
+                        }
+                    } else {
+                        crate::_internal::model::index::WrittenName {
+                            schema: None,
+                            name: written.to_string(),
+                        }
+                    };
+                    state
+                        .local
+                        .opclasses
+                        .resolve(&w, "btree", &state.local.search_path)
+                        .map(|o| ObjectId::new(o.family.schema.clone(), o.name.clone()))
+                });
+                let canonical_id = canonical
                     .as_deref()
-                    .and_then(|subtype| state.resolve_type_reference(subtype)),
-                multirange: None,
-                collation: None,
-                collation_id: None,
-                opclass: None,
-                opclass_id: None,
-                canonical: None,
-                canonical_id: None,
-                subtype_diff: None,
-                subtype_diff_id: None,
-            },
+                    .and_then(|c| state.resolve_type_reference(c));
+                let subtype_diff_id = subtype_diff
+                    .as_deref()
+                    .and_then(|d| state.resolve_type_reference(d));
+                TypeKind::Range {
+                    subtype: subtype.clone(),
+                    subtype_id: subtype
+                        .as_deref()
+                        .and_then(|subtype| state.resolve_type_reference(subtype)),
+                    multirange: None,
+                    collation: collation.clone(),
+                    collation_id,
+                    opclass: opclass.clone(),
+                    opclass_id,
+                    canonical: canonical.clone(),
+                    canonical_id,
+                    subtype_diff: subtype_diff.clone(),
+                    subtype_diff_id,
+                }
+            }
             TypeCreationKind::Composite { fields } => TypeKind::Composite {
                 fields: fields
                     .iter()
-                    .map(
-                        |field| crate::_internal::model::types::CompositeFieldState {
+                    .map(|field| {
+                        let collation_id = field.collation.as_deref().and_then(|written| {
+                            let w = if let Some((s, n)) = written.split_once('.') {
+                                crate::_internal::model::index::WrittenName {
+                                    schema: Some(s.to_string()),
+                                    name: n.to_string(),
+                                }
+                            } else {
+                                crate::_internal::model::index::WrittenName {
+                                    schema: None,
+                                    name: written.to_string(),
+                                }
+                            };
+                            state
+                                .local
+                                .collations
+                                .resolve(&w, &state.local.search_path)
+                                .map(|c| ObjectId::new(c.schema, c.name))
+                        });
+                        crate::_internal::model::types::CompositeFieldState {
                             name: field.name.clone(),
                             data_type: field.data_type.clone(),
                             data_type_id: state.resolve_type_reference(&field.data_type),
-                            collation: None,
-                            collation_id: None,
-                        },
-                    )
+                            collation: field.collation.clone(),
+                            collation_id,
+                        }
+                    })
                     .collect(),
             },
-            TypeCreationKind::Base { element } => TypeKind::Base {
+            TypeCreationKind::Base { options } => TypeKind::Base {
                 shell: false,
-                options: crate::_internal::model::types::BaseTypeOptions {
-                    element: element.clone(),
-                    ..Default::default()
-                },
+                options: options.clone(),
             },
         };
         Mutation::CreateType(CreateTypeMutation {
             id: Self::resolve_creation_name(&fact.name, state),
             kind,
+            multirange_name,
         })
     }
 
@@ -98,6 +169,69 @@ impl Resolver {
                         new_value: new_value.clone(),
                     },
                 }),
+                AlterTypeActionFact::OwnerTo { new_owner } => {
+                    Mutation::AlterType(AlterTypeMutation {
+                        id: id.clone(),
+                        action: AlterTypeActionMutation::OwnerTo {
+                            new_owner: new_owner.clone(),
+                        },
+                    })
+                }
+                AlterTypeActionFact::AddAttribute {
+                    name,
+                    data_type,
+                    collation,
+                } => Mutation::AlterType(AlterTypeMutation {
+                    id: id.clone(),
+                    action: AlterTypeActionMutation::AddAttribute {
+                        name: name.resolve(),
+                        data_type: data_type.clone(),
+                        collation: collation.clone(),
+                    },
+                }),
+                AlterTypeActionFact::DropAttribute {
+                    name,
+                    if_exists,
+                    cascade,
+                } => Mutation::AlterType(AlterTypeMutation {
+                    id: id.clone(),
+                    action: AlterTypeActionMutation::DropAttribute {
+                        name: name.resolve(),
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    },
+                }),
+                AlterTypeActionFact::AlterAttributeType {
+                    name,
+                    data_type,
+                    collation,
+                    cascade,
+                } => Mutation::AlterType(AlterTypeMutation {
+                    id: id.clone(),
+                    action: AlterTypeActionMutation::AlterAttributeType {
+                        name: name.resolve(),
+                        data_type: data_type.clone(),
+                        collation: collation.clone(),
+                        cascade: *cascade,
+                    },
+                }),
+                AlterTypeActionFact::RenameAttribute { old_name, new_name } => {
+                    Mutation::AlterType(AlterTypeMutation {
+                        id: id.clone(),
+                        action: AlterTypeActionMutation::RenameAttribute {
+                            old_name: old_name.resolve(),
+                            new_name: new_name.resolve(),
+                        },
+                    })
+                }
+                AlterTypeActionFact::SetOptions { options } => {
+                    Mutation::AlterType(AlterTypeMutation {
+                        id: id.clone(),
+                        action: AlterTypeActionMutation::SetOptions {
+                            options: options.clone(),
+                        },
+                    })
+                }
             })
             .collect()
     }

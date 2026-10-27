@@ -1399,18 +1399,34 @@ fn range_and_base_types_match_the_synced_catalog_kinds() {
             "CREATE TYPE floatrange AS RANGE (subtype = float8);",
             TypeCreationKind::Range {
                 subtype: Some("float8".to_string()),
+                multirange_type_name: None,
+                collation: None,
+                opclass: None,
+                canonical: None,
+                subtype_diff: None,
             },
         ),
         (
             "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
-            TypeCreationKind::Base { element: None },
+            TypeCreationKind::Base {
+                options: crate::_internal::model::types::BaseTypeOptions {
+                    input: Some("int4in".to_string()),
+                    output: Some("int4out".to_string()),
+                    ..Default::default()
+                },
+            },
         ),
         (
             // PostgreSQL spells the base-type element `ELEMENT`; `typelem`
             // is only the catalog column name.
             "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out, ELEMENT = int4);",
             TypeCreationKind::Base {
-                element: Some("int4".to_string()),
+                options: crate::_internal::model::types::BaseTypeOptions {
+                    input: Some("int4in".to_string()),
+                    output: Some("int4out".to_string()),
+                    element: Some("int4".to_string()),
+                    ..Default::default()
+                },
             },
         ),
     ] {
@@ -1450,16 +1466,19 @@ fn unsupported_create_policy_semantics_are_not_silent() {
 }
 
 #[test]
-fn unsupported_alter_type_actions_are_not_silent_noops() {
+fn supported_alter_type_actions_produce_typed_facts() {
     for sql in [
         "ALTER TYPE mood OWNER TO app_user;",
         "ALTER TYPE mood ADD ATTRIBUTE label text;",
+        "ALTER TYPE mood DROP ATTRIBUTE label;",
+        "ALTER TYPE mood ALTER ATTRIBUTE label TYPE varchar(50);",
+        "ALTER TYPE mood RENAME ATTRIBUTE label TO new_label;",
     ] {
         let parsed = SourceFile::parse(sql);
         let statement = parsed.tree().stmts().next().expect("statement");
         assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unsupported ALTER TYPE action must use the opaque engine path: {sql}"
+            AstVisitor::extract(&statement).is_some(),
+            "supported ALTER TYPE action must produce a typed fact: {sql}"
         );
     }
 }

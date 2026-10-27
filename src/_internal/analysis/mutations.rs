@@ -473,6 +473,7 @@ pub(crate) struct DropTypeMutation {
 pub(crate) struct CreateTypeMutation {
     pub id: ObjectId,
     pub kind: TypeKind,
+    pub multirange_name: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -481,6 +482,7 @@ pub(crate) struct AlterTypeMutation {
     pub action: AlterTypeActionMutation,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTypeActionMutation {
     AddValue {
@@ -491,6 +493,32 @@ pub(crate) enum AlterTypeActionMutation {
     RenameValue {
         old_value: String,
         new_value: String,
+    },
+    OwnerTo {
+        new_owner: crate::_internal::analysis::facts::RoleFact,
+    },
+    AddAttribute {
+        name: String,
+        data_type: String,
+        collation: Option<String>,
+    },
+    DropAttribute {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterAttributeType {
+        name: String,
+        data_type: String,
+        collation: Option<String>,
+        cascade: bool,
+    },
+    RenameAttribute {
+        old_name: String,
+        new_name: String,
+    },
+    SetOptions {
+        options: crate::_internal::model::types::BaseTypeOptions,
     },
 }
 

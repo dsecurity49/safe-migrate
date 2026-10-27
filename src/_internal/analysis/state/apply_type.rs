@@ -68,6 +68,157 @@ impl AnalysisState {
         if let Err(result) = self.check_created_type(&create.kind) {
             return result;
         }
+
+        let mut kind = create.kind.clone();
+        let mut companion_id = None;
+
+        if let TypeKind::Range {
+            ref subtype,
+            ref subtype_id,
+            ref mut multirange,
+            ..
+        } = kind
+        {
+            let multirange_id = create
+                .multirange_name
+                .clone()
+                .unwrap_or_else(|| Self::multirange_companion_id(&create.id));
+
+            if self.relation_namespace_is_taken(&multirange_id) {
+                return MutationResult::conflict(format!(
+                    "type '{}' already exists",
+                    multirange_id
+                ));
+            }
+            if let Err(result) = self.ensure_creation_target(&multirange_id) {
+                return result;
+            }
+
+            *multirange = Some(multirange_id.clone());
+            companion_id = Some(multirange_id);
+
+            // Register constructors for range and multirange.
+            let subtype_name = subtype.as_deref().unwrap_or("anyelement");
+            let range_schema = &create.id.schema;
+            let range_name = &create.id.name;
+
+            let make_constructor = |id: ObjectId,
+                                    arg_types: Vec<String>,
+                                    arg_type_ids: Vec<Option<ObjectId>>,
+                                    ret_type: String,
+                                    ret_id: Option<ObjectId>,
+                                    owner: ObjectId| {
+                crate::_internal::model::function::FunctionState {
+                    id,
+                    internal_type_owner: Some(owner),
+                    routine_kind: crate::_internal::model::function::RoutineKind::Function,
+                    arg_types,
+                    arg_type_ids,
+                    return_type: ret_type,
+                    return_type_id: ret_id,
+                    returns_set: false,
+                    parameters: Vec::new(),
+                    default_count: 0,
+                    volatility: crate::_internal::model::function::Volatility::Immutable,
+                    language: "internal".to_string(),
+                    security: crate::_internal::model::function::SecurityMode::Invoker,
+                    aggregate: None,
+                }
+            };
+
+            // Range constructors: range(subtype, subtype), range(subtype, subtype, text)
+            let r_ctor2_id = ObjectId::new(
+                range_schema,
+                format!("{range_name}({subtype_name},{subtype_name})"),
+            );
+            let r_ctor2 = make_constructor(
+                r_ctor2_id.clone(),
+                vec![subtype_name.to_string(), subtype_name.to_string()],
+                vec![subtype_id.clone(), subtype_id.clone()],
+                create.id.to_string(),
+                Some(create.id.clone()),
+                create.id.clone(),
+            );
+            self.snapshot_function(&r_ctor2_id);
+            self.local
+                .functions
+                .insert(r_ctor2_id, FunctionOverlay::Present(r_ctor2));
+
+            let r_ctor3_id = ObjectId::new(
+                range_schema,
+                format!("{range_name}({subtype_name},{subtype_name},text)"),
+            );
+            let r_ctor3 = make_constructor(
+                r_ctor3_id.clone(),
+                vec![
+                    subtype_name.to_string(),
+                    subtype_name.to_string(),
+                    "text".to_string(),
+                ],
+                vec![
+                    subtype_id.clone(),
+                    subtype_id.clone(),
+                    Some(ObjectId::new("pg_catalog", "text")),
+                ],
+                create.id.to_string(),
+                Some(create.id.clone()),
+                create.id.clone(),
+            );
+            self.snapshot_function(&r_ctor3_id);
+            self.local
+                .functions
+                .insert(r_ctor3_id, FunctionOverlay::Present(r_ctor3));
+
+            // Multirange constructors in range's schema: mr(), mr(range), mr(range[])
+            let mr_id = companion_id.as_ref().unwrap();
+            let mr_name = &mr_id.name;
+
+            let mr_ctor0_id = ObjectId::new(range_schema, format!("{mr_name}()"));
+            let mr_ctor0 = make_constructor(
+                mr_ctor0_id.clone(),
+                Vec::new(),
+                Vec::new(),
+                mr_id.to_string(),
+                Some(mr_id.clone()),
+                mr_id.clone(),
+            );
+            self.snapshot_function(&mr_ctor0_id);
+            self.local
+                .functions
+                .insert(mr_ctor0_id, FunctionOverlay::Present(mr_ctor0));
+
+            let mr_ctor1_id = ObjectId::new(range_schema, format!("{mr_name}({})", create.id.name));
+            let mr_ctor1 = make_constructor(
+                mr_ctor1_id.clone(),
+                vec![create.id.name.clone()],
+                vec![Some(create.id.clone())],
+                mr_id.to_string(),
+                Some(mr_id.clone()),
+                mr_id.clone(),
+            );
+            self.snapshot_function(&mr_ctor1_id);
+            self.local
+                .functions
+                .insert(mr_ctor1_id, FunctionOverlay::Present(mr_ctor1));
+
+            let mr_ctor2_id = ObjectId::new(
+                range_schema,
+                format!("{mr_name}(VARIADIC {}[])", create.id.name),
+            );
+            let mr_ctor2 = make_constructor(
+                mr_ctor2_id.clone(),
+                vec![format!("{}[]", create.id.name)],
+                vec![Some(Self::array_type_id(&create.id))],
+                mr_id.to_string(),
+                Some(mr_id.clone()),
+                mr_id.clone(),
+            );
+            self.snapshot_function(&mr_ctor2_id);
+            self.local
+                .functions
+                .insert(mr_ctor2_id, FunctionOverlay::Present(mr_ctor2));
+        }
+
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -78,9 +229,27 @@ impl AnalysisState {
                 id: create.id.clone(),
                 generation,
                 owner: ObjectId::new("", self.local.current_role.clone()),
-                kind: create.kind.clone(),
+                kind,
             }),
         );
+
+        if let Some(multirange_id) = companion_id {
+            self.snapshot_type(&multirange_id);
+            self.local.generation_counter += 1;
+            let mr_gen = self.local.generation_counter;
+            self.local.types.insert(
+                multirange_id.clone(),
+                TypeOverlay::Present(TypeState {
+                    id: multirange_id,
+                    generation: mr_gen,
+                    owner: ObjectId::new("", self.local.current_role.clone()),
+                    kind: TypeKind::Multirange {
+                        range: Some(create.id.clone()),
+                    },
+                }),
+            );
+        }
+
         MutationResult::Applied
     }
 
@@ -264,6 +433,7 @@ impl AnalysisState {
                 TypeKind::Range {
                     subtype,
                     subtype_id,
+                    multirange,
                     ..
                 } => {
                     if let Some(new_id) = subtype_id
@@ -279,8 +449,23 @@ impl AnalysisState {
                         }
                         *subtype_id = Some(new_id);
                     }
+                    if multirange.as_ref() == Some(&rename.old_id) {
+                        *multirange = Some(rename.new_id.clone());
+                    }
                 }
-                TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange { .. } => {}
+                TypeKind::Multirange { range } => {
+                    if range.as_ref() == Some(&rename.old_id) {
+                        *range = Some(rename.new_id.clone());
+                    }
+                }
+                TypeKind::Base { options, .. } => {
+                    if let Some(ref elem) = options.element
+                        && (elem == &rename.old_id.name || elem == &rename.old_id.to_string())
+                    {
+                        options.element = Some(rename.new_id.name.clone());
+                    }
+                }
+                TypeKind::Enum { .. } => {}
             }
         }
         for (old_id, new_id, arg_types, return_type) in remapped_functions {
@@ -318,6 +503,29 @@ impl AnalysisState {
                 }
             }
         }
+
+        // Remap extension membership when a type is renamed or moved across schemas.
+        for overlay in self.local.extensions.values_mut() {
+            let crate::_internal::model::extension::ExtensionOverlay::Present(ext) = overlay else {
+                continue;
+            };
+            if ext.members.iter().any(|m| {
+                m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
+                    && m.id == rename.old_id
+            }) {
+                let mut updated_members = std::collections::BTreeSet::new();
+                for mut m in ext.members.iter().cloned() {
+                    if m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
+                        && m.id == rename.old_id
+                    {
+                        m.id = rename.new_id.clone();
+                    }
+                    updated_members.insert(m);
+                }
+                ext.members = updated_members;
+            }
+        }
+
         MutationResult::Applied
     }
 
@@ -332,20 +540,210 @@ impl AnalysisState {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
-        if matches!(&alter.action, AlterTypeActionMutation::AddValue { .. })
+        if matches!(
+            &alter.action,
+            AlterTypeActionMutation::AddValue { .. } | AlterTypeActionMutation::RenameValue { .. }
+        ) && !matches!(
+            self.local.types.get(&alter.id),
+            Some(TypeOverlay::Present(TypeState {
+                kind: TypeKind::Enum { .. },
+                ..
+            }))
+        ) {
+            return MutationResult::conflict(format!("type '{}' is not an enum", alter.id));
+        }
+
+        if matches!(
+            &alter.action,
+            AlterTypeActionMutation::AddAttribute { .. }
+                | AlterTypeActionMutation::DropAttribute { .. }
+                | AlterTypeActionMutation::AlterAttributeType { .. }
+                | AlterTypeActionMutation::RenameAttribute { .. }
+        ) && !matches!(
+            self.local.types.get(&alter.id),
+            Some(TypeOverlay::Present(TypeState {
+                kind: TypeKind::Composite { .. },
+                ..
+            }))
+        ) {
+            return MutationResult::conflict(format!(
+                "type '{}' is not a composite type",
+                alter.id
+            ));
+        }
+
+        if matches!(&alter.action, AlterTypeActionMutation::SetOptions { .. })
             && !matches!(
                 self.local.types.get(&alter.id),
                 Some(TypeOverlay::Present(TypeState {
-                    kind: TypeKind::Enum { .. },
+                    kind: TypeKind::Base { .. },
                     ..
                 }))
             )
         {
-            return MutationResult::conflict(format!("type '{}' is not an enum", alter.id));
+            return MutationResult::conflict(format!("type '{}' is not a base type", alter.id));
         }
+
+        // Check if typed tables require CASCADE for attribute changes.
+        let typed_tables: Vec<ObjectId> = self
+            .local
+            .relations
+            .iter()
+            .filter_map(|(id, overlay)| match overlay {
+                RelationOverlay::Present(rel) if rel.of_type.as_ref() == Some(&alter.id) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        match &alter.action {
+            AlterTypeActionMutation::DropAttribute { cascade, .. }
+            | AlterTypeActionMutation::AlterAttributeType { cascade, .. }
+                if !typed_tables.is_empty() && !cascade =>
+            {
+                return MutationResult::conflict(format!(
+                    "cannot alter type \"{}\" because it is the type of a typed table",
+                    alter.id.name
+                ));
+            }
+            _ => {}
+        }
+
+        let resolved_attr_type_id = match &alter.action {
+            AlterTypeActionMutation::AddAttribute { data_type, .. }
+            | AlterTypeActionMutation::AlterAttributeType { data_type, .. } => {
+                self.resolve_type_reference(data_type)
+            }
+            _ => None,
+        };
+
         self.snapshot_type(&alter.id);
         if let Some(TypeOverlay::Present(existing)) = self.local.types.get_mut(&alter.id) {
             match &alter.action {
+                AlterTypeActionMutation::OwnerTo { new_owner } => {
+                    let owner_id = Self::resolve_role_name(
+                        new_owner,
+                        &self.local.current_role,
+                        &self.local.session_role,
+                    )
+                    .unwrap_or_else(|| ObjectId::new("", "unknown"));
+                    existing.owner = owner_id;
+                }
+                AlterTypeActionMutation::SetOptions { options } => {
+                    if let TypeKind::Base {
+                        options: base_opts,
+                        shell,
+                    } = &mut existing.kind
+                    {
+                        *base_opts = options.clone();
+                        *shell = false;
+                    }
+                }
+                AlterTypeActionMutation::AddAttribute {
+                    name,
+                    data_type,
+                    collation,
+                } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        if fields.iter().any(|f| f.name == *name) {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" already exists",
+                                name, alter.id.name
+                            ));
+                        }
+                        let collation_id = collation.as_deref().and_then(|written| {
+                            let w = if let Some((s, n)) = written.split_once('.') {
+                                crate::_internal::model::index::WrittenName {
+                                    schema: Some(s.to_string()),
+                                    name: n.to_string(),
+                                }
+                            } else {
+                                crate::_internal::model::index::WrittenName {
+                                    schema: None,
+                                    name: written.to_string(),
+                                }
+                            };
+                            self.local
+                                .collations
+                                .resolve(&w, &self.local.search_path)
+                                .map(|c| ObjectId::new(c.schema, c.name))
+                        });
+                        fields.push(crate::_internal::model::types::CompositeFieldState {
+                            name: name.clone(),
+                            data_type: data_type.clone(),
+                            data_type_id: resolved_attr_type_id.clone(),
+                            collation: collation.clone(),
+                            collation_id,
+                        });
+                    }
+                }
+                AlterTypeActionMutation::DropAttribute {
+                    name, if_exists, ..
+                } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        if let Some(idx) = fields.iter().position(|f| f.name == *name) {
+                            fields.remove(idx);
+                        } else if !if_exists {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, alter.id.name
+                            ));
+                        }
+                    }
+                }
+                AlterTypeActionMutation::AlterAttributeType {
+                    name,
+                    data_type,
+                    collation,
+                    ..
+                } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        let Some(field) = fields.iter_mut().find(|f| f.name == *name) else {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, alter.id.name
+                            ));
+                        };
+                        field.data_type = data_type.clone();
+                        field.data_type_id = resolved_attr_type_id.clone();
+                        field.collation = collation.clone();
+                        field.collation_id = collation.as_deref().and_then(|written| {
+                            let w = if let Some((s, n)) = written.split_once('.') {
+                                crate::_internal::model::index::WrittenName {
+                                    schema: Some(s.to_string()),
+                                    name: n.to_string(),
+                                }
+                            } else {
+                                crate::_internal::model::index::WrittenName {
+                                    schema: None,
+                                    name: written.to_string(),
+                                }
+                            };
+                            self.local
+                                .collations
+                                .resolve(&w, &self.local.search_path)
+                                .map(|c| ObjectId::new(c.schema, c.name))
+                        });
+                    }
+                }
+                AlterTypeActionMutation::RenameAttribute { old_name, new_name } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        if fields.iter().any(|f| f.name == *new_name) {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" already exists",
+                                new_name, alter.id.name
+                            ));
+                        }
+                        let Some(field) = fields.iter_mut().find(|f| f.name == *old_name) else {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                old_name, alter.id.name
+                            ));
+                        };
+                        field.name = new_name.clone();
+                    }
+                }
                 AlterTypeActionMutation::AddValue {
                     new_value,
                     neighbor,
@@ -397,6 +795,54 @@ impl AnalysisState {
                 }
             }
         }
+
+        // Synchronize typed tables with composite alterations
+        for tbl_id in typed_tables {
+            self.snapshot_relation(&tbl_id);
+            if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&tbl_id) {
+                match &alter.action {
+                    AlterTypeActionMutation::AddAttribute {
+                        name, data_type, ..
+                    } => {
+                        if !rel.columns.iter().any(|c| c.name == *name) {
+                            rel.columns.push(crate::_internal::model::column::Column {
+                                name: name.clone(),
+                                data_type: Some(data_type.clone()),
+                                type_id: resolved_attr_type_id.clone(),
+                                is_nullable: true,
+                                default: None,
+                                avg_width: None,
+                                default_expr_text: None,
+                                type_modifier: None,
+                                storage: None,
+                                compression: None,
+                                statistics_target: None,
+                                options: Default::default(),
+                                generated: None,
+                            });
+                        }
+                    }
+                    AlterTypeActionMutation::DropAttribute { name, .. } => {
+                        rel.columns.retain(|c| c.name != *name);
+                    }
+                    AlterTypeActionMutation::AlterAttributeType {
+                        name, data_type, ..
+                    } => {
+                        if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *name) {
+                            col.data_type = Some(data_type.clone());
+                            col.type_id = resolved_attr_type_id.clone();
+                        }
+                    }
+                    AlterTypeActionMutation::RenameAttribute { old_name, new_name } => {
+                        if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *old_name) {
+                            col.name = new_name.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         MutationResult::Applied
     }
 
