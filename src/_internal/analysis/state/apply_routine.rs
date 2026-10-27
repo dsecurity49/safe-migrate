@@ -657,7 +657,10 @@ impl AnalysisState {
                     // PostgreSQL created this routine as an internal part of a
                     // type (a range constructor) and refuses to drop it while
                     // that type exists.
-                    if let Some(owner) = self.routine_internal_type_owner(&id) {
+                    if let Some(owner) = self.routine_internal_type_owner(&id)
+                        && self.type_is_present(owner)
+                        && !self.co_dropped_objects.contains(owner)
+                    {
                         return MutationResult::conflict(format!(
                             "function '{}' cannot be dropped because type '{}' requires it",
                             id, owner
@@ -673,8 +676,11 @@ impl AnalysisState {
                             else {
                                 return None;
                             };
-                            (function_id == &id)
-                                .then(|| (edge.dependent.clone(), edge.referenced.clone()))
+                            // A DROP EXTENSION removes member triggers together
+                            // with the function, so they are not external here.
+                            (function_id == &id
+                                && !self.co_dropped_objects.contains(&edge.dependent))
+                            .then(|| (edge.dependent.clone(), edge.referenced.clone()))
                         })
                         .collect();
                     if !dependent_triggers.is_empty() && !function.cascade {
@@ -695,7 +701,8 @@ impl AnalysisState {
                             else {
                                 return None;
                             };
-                            Some((edge.dependent.clone(), unresolved_name.clone()))
+                            (!self.co_dropped_objects.contains(&edge.dependent))
+                                .then(|| (edge.dependent.clone(), unresolved_name.clone()))
                         })
                         .collect();
                     if !dependent_views.is_empty() && !function.cascade {
@@ -1360,7 +1367,8 @@ impl AnalysisState {
                         let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind else {
                             return None;
                         };
-                        Some((edge.dependent.clone(), unresolved_name.clone()))
+                        (!self.co_dropped_objects.contains(&edge.dependent))
+                            .then(|| (edge.dependent.clone(), unresolved_name.clone()))
                     })
             })
             .collect();

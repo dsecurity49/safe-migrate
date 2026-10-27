@@ -1245,48 +1245,56 @@ impl AnalysisState {
         ids
     }
 
-    fn has_type_dependents(&self, id: &ObjectId) -> bool {
+    pub(super) fn has_type_dependents(&self, id: &ObjectId) -> bool {
+        // Extension drops call this after seeding co_dropped_objects, so a
+        // dependent member scheduled in the same statement is not external.
         let ids = self.type_dependent_ids(id);
         let matches_id = |reference: Option<&ObjectId>| {
             ids.iter()
                 .any(|id| Self::type_reference_matches(reference, id))
         };
-        self.local.relations.values().any(|overlay| {
-            matches!(overlay, RelationOverlay::Present(relation)
-                if relation.of_type.as_ref() == Some(id)
-                    || relation.columns.iter().any(|column| matches_id(column.type_id.as_ref())))
-        }) || self.local.functions.values().any(|overlay| {
-            matches!(overlay, FunctionOverlay::Present(function)
-                // A routine PostgreSQL created as an internal part of the type
-                // (a range constructor) is dropped with it, so it does not
-                // require CASCADE.
-                if function.internal_type_owner.as_ref() != Some(id)
-                    && (function.arg_type_ids.iter().flatten().any(|type_id| matches_id(Some(type_id)))
-                        || matches_id(function.return_type_id.as_ref())))
-        }) || self.local.types.values().any(|overlay| {
-            matches!(overlay, TypeOverlay::Present(TypeState {
-                kind: TypeKind::Domain { base_type_id: Some(base), .. },
-                ..
-            }) if matches_id(Some(base)))
-        }) || self.local.types.values().any(|overlay| {
-            matches!(overlay, TypeOverlay::Present(TypeState {
-                kind: TypeKind::Composite { fields },
-                ..
-            }) if fields.iter().any(|f| matches_id(f.data_type_id.as_ref())))
-        }) || self.local.types.values().any(|overlay| {
-            matches!(overlay, TypeOverlay::Present(TypeState {
-                kind: TypeKind::Range { subtype_id: Some(sub_id), .. },
-                ..
-            }) if matches_id(Some(sub_id)))
+        self.local.relations.iter().any(|(relation_id, overlay)| {
+            !self.co_dropped_objects.contains(relation_id)
+                && matches!(overlay, RelationOverlay::Present(relation)
+                    if relation.of_type.as_ref() == Some(id)
+                        || relation.columns.iter().any(|column| matches_id(column.type_id.as_ref())))
+        }) || self.local.functions.iter().any(|(function_id, overlay)| {
+            !self.co_dropped_objects.contains(function_id)
+                && matches!(overlay, FunctionOverlay::Present(function)
+                    // A routine PostgreSQL created as an internal part of the
+                    // type (a range constructor) is dropped with it, so it
+                    // does not require CASCADE.
+                    if function.internal_type_owner.as_ref() != Some(id)
+                        && (function.arg_type_ids.iter().flatten().any(|type_id| matches_id(Some(type_id)))
+                            || matches_id(function.return_type_id.as_ref())))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { base_type_id: Some(base), .. },
+                    ..
+                }) if matches_id(Some(base)))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Composite { fields },
+                    ..
+                }) if fields.iter().any(|f| matches_id(f.data_type_id.as_ref())))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Range { subtype_id: Some(sub_id), .. },
+                    ..
+                }) if matches_id(Some(sub_id)))
         }) || ids.iter().any(|blocking| {
             [blocking.clone(), Self::array_type_id(blocking)]
                 .iter()
                 .any(|probe| {
                     self.local.graph.views_for_type(probe).iter().any(|edge| {
-                        matches!(
-                            self.local.relations.get(&edge.dependent),
-                            Some(RelationOverlay::Present(_))
-                        )
+                        !self.co_dropped_objects.contains(&edge.dependent)
+                            && matches!(
+                                self.local.relations.get(&edge.dependent),
+                                Some(RelationOverlay::Present(_))
+                            )
                     })
                 })
         })

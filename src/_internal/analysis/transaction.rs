@@ -14,6 +14,7 @@ pub(crate) struct NamespaceSnapshot {
     pub types: HashMap<ObjectId, TypeOverlay>,
     pub functions: HashMap<ObjectId, crate::_internal::model::function::FunctionOverlay>,
     pub sequences: HashMap<ObjectId, SequenceOverlay>,
+    pub collations: crate::_internal::model::collation::CollationCatalogue,
     pub extensions: HashMap<String, crate::_internal::model::extension::ExtensionOverlay>,
     pub publications: HashMap<String, crate::_internal::model::replication::PublicationOverlay>,
     pub triggers: HashMap<ObjectId, crate::_internal::model::trigger::TriggerOverlay>,
@@ -53,7 +54,6 @@ pub(crate) enum StateChange {
         id: ObjectId,
         previous: Option<SequenceOverlay>,
     },
-    #[allow(dead_code)] // Consumed by extension transitions.
     ExtensionSnapshot {
         name: String,
         previous: Option<crate::_internal::model::extension::ExtensionOverlay>,

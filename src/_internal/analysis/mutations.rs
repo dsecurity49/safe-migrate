@@ -90,6 +90,9 @@ pub(crate) enum Mutation {
     CreateType(CreateTypeMutation),
     AlterType(AlterTypeMutation),
     RenameType(Rename),
+    CreateExtension(CreateExtensionMutation),
+    AlterExtension(AlterExtensionMutation),
+    DropExtension(DropExtensionMutation),
     CreateDomain(CreateDomainMutation),
     AlterDomain(AlterDomainMutation),
     DropDomain(DropDomainMutation),
@@ -403,6 +406,36 @@ impl SequenceOptionMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DropSequenceMutation {
     pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateExtensionMutation {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub schema: Option<String>,
+    pub version: Option<String>,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterExtensionMutation {
+    pub name: String,
+    pub action: AlterExtensionActionMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterExtensionActionMutation {
+    Add(crate::_internal::model::extension::ExtensionMember),
+    Drop(crate::_internal::model::extension::ExtensionMember),
+    Update { version: Option<String> },
+    SetSchema { new_schema: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropExtensionMutation {
+    pub names: Vec<String>,
     pub if_exists: bool,
     pub cascade: bool,
 }

@@ -28,6 +28,7 @@ use crate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
+mod apply_extension;
 mod apply_misc;
 mod apply_policy_trigger;
 mod apply_relation;
@@ -302,6 +303,9 @@ pub(crate) struct AnalysisState {
     /// Out-of-scope schemas that reference the scope through a catalog class
     /// the model does not hold, so no edge can attribute them to a family.
     pub external_referencing_schemas: BTreeSet<String>,
+    /// Objects removed by the current statement. Dependency checks treat them
+    /// as internal, so one member of a multi-object drop does not block another.
+    pub co_dropped_objects: HashSet<ObjectId>,
     pub local: LocalState,
 }
 

@@ -38,6 +38,7 @@ impl AnalysisState {
                     self.local.types = snapshot.types;
                     self.local.functions = snapshot.functions;
                     self.local.sequences = snapshot.sequences;
+                    self.local.collations = snapshot.collations;
                     self.local.extensions = snapshot.extensions;
                     self.local.publications = snapshot.publications;
                     self.local.triggers = snapshot.triggers;

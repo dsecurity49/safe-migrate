@@ -44,7 +44,6 @@ pub(crate) struct ExtensionConfigTable {
     pub condition: Option<String>,
 }
 
-#[allow(dead_code)] // Consumed by extension transitions.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ExtensionOverlay {
     Present(ExtensionState),

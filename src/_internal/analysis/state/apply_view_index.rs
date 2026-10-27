@@ -537,6 +537,9 @@ impl AnalysisState {
                 && matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && roots.contains(self.local.graph.resolve_rename(&edge.referenced))
                 && !roots.contains(self.local.graph.resolve_rename(&edge.dependent))
+                && !self
+                    .co_dropped_objects
+                    .contains(self.local.graph.resolve_rename(&edge.dependent))
         })
     }
 

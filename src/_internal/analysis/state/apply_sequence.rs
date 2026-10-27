@@ -914,6 +914,9 @@ impl AnalysisState {
             let has_default_dependencies = self.local.graph.edges().iter().any(|edge| {
                 edge.referenced == *id
                     && matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                    && !self
+                        .co_dropped_objects
+                        .contains(self.local.graph.resolve_rename(&edge.dependent))
             });
             if (sequence.kind == SequenceKind::SerialLike || has_default_dependencies)
                 && !drop.cascade

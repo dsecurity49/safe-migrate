@@ -660,6 +660,7 @@ impl AnalysisState {
             baseline_sequences,
             scoped_external_dependencies,
             external_referencing_schemas,
+            co_dropped_objects: HashSet::new(),
             local: LocalState {
                 schemas,
                 relations,

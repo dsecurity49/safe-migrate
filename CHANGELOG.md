@@ -13,6 +13,11 @@ notes are available on the
 - Sequences track runtime values, so `ALTER SEQUENCE` bound changes report a
   certain conflict, taint when a cached runtime may have advanced, and
   `TRUNCATE ... RESTART IDENTITY` is treated as unmodeled runtime state.
+- Extensions are modeled from catalog membership: `ALTER EXTENSION SET SCHEMA`
+  moves members atomically, `DROP EXTENSION` drops modeled members in dependency
+  order, and a dependent outside the extension blocks the drop until `CASCADE`.
+  Dropping an extension-owned member directly is reported, and schema renames
+  remap extension membership and collation references.
 - Cache V11 adds domain, sequence-runtime, and extension catalog state. Re-run
   `safe-migrate sync`; older caches are rejected rather than misread.
 

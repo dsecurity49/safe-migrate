@@ -333,6 +333,9 @@ pub(crate) enum StatementFact {
     },
     CreateType(CreateTypeFact),
     AlterType(AlterTypeFact),
+    CreateExtension(CreateExtensionFact),
+    AlterExtension(AlterExtensionFact),
+    DropExtension(DropExtensionFact),
     CreateDomain(CreateDomainFact),
     AlterDomain {
         name: QualifiedName,
@@ -635,6 +638,50 @@ pub(crate) enum AlterTypeActionFact {
         old_value: String,
         new_value: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateExtensionFact {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub schema: Option<String>,
+    pub version: Option<String>,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterExtensionFact {
+    pub name: String,
+    pub action: AlterExtensionActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterExtensionActionFact {
+    Add(ExtensionMemberFact),
+    Drop(ExtensionMemberFact),
+    Update { version: Option<String> },
+    SetSchema { new_schema: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropExtensionFact {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExtensionMemberFact {
+    Named {
+        kind: crate::_internal::model::extension::ExtensionMemberKind,
+        name: QualifiedName,
+    },
+    Routine {
+        name: QualifiedName,
+        params: Vec<String>,
+    },
+    Schema(String),
+    Unmodeled(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
