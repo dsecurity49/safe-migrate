@@ -227,6 +227,17 @@ impl AnalysisState {
             return result;
         }
         let trigger_id = Self::trigger_key(&drop_trigger.table, &drop_trigger.name);
+        let member_id = ObjectId::new(
+            drop_trigger.table.schema.clone(),
+            format!("{}.{}", drop_trigger.table.name, drop_trigger.name),
+        );
+        if let Some(result) = self.extension_member_drop_conflict(
+            crate::_internal::model::extension::ExtensionMemberKind::Trigger,
+            &member_id,
+            "trigger",
+        ) {
+            return result;
+        }
         if self.trigger_lookup(&trigger_id) != TriggerLookup::Present {
             return if drop_trigger.if_exists {
                 MutationResult::NoOp

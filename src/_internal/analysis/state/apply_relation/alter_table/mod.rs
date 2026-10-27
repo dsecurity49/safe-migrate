@@ -359,6 +359,17 @@ impl AnalysisState {
             AlterTableActionMutation::DropConstraint {
                 name, if_exists, ..
             } => {
+                let member_id = ObjectId::new(
+                    alter.id.schema.clone(),
+                    format!("{}.{}", alter.id.name, name),
+                );
+                if let Some(result) = self.extension_member_drop_conflict(
+                    crate::_internal::model::extension::ExtensionMemberKind::Constraint,
+                    &member_id,
+                    "constraint",
+                ) {
+                    return result;
+                }
                 if !self
                     .local
                     .constraints

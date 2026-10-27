@@ -245,6 +245,360 @@ fn drop_extension_requires_cascade_for_external_dependents() {
 }
 
 #[test]
+fn direct_drop_of_an_extension_member_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze("CREATE TABLE public.items (id integer);", &mut state)
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Relation, "public", "items")],
+    );
+
+    let violations = engine
+        .analyze("DROP TABLE public.items;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.relation_is_present(&object_id("public", "items")));
+}
+
+#[test]
+fn direct_drop_of_an_extension_sequence_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze("CREATE SEQUENCE public.items_seq;", &mut state)
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Sequence, "public", "items_seq")],
+    );
+
+    let violations = engine
+        .analyze("DROP SEQUENCE public.items_seq;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.sequence_is_present(&object_id("public", "items_seq")));
+}
+
+#[test]
+fn direct_drop_of_an_extension_domain_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN public.positive AS integer CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Type, "public", "positive")],
+    );
+
+    let violations = engine
+        .analyze("DROP DOMAIN public.positive;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(
+        state
+            .local
+            .types
+            .contains_key(&object_id("public", "positive"))
+    );
+}
+
+#[test]
+fn direct_drop_of_an_extension_type_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze("CREATE TYPE public.mood AS ENUM ('ok');", &mut state)
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Type, "public", "mood")],
+    );
+
+    let violations = engine
+        .analyze("DROP TYPE public.mood;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.local.types.contains_key(&object_id("public", "mood")));
+}
+
+#[test]
+fn direct_drop_of_an_extension_view_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE VIEW public.items_view AS SELECT 1 AS id;",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(
+            ExtensionMemberKind::Relation,
+            "public",
+            "items_view",
+        )],
+    );
+
+    let violations = engine
+        .analyze("DROP VIEW public.items_view;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.relation_is_present(&object_id("public", "items_view")));
+}
+
+#[test]
+fn direct_drop_of_an_extension_materialized_view_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE MATERIALIZED VIEW public.items_mv AS SELECT 1 AS id;",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Relation, "public", "items_mv")],
+    );
+
+    let violations = engine
+        .analyze("DROP MATERIALIZED VIEW public.items_mv;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.relation_is_present(&object_id("public", "items_mv")));
+}
+
+#[test]
+fn direct_drop_of_an_extension_index_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE public.items (id integer);
+             CREATE INDEX items_id_idx ON public.items (id);",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Index, "public", "items_id_idx")],
+    );
+
+    let violations = engine
+        .analyze("DROP INDEX public.items_id_idx;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.index_is_present(&object_id("public", "items_id_idx")));
+}
+
+#[test]
+fn direct_drop_of_an_extension_function_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION public.f() RETURNS integer LANGUAGE sql AS 'SELECT 1';",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Routine, "public", "f()")],
+    );
+
+    let violations = engine
+        .analyze("DROP FUNCTION public.f();", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(
+        state
+            .local
+            .functions
+            .contains_key(&object_id("public", "f()"))
+    );
+}
+
+#[test]
+fn direct_drop_of_an_extension_procedure_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE PROCEDURE public.p() LANGUAGE sql AS 'SELECT 1';",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Routine, "public", "p()")],
+    );
+
+    let violations = engine
+        .analyze("DROP PROCEDURE public.p();", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(
+        state
+            .local
+            .functions
+            .contains_key(&object_id("public", "p()"))
+    );
+}
+
+#[test]
+fn direct_drop_of_an_extension_aggregate_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE AGGREGATE public.total(integer) (sfunc = int4pl, stype = integer);",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(
+            ExtensionMemberKind::Routine,
+            "public",
+            "total(integer)",
+        )],
+    );
+
+    let violations = engine
+        .analyze("DROP AGGREGATE public.total(integer);", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(
+        state
+            .local
+            .functions
+            .contains_key(&object_id("public", "total(integer)"))
+    );
+}
+
+#[test]
+fn direct_drop_of_an_extension_schema_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine.analyze("CREATE SCHEMA app;", &mut state).unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(ExtensionMemberKind::Schema, "", "app")],
+    );
+
+    let violations = engine.analyze("DROP SCHEMA app;", &mut state).unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(state.local.schemas.contains_key("app"));
+}
+
+#[test]
 fn set_schema_rejects_a_target_schema_owned_by_the_extension() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -534,6 +888,90 @@ fn drop_extension_ignores_trigger_dependencies_between_its_members() {
         overlay,
         safe_migrate::_internal::model::trigger::TriggerOverlay::Present(_)
     )));
+}
+
+#[test]
+fn direct_drop_of_an_extension_trigger_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE public.external_table (id integer);
+             CREATE FUNCTION public.f() RETURNS trigger
+                 LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+             CREATE TRIGGER trg BEFORE INSERT ON public.external_table
+                 FOR EACH ROW EXECUTE FUNCTION public.f();",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(
+            ExtensionMemberKind::Trigger,
+            "public",
+            "external_table.trg",
+        )],
+    );
+
+    let violations = engine
+        .analyze("DROP TRIGGER trg ON public.external_table;", &mut state)
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert_eq!(state.local.triggers.len(), 1);
+}
+
+#[test]
+fn direct_drop_of_an_extension_constraint_is_rejected() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE public.items (
+                 id integer CONSTRAINT items_id_check CHECK (id > 0)
+             );",
+            &mut state,
+        )
+        .unwrap();
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [member(
+            ExtensionMemberKind::Constraint,
+            "public",
+            "items.items_id_check",
+        )],
+    );
+
+    let violations = engine
+        .analyze(
+            "ALTER TABLE public.items DROP CONSTRAINT items_id_check;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(violations.iter().any(|violation| {
+        violation.rule_id == "chain-conflict"
+            && violation
+                .reason
+                .contains("because extension ext requires it")
+    }));
+    assert!(
+        state
+            .local
+            .constraints
+            .contains_key(&(object_id("public", "items"), "items_id_check".to_string()))
+    );
 }
 
 #[test]

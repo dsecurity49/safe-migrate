@@ -9,6 +9,16 @@ impl AnalysisState {
         if drop_table.ids.is_empty() {
             return MutationResult::NoOp;
         }
+        for id in &drop_table.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Relation,
+                id,
+                "table",
+            ) {
+                return result;
+            }
+        }
+
         let renames: Vec<DependencyEdge> = self
             .local
             .graph

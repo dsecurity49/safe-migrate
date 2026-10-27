@@ -863,6 +863,15 @@ impl AnalysisState {
 
     pub(super) fn apply_drop_sequence(&mut self, drop: &DropSequenceMutation) -> MutationResult {
         for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Sequence,
+                id,
+                "sequence",
+            ) {
+                return result;
+            }
+        }
+        for id in &drop.ids {
             match self.sequence_lookup(id) {
                 SequenceLookup::Present => {}
                 SequenceLookup::AuthoritativelyAbsent | SequenceLookup::Tombstone

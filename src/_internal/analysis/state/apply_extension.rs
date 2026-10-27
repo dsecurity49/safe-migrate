@@ -1272,6 +1272,51 @@ impl AnalysisState {
         })
     }
 
+    pub(super) fn extension_member_drop_conflict(
+        &self,
+        kind: ExtensionMemberKind,
+        id: &ObjectId,
+        object_name: &str,
+    ) -> Option<MutationResult> {
+        let extension = self.local.extensions.iter().find_map(|(name, overlay)| {
+            let ExtensionOverlay::Present(extension) = overlay else {
+                return None;
+            };
+            extension
+                .members
+                .iter()
+                .any(|member| {
+                    member.kind == kind && self.resolve_extension_member(member).id == *id
+                })
+                .then_some(name.as_str())
+        })?;
+        Some(MutationResult::conflict(format!(
+            "cannot drop {object_name} {id} because extension {extension} requires it"
+        )))
+    }
+
+    pub(super) fn extension_schema_drop_conflict(&self, name: &str) -> Option<MutationResult> {
+        let extension = self
+            .local
+            .extensions
+            .iter()
+            .find_map(|(extension_name, overlay)| {
+                let ExtensionOverlay::Present(extension) = overlay else {
+                    return None;
+                };
+                extension
+                    .members
+                    .iter()
+                    .any(|member| {
+                        member.kind == ExtensionMemberKind::Schema && member.id.name == name
+                    })
+                    .then_some(extension_name.as_str())
+            })?;
+        Some(MutationResult::conflict(format!(
+            "cannot drop schema {name} because extension {extension} requires it"
+        )))
+    }
+
     fn extension_member_presence(&self, member: &ExtensionMember) -> ExtensionMemberPresence {
         let member = self.resolve_extension_member(member);
         match &member.kind {

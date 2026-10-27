@@ -637,6 +637,13 @@ impl AnalysisState {
             );
             let schema = self.resolve_function_schema(&signature.name, &signature_name);
             let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "function",
+            ) {
+                return result;
+            }
             match self.routine_lookup(&id, |kind| {
                 matches!(kind, RoutineKind::Function | RoutineKind::Window)
             }) {
@@ -984,6 +991,13 @@ impl AnalysisState {
             );
             let schema = self.resolve_function_schema(&signature.name, &signature_name);
             let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "procedure",
+            ) {
+                return result;
+            }
             match self.routine_lookup(&id, |kind| kind == RoutineKind::Procedure) {
                 RoutineLookup::Present => {
                     if !targets.contains(&id) {
@@ -1326,6 +1340,13 @@ impl AnalysisState {
             );
             let schema = self.resolve_function_schema(&signature.name, &signature_name);
             let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "aggregate",
+            ) {
+                return result;
+            }
             match self.routine_lookup(&id, |kind| kind == RoutineKind::Aggregate) {
                 RoutineLookup::Present => {
                     if !targets.contains(&id) {

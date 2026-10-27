@@ -1134,6 +1134,15 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_domain(&mut self, drop: &DropDomainMutation) -> MutationResult {
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Type,
+                id,
+                "type",
+            ) {
+                return result;
+            }
+        }
         let mut present = Vec::new();
         for id in &drop.ids {
             match self.type_lookup(id, |kind| matches!(kind, TypeKind::Domain { .. })) {
@@ -1157,6 +1166,15 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_type(&mut self, drop: &DropTypeMutation) -> MutationResult {
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Type,
+                id,
+                "type",
+            ) {
+                return result;
+            }
+        }
         let mut present = Vec::new();
         for id in &drop.ids {
             match self.type_lookup(id, |kind| !matches!(kind, TypeKind::Domain { .. })) {
