@@ -180,6 +180,7 @@ enum ComparisonScope {
     Publications,
     Subscriptions,
     ExtendedStatistics,
+    Extensions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,6 +203,7 @@ struct NormalizedState {
     publications: BTreeMap<String, NormalizedPublication>,
     subscriptions: BTreeMap<String, NormalizedSubscription>,
     extended_statistics: BTreeMap<String, NormalizedExtendedStatistics>,
+    extensions: BTreeMap<String, NormalizedExtension>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -334,12 +336,40 @@ struct NormalizedExtendedStatistics {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum NormalizedType {
-    Enum { variants: Vec<String> },
-    Domain { base_type: String },
-    Base,
-    Composite,
-    Range,
-    Multirange,
+    Enum {
+        variants: Vec<String>,
+    },
+    Domain {
+        base_type: String,
+        collation: Option<String>,
+        default: Option<String>,
+        not_null: bool,
+        constraints: BTreeMap<String, (String, bool)>,
+    },
+    Base {
+        shell: bool,
+    },
+    Composite {
+        fields: Vec<(String, String, Option<String>)>,
+    },
+    Range {
+        subtype: Option<String>,
+        multirange: Option<String>,
+        collation: Option<String>,
+    },
+    Multirange {
+        range: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedExtension {
+    owner: String,
+    schema: Option<String>,
+    version: Option<String>,
+    relocatable: Option<bool>,
+    members: BTreeSet<(String, String)>,
+    config_tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -417,6 +447,9 @@ enum MismatchCategory {
     MissingSubscriptionInSimulator,
     ExtraSubscriptionInSimulator,
     SubscriptionDefinitionMismatch,
+    MissingExtensionInSimulator,
+    ExtraExtensionInSimulator,
+    ExtensionDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
     BaselineSearchPathMismatch,
@@ -1037,7 +1070,7 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{} extended_statistics:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{} extended_statistics:{} extensions:{}",
         state.schemas.len(),
         state.sequences.len(),
         state.relations.len(),
@@ -1053,7 +1086,8 @@ fn state_counts(state: &NormalizedState) -> String {
         state.view_dependencies.len(),
         state.publications.len(),
         state.subscriptions.len(),
-        state.extended_statistics.len()
+        state.extended_statistics.len(),
+        state.extensions.len()
     )
 }
 
@@ -1356,7 +1390,7 @@ fn state_counts_include_every_replication_family() {
         },
     );
     let counts = state_counts(&state);
-    assert!(counts.ends_with("publications:0 subscriptions:1 extended_statistics:0"));
+    assert!(counts.ends_with("publications:0 subscriptions:1 extended_statistics:0 extensions:0"));
 }
 
 fn load_manifest(path: &Path) -> DifferentialManifest {

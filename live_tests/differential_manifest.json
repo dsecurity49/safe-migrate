@@ -173,7 +173,9 @@
     "safe_010_drop_view_restrict.sql",
     "007_drop_pub_cascade.sql",
     "safe_006_drop_pub.sql",
-    "safe_011_alter_pub_options.sql"
+    "safe_011_alter_pub_options.sql",
+    "011_drop_extension_cascade.sql",
+    "safe_012_drop_extension_restrict.sql"
    ],
    "excluded_fixtures": [
     {
@@ -227,6 +229,12 @@
     ],
     "safe_011_alter_pub_options.sql": [
      "publications"
+    ],
+    "011_drop_extension_cascade.sql": [
+     "extensions"
+    ],
+    "safe_012_drop_extension_restrict.sql": [
+     "extensions"
     ]
    },
    "required_relations": [
@@ -732,7 +740,9 @@
     "safe_007_drop_matview_if_exists.sql",
     "safe_008_add_column_if_not_exists.sql",
     "safe_010_drop_policy_if_exists.sql",
-    "safe_011_create_schema_if_not_exists.sql"
+    "safe_011_create_schema_if_not_exists.sql",
+    "safe_012_create_extension_if_not_exists.sql",
+    "safe_013_drop_extension_if_exists.sql"
   ],
    "excluded_fixtures": [
     {
@@ -742,6 +752,14 @@
     {
      "fixture": "005_drop_sequence.sql",
      "reason": "Requires sequence \"s\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
+    },
+    {
+     "fixture": "019_create_extension.sql",
+     "reason": "Missing IF NOT EXISTS; rule diagnostic fixture with no live state comparison."
+    },
+    {
+     "fixture": "020_drop_extension.sql",
+     "reason": "Missing IF EXISTS; rule diagnostic fixture with no live state comparison."
     },
     {
       "fixture": "009_drop_column.sql",
@@ -978,6 +996,14 @@
      "reason": "PostgreSQL rejects the unknown relation; this is a rule diagnostic case with no resulting live state."
     },
     {
+     "fixture": "010_drop_unknown_extension.sql",
+     "reason": "PostgreSQL rejects the unknown extension; this is a rule diagnostic case with no resulting live state."
+    },
+    {
+     "fixture": "011_alter_unknown_extension.sql",
+     "reason": "PostgreSQL rejects the unknown extension; this is a rule diagnostic case with no resulting live state."
+    },
+    {
      "fixture": "safe_001_drop_known_table.sql",
      "reason": "PostgreSQL rejects dropping public.test_table without CASCADE because enterprise baseline dependencies exist."
     },
@@ -1168,7 +1194,9 @@
     "safe_005_drop_column.sql",
     "safe_013_unique_using_index.sql",
     "safe_011_foreign_key_not_valid.sql",
-    "safe_012_foreign_key_validate_later.sql"
+    "safe_012_foreign_key_validate_later.sql",
+    "011_domain_check.sql",
+    "safe_014_domain_check_not_valid.sql"
    ],
    "excluded_fixtures": [
     {
@@ -1178,6 +1206,10 @@
     {
      "fixture": "007_set_access_method.sql",
      "reason": "Table access method identity is not synchronized or normalized by the differential harness."
+    },
+    {
+     "fixture": "012_domain_validate.sql",
+     "reason": "Requires domain constraint \"chk_email\" which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "safe_010_drop_index.sql",
@@ -1254,6 +1286,12 @@
      "relations",
      "indexes",
      "constraints"
+    ],
+    "011_domain_check.sql": [
+     "types"
+    ],
+    "safe_014_domain_check_not_valid.sql": [
+     "types"
     ]
    },
    "required_relations": [

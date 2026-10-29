@@ -643,6 +643,20 @@ impl Rule for GeneralCascadeRule {
             Mutation::DropPublication(d) if d.cascade => {
                 Some((ObjectKind::Publication, d.names.join(", ")))
             }
+            Mutation::DropExtension(d) if d.cascade => {
+                Some((ObjectKind::Extension, d.names.join(", ")))
+            }
+            Mutation::AlterType(a) => match &a.action {
+                crate::_internal::analysis::mutations::AlterTypeActionMutation::DropAttribute {
+                    cascade,
+                    ..
+                }
+                | crate::_internal::analysis::mutations::AlterTypeActionMutation::AlterAttributeType {
+                    cascade,
+                    ..
+                } if *cascade => Some((ObjectKind::Type, a.id.to_string())),
+                _ => None,
+            },
             _ => None,
         };
 

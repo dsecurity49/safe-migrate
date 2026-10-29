@@ -18,10 +18,17 @@ notes are available on the
   order, and a dependent outside the extension blocks the drop until `CASCADE`.
   Dropping an extension-owned member directly is reported, and schema renames
   remap extension membership and collation references.
+- Extensions that provide base types now synchronize their catalog metadata,
+  including the type delimiter.
 - Range creation automatically produces the companion multirange type, explicit
   bidirectional links, and internal constructors. Independent multirange renames
   preserve companion links, composite attribute changes synchronize typed tables,
   and base/shell type options are fully represented in state.
+- `schema-drift` now covers `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER EXTENSION`,
+  and unguarded `DROP EXTENSION`; `missing-idempotency` requires
+  `IF [NOT] EXISTS` for extension creation and drops; and
+  `destructive-general-cascade` reports `DROP EXTENSION ... CASCADE` and
+  composite attribute drops or type changes performed with `CASCADE`.
 - Cache V11 adds domain, sequence-runtime, and extension catalog state. Re-run
   `safe-migrate sync`; older caches are rejected rather than misread.
 

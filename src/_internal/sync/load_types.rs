@@ -255,7 +255,7 @@ pub(super) fn load_types(
             t.typcategory::text AS category,
             t.typispreferred AS preferred,
             t.typdefault AS base_default,
-            t.typdelim AS delimiter,
+            t.typdelim::text AS delimiter,
             t.typcollation <> 0 AS collatable,
             t.typinput::regprocedure::text AS input_function,
             t.typoutput::regprocedure::text AS output_function,

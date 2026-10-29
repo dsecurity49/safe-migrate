@@ -300,6 +300,78 @@ impl Rule for DriftDetectionRule {
 
                 });
             }
+            Mutation::AlterDomain(a) if !pre_state.types.contains_key(&a.id) => {
+                violations.push(Violation { source_range: None,
+                    rule_id: self.id(),
+
+                    object_kind: ObjectKind::Domain,
+                    object_name: a.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs domain \"{}\" which does not exist in the production baseline",
+                        a.id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                            sql: None,
+
+                });
+            }
+            Mutation::AlterSequence(a) if !pre_state.sequences.contains_key(&a.id) => {
+                violations.push(Violation { source_range: None,
+                    rule_id: self.id(),
+
+                    object_kind: ObjectKind::Sequence,
+                    object_name: a.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs sequence \"{}\" which does not exist in the production baseline",
+                        a.id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                            sql: None,
+
+                });
+            }
+            Mutation::AlterExtension(a) if !pre_state.extensions.contains_key(&a.name) => {
+                violations.push(Violation { source_range: None,
+                    rule_id: self.id(),
+
+                    object_kind: ObjectKind::Extension,
+                    object_name: a.name.clone(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs extension \"{}\" which does not exist in the production baseline",
+                        a.name
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                            sql: None,
+
+                });
+            }
+            Mutation::DropExtension(d) => {
+                for name in &d.names {
+                    if !d.if_exists && !pre_state.extensions.contains_key(name) {
+                        violations.push(Violation { source_range: None,
+                            rule_id: self.id(),
+
+                            object_kind: ObjectKind::Extension,
+                            object_name: name.clone(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs extension \"{}\" which does not exist in the production baseline",
+                                name
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+
+                        });
+                    }
+                }
+            }
             Mutation::AlterFunction(f) if !pre_state.functions.contains_key(&f.id) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),

@@ -2547,3 +2547,67 @@ fn a_temporary_relation_is_exempt_from_requiring_concurrency() {
         "a temporary relation cannot be reindexed concurrently: {v:?}"
     );
 }
+
+#[test]
+fn schema_drift_and_idempotency_cover_extensions_and_domains() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    state.baseline_available = true;
+
+    // Drop extension without IF EXISTS when missing -> drift and idempotency
+    let findings = engine
+        .analyze("DROP EXTENSION uninstalled;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "schema-drift" && f.object_name == "uninstalled")
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "missing-idempotency" && f.object_name == "uninstalled")
+    );
+
+    // Create extension without IF NOT EXISTS -> idempotency
+    let findings = engine
+        .analyze("CREATE EXTENSION hstore;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "missing-idempotency" && f.object_name == "hstore")
+    );
+
+    // Alter missing extension -> schema drift
+    let findings = engine
+        .analyze(
+            "ALTER EXTENSION missing_ext SET SCHEMA new_schema;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "schema-drift" && f.object_name == "missing_ext")
+    );
+
+    // Alter missing domain -> schema drift
+    let findings = engine
+        .analyze(
+            "ALTER DOMAIN public.missing_domain DROP NOT NULL;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(findings.iter().any(|f| f.rule_id == "schema-drift"));
+
+    // Drop extension CASCADE -> destructive-general-cascade
+    let findings = engine
+        .analyze("DROP EXTENSION IF EXISTS hstore CASCADE;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule_id == "destructive-general-cascade")
+    );
+}
