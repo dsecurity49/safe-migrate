@@ -23,7 +23,11 @@ notes are available on the
 - Range creation automatically produces the companion multirange type, explicit
   bidirectional links, and internal constructors. Independent multirange renames
   preserve companion links, composite attribute changes synchronize typed tables,
-  and base/shell type options are fully represented in state.
+  and base/shell type options are fully represented in state. Base-type input,
+  output, and support routines are dependencies, so dropping or renaming one
+  keeps the type accurate. `ALTER TYPE ... SET` rejects shell types, immutable
+  attributes, unknown storage classes, and non-`PLAIN` storage on fixed-length
+  types, matching PostgreSQL.
 - `schema-drift` now covers `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER EXTENSION`,
   and unguarded `DROP EXTENSION`; `missing-idempotency` requires
   `IF [NOT] EXISTS` for extension creation and drops; and

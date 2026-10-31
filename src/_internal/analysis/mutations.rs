@@ -96,6 +96,7 @@ pub(crate) enum Mutation {
     CreateDomain(CreateDomainMutation),
     AlterDomain(AlterDomainMutation),
     DropDomain(DropDomainMutation),
+    RenameDomain(Rename),
     DropType(DropTypeMutation),
     CreateSequence(CreateSequenceMutation),
     AlterSequence(AlterSequenceMutation),

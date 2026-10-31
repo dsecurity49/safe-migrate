@@ -59,6 +59,8 @@ struct RuleManifest {
     #[serde(default)]
     fixture_min_pg_version: BTreeMap<String, u32>,
     #[serde(default)]
+    fixture_requires_extensions: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     excluded_fixtures: Vec<FixtureExclusion>,
     schemas: Vec<String>,
     scope: Vec<ComparisonScope>,
@@ -567,6 +569,20 @@ fn live_postgres_differential_harness() {
         .get::<_, String>(0)
         .parse()
         .expect("server_version_num must be numeric");
+    let any_extension_requirement = manifest
+        .rules
+        .iter()
+        .any(|rule| !rule.fixture_requires_extensions.is_empty());
+    let available_extensions: BTreeSet<String> = if any_extension_requirement {
+        client
+            .query("SELECT name FROM pg_available_extensions", &[])
+            .expect("failed to inspect available extensions")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let engine = SafeMigrateEngine::new(Config::default());
     let mut mismatches = Vec::new();
     let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
@@ -667,6 +683,24 @@ fn live_postgres_differential_harness() {
             let sql = fs::read_to_string(&fixture_path).unwrap_or_else(|error| {
                 panic!("failed to read {}: {error}", fixture_path.display())
             });
+            if let Some(required) = rule.fixture_requires_extensions.get(fixture) {
+                let missing = required
+                    .iter()
+                    .filter(|extension| !available_extensions.contains(*extension))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    verbose(
+                        verbosity,
+                        1,
+                        format!(
+                            "case={}/{} phase=skip unavailable_extensions={missing:?}",
+                            rule.rule_dir, fixture
+                        ),
+                    );
+                    continue;
+                }
+            }
             let live_statements = if rule.fixture_autocommit.contains(fixture) {
                 split_fixture_statements(&sql).unwrap_or_else(|error| {
                     panic!(
@@ -1485,6 +1519,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                 fixture
             );
         }
+        for fixture in rule.fixture_requires_extensions.keys() {
+            assert!(
+                included.contains(fixture),
+                "extension requirement references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
         for fixture in rule.pending_detach_setup.keys() {
             assert!(
                 rule.fixture_autocommit.contains(fixture),
@@ -1613,6 +1655,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         fixture_transactional: BTreeMap::new(),
         fixture_autocommit: BTreeSet::new(),
         fixture_min_pg_version: BTreeMap::new(),
+        fixture_requires_extensions: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -1643,6 +1686,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         fixture_transactional: BTreeMap::new(),
         fixture_autocommit: BTreeSet::new(),
         fixture_min_pg_version: BTreeMap::new(),
+        fixture_requires_extensions: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),

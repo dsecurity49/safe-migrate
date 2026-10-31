@@ -14,6 +14,7 @@ use crate::_internal::model::function::{
     FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
 };
 use crate::_internal::model::trigger::TriggerOverlay;
+use crate::_internal::model::types::{TypeKind, TypeOverlay};
 use std::collections::HashSet;
 
 type RoutineLookup = ObjectLookup;
@@ -620,6 +621,33 @@ impl AnalysisState {
             })
     }
 
+    fn types_requiring_routine(&self, routine: &ObjectId) -> Vec<(ObjectId, &'static str)> {
+        self.local
+            .types
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let TypeOverlay::Present(state) = overlay else {
+                    return None;
+                };
+                match &state.kind {
+                    TypeKind::Range {
+                        canonical_id,
+                        subtype_diff_id,
+                        ..
+                    } => (canonical_id == &Some(routine.clone())
+                        || subtype_diff_id == &Some(routine.clone()))
+                        .then(|| (id.clone(), "range type")),
+                    TypeKind::Base { options, .. }
+                        if self.base_type_option_references_routine(options, routine) =>
+                    {
+                        Some((id.clone(), "base type"))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn apply_drop_function(
         &mut self,
         function: &DropFunctionMutation,
@@ -629,6 +657,7 @@ impl AnalysisState {
         // later signature cannot leave an earlier function dropped in the
         // simulator when the statement itself would fail.
         let mut targets: Vec<DropTarget> = Vec::new();
+        let mut cascade_types: Vec<ObjectId> = Vec::new();
         for signature in &function.signatures {
             let signature_name = format!(
                 "{}({})",
@@ -672,6 +701,17 @@ impl AnalysisState {
                             "function '{}' cannot be dropped because type '{}' requires it",
                             id, owner
                         ));
+                    }
+                    let dependent_types = self.types_requiring_routine(&id);
+                    if !dependent_types.is_empty() {
+                        if !function.cascade {
+                            return MutationResult::conflict(format!(
+                                "function '{}' is required by {} '{}'; use CASCADE",
+                                id, dependent_types[0].1, dependent_types[0].0
+                            ));
+                        }
+                        cascade_types
+                            .extend(dependent_types.into_iter().map(|(type_id, _)| type_id));
                     }
                     let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
                         .local
@@ -768,6 +808,16 @@ impl AnalysisState {
                 self.local
                     .functions
                     .insert(id.clone(), FunctionOverlay::Dropped);
+            }
+        }
+        if !cascade_types.is_empty() {
+            cascade_types.sort();
+            cascade_types.dedup();
+            if !self.apply_type_cascade(&cascade_types) {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
         }
         if surviving_reference {

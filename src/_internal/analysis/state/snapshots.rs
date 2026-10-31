@@ -95,6 +95,7 @@ impl AnalysisState {
 
         self.snapshot_graph_full();
         self.local.graph.propagate_function_rename(old_id, new_id);
+        self.remap_range_routine_reference(old_id, new_id);
         self.local.graph.add_edge(DependencyEdge::new(
             old_id.clone(),
             new_id.clone(),

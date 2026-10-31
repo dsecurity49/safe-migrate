@@ -64,6 +64,7 @@ impl AnalysisState {
             Mutation::CreateDomain(create) => self.apply_create_domain(create),
             Mutation::AlterDomain(alter) => self.apply_alter_domain(alter),
             Mutation::DropDomain(drop) => self.apply_drop_domain(drop),
+            Mutation::RenameDomain(rename) => self.apply_rename_domain(rename),
             Mutation::DropType(drop) => self.apply_drop_type(drop),
             Mutation::CreateSequence(create) => self.apply_create_sequence(create),
             Mutation::AlterSequence(alter) => self.apply_alter_sequence(alter),

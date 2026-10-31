@@ -274,7 +274,10 @@ impl AnalysisState {
     /// Present routines that reference a dropped type: an explicit argument or
     /// return type, or the internal ownership link PostgreSQL records for a
     /// range constructor.
-    fn routine_cascade_victims(&self, dropped_types: &HashSet<ObjectId>) -> Vec<ObjectId> {
+    pub(super) fn routine_cascade_victims(
+        &self,
+        dropped_types: &HashSet<ObjectId>,
+    ) -> Vec<ObjectId> {
         self.local
             .functions
             .iter()

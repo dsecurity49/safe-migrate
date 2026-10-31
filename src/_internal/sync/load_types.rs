@@ -197,6 +197,7 @@ pub(super) fn load_types(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
     schema_filter: &str,
+    builtin_types: &crate::_internal::model::builtin_type::BuiltinTypeCatalogue,
 ) -> Result<std::collections::HashMap<ObjectId, crate::_internal::model::types::TypeState>> {
     // Every `typtype` a user can name in `DROP TYPE` / `ALTER TYPE`. Array
     // types are excluded because PostgreSQL refuses both for them ("cannot
@@ -211,7 +212,7 @@ pub(super) fn load_types(
             t.typtype::text AS type_kind,
             pg_catalog.pg_get_userbyid(t.typowner) AS owner_name,
             CASE WHEN t.typtype = 'd'
-                THEN pg_catalog.format_type(t.typbasetype, t.typtypmod)
+                THEN pg_catalog.format_type(t.typbasetype, t.typtypmod) || CASE WHEN t.typndims > 1 THEN repeat('[]', t.typndims - 1) ELSE '' END
                 ELSE NULL
             END AS domain_base_type,
             t.typnotnull AS domain_not_null,
@@ -237,10 +238,24 @@ pub(super) fn load_types(
                  THEN range.rngcanonical::regprocedure::text
                  ELSE NULL
             END AS canonical_function,
+            CASE WHEN range.rngcanonical <> 0 THEN cpn.nspname END AS canonical_schema,
+            CASE WHEN range.rngcanonical <> 0 THEN cp.proname END AS canonical_name,
+            CASE WHEN range.rngcanonical <> 0 THEN ARRAY(
+                SELECT pg_catalog.format_type(t, NULL)
+                FROM unnest(cp.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                ORDER BY n
+            )::text[] END AS canonical_args,
             CASE WHEN range.rngsubdiff <> 0
                  THEN range.rngsubdiff::regprocedure::text
                  ELSE NULL
             END AS subtype_diff_function,
+            CASE WHEN range.rngsubdiff <> 0 THEN spn.nspname END AS subtype_diff_schema,
+            CASE WHEN range.rngsubdiff <> 0 THEN sp.proname END AS subtype_diff_name,
+            CASE WHEN range.rngsubdiff <> 0 THEN ARRAY(
+                SELECT pg_catalog.format_type(t, NULL)
+                FROM unnest(sp.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                ORDER BY n
+            )::text[] END AS subtype_diff_args,
             CASE WHEN mr.rngtypid IS NOT NULL THEN rn.nspname END AS range_schema,
             CASE WHEN mr.rngtypid IS NOT NULL THEN rt.typname END AS range_name,
             CASE WHEN t.typelem <> 0
@@ -296,6 +311,10 @@ pub(super) fn load_types(
         LEFT JOIN pg_namespace rcn ON rcn.oid = rc.collnamespace
         LEFT JOIN pg_opclass opc ON opc.oid = range.rngsubopc
         LEFT JOIN pg_namespace opn ON opn.oid = opc.opcnamespace
+        LEFT JOIN pg_proc cp ON cp.oid = range.rngcanonical
+        LEFT JOIN pg_namespace cpn ON cpn.oid = cp.pronamespace
+        LEFT JOIN pg_proc sp ON sp.oid = range.rngsubdiff
+        LEFT JOIN pg_namespace spn ON spn.oid = sp.pronamespace
         LEFT JOIN pg_range mr ON mr.rngmultitypid = t.oid
         LEFT JOIN pg_type rt ON rt.oid = mr.rngtypid
         LEFT JOIN pg_namespace rn ON rn.oid = rt.typnamespace
@@ -309,11 +328,12 @@ pub(super) fn load_types(
           ))
           {schema_filter}
         GROUP BY n.nspname, t.typname, t.typtype, t.typowner, t.typbasetype,
-                 t.typtypmod, t.typnotnull, t.typdefault, t.typcollation,
+                 t.typtypmod, t.typndims, t.typnotnull, t.typdefault, t.typcollation,
                  c.collname, cn.nspname, range.rngsubtype, range.rngmultitypid,
                  mt.typname, mtn.nspname, range.rngcollation, rc.collname,
                  rcn.nspname, range.rngsubopc, opc.opcname, opn.nspname,
-                 range.rngcanonical, range.rngsubdiff, mr.rngtypid,
+                 range.rngcanonical, cp.oid, cpn.nspname,
+                 range.rngsubdiff, sp.oid, spn.nspname, mr.rngtypid,
                  rt.typname, rn.nspname, t.typelem, t.typisdefined, t.typlen,
                  t.typbyval, t.typalign, t.typstorage, t.typcategory,
                  t.typispreferred, t.typdelim, t.typinput, t.typoutput,
@@ -397,6 +417,24 @@ pub(super) fn load_types(
                         }
                         None => (None, None),
                     };
+                    let canonical_id = routine_id_from_parts(
+                        row.try_get("canonical_schema")
+                            .context("canonical function schema")?,
+                        row.try_get("canonical_name")
+                            .context("canonical function name")?,
+                        row.try_get("canonical_args")
+                            .context("canonical function arguments")?,
+                        builtin_types,
+                    );
+                    let subtype_diff_id = routine_id_from_parts(
+                        row.try_get("subtype_diff_schema")
+                            .context("subtype_diff function schema")?,
+                        row.try_get("subtype_diff_name")
+                            .context("subtype_diff function name")?,
+                        row.try_get("subtype_diff_args")
+                            .context("subtype_diff function arguments")?,
+                        builtin_types,
+                    );
                     crate::_internal::model::types::TypeKind::Range {
                         subtype: row.try_get("range_subtype").context("range subtype")?,
                         subtype_id: None,
@@ -408,11 +446,11 @@ pub(super) fn load_types(
                         canonical: row
                             .try_get("canonical_function")
                             .context("range canonical function")?,
-                        canonical_id: None,
+                        canonical_id,
                         subtype_diff: row
                             .try_get("subtype_diff_function")
                             .context("range subtype_diff function")?,
-                        subtype_diff_id: None,
+                        subtype_diff_id,
                     }
                 }
                 "m" => {
@@ -632,4 +670,24 @@ fn load_domain_constraints(
         );
     }
     Ok(())
+}
+
+fn routine_id_from_parts(
+    schema: Option<String>,
+    name: Option<String>,
+    args: Option<Vec<String>>,
+    builtin_types: &crate::_internal::model::builtin_type::BuiltinTypeCatalogue,
+) -> Option<ObjectId> {
+    let (schema, name, args) = (schema?, name?, args?);
+    let args = args
+        .iter()
+        .map(|arg| {
+            crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                arg,
+                builtin_types,
+            )
+            .render()
+        })
+        .collect::<Vec<_>>();
+    Some(ObjectId::new(schema, format!("{name}({})", args.join(","))))
 }

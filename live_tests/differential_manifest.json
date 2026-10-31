@@ -744,6 +744,11 @@
     "safe_012_create_extension_if_not_exists.sql",
     "safe_013_drop_extension_if_exists.sql"
   ],
+   "fixture_requires_extensions": {
+    "safe_012_create_extension_if_not_exists.sql": [
+     "hstore"
+    ]
+   },
    "excluded_fixtures": [
     {
      "fixture": "004_drop_index.sql",
@@ -1744,6 +1749,7 @@
     "021_concurrent_detach_default_partition.sql",
     "safe_054_drop_range_type.sql",
     "safe_055_rename_range_multirange.sql",
+    "safe_056_rename_multirange_then_drop_range.sql",
     "022_drop_range_constructor.sql",
     "004_conflict.sql",
     "safe_001_chain.sql",

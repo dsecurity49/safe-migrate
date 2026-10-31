@@ -341,6 +341,9 @@ pub(super) fn snapshot_live_state(
     }
 
     if scope.contains(&ComparisonScope::Sequences) {
+        // Sequence runtime (last_value, is_called, log_cnt) is volatile and
+        // connection-state dependent, so the differential harness deliberately
+        // compares definition parameters rather than transaction runtime state.
         for (id, sequence) in &cache.sequences {
             state.sequences.insert(
                 qualified_name(&id.schema, &id.name),

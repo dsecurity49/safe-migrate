@@ -64,12 +64,8 @@ impl Resolver {
                         .resolve(&w, "btree", &state.local.search_path)
                         .map(|o| ObjectId::new(o.family.schema.clone(), o.name.clone()))
                 });
-                let canonical_id = canonical
-                    .as_deref()
-                    .and_then(|c| state.resolve_type_reference(c));
-                let subtype_diff_id = subtype_diff
-                    .as_deref()
-                    .and_then(|d| state.resolve_type_reference(d));
+                let canonical_id = None;
+                let subtype_diff_id = None;
                 TypeKind::Range {
                     subtype: subtype.clone(),
                     subtype_id: subtype
@@ -118,10 +114,14 @@ impl Resolver {
                     })
                     .collect(),
             },
-            TypeCreationKind::Base { options } => TypeKind::Base {
-                shell: false,
-                options: options.clone(),
-            },
+            TypeCreationKind::Base { options } => {
+                let is_shell =
+                    options == &crate::_internal::model::types::BaseTypeOptions::default();
+                TypeKind::Base {
+                    shell: is_shell,
+                    options: options.clone(),
+                }
+            }
         };
         Mutation::CreateType(CreateTypeMutation {
             id: Self::resolve_creation_name(&fact.name, state),
@@ -262,9 +262,9 @@ impl Resolver {
             AlterDomainActionFact::RenameTo { new_name } => {
                 let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
                 new_id.inferred_schema = id.inferred_schema;
-                Mutation::RenameType(Rename { old_id: id, new_id })
+                Mutation::RenameDomain(Rename { old_id: id, new_id })
             }
-            AlterDomainActionFact::SetSchema { new_schema } => Mutation::RenameType(Rename {
+            AlterDomainActionFact::SetSchema { new_schema } => Mutation::RenameDomain(Rename {
                 old_id: id.clone(),
                 new_id: ObjectId::new(new_schema, &id.name),
             }),

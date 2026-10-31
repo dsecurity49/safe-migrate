@@ -240,8 +240,11 @@ impl AstVisitor {
         let path = node.type_name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
 
-        let kind = match node.kind()? {
-            ast::CreateTypeKind::EnumType(enum_type) => TypeCreationKind::Enum {
+        let kind = match node.kind() {
+            None => TypeCreationKind::Base {
+                options: crate::_internal::model::types::BaseTypeOptions::default(),
+            },
+            Some(ast::CreateTypeKind::EnumType(enum_type)) => TypeCreationKind::Enum {
                 variants: enum_type
                     .variant_list()?
                     .variants()
@@ -252,16 +255,17 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            ast::CreateTypeKind::CompositeType(composite) => TypeCreationKind::Composite {
+            Some(ast::CreateTypeKind::CompositeType(composite)) => TypeCreationKind::Composite {
                 fields: composite
                     .composite_field_list()?
                     .composite_field_defs()
                     .map(|field| {
-                        let collation = field.collate().and_then(|collate| {
-                            collate
-                                .collation_ref()
-                                .and_then(|c| c.path_ref())
-                                .map(|p| p.syntax().text().to_string().trim().to_string())
+                        let collation = Self::index_item_written_name(field.collate(), |collate| {
+                            collate.collation_ref()?.path_ref()
+                        })
+                        .map(|written| match written.schema {
+                            Some(schema) => format!("{schema}.{}", written.name),
+                            None => written.name,
                         });
                         let name = field
                             .name()
@@ -279,7 +283,7 @@ impl AstVisitor {
             },
             // A range type is defined by its subtype, optional multirange name,
             // collation, opclass, canonical, and subtype_diff.
-            ast::CreateTypeKind::RangeType(range) => {
+            Some(ast::CreateTypeKind::RangeType(range)) => {
                 let attrs = Self::extract_attribute_list(range.attribute_list());
                 let multirange_type_name = attrs
                     .iter()
@@ -304,7 +308,7 @@ impl AstVisitor {
                     subtype_diff: Self::type_attribute(attrs, "subtype_diff"),
                 }
             }
-            ast::CreateTypeKind::BaseType(base) => {
+            Some(ast::CreateTypeKind::BaseType(base)) => {
                 let attrs = Self::extract_attribute_list(base.attribute_list());
                 TypeCreationKind::Base {
                     options: Self::extract_base_type_options(&attrs),
@@ -462,12 +466,16 @@ impl AstVisitor {
                             let field_syntax = add.composite_field()?.syntax().text().to_string();
                             let name = Self::identifier_from_name(field_syntax.trim(), false);
                             let data_type = add.ty()?.syntax().text().to_string();
-                            let collation = add.collate().and_then(|collate| {
-                                collate
-                                    .collation_ref()
-                                    .and_then(|c| c.path_ref())
-                                    .map(|p| p.syntax().text().to_string().trim().to_string())
-                            });
+                            let collation =
+                                Self::index_item_written_name(add.collate(), |collate| {
+                                    collate.collation_ref()?.path_ref()
+                                })
+                                .map(|written| {
+                                    match written.schema {
+                                        Some(schema) => format!("{schema}.{}", written.name),
+                                        None => written.name,
+                                    }
+                                });
                             actions.push(AlterTypeActionFact::AddAttribute {
                                 name,
                                 data_type,
@@ -491,12 +499,16 @@ impl AstVisitor {
                                 alter.composite_field_ref()?.syntax().text().to_string();
                             let name = Self::identifier_from_name(field_syntax.trim(), false);
                             let data_type = alter.ty()?.syntax().text().to_string();
-                            let collation = alter.collate().and_then(|collate| {
-                                collate
-                                    .collation_ref()
-                                    .and_then(|c| c.path_ref())
-                                    .map(|p| p.syntax().text().to_string().trim().to_string())
-                            });
+                            let collation =
+                                Self::index_item_written_name(alter.collate(), |collate| {
+                                    collate.collation_ref()?.path_ref()
+                                })
+                                .map(|written| {
+                                    match written.schema {
+                                        Some(schema) => format!("{schema}.{}", written.name),
+                                        None => written.name,
+                                    }
+                                });
                             let cascade = Self::is_cascade(alter.drop_behavior());
                             actions.push(AlterTypeActionFact::AlterAttributeType {
                                 name,

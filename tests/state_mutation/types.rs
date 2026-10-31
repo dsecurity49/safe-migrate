@@ -663,6 +663,130 @@ fn domain_collation_is_inherited_from_arrays_and_rejected_for_non_collatable_bas
 }
 
 #[test]
+fn composite_fields_inherit_effective_collation_and_reject_non_collatable_overrides() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TYPE comp AS (code text, id integer, tags text[]);
+             ALTER TYPE comp ADD ATTRIBUTE note varchar(10);
+             ALTER TYPE comp ALTER ATTRIBUTE id TYPE text;
+             ALTER TYPE comp ALTER ATTRIBUTE code TYPE text COLLATE \"C\";",
+            &mut state,
+        )
+        .unwrap();
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Composite { fields },
+        ..
+    })) = state.local.types.get(&object_id("public", "comp"))
+    else {
+        panic!("expected composite");
+    };
+    let field = |name: &str| fields.iter().find(|field| field.name == name).unwrap();
+    for name in ["tags", "note"] {
+        assert_eq!(field(name).collation.as_deref(), Some("default"), "{name}");
+        assert_eq!(
+            field(name).collation_id,
+            Some(object_id("pg_catalog", "default")),
+            "{name}"
+        );
+    }
+    assert_eq!(field("code").collation.as_deref(), Some("C"));
+    assert_eq!(
+        field("code").collation_id,
+        Some(object_id("pg_catalog", "C"))
+    );
+    assert_eq!(field("id").data_type, "text");
+    assert_eq!(field("id").collation.as_deref(), Some("default"));
+
+    let violations = engine
+        .analyze(
+            "ALTER TYPE comp ADD ATTRIBUTE bad integer COLLATE \"C\";",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict")
+    );
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Composite { fields },
+        ..
+    })) = state.local.types.get(&object_id("public", "comp"))
+    else {
+        panic!("expected composite");
+    };
+    assert!(fields.iter().all(|field| field.name != "bad"));
+}
+
+#[test]
+fn domain_validation_taints_only_when_existing_columns_are_scanned() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer; CREATE TABLE t (value d);
+             ALTER DOMAIN d ADD CONSTRAINT positive CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer;
+             ALTER DOMAIN d ADD CONSTRAINT positive CHECK (VALUE > 0);",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.local.confidence, Confidence::Exact);
+
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE DOMAIN d AS integer; CREATE TABLE t (value d);
+             ALTER DOMAIN d ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.local.confidence, Confidence::Exact);
+}
+
+#[test]
+fn alter_domain_rename_and_set_schema_reject_non_domain_targets() {
+    let engine = setup_engine();
+    for sql in [
+        "ALTER DOMAIN e RENAME TO renamed;",
+        "ALTER DOMAIN e SET SCHEMA other;",
+    ] {
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE e AS ENUM ('a'); CREATE SCHEMA other;",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "{sql}: {violations:#?}"
+        );
+        assert!(state.local.types.contains_key(&object_id("public", "e")));
+        assert!(
+            !state
+                .local
+                .types
+                .contains_key(&object_id("public", "renamed"))
+        );
+        assert!(!state.local.types.contains_key(&object_id("other", "e")));
+    }
+}
+
+#[test]
 fn domain_validation_conflicts_when_a_container_stores_the_domain() {
     let engine = setup_engine();
     for setup in [
@@ -1420,6 +1544,93 @@ fn type_change_rewrite_matches_postgres_rewrite_behaviour() {
 }
 
 #[test]
+fn type_change_rewrite_handles_typed_tables_when_composite_fields_change() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let violations = engine
+        .analyze(
+            "CREATE TYPE public.item AS (a integer);
+             CREATE TABLE public.typed OF public.item;
+             ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "type-change-rewrite"
+                && violation.object_name == "public.item.a"),
+        "{violations:#?}"
+    );
+
+    let mut state = setup_state();
+    let violations = engine
+        .analyze(
+            "CREATE TYPE public.item AS (a integer);
+             ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "type-change-rewrite"),
+        "a composite without typed tables does not rewrite table storage: {violations:#?}"
+    );
+
+    let mut state = setup_state();
+    let violations = engine
+        .analyze(
+            "CREATE TYPE public.item AS (a integer);
+             CREATE TABLE public.typed OF public.item;
+             ALTER TYPE public.item ALTER ATTRIBUTE a TYPE integer CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "type-change-rewrite"),
+        "equivalent spellings are a binary-compatible change: {violations:#?}"
+    );
+}
+
+#[test]
+fn domain_default_coercibility_is_only_assumed_when_provable() {
+    let engine = setup_engine();
+
+    for (sql, exact) in [
+        ("CREATE DOMAIN d AS integer DEFAULT 1;", true),
+        ("CREATE DOMAIN d AS text DEFAULT 1;", true),
+        ("CREATE DOMAIN d AS boolean DEFAULT true;", true),
+        ("CREATE DOMAIN d AS integer DEFAULT 'x';", false),
+        ("CREATE DOMAIN d AS date DEFAULT 'not-a-date';", false),
+        ("CREATE DOMAIN d AS integer[] DEFAULT 'x';", false),
+    ] {
+        let mut state = setup_state();
+        engine.analyze(sql, &mut state).unwrap();
+        assert_eq!(
+            state.local.confidence,
+            if exact {
+                Confidence::Exact
+            } else {
+                Confidence::Tainted
+            },
+            "{sql}"
+        );
+    }
+
+    let mut state = setup_state();
+    engine
+        .analyze("CREATE DOMAIN d AS integer DEFAULT 1;", &mut state)
+        .unwrap();
+    engine
+        .analyze("ALTER DOMAIN d SET DEFAULT 'x';", &mut state)
+        .unwrap();
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+}
+
+#[test]
 fn rename_type_remaps_only_the_resolved_schema_and_preserves_quoted_identity() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -1923,7 +2134,7 @@ fn test_state_alter_column_types() {
 }
 
 #[test]
-fn range_creation_produces_companion_constructors_and_cast() {
+fn range_creation_produces_companion_constructors() {
     let engine = setup_engine();
     let mut state = setup_state();
 
@@ -1985,6 +2196,159 @@ fn range_creation_produces_companion_constructors_and_cast() {
 }
 
 #[test]
+fn base_type_routine_options_are_dependencies_that_track_renames() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION public.base_in(cstring) RETURNS cstring
+                 LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             CREATE FUNCTION public.base_out(cstring) RETURNS cstring
+                 LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             CREATE TYPE public.base_type (
+                 INPUT = public.base_in,
+                 OUTPUT = public.base_out
+             );",
+            &mut state,
+        )
+        .unwrap();
+
+    let base = object_id("public", "base_type");
+    let input = object_id("public", "base_in(cstring)");
+    let expected_input = input.to_string();
+    match state.local.types.get(&base) {
+        Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Base { options, .. },
+            ..
+        })) => {
+            assert_eq!(options.input.as_deref(), Some(expected_input.as_str()));
+        }
+        other => panic!("expected base type, got {other:?}"),
+    }
+
+    let violations = engine
+        .analyze("DROP FUNCTION public.base_in(cstring);", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation.reason.contains("base type")),
+        "{violations:#?}"
+    );
+
+    engine
+        .analyze(
+            "ALTER FUNCTION public.base_in(cstring) RENAME TO base_in_renamed;",
+            &mut state,
+        )
+        .unwrap();
+    let renamed = object_id("public", "base_in_renamed(cstring)");
+    let expected_renamed = renamed.to_string();
+    match state.local.types.get(&base) {
+        Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Base { options, .. },
+            ..
+        })) => assert_eq!(options.input.as_deref(), Some(expected_renamed.as_str())),
+        other => panic!("expected base type, got {other:?}"),
+    }
+
+    engine
+        .analyze(
+            "DROP FUNCTION public.base_in_renamed(cstring) CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(!matches!(
+        state.local.types.get(&base),
+        Some(TypeOverlay::Present(_))
+    ));
+}
+
+#[test]
+fn range_subtype_diff_is_a_routine_dependency_that_tracks_renames() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION public.diff(integer, integer) RETURNS double precision
+                 LANGUAGE sql IMMUTABLE AS 'SELECT ($1 - $2)::double precision';
+             CREATE TYPE public.r AS RANGE (subtype = integer, subtype_diff = public.diff);",
+            &mut state,
+        )
+        .unwrap();
+
+    let diff = object_id("public", "diff(integer,integer)");
+    let range = object_id("public", "r");
+    match state.local.types.get(&range) {
+        Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Range {
+                subtype_diff_id, ..
+            },
+            ..
+        })) => assert_eq!(subtype_diff_id.as_ref(), Some(&diff)),
+        other => panic!("expected range type, got {other:?}"),
+    }
+
+    let violations = engine
+        .analyze("DROP FUNCTION public.diff(integer, integer);", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation.reason.contains("range type")),
+        "{violations:#?}"
+    );
+    assert!(matches!(
+        state.local.types.get(&range),
+        Some(TypeOverlay::Present(_))
+    ));
+
+    engine
+        .analyze(
+            "ALTER FUNCTION public.diff(integer, integer) RENAME TO diff2;",
+            &mut state,
+        )
+        .unwrap();
+    let renamed = object_id("public", "diff2(integer,integer)");
+    match state.local.types.get(&range) {
+        Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Range {
+                subtype_diff_id, ..
+            },
+            ..
+        })) => assert_eq!(subtype_diff_id.as_ref(), Some(&renamed)),
+        other => panic!("expected range type, got {other:?}"),
+    }
+
+    let violations = engine
+        .analyze("DROP FUNCTION public.diff2(integer, integer);", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "{violations:#?}"
+    );
+
+    engine
+        .analyze(
+            "DROP FUNCTION public.diff2(integer, integer) CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(!matches!(
+        state.local.types.get(&range),
+        Some(TypeOverlay::Present(_))
+    ));
+    assert!(!matches!(
+        state.local.types.get(&object_id("public", "r_multirange")),
+        Some(TypeOverlay::Present(_))
+    ));
+}
+
+#[test]
 fn explicit_multirange_name_is_respected_and_independent_rename_updates_links() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -2038,6 +2402,64 @@ fn explicit_multirange_name_is_respected_and_independent_rename_updates_links() 
 }
 
 #[test]
+fn range_drop_after_multirange_rename_does_not_require_cascade() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TYPE custom_r AS RANGE (subtype = integer, multirange_type_name = custom_mr);
+             ALTER TYPE custom_mr RENAME TO custom_mr_renamed;",
+            &mut state,
+        )
+        .unwrap();
+    let violations = engine.analyze("DROP TYPE custom_r;", &mut state).unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "{violations:#?}"
+    );
+    assert!(matches!(
+        state.local.types.get(&object_id("public", "custom_r")),
+        Some(TypeOverlay::Dropped)
+    ));
+    assert!(matches!(
+        state
+            .local
+            .types
+            .get(&object_id("public", "custom_mr_renamed")),
+        Some(TypeOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn dropping_a_multirange_without_cascade_is_blocked_by_its_range() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TYPE custom_r AS RANGE (subtype = integer, multirange_type_name = custom_mr);",
+            &mut state,
+        )
+        .unwrap();
+    let violations = engine.analyze("DROP TYPE custom_mr;", &mut state).unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "{violations:#?}"
+    );
+    assert!(matches!(
+        state.local.types.get(&object_id("public", "custom_mr")),
+        Some(TypeOverlay::Present(_))
+    ));
+    assert!(matches!(
+        state.local.types.get(&object_id("public", "custom_r")),
+        Some(TypeOverlay::Present(_))
+    ));
+}
+
+#[test]
 fn composite_attribute_alterations_synchronize_typed_tables() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -2066,6 +2488,158 @@ fn composite_attribute_alterations_synchronize_typed_tables() {
     assert_eq!(col_b.data_type.as_deref(), Some("text"));
     let col_c = tbl.get_column("c").unwrap();
     assert_eq!(col_c.data_type.as_deref(), Some("boolean"));
+}
+
+#[test]
+fn base_type_option_changes_reject_immutable_and_invalid_physical_shape() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let violations = engine
+        .analyze(
+            "CREATE TYPE fixed_t (INTERNALLENGTH = 4, STORAGE = external);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("fixed-size types must have storage PLAIN")),
+        "{violations:#?}"
+    );
+    assert!(
+        !state
+            .local
+            .types
+            .contains_key(&object_id("public", "fixed_t"))
+    );
+
+    let violations = engine
+        .analyze(
+            "CREATE TYPE invalid_storage_t (STORAGE = bogus);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("storage \"bogus\" not recognized")),
+        "{violations:#?}"
+    );
+    assert!(
+        !state
+            .local
+            .types
+            .contains_key(&object_id("public", "invalid_storage_t"))
+    );
+
+    engine.analyze("CREATE TYPE shell_t;", &mut state).unwrap();
+    let violations = engine
+        .analyze("ALTER TYPE shell_t SET (STORAGE = external);", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation.reason.contains("only a shell")),
+        "{violations:#?}"
+    );
+    let shell = object_id("public", "shell_t");
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Base { shell: true, .. },
+        ..
+    })) = state.local.types.get(&shell)
+    else {
+        panic!("shell_t should remain a shell");
+    };
+
+    let violations = engine
+        .analyze(
+            "CREATE TYPE shell_t (INTERNALLENGTH = 4, STORAGE = external);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("fixed-size types must have storage PLAIN")),
+        "{violations:#?}"
+    );
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Base { shell: true, .. },
+        ..
+    })) = state.local.types.get(&shell)
+    else {
+        panic!("invalid completion must leave shell_t a shell");
+    };
+
+    engine
+        .analyze(
+            "CREATE TYPE shell_t (INPUT = shell_in, OUTPUT = shell_out, INTERNALLENGTH = VARIABLE);",
+            &mut state,
+        )
+        .unwrap();
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Base {
+            shell: false,
+            options,
+        },
+        ..
+    })) = state.local.types.get(&shell)
+    else {
+        panic!("shell_t should be completed");
+    };
+    assert_eq!(options.input.as_deref(), Some("shell_in"));
+    assert_eq!(options.output.as_deref(), Some("shell_out"));
+
+    engine
+        .analyze(
+            "CREATE TYPE variable_t (INTERNALLENGTH = VARIABLE);",
+            &mut state,
+        )
+        .unwrap();
+    for statement in [
+        "ALTER TYPE variable_t SET (INPUT = public.some_input);",
+        "ALTER TYPE variable_t SET (INTERNALLENGTH = 8);",
+        "ALTER TYPE variable_t SET (STORAGE = external);",
+    ] {
+        let violations = engine.analyze(statement, &mut state).unwrap();
+        if statement.contains("STORAGE") {
+            assert!(violations.is_empty(), "{violations:#?}");
+        } else {
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"
+                        && violation.reason.contains("cannot be changed")),
+                "{violations:#?}"
+            );
+        }
+    }
+
+    let variable = object_id("public", "variable_t");
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Base { options, .. },
+        ..
+    })) = state.local.types.get(&variable)
+    else {
+        panic!("variable_t should be present");
+    };
+    assert_eq!(options.input, None);
+    assert_eq!(
+        options.internallength,
+        Some(crate::_internal::model::types::BaseTypeLength::Variable)
+    );
+    assert_eq!(options.storage.as_deref(), Some("external"));
 }
 
 #[test]

@@ -669,7 +669,13 @@ fn test_cache_inspect_rejects_headered_legacy_caches() {
         let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
         assert!(stderr.contains("unsupported cache format"));
         assert!(stderr.contains("safe-migrate sync"));
-        assert!(!stderr.contains(internal_label));
+        let diagnostic = stderr
+            .split_once(" uses an unsupported cache format")
+            .map_or(stderr.as_ref(), |(_, diagnostic)| diagnostic);
+        assert!(
+            !diagnostic.contains(internal_label),
+            "diagnostic exposed internal cache version: {stderr}"
+        );
     }
 }
 

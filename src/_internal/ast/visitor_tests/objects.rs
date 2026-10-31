@@ -1484,6 +1484,24 @@ fn supported_alter_type_actions_produce_typed_facts() {
 }
 
 #[test]
+fn alter_attribute_type_retains_explicit_collation() {
+    let parsed =
+        SourceFile::parse("ALTER TYPE mood ALTER ATTRIBUTE label TYPE varchar(50) COLLATE \"C\";");
+    let statement = parsed.tree().stmts().next().expect("statement");
+    let Some(StatementFact::AlterType(fact)) = AstVisitor::extract(&statement) else {
+        panic!("expected ALTER TYPE fact");
+    };
+    assert!(matches!(
+        fact.actions.as_slice(),
+        [AlterTypeActionFact::AlterAttributeType {
+            data_type,
+            collation: Some(collation),
+            ..
+        }] if data_type == "varchar(50)" && collation == "C"
+    ));
+}
+
+#[test]
 fn alter_materialized_view_actions_produce_typed_facts_not_opaque_paths() {
     use crate::_internal::analysis::facts::AlterMaterializedViewActionFact;
 
