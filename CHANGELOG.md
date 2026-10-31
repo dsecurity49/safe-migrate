@@ -5,36 +5,16 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.12.0 — 2026-10-27
+## v0.12.0 — 2026-10-31
 
-- Domains are modeled end to end: `CREATE`/`ALTER`/`DROP DOMAIN`, defaults,
-  `NOT NULL`, collation, and named or generated constraints. Destructive column
-  changes are reported when a relation's domain constraint still protects it.
-- Sequences track runtime values, so `ALTER SEQUENCE` bound changes report a
-  certain conflict, taint when a cached runtime may have advanced, and
-  `TRUNCATE ... RESTART IDENTITY` is treated as unmodeled runtime state.
-- Extensions are modeled from catalog membership: `ALTER EXTENSION SET SCHEMA`
-  moves members atomically, `DROP EXTENSION` drops modeled members in dependency
-  order, and a dependent outside the extension blocks the drop until `CASCADE`.
-  Dropping an extension-owned member directly is reported, and schema renames
-  remap extension membership and collation references.
-- Extensions that provide base types now synchronize their catalog metadata,
-  including the type delimiter.
-- Range creation automatically produces the companion multirange type, explicit
-  bidirectional links, and internal constructors. Independent multirange renames
-  preserve companion links, composite attribute changes synchronize typed tables,
-  and base/shell type options are fully represented in state. Base-type input,
-  output, and support routines are dependencies, so dropping or renaming one
-  keeps the type accurate. `ALTER TYPE ... SET` rejects shell types, immutable
-  attributes, unknown storage classes, and non-`PLAIN` storage on fixed-length
-  types, matching PostgreSQL.
-- `schema-drift` now covers `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER EXTENSION`,
-  and unguarded `DROP EXTENSION`; `missing-idempotency` requires
-  `IF [NOT] EXISTS` for extension creation and drops; and
-  `destructive-general-cascade` reports `DROP EXTENSION ... CASCADE` and
-  composite attribute drops or type changes performed with `CASCADE`.
-- Cache V11 adds domain, sequence-runtime, and extension catalog state. Re-run
-  `safe-migrate sync`; older caches are rejected rather than misread.
+- Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled
+  end to end, including defaults, constraints, ownership, renames, dependency
+  tracking, and cascading drops.
+- `schema-drift`, `missing-idempotency`, and destructive-cascade checks cover
+  domain, sequence, extension, composite, and base-type changes. Invalid
+  base-type option changes are reported as conflicts.
+- Cache V11 adds domain, sequence-runtime, extension, and expanded type state.
+  Re-run `safe-migrate sync`; older caches are rejected rather than misread.
 
 ## v0.11.2 — 2026-10-24
 

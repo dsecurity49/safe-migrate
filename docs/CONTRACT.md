@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.11.2's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.12.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -201,7 +201,9 @@ Cache V11 supplies typed evidence for:
   foreign-key equality operators;
 - indexes, including included and expression/predicate dependency columns;
 - inheritance and partition topology, view dependencies, sequence ownership,
-  and standalone sequence references;
+  bounds, runtime state, and standalone sequence references;
+- domain defaults, constraints, and collations, plus extension membership and
+  owned members;
 - every `pg_proc.prokind` with the columns that make a routine's identity
   (`proretset`, parameter names and modes, and `pronargdefaults`), plus
   publications and redacted subscriptions;
