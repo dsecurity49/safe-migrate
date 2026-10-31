@@ -90,7 +90,7 @@ fn run_auto_sync_case(
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V10(cache) = versioned else {
+    let DbCacheVersioned::V11(cache) = versioned else {
         panic!("auto-sync must encode the V8 cache variant");
     };
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));

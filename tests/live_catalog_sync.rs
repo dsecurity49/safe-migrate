@@ -90,7 +90,7 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V10(cache) = versioned else {
+    let DbCacheVersioned::V11(cache) = versioned else {
         panic!("catalog sync must encode the V8 cache variant");
     };
     (*cache, payload)
@@ -153,6 +153,7 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
                derived integer GENERATED ALWAYS AS (source * 2) STORED
              );
              CREATE SEQUENCE {SCHEMA}.standalone_default_seq;
+             SELECT nextval('{SCHEMA}.standalone_default_seq'::regclass);
              CREATE TABLE {SCHEMA}.default_source (
                value integer DEFAULT nextval('{SCHEMA}.standalone_default_seq'::regclass)
              );
@@ -187,6 +188,7 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
                 FINALFUNC = float8pl
              );
              CREATE DOMAIN {SCHEMA}.positive_score AS integer CHECK (VALUE > 0);
+             CREATE DOMAIN {SCHEMA}.positive_scores AS integer[] CHECK (VALUE IS NOT NULL);
              CREATE TYPE {SCHEMA}.mood AS ENUM ('calm', 'anxious');
              CREATE TYPE {SCHEMA}.score_span AS RANGE (subtype = float8);
              CREATE TYPE {SCHEMA}.reading AS (value integer, taken_at timestamp);
@@ -438,6 +440,13 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     );
     let default_table = ObjectId::new(SCHEMA, "default_source");
     let default_sequence = ObjectId::new(SCHEMA, "standalone_default_seq");
+    let sequence = cache
+        .sequences
+        .get(&default_sequence)
+        .expect("synchronized standalone sequence");
+    assert_eq!(sequence.runtime.last_value, Some(1));
+    assert_eq!(sequence.runtime.is_called, Some(true));
+    assert!(!sequence.runtime_exact);
     assert!(
         cache
             .default_sequence_dependencies
@@ -712,6 +721,17 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         );
     }
 
+    let plpgsql = cache
+        .extensions
+        .get("plpgsql")
+        .expect("synchronized plpgsql extension");
+    assert_eq!(plpgsql.schema.as_deref(), Some("pg_catalog"));
+    assert!(!plpgsql.members.is_empty());
+    assert!(
+        !plpgsql.members_complete,
+        "plpgsql owns unmodeled catalog classes such as pg_language"
+    );
+
     // `Types` coverage is what lets the analyzer assert a type is absent, so
     // every independently-nameable typtype must reach the cache. PostgreSQL
     // auto-creates a multirange alongside each range.
@@ -722,6 +742,13 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
             TypeKind::Domain {
                 base_type: "integer".into(),
                 base_type_id: None,
+                collation: None,
+                collation_id: None,
+                default: None,
+                default_text: None,
+                not_null: false,
+                not_null_constraint: None,
+                constraints: Default::default(),
             },
         ),
         ("reading", TypeKind::Composite { fields: vec![] }),
@@ -730,9 +757,23 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
             TypeKind::Range {
                 subtype: Some("int4".to_string()),
                 subtype_id: None,
+                multirange: Some(ObjectId::new(SCHEMA, "score_span_multirange")),
+                collation: None,
+                collation_id: None,
+                opclass: None,
+                opclass_id: None,
+                canonical: None,
+                canonical_id: None,
+                subtype_diff: None,
+                subtype_diff_id: None,
             },
         ),
-        ("score_span_multirange", TypeKind::Multirange),
+        (
+            "score_span_multirange",
+            TypeKind::Multirange {
+                range: Some(ObjectId::new(SCHEMA, "score_span")),
+            },
+        ),
     ] {
         let type_state = cache
             .types
@@ -746,6 +787,44 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
             type_state.kind
         );
     }
+
+    let domain = cache
+        .types
+        .get(&ObjectId::new(SCHEMA, "positive_score"))
+        .expect("synchronized domain");
+    let TypeKind::Domain {
+        base_type,
+        constraints,
+        not_null,
+        ..
+    } = &domain.kind
+    else {
+        panic!("positive_score must be a domain");
+    };
+    assert_eq!(base_type, "integer");
+    assert!(!not_null);
+    let check = constraints
+        .get("positive_score_check")
+        .expect("synchronized domain check");
+    assert!(check.validated);
+    assert_eq!(check.expression_text.as_deref(), Some("(VALUE > 0)"));
+
+    let array_domain = cache
+        .types
+        .get(&ObjectId::new(SCHEMA, "positive_scores"))
+        .expect("synchronized array domain");
+    let TypeKind::Domain { base_type, .. } = &array_domain.kind else {
+        panic!("positive_scores must be a domain");
+    };
+    assert_eq!(base_type, "integer[]");
+
+    let builtins = cache
+        .builtin_types
+        .as_ref()
+        .expect("synchronized built-in types");
+    assert!(builtins.resolve("text").expect("text").collatable);
+    assert!(builtins.resolve("varchar").expect("varchar").collatable);
+    assert!(!builtins.resolve("int4").expect("int4").collatable);
 
     // PostgreSQL records the range constructor as an internal part of the
     // range type, so the type owns it rather than the reverse.

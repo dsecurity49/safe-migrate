@@ -537,6 +537,9 @@ impl AnalysisState {
                 && matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && roots.contains(self.local.graph.resolve_rename(&edge.referenced))
                 && !roots.contains(self.local.graph.resolve_rename(&edge.dependent))
+                && !self
+                    .co_dropped_objects
+                    .contains(self.local.graph.resolve_rename(&edge.dependent))
         })
     }
 
@@ -1199,6 +1202,15 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_view(&mut self, drop: &DropViewMutation) -> MutationResult {
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Relation,
+                id,
+                "view",
+            ) {
+                return result;
+            }
+        }
         let mut present = Vec::new();
         let mut unknown_target = false;
         for id in &drop.ids {
@@ -1236,6 +1248,15 @@ impl AnalysisState {
         &mut self,
         drop: &DropMaterializedViewMutation,
     ) -> MutationResult {
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Relation,
+                id,
+                "materialized view",
+            ) {
+                return result;
+            }
+        }
         let mut present = Vec::new();
         let mut unknown_target = false;
         for id in &drop.ids {
@@ -1286,6 +1307,15 @@ impl AnalysisState {
             return MutationResult::conflict(
                 "DROP INDEX CONCURRENTLY cannot use CASCADE".to_string(),
             );
+        }
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Index,
+                id,
+                "index",
+            ) {
+                return result;
+            }
         }
         // PostgreSQL resolves every target before it applies a multi-index
         // DROP. Preflight the complete statement so a later invalid target

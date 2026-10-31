@@ -276,6 +276,7 @@ mod tests {
             crate::_internal::model::types::TypeState {
                 id: type_id.clone(),
                 generation: 0,
+                owner: ObjectId::new("", "postgres"),
                 kind: crate::_internal::model::types::TypeKind::Enum {
                     variants: vec!["new".into(), "active".into()],
                 },
@@ -339,7 +340,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V10(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V11(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
@@ -445,7 +446,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V10(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V11(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         let rel = deserialized.relations.get(&id).unwrap();
@@ -557,31 +558,36 @@ mod tests {
     }
 
     #[test]
-    fn domain_type_identity_link_does_not_change_the_cache_bincode_layout() {
-        #[allow(dead_code)]
-        #[derive(Serialize)]
-        enum LegacyTypeKind {
-            Enum { variants: Vec<String> },
-            Domain { base_type: String },
-            Base,
-            Composite,
-            Range,
-        }
-
-        let legacy = LegacyTypeKind::Domain {
-            base_type: "mood".into(),
-        };
-        let current = crate::_internal::model::types::TypeKind::Domain {
+    fn domain_type_identity_link_is_skipped_in_the_cache_layout() {
+        let with_id = crate::_internal::model::types::TypeKind::Domain {
             base_type: "mood".into(),
             base_type_id: Some(ObjectId::new("public", "mood")),
+            collation: None,
+            collation_id: None,
+            default: None,
+            default_text: None,
+            not_null: false,
+            not_null_constraint: None,
+            constraints: Default::default(),
+        };
+        let without_id = crate::_internal::model::types::TypeKind::Domain {
+            base_type: "mood".into(),
+            base_type_id: None,
+            collation: None,
+            collation_id: None,
+            default: None,
+            default_text: None,
+            not_null: false,
+            not_null_constraint: None,
+            constraints: Default::default(),
         };
         let config = bincode::config::standard().with_variable_int_encoding();
-        let legacy_bytes = bincode::serde::encode_to_vec(&legacy, config).unwrap();
-        let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
+        let with_id_bytes = bincode::serde::encode_to_vec(&with_id, config).unwrap();
+        let without_id_bytes = bincode::serde::encode_to_vec(&without_id, config).unwrap();
 
-        assert_eq!(current_bytes, legacy_bytes);
+        assert_eq!(with_id_bytes, without_id_bytes);
         let restored: crate::_internal::model::types::TypeKind =
-            bincode::serde::decode_from_slice(&legacy_bytes, config)
+            bincode::serde::decode_from_slice(&without_id_bytes, config)
                 .unwrap()
                 .0;
         assert!(matches!(
@@ -589,6 +595,7 @@ mod tests {
             crate::_internal::model::types::TypeKind::Domain {
                 base_type,
                 base_type_id: None,
+                ..
             } if base_type == "mood"
         ));
     }

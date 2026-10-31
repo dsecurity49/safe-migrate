@@ -71,6 +71,13 @@ impl Rule for IdempotencyRule {
                     format!("CREATE SEQUENCE {} without IF NOT EXISTS", c.id),
                 );
             }
+            Mutation::CreateExtension(c) if !c.if_not_exists => {
+                add_violation(
+                    ObjectKind::Extension,
+                    c.name.clone(),
+                    format!("CREATE EXTENSION {} without IF NOT EXISTS", c.name),
+                );
+            }
 
             // Drop Guards
             Mutation::DropTable(d) if !d.if_exists => {
@@ -149,6 +156,15 @@ impl Rule for IdempotencyRule {
                         ObjectKind::Domain,
                         id.to_string(),
                         format!("DROP DOMAIN {} without IF EXISTS", id),
+                    );
+                }
+            }
+            Mutation::DropExtension(d) if !d.if_exists => {
+                for name in &d.names {
+                    add_violation(
+                        ObjectKind::Extension,
+                        name.clone(),
+                        format!("DROP EXTENSION {} without IF EXISTS", name),
                     );
                 }
             }

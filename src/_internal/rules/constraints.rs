@@ -1,4 +1,7 @@
-use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
+use crate::_internal::analysis::facts::{AlterDomainActionFact, DomainConstraintFact};
+use crate::_internal::analysis::mutations::{
+    AlterDomainMutation, AlterTableActionMutation, Mutation,
+};
 
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
@@ -23,6 +26,10 @@ impl Rule for BlockingConstraintRule {
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
+
+        if let Mutation::AlterDomain(alter) = context.mutation() {
+            return self.evaluate_domain(context, alter);
+        }
 
         if let Mutation::AlterTable(alter) = context.mutation() {
             let (is_temp, mut is_stale, child_rows) =
@@ -341,6 +348,151 @@ impl Rule for BlockingConstraintRule {
                 _ => {}
             }
         }
+        violations
+    }
+}
+
+impl BlockingConstraintRule {
+    fn evaluate_domain(
+        &self,
+        context: &RuleContext<'_>,
+        alter: &AlterDomainMutation,
+    ) -> Vec<Violation> {
+        let Some(action) = &alter.action else {
+            return Vec::new();
+        };
+        let Some(not_null) =
+            context
+                .pre_state()
+                .types
+                .get(&alter.id)
+                .and_then(|state| match &state.kind {
+                    crate::_internal::model::types::TypeKind::Domain { not_null, .. } => {
+                        Some(*not_null)
+                    }
+                    _ => None,
+                })
+        else {
+            return Vec::new();
+        };
+        let action_is_relevant = match action {
+            AlterDomainActionFact::AddConstraint(DomainConstraintFact::Check(check)) => {
+                !check.not_valid
+            }
+            AlterDomainActionFact::AddConstraint(DomainConstraintFact::NotNull { .. })
+            | AlterDomainActionFact::SetNotNull => !not_null,
+            AlterDomainActionFact::ValidateConstraint { .. } => true,
+            _ => false,
+        };
+        if !action_is_relevant {
+            return Vec::new();
+        }
+
+        let relations = context.state().relations_using_domain(&alter.id);
+        if relations.is_empty() {
+            return Vec::new();
+        }
+
+        let mut violations = Vec::new();
+        let mut is_stale = false;
+        let mut max_rows = 0;
+        let mut has_live_relation = false;
+        for relation in relations {
+            let (is_temp, stale, rows) = match context.pre_state().relations.get(&relation.id) {
+                Some(baseline) => (
+                    baseline.persistence == Persistence::Temporary,
+                    baseline.is_stale() && context.state().baseline_relation_is_known(&relation.id),
+                    baseline
+                        .estimated_rows
+                        .unwrap_or(context.config().default_rows),
+                ),
+                None => (
+                    relation.persistence == Persistence::Temporary,
+                    true,
+                    context.config().default_rows,
+                ),
+            };
+            if is_temp {
+                continue;
+            }
+            has_live_relation = true;
+            is_stale |= stale;
+            max_rows = std::cmp::max(max_rows, rows);
+        }
+        if !has_live_relation {
+            return violations;
+        }
+
+        let tier1_threshold = context.config().rule_tier1_threshold(self.id());
+        let tier2_threshold = context.config().rule_tier2_threshold(self.id());
+        let tier = if max_rows >= tier1_threshold {
+            ViolationTier::Tier1
+        } else if max_rows >= tier2_threshold {
+            ViolationTier::Tier2
+        } else {
+            ViolationTier::Tier3
+        };
+        if tier == ViolationTier::Tier3 {
+            return violations;
+        }
+
+        if is_stale {
+            violations.push(Violation {
+                source_range: None,
+                rule_id: self.id(),
+                object_kind: ObjectKind::Domain,
+                object_name: alter.id.to_string(),
+                tier: ViolationTier::Tier2,
+                reason:
+                    "Relation statistics are offline/stale. Lock evaluations may be inaccurate."
+                        .to_string(),
+                recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
+                dedup_key: Some(format!("{}_stale_{}", self.id(), alter.id)),
+                sql: None,
+            });
+        }
+
+        let reason = match action {
+            AlterDomainActionFact::AddConstraint(DomainConstraintFact::Check(check)) => {
+                let name = check.name.as_deref().unwrap_or("unnamed");
+                format!(
+                    "Synchronous CHECK constraint '{}' addition on domain {}",
+                    name, alter.id
+                )
+            }
+            AlterDomainActionFact::AddConstraint(DomainConstraintFact::NotNull { name }) => {
+                let name = name.as_deref().unwrap_or("unnamed");
+                format!(
+                    "Synchronous NOT NULL constraint '{}' addition on domain {}",
+                    name, alter.id
+                )
+            }
+            AlterDomainActionFact::SetNotNull => {
+                format!("Synchronous SET NOT NULL on domain {}", alter.id)
+            }
+            AlterDomainActionFact::ValidateConstraint { name } => {
+                format!(
+                    "Validating CHECK constraint '{}' on domain {}",
+                    name, alter.id
+                )
+            }
+            _ => unreachable!("domain action relevance checked above"),
+        };
+        let mut reason = reason;
+        if is_stale {
+            reason.push_str(" [WARNING: Based on offline/stale statistics]");
+        }
+        violations.push(Violation {
+            source_range: None,
+            rule_id: self.id(),
+            object_kind: ObjectKind::Domain,
+            object_name: alter.id.to_string(),
+            tier,
+            reason,
+            recipe: "Add the constraint as NOT VALID, then VALIDATE it separately during a maintenance window; validation scans every table column that uses the domain.",
+            dedup_key: None,
+            sql: None,
+        });
         violations
     }
 }

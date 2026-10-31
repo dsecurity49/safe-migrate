@@ -1,7 +1,8 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
-    AttributeFact, LockModeFact, ResetSettingTarget, SearchPathTarget, TableConstraintFact,
-    TimeoutSetting, TimeoutSettingValue, ViewUpdatabilityFact,
+    AttributeFact, DomainConstraintFact, DomainDefaultFact, LockModeFact, ResetSettingTarget,
+    SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+    ViewUpdatabilityFact,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
@@ -89,9 +90,13 @@ pub(crate) enum Mutation {
     CreateType(CreateTypeMutation),
     AlterType(AlterTypeMutation),
     RenameType(Rename),
+    CreateExtension(CreateExtensionMutation),
+    AlterExtension(AlterExtensionMutation),
+    DropExtension(DropExtensionMutation),
     CreateDomain(CreateDomainMutation),
     AlterDomain(AlterDomainMutation),
     DropDomain(DropDomainMutation),
+    RenameDomain(Rename),
     DropType(DropTypeMutation),
     CreateSequence(CreateSequenceMutation),
     AlterSequence(AlterSequenceMutation),
@@ -407,9 +412,42 @@ pub(crate) struct DropSequenceMutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateExtensionMutation {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub schema: Option<String>,
+    pub version: Option<String>,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterExtensionMutation {
+    pub name: String,
+    pub action: AlterExtensionActionMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterExtensionActionMutation {
+    Add(crate::_internal::model::extension::ExtensionMember),
+    Drop(crate::_internal::model::extension::ExtensionMember),
+    Update { version: Option<String> },
+    SetSchema { new_schema: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropExtensionMutation {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateDomainMutation {
     pub id: ObjectId,
     pub base_type: String,
+    pub collation: Option<WrittenName>,
+    pub default: Option<DomainDefaultFact>,
+    pub constraints: Vec<DomainConstraintFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -436,6 +474,7 @@ pub(crate) struct DropTypeMutation {
 pub(crate) struct CreateTypeMutation {
     pub id: ObjectId,
     pub kind: TypeKind,
+    pub multirange_name: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -444,6 +483,7 @@ pub(crate) struct AlterTypeMutation {
     pub action: AlterTypeActionMutation,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTypeActionMutation {
     AddValue {
@@ -454,6 +494,32 @@ pub(crate) enum AlterTypeActionMutation {
     RenameValue {
         old_value: String,
         new_value: String,
+    },
+    OwnerTo {
+        new_owner: crate::_internal::analysis::facts::RoleFact,
+    },
+    AddAttribute {
+        name: String,
+        data_type: String,
+        collation: Option<String>,
+    },
+    DropAttribute {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterAttributeType {
+        name: String,
+        data_type: String,
+        collation: Option<String>,
+        cascade: bool,
+    },
+    RenameAttribute {
+        old_name: String,
+        new_name: String,
+    },
+    SetOptions {
+        options: crate::_internal::model::types::BaseTypeOptions,
     },
 }
 

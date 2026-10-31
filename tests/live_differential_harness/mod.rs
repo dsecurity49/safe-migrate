@@ -59,6 +59,8 @@ struct RuleManifest {
     #[serde(default)]
     fixture_min_pg_version: BTreeMap<String, u32>,
     #[serde(default)]
+    fixture_requires_extensions: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     excluded_fixtures: Vec<FixtureExclusion>,
     schemas: Vec<String>,
     scope: Vec<ComparisonScope>,
@@ -180,6 +182,7 @@ enum ComparisonScope {
     Publications,
     Subscriptions,
     ExtendedStatistics,
+    Extensions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,6 +205,7 @@ struct NormalizedState {
     publications: BTreeMap<String, NormalizedPublication>,
     subscriptions: BTreeMap<String, NormalizedSubscription>,
     extended_statistics: BTreeMap<String, NormalizedExtendedStatistics>,
+    extensions: BTreeMap<String, NormalizedExtension>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -334,12 +338,40 @@ struct NormalizedExtendedStatistics {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum NormalizedType {
-    Enum { variants: Vec<String> },
-    Domain { base_type: String },
-    Base,
-    Composite,
-    Range,
-    Multirange,
+    Enum {
+        variants: Vec<String>,
+    },
+    Domain {
+        base_type: String,
+        collation: Option<String>,
+        default: Option<String>,
+        not_null: bool,
+        constraints: BTreeMap<String, (String, bool)>,
+    },
+    Base {
+        shell: bool,
+    },
+    Composite {
+        fields: Vec<(String, String, Option<String>)>,
+    },
+    Range {
+        subtype: Option<String>,
+        multirange: Option<String>,
+        collation: Option<String>,
+    },
+    Multirange {
+        range: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedExtension {
+    owner: String,
+    schema: Option<String>,
+    version: Option<String>,
+    relocatable: Option<bool>,
+    members: BTreeSet<(String, String)>,
+    config_tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -417,6 +449,9 @@ enum MismatchCategory {
     MissingSubscriptionInSimulator,
     ExtraSubscriptionInSimulator,
     SubscriptionDefinitionMismatch,
+    MissingExtensionInSimulator,
+    ExtraExtensionInSimulator,
+    ExtensionDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
     BaselineSearchPathMismatch,
@@ -534,6 +569,20 @@ fn live_postgres_differential_harness() {
         .get::<_, String>(0)
         .parse()
         .expect("server_version_num must be numeric");
+    let any_extension_requirement = manifest
+        .rules
+        .iter()
+        .any(|rule| !rule.fixture_requires_extensions.is_empty());
+    let available_extensions: BTreeSet<String> = if any_extension_requirement {
+        client
+            .query("SELECT name FROM pg_available_extensions", &[])
+            .expect("failed to inspect available extensions")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let engine = SafeMigrateEngine::new(Config::default());
     let mut mismatches = Vec::new();
     let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
@@ -634,6 +683,24 @@ fn live_postgres_differential_harness() {
             let sql = fs::read_to_string(&fixture_path).unwrap_or_else(|error| {
                 panic!("failed to read {}: {error}", fixture_path.display())
             });
+            if let Some(required) = rule.fixture_requires_extensions.get(fixture) {
+                let missing = required
+                    .iter()
+                    .filter(|extension| !available_extensions.contains(*extension))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    verbose(
+                        verbosity,
+                        1,
+                        format!(
+                            "case={}/{} phase=skip unavailable_extensions={missing:?}",
+                            rule.rule_dir, fixture
+                        ),
+                    );
+                    continue;
+                }
+            }
             let live_statements = if rule.fixture_autocommit.contains(fixture) {
                 split_fixture_statements(&sql).unwrap_or_else(|error| {
                     panic!(
@@ -1037,7 +1104,7 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{} extended_statistics:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{} extended_statistics:{} extensions:{}",
         state.schemas.len(),
         state.sequences.len(),
         state.relations.len(),
@@ -1053,7 +1120,8 @@ fn state_counts(state: &NormalizedState) -> String {
         state.view_dependencies.len(),
         state.publications.len(),
         state.subscriptions.len(),
-        state.extended_statistics.len()
+        state.extended_statistics.len(),
+        state.extensions.len()
     )
 }
 
@@ -1356,7 +1424,7 @@ fn state_counts_include_every_replication_family() {
         },
     );
     let counts = state_counts(&state);
-    assert!(counts.ends_with("publications:0 subscriptions:1 extended_statistics:0"));
+    assert!(counts.ends_with("publications:0 subscriptions:1 extended_statistics:0 extensions:0"));
 }
 
 fn load_manifest(path: &Path) -> DifferentialManifest {
@@ -1447,6 +1515,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                     .copied()
                     .unwrap_or(rule.transactional),
                 "autocommit fixture cannot use the rollback wrapper: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
+        for fixture in rule.fixture_requires_extensions.keys() {
+            assert!(
+                included.contains(fixture),
+                "extension requirement references a non-included fixture: {}/{}",
                 rule.rule_dir,
                 fixture
             );
@@ -1579,6 +1655,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         fixture_transactional: BTreeMap::new(),
         fixture_autocommit: BTreeSet::new(),
         fixture_min_pg_version: BTreeMap::new(),
+        fixture_requires_extensions: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -1609,6 +1686,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         fixture_transactional: BTreeMap::new(),
         fixture_autocommit: BTreeSet::new(),
         fixture_min_pg_version: BTreeMap::new(),
+        fixture_requires_extensions: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),

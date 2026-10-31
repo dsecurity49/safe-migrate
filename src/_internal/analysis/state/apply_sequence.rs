@@ -24,6 +24,38 @@ pub(super) fn sequence_type(data_type: &str) -> Option<(&'static str, i64, i64)>
     }
 }
 
+/// Whether the merged bounds exclude values the old bounds admitted.
+fn sequence_bounds_narrowed(
+    current: &crate::_internal::model::sequence::SequenceParameters,
+    merged: &crate::_internal::model::sequence::SequenceParameters,
+) -> bool {
+    merged.min_value > current.min_value || merged.max_value < current.max_value
+}
+
+/// The runtime check PostgreSQL performs after merging sequence parameters.
+///
+/// `RESTART` is checked separately by `init_sequence_parameters`; this covers
+/// the current value when the statement does not restart the sequence.
+fn sequence_runtime_bounds_conflict(
+    runtime: &crate::_internal::model::sequence::SequenceRuntime,
+    parameters: &crate::_internal::model::sequence::SequenceParameters,
+) -> Option<MutationResult> {
+    let last_value = runtime.last_value?;
+    if last_value < parameters.min_value {
+        return Some(MutationResult::conflict(format!(
+            "RESTART value ({last_value}) cannot be less than MINVALUE ({})",
+            parameters.min_value
+        )));
+    }
+    if last_value > parameters.max_value {
+        return Some(MutationResult::conflict(format!(
+            "RESTART value ({last_value}) cannot be greater than MAXVALUE ({})",
+            parameters.max_value
+        )));
+    }
+    None
+}
+
 /// The option bag of a `CREATE`/`ALTER SEQUENCE` statement, keyed the way
 /// PostgreSQL keys the underlying `DefElem`s.
 #[derive(Default)]
@@ -225,8 +257,8 @@ pub(super) fn init_sequence_parameters(
         )));
     }
 
-    // PostgreSQL also cross-checks the sequence's current value here, which is
-    // runtime state this model does not track; a written RESTART is checkable.
+    // PostgreSQL also cross-checks the sequence's current value after merging.
+    // The caller performs that check because it depends on runtime state.
     if let Some(restart) = options.restart {
         let restart = restart.unwrap_or(merged.start_value);
         if restart < merged.min_value {
@@ -545,6 +577,8 @@ impl AnalysisState {
         if let Some(persistence) = option_set.persistence() {
             parameters.persistence = persistence;
         }
+        let runtime =
+            crate::_internal::model::sequence::SequenceRuntime::fresh(parameters.start_value);
         self.local.sequences.insert(
             create.id.clone(),
             SequenceOverlay::Present(SequenceState {
@@ -557,6 +591,8 @@ impl AnalysisState {
                     SequenceKind::Standalone
                 },
                 parameters,
+                runtime,
+                runtime_exact: true,
                 generation,
             }),
         );
@@ -623,12 +659,33 @@ impl AnalysisState {
             _ => None,
         });
 
-        if merged != current.parameters {
+        let restart_runtime = option_set.restart.map(|restart| {
+            crate::_internal::model::sequence::SequenceRuntime::fresh(
+                restart.unwrap_or(merged.start_value),
+            )
+        });
+        if restart_runtime.is_none() {
+            if let Some(conflict) = sequence_runtime_bounds_conflict(&current.runtime, &merged) {
+                return conflict;
+            }
+            if sequence_bounds_narrowed(&current.parameters, &merged) && !current.runtime_exact {
+                // A synchronized runtime may have advanced past the new bound
+                // before this migration ran. The statement still applies, but
+                // its success cannot be asserted exactly.
+                self.taint(EvidenceCode::BaselineStale, EvidenceScope::Chain);
+            }
+        }
+
+        if merged != current.parameters || restart_runtime.is_some() {
             self.snapshot_sequence(&alter.id);
             if let Some(SequenceOverlay::Present(sequence)) =
                 self.local.sequences.get_mut(&alter.id)
             {
                 sequence.parameters = merged;
+                if let Some(runtime) = restart_runtime {
+                    sequence.runtime = runtime;
+                    sequence.runtime_exact = true;
+                }
             }
         }
 
@@ -708,7 +765,10 @@ impl AnalysisState {
                     );
                 }
                 self.snapshot_namespace();
-                let mut moved = current;
+                let mut moved = match self.local.sequences.get(&alter.id) {
+                    Some(SequenceOverlay::Present(sequence)) => sequence.clone(),
+                    _ => unreachable!("sequence presence checked above"),
+                };
                 moved.id = new_id.clone();
                 self.local.sequences.remove(&alter.id);
                 self.local
@@ -803,6 +863,15 @@ impl AnalysisState {
 
     pub(super) fn apply_drop_sequence(&mut self, drop: &DropSequenceMutation) -> MutationResult {
         for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Sequence,
+                id,
+                "sequence",
+            ) {
+                return result;
+            }
+        }
+        for id in &drop.ids {
             match self.sequence_lookup(id) {
                 SequenceLookup::Present => {}
                 SequenceLookup::AuthoritativelyAbsent | SequenceLookup::Tombstone
@@ -854,6 +923,9 @@ impl AnalysisState {
             let has_default_dependencies = self.local.graph.edges().iter().any(|edge| {
                 edge.referenced == *id
                     && matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                    && !self
+                        .co_dropped_objects
+                        .contains(self.local.graph.resolve_rename(&edge.dependent))
             });
             if (sequence.kind == SequenceKind::SerialLike || has_default_dependencies)
                 && !drop.cascade

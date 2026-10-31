@@ -64,6 +64,8 @@ fn cache_v5_hydrates_schema_sequence_and_ownership_edge() {
             owned_by: Some((table_id.clone(), "id".into())),
             kind: SequenceKind::SerialLike,
             parameters: Default::default(),
+            runtime: safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -146,6 +148,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
         TypeState {
             id: ty,
             generation: 0,
+            owner: object_id("", "owner"),
             kind: TypeKind::Enum {
                 variants: vec!["ok".into()],
             },
@@ -160,6 +163,8 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             owned_by: Some((table.clone(), "id".into())),
             kind: SequenceKind::Owned,
             parameters: Default::default(),
+            runtime: safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -314,6 +319,8 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
             owned_by: Some((old_id.clone(), "id".into())),
             kind: SequenceKind::SerialLike,
             parameters: Default::default(),
+            runtime: safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );

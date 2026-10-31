@@ -104,7 +104,11 @@ pub(super) fn populate_cache_from_client(
         .search_path
         .retain(|schema| cache.schemas.contains_key(schema));
 
-    cache.sequences = load_sequences(client, &schema_values)?;
+    cache.sequences = load_sequences(
+        client,
+        &schema_values,
+        cache.pg_version_num.unwrap_or_default(),
+    )?;
     coverage.record(CatalogFamily::Sequences);
 
     cache.relations =
@@ -185,8 +189,11 @@ pub(super) fn populate_cache_from_client(
     coverage.record(CatalogFamily::Publications);
     coverage.record(CatalogFamily::Subscriptions);
 
-    cache.types = load_types(client, &schema_values, schema_filter)?;
+    cache.types = load_types(client, &schema_values, schema_filter, builtin_types)?;
     coverage.record(CatalogFamily::Types);
+
+    cache.extensions = load_extensions(client, &schema_values, builtin_types)?;
+    coverage.record(CatalogFamily::Extensions);
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored

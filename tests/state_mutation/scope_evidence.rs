@@ -239,6 +239,7 @@ fn an_unknown_user_schema_taints_only_the_lookup_that_resolves_past_it() {
         TypeState {
             id: id.clone(),
             generation: 0,
+            owner: object_id("", "postgres"),
             kind: TypeKind::Enum {
                 variants: vec!["old".into()],
             },
@@ -308,6 +309,7 @@ fn a_scoped_baseline_does_not_make_its_scope_searchable() {
         TypeState {
             id,
             generation: 0,
+            owner: object_id("", "postgres"),
             kind: TypeKind::Enum {
                 variants: vec!["old".into()],
             },

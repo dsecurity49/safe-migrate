@@ -194,6 +194,7 @@ impl AnalysisState {
             TypeKind::Domain {
                 base_type,
                 base_type_id,
+                ..
             } => {
                 return self.default_family_for_column(
                     Some(base_type),
@@ -203,7 +204,7 @@ impl AnalysisState {
             }
             TypeKind::Enum { .. } => &["anyenum"],
             TypeKind::Range { .. } => &["anyrange"],
-            TypeKind::Multirange => &["anymultirange"],
+            TypeKind::Multirange { .. } => &["anymultirange"],
             TypeKind::Composite { .. } => &["record"],
             // A user base type has no pseudo-type fallback; only a class
             // written for it exactly can be its default.

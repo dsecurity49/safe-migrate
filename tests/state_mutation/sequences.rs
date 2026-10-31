@@ -484,6 +484,8 @@ fn standalone_default_sequence_is_a_drop_dependency() {
             owned_by: None,
             kind: SequenceKind::Standalone,
             parameters: Default::default(),
+            runtime: safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -564,6 +566,8 @@ fn standalone_default_sequence_is_a_drop_dependency() {
             owned_by: None,
             kind: SequenceKind::Standalone,
             parameters: Default::default(),
+            runtime: safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -687,6 +691,8 @@ fn alter_table_owner_moves_owned_sequence_owner() {
             owned_by: Some((table.clone(), "id".into())),
             kind: SequenceKind::Owned,
             parameters: Default::default(),
+            runtime: safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -704,4 +710,269 @@ fn alter_table_owner_moves_owned_sequence_owner() {
         panic!("owned sequence missing");
     };
     assert_eq!(sequence_state.owner, object_id("", "new_owner"));
+}
+
+fn present_sequence<'a>(state: &'a AnalysisState, id: &ObjectId) -> &'a SequenceState {
+    match state.local.sequences.get(id) {
+        Some(SequenceOverlay::Present(sequence)) => sequence,
+        _ => panic!("sequence '{}' should be present", id),
+    }
+}
+
+fn baseline_sequence_cache(
+    runtime: safe_migrate::_internal::model::sequence::SequenceRuntime,
+    parameters: safe_migrate::_internal::model::sequence::SequenceParameters,
+) -> (safe_migrate::_internal::db::cache::DbCache, ObjectId) {
+    let mut cache = synced_cache();
+    let id = object_id("public", "s");
+    cache.sequences.insert(
+        id.clone(),
+        SequenceState {
+            id: id.clone(),
+            owner: object_id("", "postgres"),
+            owned_by: None,
+            kind: SequenceKind::Standalone,
+            parameters,
+            runtime,
+            runtime_exact: false,
+            generation: 0,
+        },
+    );
+    (cache, id)
+}
+
+#[test]
+fn sequence_runtime_tracks_create_restart_and_start() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let id = object_id("public", "s");
+
+    engine.analyze("CREATE SEQUENCE s;", &mut state).unwrap();
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.runtime.last_value, Some(1));
+    assert_eq!(sequence.runtime.is_called, Some(false));
+    assert!(sequence.runtime_exact);
+
+    engine
+        .analyze("ALTER SEQUENCE s START WITH 7;", &mut state)
+        .unwrap();
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.parameters.start_value, 7);
+    assert_eq!(sequence.runtime.last_value, Some(1));
+    assert_eq!(sequence.runtime.is_called, Some(false));
+
+    engine
+        .analyze("ALTER SEQUENCE s RESTART;", &mut state)
+        .unwrap();
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.runtime.last_value, Some(7));
+    assert_eq!(sequence.runtime.is_called, Some(false));
+    assert!(sequence.runtime_exact);
+
+    engine
+        .analyze("ALTER SEQUENCE s RESTART WITH 12;", &mut state)
+        .unwrap();
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.runtime.last_value, Some(12));
+    assert_eq!(sequence.runtime.is_called, Some(false));
+
+    engine
+        .analyze("ALTER SEQUENCE s INCREMENT BY 2;", &mut state)
+        .unwrap();
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.parameters.increment, 2);
+    assert_eq!(sequence.runtime.last_value, Some(12));
+    assert_eq!(sequence.runtime.is_called, Some(false));
+}
+
+#[test]
+fn sequence_runtime_bounds_are_checked_without_restart() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let id = object_id("public", "s");
+
+    engine
+        .analyze(
+            "CREATE SEQUENCE s MAXVALUE 100; ALTER SEQUENCE s RESTART WITH 10;",
+            &mut state,
+        )
+        .unwrap();
+    let reason = conflict_reason(&engine, &mut state, "ALTER SEQUENCE s MAXVALUE 5;");
+    assert!(
+        reason.contains("RESTART value (10) cannot be greater than MAXVALUE (5)"),
+        "{reason}"
+    );
+    assert_eq!(present_sequence(&state, &id).parameters.max_value, 100);
+
+    engine
+        .analyze(
+            "CREATE SEQUENCE wide; ALTER SEQUENCE wide RESTART WITH 3000000000;",
+            &mut state,
+        )
+        .unwrap();
+    let reason = conflict_reason(&engine, &mut state, "ALTER SEQUENCE wide AS integer;");
+    assert!(
+        reason.contains("RESTART value (3000000000) cannot be greater than MAXVALUE (2147483647)"),
+        "{reason}"
+    );
+    assert_eq!(
+        present_sequence(&state, &object_id("public", "wide"))
+            .parameters
+            .data_type,
+        "bigint"
+    );
+}
+
+#[test]
+fn sequence_narrowing_from_a_cached_runtime_is_tainted() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        max_value: 100,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime {
+            last_value: Some(5),
+            is_called: Some(true),
+        },
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("ALTER SEQUENCE s MAXVALUE 50;", &mut state)
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert!(
+        state
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::BaselineStale)
+    );
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.parameters.max_value, 50);
+    assert_eq!(sequence.runtime.last_value, Some(5));
+    assert!(!sequence.runtime_exact);
+}
+
+#[test]
+fn sequence_narrowing_with_an_unknown_runtime_is_tainted() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        max_value: 100,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("ALTER SEQUENCE s MAXVALUE 50;", &mut state)
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert_eq!(present_sequence(&state, &id).parameters.max_value, 50);
+}
+
+#[test]
+fn sequence_widening_with_an_unknown_runtime_is_exact() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        max_value: 100,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("ALTER SEQUENCE s MAXVALUE 200;", &mut state)
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    assert_eq!(present_sequence(&state, &id).parameters.max_value, 200);
+}
+
+#[test]
+fn sequence_restart_makes_a_cached_runtime_exact() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        max_value: 100,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime::unknown(),
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("ALTER SEQUENCE s RESTART WITH 5;", &mut state)
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    let sequence = present_sequence(&state, &id);
+    assert_eq!(sequence.runtime.last_value, Some(5));
+    assert_eq!(sequence.runtime.is_called, Some(false));
+    assert!(sequence.runtime_exact);
+}
+
+#[test]
+fn sequence_local_narrowing_is_exact() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let id = object_id("public", "s");
+
+    engine
+        .analyze(
+            "CREATE SEQUENCE s MAXVALUE 100; ALTER SEQUENCE s MAXVALUE 50;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    assert_eq!(present_sequence(&state, &id).parameters.max_value, 50);
+}
+
+#[test]
+fn truncate_restart_identity_taints_unmodeled_sequence_resets() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE TABLE t (id serial); TRUNCATE t RESTART IDENTITY;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert!(
+        state
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::UnmodeledState)
+    );
+    let sequence = state
+        .local
+        .sequences
+        .values()
+        .find_map(|overlay| match overlay {
+            SequenceOverlay::Present(sequence)
+                if sequence.owned_by.as_ref().is_some_and(|(table, column)| {
+                    table == &object_id("public", "t") && column == "id"
+                }) =>
+            {
+                Some(sequence)
+            }
+            _ => None,
+        })
+        .expect("serial sequence");
+    assert_eq!(sequence.runtime.last_value, None);
+    assert!(!sequence.runtime_exact);
 }

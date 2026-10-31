@@ -83,16 +83,31 @@ pub(crate) enum ResetSettingTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeCreationKind {
-    Enum { variants: Vec<String> },
-    Range { subtype: Option<String> },
-    Composite { fields: Vec<CompositeFieldFact> },
-    Base { element: Option<String> },
+    Enum {
+        variants: Vec<String>,
+    },
+    Range {
+        subtype: Option<String>,
+        multirange_type_name: Option<QualifiedName>,
+        collation: Option<String>,
+        opclass: Option<String>,
+        canonical: Option<String>,
+        subtype_diff: Option<String>,
+    },
+    Composite {
+        fields: Vec<CompositeFieldFact>,
+    },
+    Base {
+        options: crate::_internal::model::types::BaseTypeOptions,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompositeFieldFact {
     pub name: String,
     pub data_type: String,
+    #[serde(default)]
+    pub collation: Option<String>,
 }
 
 /// A routine a view calls.
@@ -333,10 +348,10 @@ pub(crate) enum StatementFact {
     },
     CreateType(CreateTypeFact),
     AlterType(AlterTypeFact),
-    CreateDomain {
-        name: QualifiedName,
-        base_type: String,
-    },
+    CreateExtension(CreateExtensionFact),
+    AlterExtension(AlterExtensionFact),
+    DropExtension(DropExtensionFact),
+    CreateDomain(CreateDomainFact),
     AlterDomain {
         name: QualifiedName,
         action: Option<AlterDomainActionFact>,
@@ -621,6 +636,7 @@ pub(crate) struct AlterTypeFact {
     pub actions: Vec<AlterTypeActionFact>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTypeActionFact {
     RenameTo {
@@ -628,6 +644,9 @@ pub(crate) enum AlterTypeActionFact {
     },
     SetSchema {
         new_schema: String,
+    },
+    OwnerTo {
+        new_owner: RoleFact,
     },
     AddValue {
         new_value: String,
@@ -638,6 +657,73 @@ pub(crate) enum AlterTypeActionFact {
         old_value: String,
         new_value: String,
     },
+    AddAttribute {
+        name: Ident,
+        data_type: String,
+        collation: Option<String>,
+    },
+    DropAttribute {
+        name: Ident,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterAttributeType {
+        name: Ident,
+        data_type: String,
+        collation: Option<String>,
+        cascade: bool,
+    },
+    RenameAttribute {
+        old_name: Ident,
+        new_name: Ident,
+    },
+    SetOptions {
+        options: crate::_internal::model::types::BaseTypeOptions,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateExtensionFact {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub schema: Option<String>,
+    pub version: Option<String>,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterExtensionFact {
+    pub name: String,
+    pub action: AlterExtensionActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterExtensionActionFact {
+    Add(ExtensionMemberFact),
+    Drop(ExtensionMemberFact),
+    Update { version: Option<String> },
+    SetSchema { new_schema: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropExtensionFact {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExtensionMemberFact {
+    Named {
+        kind: crate::_internal::model::extension::ExtensionMemberKind,
+        name: QualifiedName,
+    },
+    Routine {
+        name: QualifiedName,
+        params: Vec<String>,
+    },
+    Schema(String),
+    Unmodeled(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -1327,18 +1413,65 @@ pub(crate) enum TableConstraintFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateDomainFact {
+    pub name: QualifiedName,
+    pub base_type: String,
+    pub collation: Option<WrittenName>,
+    pub default: Option<DomainDefaultFact>,
+    pub constraints: Vec<DomainConstraintFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DomainDefaultFact {
+    pub expression: ExprIr,
+    pub text: String,
+    /// PostgreSQL folds a bare `NULL` (including casts of it) into "no
+    /// default", so the fact keeps that distinction out of the expression.
+    pub is_null: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DomainCheckFact {
+    pub name: Option<String>,
+    pub expression: ExprIr,
+    pub expression_text: String,
+    pub definition: String,
+    pub not_valid: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DomainConstraintFact {
+    Check(DomainCheckFact),
+    NotNull { name: Option<String> },
+    Null,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterDomainActionFact {
-    AddConstraint,
-    DropConstraint,
+    AddConstraint(DomainConstraintFact),
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
     DropDefault,
     DropNotNull,
-    OwnerChange,
-    RenameConstraint,
-    RenameTo,
-    SetDefault,
+    OwnerChange(RoleFact),
+    RenameConstraint {
+        old_name: String,
+        new_name: String,
+    },
+    RenameTo {
+        new_name: Ident,
+    },
+    SetDefault(DomainDefaultFact),
     SetNotNull,
-    SetSchema,
-    ValidateConstraint,
+    SetSchema {
+        new_schema: String,
+    },
+    ValidateConstraint {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

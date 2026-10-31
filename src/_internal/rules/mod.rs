@@ -134,6 +134,14 @@ impl RuleCapability {
             crate::_internal::analysis::mutations::Mutation::RefreshMaterializedView(refresh) => {
                 targets.push(&refresh.id);
             }
+            crate::_internal::analysis::mutations::Mutation::AlterDomain(alter) => {
+                targets.extend(
+                    state
+                        .relations_using_domain(&alter.id)
+                        .into_iter()
+                        .map(|relation| &relation.id),
+                );
+            }
             crate::_internal::analysis::mutations::Mutation::DropIndex(drop) => {
                 for index_id in &drop.ids {
                     targets.extend(pre_state.indexes.iter().filter_map(|edge| {

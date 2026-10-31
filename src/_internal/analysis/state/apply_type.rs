@@ -1,14 +1,22 @@
 use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
-use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
+use crate::_internal::analysis::expr_ir::ExprIr;
+use crate::_internal::analysis::facts::{
+    AlterDomainActionFact, DomainCheckFact, DomainConstraintFact, DomainDefaultFact,
+};
+use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterDomainMutation, AlterTypeActionMutation, AlterTypeMutation, CreateDomainMutation,
     CreateTypeMutation, DropDomainMutation, DropTypeMutation, Rename,
 };
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
+use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 use crate::_internal::model::function::FunctionOverlay;
-use crate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
-use std::collections::HashSet;
+use crate::_internal::model::types::{
+    BaseTypeLength, BaseTypeOptions, DomainConstraintState, TypeKind, TypeOverlay, TypeState,
+};
+use std::collections::{BTreeMap, HashSet};
 
 type TypeLookup = ObjectLookup;
 
@@ -16,6 +24,11 @@ impl AnalysisState {
     /// Reject a type the server would refuse to create: a duplicate enum
     /// label, or a component type that names nothing resolvable.
     fn check_created_type(&mut self, kind: &TypeKind) -> Result<(), MutationResult> {
+        if let TypeKind::Base { options, .. } = kind
+            && let Some(result) = base_type_option_conflict(options)
+        {
+            return Err(result);
+        }
         let declared: Vec<&str> = match kind {
             TypeKind::Enum { variants } => {
                 let mut seen = HashSet::new();
@@ -34,8 +47,8 @@ impl AnalysisState {
                 .collect(),
             TypeKind::Domain { base_type, .. } => vec![base_type.as_str()],
             TypeKind::Range { subtype, .. } => subtype.as_deref().into_iter().collect(),
-            TypeKind::Base { element } => element.as_deref().into_iter().collect(),
-            TypeKind::Multirange => Vec::new(),
+            TypeKind::Base { options, .. } => options.element.as_deref().into_iter().collect(),
+            TypeKind::Multirange { .. } => Vec::new(),
         };
         for declared_type in declared {
             if let Some(result) = self.check_declared_type(declared_type) {
@@ -59,12 +72,240 @@ impl AnalysisState {
         if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
+        if let Some(TypeOverlay::Present(existing)) = self.local.types.get(&create.id) {
+            match (&existing.kind, &create.kind) {
+                (
+                    TypeKind::Base { shell: true, .. },
+                    TypeKind::Base {
+                        shell: false,
+                        options,
+                    },
+                ) => {
+                    if let Some(result) = base_type_option_conflict(options) {
+                        return result;
+                    }
+                    let mut options = options.clone();
+                    self.canonicalize_base_type_options(&mut options);
+                    self.snapshot_type(&create.id);
+                    if let Some(TypeOverlay::Present(target)) = self.local.types.get_mut(&create.id)
+                    {
+                        target.kind = TypeKind::Base {
+                            shell: false,
+                            options,
+                        };
+                    }
+                    return MutationResult::Applied;
+                }
+                _ => {
+                    return MutationResult::conflict(format!(
+                        "type '{}' already exists",
+                        create.id
+                    ));
+                }
+            }
+        }
         if self.relation_namespace_is_taken(&create.id) {
             return MutationResult::conflict(format!("type '{}' already exists", create.id));
         }
         if let Err(result) = self.check_created_type(&create.kind) {
             return result;
         }
+
+        let mut kind = create.kind.clone();
+        if let TypeKind::Base {
+            shell: false,
+            options,
+        } = &mut kind
+        {
+            self.canonicalize_base_type_options(options);
+        }
+        let mut companion_id = None;
+
+        if let TypeKind::Range {
+            canonical,
+            canonical_id,
+            subtype,
+            subtype_id,
+            subtype_diff,
+            subtype_diff_id,
+            ..
+        } = &mut kind
+        {
+            let subtype_signature = subtype_id
+                .clone()
+                .map(|id| id.to_string())
+                .or_else(|| subtype.clone());
+            if let Some(canonical) = canonical.as_deref() {
+                *canonical_id = self.resolve_internal_routine_id(canonical, &create.id.to_string());
+            }
+            if let (Some(subtype_diff), Some(signature)) =
+                (subtype_diff.as_deref(), subtype_signature)
+            {
+                *subtype_diff_id = self
+                    .resolve_internal_routine_id(subtype_diff, &format!("{signature},{signature}"));
+            }
+        }
+
+        if let TypeKind::Composite { fields } = &mut kind {
+            for field in fields {
+                let (collation, collation_id) = match self
+                    .resolve_composite_field_collation(&field.data_type, field.collation.as_deref())
+                {
+                    Ok(resolved) => resolved,
+                    Err(result) => return result,
+                };
+                field.collation = collation;
+                field.collation_id = collation_id;
+            }
+        }
+
+        if let TypeKind::Range {
+            ref subtype,
+            ref subtype_id,
+            ref mut multirange,
+            ..
+        } = kind
+        {
+            let multirange_id = create
+                .multirange_name
+                .clone()
+                .unwrap_or_else(|| Self::multirange_companion_id(&create.id));
+
+            if self.relation_namespace_is_taken(&multirange_id) {
+                return MutationResult::conflict(format!(
+                    "type '{}' already exists",
+                    multirange_id
+                ));
+            }
+            if let Err(result) = self.ensure_creation_target(&multirange_id) {
+                return result;
+            }
+
+            *multirange = Some(multirange_id.clone());
+            companion_id = Some(multirange_id);
+
+            // Register constructors for range and multirange.
+            let subtype_name = subtype.as_deref().unwrap_or("anyelement");
+            let range_schema = &create.id.schema;
+            let range_name = &create.id.name;
+
+            let make_constructor = |id: ObjectId,
+                                    arg_types: Vec<String>,
+                                    arg_type_ids: Vec<Option<ObjectId>>,
+                                    ret_type: String,
+                                    ret_id: Option<ObjectId>,
+                                    owner: ObjectId| {
+                crate::_internal::model::function::FunctionState {
+                    id,
+                    internal_type_owner: Some(owner),
+                    routine_kind: crate::_internal::model::function::RoutineKind::Function,
+                    arg_types,
+                    arg_type_ids,
+                    return_type: ret_type,
+                    return_type_id: ret_id,
+                    returns_set: false,
+                    parameters: Vec::new(),
+                    default_count: 0,
+                    volatility: crate::_internal::model::function::Volatility::Immutable,
+                    language: "internal".to_string(),
+                    security: crate::_internal::model::function::SecurityMode::Invoker,
+                    aggregate: None,
+                }
+            };
+
+            // Range constructors: range(subtype, subtype), range(subtype, subtype, text)
+            let r_ctor2_id = ObjectId::new(
+                range_schema,
+                format!("{range_name}({subtype_name},{subtype_name})"),
+            );
+            let r_ctor2 = make_constructor(
+                r_ctor2_id.clone(),
+                vec![subtype_name.to_string(), subtype_name.to_string()],
+                vec![subtype_id.clone(), subtype_id.clone()],
+                create.id.to_string(),
+                Some(create.id.clone()),
+                create.id.clone(),
+            );
+            self.snapshot_function(&r_ctor2_id);
+            self.local
+                .functions
+                .insert(r_ctor2_id, FunctionOverlay::Present(r_ctor2));
+
+            let r_ctor3_id = ObjectId::new(
+                range_schema,
+                format!("{range_name}({subtype_name},{subtype_name},text)"),
+            );
+            let r_ctor3 = make_constructor(
+                r_ctor3_id.clone(),
+                vec![
+                    subtype_name.to_string(),
+                    subtype_name.to_string(),
+                    "text".to_string(),
+                ],
+                vec![
+                    subtype_id.clone(),
+                    subtype_id.clone(),
+                    Some(ObjectId::new("pg_catalog", "text")),
+                ],
+                create.id.to_string(),
+                Some(create.id.clone()),
+                create.id.clone(),
+            );
+            self.snapshot_function(&r_ctor3_id);
+            self.local
+                .functions
+                .insert(r_ctor3_id, FunctionOverlay::Present(r_ctor3));
+
+            // Multirange constructors in range's schema: mr(), mr(range), mr(range[])
+            let mr_id = companion_id.as_ref().unwrap();
+            let mr_name = &mr_id.name;
+
+            let mr_ctor0_id = ObjectId::new(range_schema, format!("{mr_name}()"));
+            let mr_ctor0 = make_constructor(
+                mr_ctor0_id.clone(),
+                Vec::new(),
+                Vec::new(),
+                mr_id.to_string(),
+                Some(mr_id.clone()),
+                mr_id.clone(),
+            );
+            self.snapshot_function(&mr_ctor0_id);
+            self.local
+                .functions
+                .insert(mr_ctor0_id, FunctionOverlay::Present(mr_ctor0));
+
+            let mr_ctor1_id = ObjectId::new(range_schema, format!("{mr_name}({})", create.id.name));
+            let mr_ctor1 = make_constructor(
+                mr_ctor1_id.clone(),
+                vec![create.id.name.clone()],
+                vec![Some(create.id.clone())],
+                mr_id.to_string(),
+                Some(mr_id.clone()),
+                mr_id.clone(),
+            );
+            self.snapshot_function(&mr_ctor1_id);
+            self.local
+                .functions
+                .insert(mr_ctor1_id, FunctionOverlay::Present(mr_ctor1));
+
+            let mr_ctor2_id = ObjectId::new(
+                range_schema,
+                format!("{mr_name}(VARIADIC {}[])", create.id.name),
+            );
+            let mr_ctor2 = make_constructor(
+                mr_ctor2_id.clone(),
+                vec![format!("{}[]", create.id.name)],
+                vec![Some(Self::array_type_id(&create.id))],
+                mr_id.to_string(),
+                Some(mr_id.clone()),
+                mr_id.clone(),
+            );
+            self.snapshot_function(&mr_ctor2_id);
+            self.local
+                .functions
+                .insert(mr_ctor2_id, FunctionOverlay::Present(mr_ctor2));
+        }
+
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -74,9 +315,28 @@ impl AnalysisState {
             TypeOverlay::Present(TypeState {
                 id: create.id.clone(),
                 generation,
-                kind: create.kind.clone(),
+                owner: ObjectId::new("", self.local.current_role.clone()),
+                kind,
             }),
         );
+
+        if let Some(multirange_id) = companion_id {
+            self.snapshot_type(&multirange_id);
+            self.local.generation_counter += 1;
+            let mr_gen = self.local.generation_counter;
+            self.local.types.insert(
+                multirange_id.clone(),
+                TypeOverlay::Present(TypeState {
+                    id: multirange_id,
+                    generation: mr_gen,
+                    owner: ObjectId::new("", self.local.current_role.clone()),
+                    kind: TypeKind::Multirange {
+                        range: Some(create.id.clone()),
+                    },
+                }),
+            );
+        }
+
         MutationResult::Applied
     }
 
@@ -227,6 +487,7 @@ impl AnalysisState {
                 TypeKind::Domain {
                     base_type,
                     base_type_id,
+                    ..
                 } => {
                     if let Some(new_id) = base_type_id
                         .as_ref()
@@ -259,6 +520,8 @@ impl AnalysisState {
                 TypeKind::Range {
                     subtype,
                     subtype_id,
+                    multirange,
+                    ..
                 } => {
                     if let Some(new_id) = subtype_id
                         .as_ref()
@@ -273,8 +536,31 @@ impl AnalysisState {
                         }
                         *subtype_id = Some(new_id);
                     }
+                    if multirange.as_ref() == Some(&rename.old_id) {
+                        *multirange = Some(rename.new_id.clone());
+                    }
                 }
-                TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange => {}
+                TypeKind::Multirange { range } => {
+                    if range.as_ref() == Some(&rename.old_id) {
+                        *range = Some(rename.new_id.clone());
+                    }
+                }
+                TypeKind::Base { options, .. } => {
+                    if let Some(ref elem) = options.element
+                        && (elem == &rename.old_id.name || elem == &rename.old_id.to_string())
+                    {
+                        options.element = Some(rename.new_id.name.clone());
+                    }
+                }
+                TypeKind::Enum { .. } => {}
+            }
+        }
+        for overlay in self.local.functions.values_mut() {
+            if let FunctionOverlay::Present(function) = overlay
+                && let Some(owner) = function.internal_type_owner.as_mut()
+                && let Some(remapped) = Self::renamed_type_id(owner, rename)
+            {
+                *owner = remapped;
             }
         }
         for (old_id, new_id, arg_types, return_type) in remapped_functions {
@@ -312,6 +598,29 @@ impl AnalysisState {
                 }
             }
         }
+
+        // Remap extension membership when a type is renamed or moved across schemas.
+        for overlay in self.local.extensions.values_mut() {
+            let crate::_internal::model::extension::ExtensionOverlay::Present(ext) = overlay else {
+                continue;
+            };
+            if ext.members.iter().any(|m| {
+                m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
+                    && m.id == rename.old_id
+            }) {
+                let mut updated_members = std::collections::BTreeSet::new();
+                for mut m in ext.members.iter().cloned() {
+                    if m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
+                        && m.id == rename.old_id
+                    {
+                        m.id = rename.new_id.clone();
+                    }
+                    updated_members.insert(m);
+                }
+                ext.members = updated_members;
+            }
+        }
+
         MutationResult::Applied
     }
 
@@ -326,20 +635,233 @@ impl AnalysisState {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
-        if matches!(&alter.action, AlterTypeActionMutation::AddValue { .. })
+        if matches!(
+            &alter.action,
+            AlterTypeActionMutation::AddValue { .. } | AlterTypeActionMutation::RenameValue { .. }
+        ) && !matches!(
+            self.local.types.get(&alter.id),
+            Some(TypeOverlay::Present(TypeState {
+                kind: TypeKind::Enum { .. },
+                ..
+            }))
+        ) {
+            return MutationResult::conflict(format!("type '{}' is not an enum", alter.id));
+        }
+
+        if matches!(
+            &alter.action,
+            AlterTypeActionMutation::AddAttribute { .. }
+                | AlterTypeActionMutation::DropAttribute { .. }
+                | AlterTypeActionMutation::AlterAttributeType { .. }
+                | AlterTypeActionMutation::RenameAttribute { .. }
+        ) && !matches!(
+            self.local.types.get(&alter.id),
+            Some(TypeOverlay::Present(TypeState {
+                kind: TypeKind::Composite { .. },
+                ..
+            }))
+        ) {
+            return MutationResult::conflict(format!(
+                "type '{}' is not a composite type",
+                alter.id
+            ));
+        }
+
+        if matches!(&alter.action, AlterTypeActionMutation::SetOptions { .. })
             && !matches!(
                 self.local.types.get(&alter.id),
                 Some(TypeOverlay::Present(TypeState {
-                    kind: TypeKind::Enum { .. },
+                    kind: TypeKind::Base { .. },
                     ..
                 }))
             )
         {
-            return MutationResult::conflict(format!("type '{}' is not an enum", alter.id));
+            return MutationResult::conflict(format!("type '{}' is not a base type", alter.id));
         }
+
+        if let AlterTypeActionMutation::SetOptions { options } = &alter.action {
+            let Some(TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Base {
+                        shell,
+                        options: current,
+                    },
+                ..
+            })) = self.local.types.get(&alter.id)
+            else {
+                unreachable!("base type presence checked above");
+            };
+            if *shell {
+                return MutationResult::conflict(format!("type '{}' is only a shell", alter.id));
+            }
+            if let Some(attribute) = immutable_base_type_option(options) {
+                return MutationResult::conflict(format!(
+                    "type attribute \"{attribute}\" cannot be changed"
+                ));
+            }
+            if let Some(storage) = options.storage.as_deref()
+                && let Some(result) =
+                    base_type_storage_conflict(storage, current.internallength.as_ref())
+            {
+                return result;
+            }
+        }
+
+        // Check if typed tables require CASCADE for attribute changes.
+        let typed_tables: Vec<ObjectId> = self
+            .local
+            .relations
+            .iter()
+            .filter_map(|(id, overlay)| match overlay {
+                RelationOverlay::Present(rel) if rel.of_type.as_ref() == Some(&alter.id) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        match &alter.action {
+            AlterTypeActionMutation::DropAttribute { cascade, .. }
+            | AlterTypeActionMutation::AlterAttributeType { cascade, .. }
+                if !typed_tables.is_empty() && !cascade =>
+            {
+                return MutationResult::conflict(format!(
+                    "cannot alter type \"{}\" because it is the type of a typed table",
+                    alter.id.name
+                ));
+            }
+            _ => {}
+        }
+
+        let resolved_attr_type_id = match &alter.action {
+            AlterTypeActionMutation::AddAttribute { data_type, .. }
+            | AlterTypeActionMutation::AlterAttributeType { data_type, .. } => {
+                self.resolve_type_reference(data_type)
+            }
+            _ => None,
+        };
+        let resolved_attr_collation = match &alter.action {
+            AlterTypeActionMutation::AddAttribute {
+                data_type,
+                collation,
+                ..
+            }
+            | AlterTypeActionMutation::AlterAttributeType {
+                data_type,
+                collation,
+                ..
+            } => match self.resolve_composite_field_collation(data_type, collation.as_deref()) {
+                Ok(resolved) => Some(resolved),
+                Err(result) => return result,
+            },
+            _ => None,
+        };
+
+        let normalized_set_options = match &alter.action {
+            AlterTypeActionMutation::SetOptions { options } => {
+                let mut options = options.clone();
+                self.canonicalize_base_type_options(&mut options);
+                Some(options)
+            }
+            _ => None,
+        };
+
         self.snapshot_type(&alter.id);
         if let Some(TypeOverlay::Present(existing)) = self.local.types.get_mut(&alter.id) {
             match &alter.action {
+                AlterTypeActionMutation::OwnerTo { new_owner } => {
+                    let owner_id = Self::resolve_role_name(
+                        new_owner,
+                        &self.local.current_role,
+                        &self.local.session_role,
+                    )
+                    .unwrap_or_else(|| ObjectId::new("", "unknown"));
+                    existing.owner = owner_id;
+                }
+                AlterTypeActionMutation::SetOptions { .. } => {
+                    if let TypeKind::Base {
+                        options: base_opts,
+                        shell,
+                    } = &mut existing.kind
+                    {
+                        base_opts.merge(
+                            normalized_set_options
+                                .as_ref()
+                                .expect("set options normalized above"),
+                        );
+                        *shell = false;
+                    }
+                }
+                AlterTypeActionMutation::AddAttribute {
+                    name, data_type, ..
+                } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        if fields.iter().any(|f| f.name == *name) {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" already exists",
+                                name, alter.id.name
+                            ));
+                        }
+                        let (collation, collation_id) =
+                            resolved_attr_collation.clone().unwrap_or((None, None));
+                        fields.push(crate::_internal::model::types::CompositeFieldState {
+                            name: name.clone(),
+                            data_type: data_type.clone(),
+                            data_type_id: resolved_attr_type_id.clone(),
+                            collation,
+                            collation_id,
+                        });
+                    }
+                }
+                AlterTypeActionMutation::DropAttribute {
+                    name, if_exists, ..
+                } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        if let Some(idx) = fields.iter().position(|f| f.name == *name) {
+                            fields.remove(idx);
+                        } else if !if_exists {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, alter.id.name
+                            ));
+                        }
+                    }
+                }
+                AlterTypeActionMutation::AlterAttributeType {
+                    name, data_type, ..
+                } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        let Some(field) = fields.iter_mut().find(|f| f.name == *name) else {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, alter.id.name
+                            ));
+                        };
+                        field.data_type = data_type.clone();
+                        field.data_type_id = resolved_attr_type_id.clone();
+                        let (collation, collation_id) =
+                            resolved_attr_collation.clone().unwrap_or((None, None));
+                        field.collation = collation;
+                        field.collation_id = collation_id;
+                    }
+                }
+                AlterTypeActionMutation::RenameAttribute { old_name, new_name } => {
+                    if let TypeKind::Composite { fields } = &mut existing.kind {
+                        if fields.iter().any(|f| f.name == *new_name) {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" already exists",
+                                new_name, alter.id.name
+                            ));
+                        }
+                        let Some(field) = fields.iter_mut().find(|f| f.name == *old_name) else {
+                            return MutationResult::conflict(format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                old_name, alter.id.name
+                            ));
+                        };
+                        field.name = new_name.clone();
+                    }
+                }
                 AlterTypeActionMutation::AddValue {
                     new_value,
                     neighbor,
@@ -391,7 +913,249 @@ impl AnalysisState {
                 }
             }
         }
+
+        // Synchronize typed tables with composite alterations
+        for tbl_id in typed_tables {
+            self.snapshot_relation(&tbl_id);
+            if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&tbl_id) {
+                match &alter.action {
+                    AlterTypeActionMutation::AddAttribute {
+                        name, data_type, ..
+                    } => {
+                        if !rel.columns.iter().any(|c| c.name == *name) {
+                            rel.columns.push(crate::_internal::model::column::Column {
+                                name: name.clone(),
+                                data_type: Some(data_type.clone()),
+                                type_id: resolved_attr_type_id.clone(),
+                                is_nullable: true,
+                                default: None,
+                                avg_width: None,
+                                default_expr_text: None,
+                                type_modifier: None,
+                                storage: None,
+                                compression: None,
+                                statistics_target: None,
+                                options: Default::default(),
+                                generated: None,
+                            });
+                        }
+                    }
+                    AlterTypeActionMutation::DropAttribute { name, .. } => {
+                        rel.columns.retain(|c| c.name != *name);
+                    }
+                    AlterTypeActionMutation::AlterAttributeType {
+                        name, data_type, ..
+                    } => {
+                        if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *name) {
+                            col.data_type = Some(data_type.clone());
+                            col.type_id = resolved_attr_type_id.clone();
+                        }
+                    }
+                    AlterTypeActionMutation::RenameAttribute { old_name, new_name } => {
+                        if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *old_name) {
+                            col.name = new_name.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         MutationResult::Applied
+    }
+
+    /// Resolve a range's canonical or subtype-diff routine by its written name
+    /// and the exact argument identity PostgreSQL records for it. The routine
+    /// must already exist when the range type is created.
+    fn resolve_internal_routine_id(&self, written: &str, signature: &str) -> Option<ObjectId> {
+        let (schema_hint, function_name) = match written.rsplit_once('.') {
+            Some((schema, name)) => (Some(schema.trim_matches('"')), name.trim_matches('"')),
+            None => (None, written.trim_matches('"')),
+        };
+        let object_name = format!("{function_name}({signature})");
+        if let Some(schema) = schema_hint {
+            let id = ObjectId::new(schema, object_name);
+            return self.routine_is_present(&id).then_some(id);
+        }
+        self.routine_search_path().into_iter().find_map(|entry| {
+            let schema = entry.searched_schema()?;
+            let id = ObjectId::new(schema, object_name.clone());
+            self.routine_is_present(&id).then_some(id)
+        })
+    }
+
+    fn canonicalize_base_type_options(&self, options: &mut BaseTypeOptions) {
+        for written in options.routine_references_mut() {
+            if let Some(id) = self.resolve_unique_routine_reference(written) {
+                *written = id.to_string();
+            }
+        }
+    }
+
+    /// Resolve a base-type routine option written without an argument list.
+    /// Ambiguous overloads stay unresolved rather than guessing.
+    fn resolve_unique_routine_reference(&self, written: &str) -> Option<ObjectId> {
+        let (schema_hint, function_name, signature) = Self::split_routine_reference(written);
+        let schemas: Vec<String> = match schema_hint {
+            Some(schema) => vec![schema],
+            None => self
+                .routine_search_path()
+                .into_iter()
+                .filter_map(|entry| entry.searched_schema().map(str::to_string))
+                .collect(),
+        };
+        for schema in schemas {
+            if let Some(signature) = &signature {
+                let id = ObjectId::new(&schema, format!("{function_name}{signature}"));
+                if self.routine_is_present(&id) {
+                    return Some(id);
+                }
+                continue;
+            }
+            let candidates = self
+                .local
+                .functions
+                .keys()
+                .filter(|id| {
+                    id.schema == schema
+                        && DependencyGraph::split_routine_signature(id).1 == function_name
+                        && matches!(
+                            self.local.functions.get(*id),
+                            Some(FunctionOverlay::Present(_))
+                        )
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                continue;
+            }
+            return (candidates.len() == 1).then(|| candidates[0].clone());
+        }
+        None
+    }
+
+    fn split_routine_reference(written: &str) -> (Option<String>, String, Option<String>) {
+        let (head, signature) = match written.split_once('(') {
+            Some((head, args)) => (head, Some(format!("({args}"))),
+            None => (written, None),
+        };
+        let (schema, name) = match head.rsplit_once('.') {
+            Some((schema, name)) => (Some(Self::unquote_identifier(schema)), name),
+            None => (None, head),
+        };
+        (schema, Self::unquote_identifier(name), signature)
+    }
+
+    fn unquote_identifier(identifier: &str) -> String {
+        identifier
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .map(|value| value.replace("\"\"", "\""))
+            .unwrap_or_else(|| identifier.to_string())
+    }
+
+    /// Does this base-type routine option still name `routine`? Exact canonical
+    /// IDs cover synchronized state; a bare written name is accepted only when
+    /// it identifies a single live overload.
+    pub(super) fn base_type_option_references_routine(
+        &self,
+        options: &BaseTypeOptions,
+        routine: &ObjectId,
+    ) -> bool {
+        options.routine_references().any(|written| {
+            let (schema_hint, function_name, signature) = Self::split_routine_reference(written);
+            if signature.is_some() {
+                return written == &routine.to_string();
+            }
+            if DependencyGraph::split_routine_signature(routine).1 != function_name {
+                return false;
+            }
+            if let Some(ref schema) = schema_hint
+                && schema != &routine.schema
+            {
+                return false;
+            }
+            let mut candidates = self.local.functions.keys().filter(|id| {
+                DependencyGraph::split_routine_signature(id).1 == function_name
+                    && schema_hint
+                        .as_ref()
+                        .is_none_or(|schema| &id.schema == schema)
+                    && matches!(
+                        self.local.functions.get(*id),
+                        Some(FunctionOverlay::Present(_))
+                    )
+            });
+            candidates.next() == Some(routine) && candidates.next().is_none()
+        })
+    }
+
+    pub(super) fn remap_range_routine_reference(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        let affected: Vec<ObjectId> = self
+            .local
+            .types
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let TypeOverlay::Present(state) = overlay else {
+                    return None;
+                };
+                let TypeKind::Range {
+                    canonical_id,
+                    subtype_diff_id,
+                    ..
+                } = &state.kind
+                else {
+                    return None;
+                };
+                (canonical_id == &Some(old_id.clone()) || subtype_diff_id == &Some(old_id.clone()))
+                    .then(|| id.clone())
+            })
+            .collect();
+        for id in affected {
+            self.snapshot_type(&id);
+            if let Some(TypeOverlay::Present(state)) = self.local.types.get_mut(&id)
+                && let TypeKind::Range {
+                    canonical_id,
+                    subtype_diff_id,
+                    ..
+                } = &mut state.kind
+            {
+                if canonical_id.as_ref() == Some(old_id) {
+                    *canonical_id = Some(new_id.clone());
+                }
+                if subtype_diff_id.as_ref() == Some(old_id) {
+                    *subtype_diff_id = Some(new_id.clone());
+                }
+            }
+        }
+
+        let base_affected: Vec<ObjectId> = self
+            .local
+            .types
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let TypeOverlay::Present(state) = overlay else {
+                    return None;
+                };
+                let TypeKind::Base { options, .. } = &state.kind else {
+                    return None;
+                };
+                options
+                    .routine_references()
+                    .any(|written| written == &old_id.to_string())
+                    .then(|| id.clone())
+            })
+            .collect();
+        for id in base_affected {
+            self.snapshot_type(&id);
+            if let Some(TypeOverlay::Present(state)) = self.local.types.get_mut(&id)
+                && let TypeKind::Base { options, .. } = &mut state.kind
+            {
+                for written in options.routine_references_mut() {
+                    if written == &old_id.to_string() {
+                        *written = new_id.to_string();
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn apply_create_domain(&mut self, create: &CreateDomainMutation) -> MutationResult {
@@ -404,6 +1168,105 @@ impl AnalysisState {
         if let Some(result) = self.check_declared_type(&create.base_type) {
             return result;
         }
+        let inherited_collation = self.effective_type_collation(&create.base_type);
+        let (collation, collation_id) = match &create.collation {
+            Some(written) => {
+                if matches!(inherited_collation, Some((None, None))) {
+                    return MutationResult::conflict(format!(
+                        "collation specified for non-collatable type '{}'",
+                        create.base_type
+                    ));
+                }
+                match self
+                    .local
+                    .collations
+                    .resolve(written, &self.local.search_path)
+                {
+                    Some(resolved) => (
+                        Some(resolved.name.clone()),
+                        Some(ObjectId::new(resolved.schema, resolved.name)),
+                    ),
+                    None => return self.unresolved(EvidenceCode::UnresolvedReference),
+                }
+            }
+            None => match inherited_collation {
+                Some(pair) => pair,
+                None => {
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+                    (None, None)
+                }
+            },
+        };
+
+        let mut reserved = HashSet::new();
+        let mut constraints = BTreeMap::new();
+        let mut not_null_constraint = None;
+        let mut saw_null = false;
+        for constraint in &create.constraints {
+            match constraint {
+                DomainConstraintFact::Check(check) => {
+                    let name = self.domain_constraint_name(&create.id, check, &mut reserved);
+                    let name = match name {
+                        Ok(name) => name,
+                        Err(result) => return result,
+                    };
+                    constraints.insert(
+                        name.clone(),
+                        DomainConstraintState {
+                            name,
+                            expression: Some(check.expression.clone()),
+                            expression_text: Some(check.expression_text.clone()),
+                            definition: check.definition.clone(),
+                            validated: !check.not_valid,
+                        },
+                    );
+                }
+                DomainConstraintFact::NotNull { name } => {
+                    if not_null_constraint.is_some() {
+                        return MutationResult::conflict(
+                            "redundant NOT NULL constraint definition",
+                        );
+                    }
+                    if saw_null {
+                        return MutationResult::conflict("conflicting NULL/NOT NULL constraints");
+                    }
+                    not_null_constraint = Some(match name {
+                        Some(name) => {
+                            if !reserved.insert(name.clone()) {
+                                return MutationResult::conflict(format!(
+                                    "constraint '{}' for domain '{}' already exists",
+                                    name, create.id
+                                ));
+                            }
+                            name.clone()
+                        }
+                        None => self.allocate_domain_constraint_name(
+                            &create.id,
+                            None,
+                            "not_null",
+                            &mut reserved,
+                        ),
+                    });
+                }
+                DomainConstraintFact::Null => {
+                    if not_null_constraint.is_some() {
+                        return MutationResult::conflict("conflicting NULL/NOT NULL constraints");
+                    }
+                    saw_null = true;
+                }
+            }
+        }
+
+        let (default, default_text) = match &create.default {
+            Some(default) if !default.is_null => {
+                (Some(default.expression.clone()), Some(default.text.clone()))
+            }
+            _ => (None, None),
+        };
+        if let Some(default) = &create.default {
+            self.taint_unproven_domain_default(&create.base_type, default);
+        }
+
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -413,29 +1276,719 @@ impl AnalysisState {
             TypeOverlay::Present(TypeState {
                 id: create.id.clone(),
                 generation,
+                owner: ObjectId::new("", self.local.current_role.clone()),
                 kind: TypeKind::Domain {
                     base_type: create.base_type.clone(),
                     base_type_id: self.resolve_type_reference(&create.base_type),
+                    collation,
+                    collation_id,
+                    default,
+                    default_text,
+                    not_null: not_null_constraint.is_some(),
+                    not_null_constraint,
+                    constraints,
                 },
             }),
         );
         MutationResult::Applied
     }
 
-    pub(super) fn apply_alter_domain(&mut self, alter: &AlterDomainMutation) -> MutationResult {
-        match self.type_lookup(&alter.id, |kind| matches!(kind, TypeKind::Domain { .. })) {
-            TypeLookup::Present => self.unresolved(EvidenceCode::UnsupportedSemantics),
+    fn domain_constraint_name(
+        &self,
+        domain: &ObjectId,
+        check: &DomainCheckFact,
+        reserved: &mut HashSet<String>,
+    ) -> Result<String, MutationResult> {
+        if let Some(name) = &check.name {
+            if !reserved.insert(name.clone()) {
+                return Err(MutationResult::conflict(format!(
+                    "constraint '{}' for domain '{}' already exists",
+                    name, domain
+                )));
+            }
+            return Ok(name.clone());
+        }
+        Ok(self.allocate_domain_constraint_name(domain, None, "check", reserved))
+    }
+
+    fn allocate_domain_constraint_name(
+        &self,
+        domain: &ObjectId,
+        explicit: Option<&str>,
+        label: &str,
+        reserved: &mut HashSet<String>,
+    ) -> String {
+        if let Some(name) = explicit {
+            reserved.insert(name.to_string());
+            return name.to_string();
+        }
+        let name = (0..)
+            .map(|suffix| {
+                let label = if suffix == 0 {
+                    label.to_string()
+                } else {
+                    format!("{label}{suffix}")
+                };
+                Self::postgres_object_name(&domain.name, None, &label)
+            })
+            .find(|candidate| {
+                !reserved.contains(candidate)
+                    && !self.namespace_constraint_name_is_taken(&domain.schema, candidate)
+            })
+            .expect("constraint suffix space is unbounded");
+        reserved.insert(name.clone());
+        name
+    }
+
+    fn domain_constraint_name_is_taken(&self, domain: &ObjectId, name: &str) -> bool {
+        self.local.types.values().any(|overlay| {
+            let TypeOverlay::Present(TypeState {
+                id,
+                kind:
+                    TypeKind::Domain {
+                        constraints,
+                        not_null_constraint,
+                        ..
+                    },
+                ..
+            }) = overlay
+            else {
+                return false;
+            };
+            id == domain
+                && (constraints.contains_key(name) || not_null_constraint.as_deref() == Some(name))
+        })
+    }
+
+    fn namespace_constraint_name_is_taken(&self, schema: &str, name: &str) -> bool {
+        self.local
+            .constraints
+            .keys()
+            .any(|(owner, existing)| owner.schema == schema && existing == name)
+            || self.local.types.values().any(|overlay| {
+                let TypeOverlay::Present(TypeState {
+                    id,
+                    kind:
+                        TypeKind::Domain {
+                            constraints,
+                            not_null_constraint,
+                            ..
+                        },
+                    ..
+                }) = overlay
+                else {
+                    return false;
+                };
+                id.schema == schema
+                    && (constraints.keys().any(|existing| existing == name)
+                        || not_null_constraint.as_deref() == Some(name))
+            })
+    }
+
+    fn effective_type_collation(&self, raw: &str) -> Option<(Option<String>, Option<ObjectId>)> {
+        let mut element = raw.trim();
+        while let Some(stripped) = element.strip_suffix("[]") {
+            element = stripped.trim_end();
+        }
+        let parsed = crate::_internal::model::data_type::ParsedDataType::parse(
+            element,
+            self.builtin_types(),
+        );
+        if let Some(builtin) = parsed.builtin() {
+            return Some(if builtin.is_collatable() {
+                default_collation()
+            } else {
+                (None, None)
+            });
+        }
+        let id = self.resolve_type_reference(element)?;
+        let Some(TypeOverlay::Present(TypeState { kind, .. })) = self.local.types.get(&id) else {
+            return None;
+        };
+        Some(match kind {
+            TypeKind::Domain {
+                collation,
+                collation_id,
+                ..
+            }
+            | TypeKind::Range {
+                collation,
+                collation_id,
+                ..
+            } => (collation.clone(), collation_id.clone()),
+            TypeKind::Base { options, .. } => match options.collatable {
+                Some(true) => default_collation(),
+                Some(false) => (None, None),
+                None => return None,
+            },
+            TypeKind::Enum { .. } | TypeKind::Composite { .. } | TypeKind::Multirange { .. } => {
+                (None, None)
+            }
+        })
+    }
+
+    fn resolve_composite_field_collation(
+        &mut self,
+        data_type: &str,
+        explicit: Option<&str>,
+    ) -> Result<(Option<String>, Option<ObjectId>), MutationResult> {
+        let inherited = self.effective_type_collation(data_type);
+        match explicit {
+            Some(written) => {
+                if matches!(inherited, Some((None, None))) {
+                    return Err(MutationResult::conflict(format!(
+                        "collation specified for non-collatable type '{data_type}'"
+                    )));
+                }
+                let w = if let Some((schema, name)) = written.split_once('.') {
+                    crate::_internal::model::index::WrittenName {
+                        schema: Some(schema.to_string()),
+                        name: name.to_string(),
+                    }
+                } else {
+                    crate::_internal::model::index::WrittenName {
+                        schema: None,
+                        name: written.to_string(),
+                    }
+                };
+                match self.local.collations.resolve(&w, &self.local.search_path) {
+                    Some(resolved) => Ok((
+                        Some(resolved.name.clone()),
+                        Some(ObjectId::new(resolved.schema, resolved.name)),
+                    )),
+                    None => Err(self.unresolved(EvidenceCode::UnresolvedReference)),
+                }
+            }
+            None => match inherited {
+                Some(pair) => Ok(pair),
+                None => {
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+                    Ok((None, None))
+                }
+            },
+        }
+    }
+
+    pub(super) fn apply_rename_domain(&mut self, rename: &Rename) -> MutationResult {
+        match self.type_lookup(&rename.old_id, |kind| {
+            matches!(kind, TypeKind::Domain { .. })
+        }) {
+            TypeLookup::Present => self.apply_rename_type(rename),
             TypeLookup::WrongKind => {
-                MutationResult::conflict(format!("type '{}' is not a domain", alter.id))
+                MutationResult::conflict(format!("type '{}' is not a domain", rename.old_id))
             }
             TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
-                MutationResult::conflict(format!("domain '{}' does not exist", alter.id))
+                MutationResult::conflict(format!("domain '{}' does not exist", rename.old_id))
             }
             TypeLookup::Unknown => self.unresolved(EvidenceCode::UnknownObjectState),
         }
     }
 
+    pub(super) fn apply_alter_domain(&mut self, alter: &AlterDomainMutation) -> MutationResult {
+        match self.type_lookup(&alter.id, |kind| matches!(kind, TypeKind::Domain { .. })) {
+            TypeLookup::Present => {}
+            TypeLookup::WrongKind => {
+                return MutationResult::conflict(format!("type '{}' is not a domain", alter.id));
+            }
+            TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
+                return MutationResult::conflict(format!("domain '{}' does not exist", alter.id));
+            }
+            TypeLookup::Unknown => {
+                return self.unresolved(EvidenceCode::UnknownObjectState);
+            }
+        }
+        let Some(action) = &alter.action else {
+            return self.unresolved(EvidenceCode::UnsupportedSemantics);
+        };
+        match action {
+            AlterDomainActionFact::AddConstraint(constraint) => {
+                self.apply_add_domain_constraint(alter, constraint)
+            }
+            AlterDomainActionFact::DropConstraint {
+                name,
+                if_exists,
+                cascade: _,
+            } => self.apply_drop_domain_constraint(alter, name, *if_exists),
+            AlterDomainActionFact::DropDefault => {
+                let Some(TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Domain {
+                            default,
+                            default_text,
+                            ..
+                        },
+                    ..
+                })) = self.local.types.get(&alter.id)
+                else {
+                    unreachable!("domain presence checked above");
+                };
+                if default.is_none() && default_text.is_none() {
+                    return MutationResult::NoOp;
+                }
+                self.snapshot_type(&alter.id);
+                if let Some(TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Domain {
+                            default,
+                            default_text,
+                            ..
+                        },
+                    ..
+                })) = self.local.types.get_mut(&alter.id)
+                {
+                    *default = None;
+                    *default_text = None;
+                }
+                MutationResult::Applied
+            }
+            AlterDomainActionFact::DropNotNull => {
+                let Some(TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { not_null, .. },
+                    ..
+                })) = self.local.types.get(&alter.id)
+                else {
+                    unreachable!("domain presence checked above");
+                };
+                if !not_null {
+                    return MutationResult::NoOp;
+                }
+                self.snapshot_type(&alter.id);
+                if let Some(TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Domain {
+                            not_null,
+                            not_null_constraint,
+                            ..
+                        },
+                    ..
+                })) = self.local.types.get_mut(&alter.id)
+                {
+                    *not_null = false;
+                    *not_null_constraint = None;
+                }
+                MutationResult::Applied
+            }
+            AlterDomainActionFact::OwnerChange(owner) => {
+                let Some((owner_name, known)) = self.role_fact_identity(owner) else {
+                    return self.unresolved(EvidenceCode::UnresolvedReference);
+                };
+                if known && self.local.roles_known && self.present_role(&owner_name).is_none() {
+                    return MutationResult::conflict(format!(
+                        "role '{}' does not exist",
+                        owner_name
+                    ));
+                }
+                if known && !self.local.roles_known {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                }
+                let Some(TypeOverlay::Present(TypeState { owner, .. })) =
+                    self.local.types.get(&alter.id)
+                else {
+                    unreachable!("domain presence checked above");
+                };
+                if owner.name == owner_name {
+                    return MutationResult::NoOp;
+                }
+                self.snapshot_type(&alter.id);
+                if let Some(TypeOverlay::Present(TypeState { owner, .. })) =
+                    self.local.types.get_mut(&alter.id)
+                {
+                    *owner = ObjectId::new("", owner_name);
+                }
+                MutationResult::Applied
+            }
+            AlterDomainActionFact::RenameConstraint { old_name, new_name } => {
+                self.apply_rename_domain_constraint(alter, old_name, new_name)
+            }
+            AlterDomainActionFact::RenameTo { .. } | AlterDomainActionFact::SetSchema { .. } => {
+                self.unresolved(EvidenceCode::UnsupportedSemantics)
+            }
+            AlterDomainActionFact::SetDefault(default) => {
+                self.apply_set_domain_default(alter, default)
+            }
+            AlterDomainActionFact::SetNotNull => {
+                let Some(TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { not_null, .. },
+                    ..
+                })) = self.local.types.get(&alter.id)
+                else {
+                    unreachable!("domain presence checked above");
+                };
+                if *not_null {
+                    return MutationResult::NoOp;
+                }
+                if let Some(message) = self.domain_container_validation_conflict(&alter.id) {
+                    return MutationResult::conflict(message);
+                }
+                self.taint_domain_validation_if_data_scanned(&alter.id);
+                let mut reserved = HashSet::new();
+                let name = self.allocate_domain_constraint_name(
+                    &alter.id,
+                    None,
+                    "not_null",
+                    &mut reserved,
+                );
+                let records_constraint = self.pg_version().satisfies(|version| version >= 180_000);
+                self.snapshot_type(&alter.id);
+                if let Some(TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Domain {
+                            not_null,
+                            not_null_constraint,
+                            ..
+                        },
+                    ..
+                })) = self.local.types.get_mut(&alter.id)
+                {
+                    *not_null = true;
+                    *not_null_constraint = records_constraint.then_some(name);
+                }
+                MutationResult::Applied
+            }
+            AlterDomainActionFact::ValidateConstraint { name } => {
+                self.apply_validate_domain_constraint(alter, name)
+            }
+        }
+    }
+
+    fn taint_domain_validation_if_data_scanned(&mut self, domain: &ObjectId) {
+        if !self.relations_using_domain(domain).is_empty() {
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        }
+    }
+
+    fn apply_add_domain_constraint(
+        &mut self,
+        alter: &AlterDomainMutation,
+        constraint: &DomainConstraintFact,
+    ) -> MutationResult {
+        let mut reserved = HashSet::new();
+        match constraint {
+            DomainConstraintFact::Check(check) => {
+                let name = match self.domain_constraint_name(&alter.id, check, &mut reserved) {
+                    Ok(name) => name,
+                    Err(result) => return result,
+                };
+                if self.domain_constraint_name_is_taken(&alter.id, &name) {
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' for domain '{}' already exists",
+                        name, alter.id
+                    ));
+                }
+                if !check.not_valid
+                    && let Some(message) = self.domain_container_validation_conflict(&alter.id)
+                {
+                    return MutationResult::conflict(message);
+                }
+                if !check.not_valid {
+                    self.taint_domain_validation_if_data_scanned(&alter.id);
+                }
+                self.snapshot_type(&alter.id);
+                if let Some(TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { constraints, .. },
+                    ..
+                })) = self.local.types.get_mut(&alter.id)
+                {
+                    constraints.insert(
+                        name.clone(),
+                        DomainConstraintState {
+                            name,
+                            expression: Some(check.expression.clone()),
+                            expression_text: Some(check.expression_text.clone()),
+                            definition: check.definition.clone(),
+                            validated: !check.not_valid,
+                        },
+                    );
+                }
+                MutationResult::Applied
+            }
+            DomainConstraintFact::NotNull { name } => {
+                let Some(TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { not_null, .. },
+                    ..
+                })) = self.local.types.get(&alter.id)
+                else {
+                    unreachable!("domain presence checked above");
+                };
+                if *not_null {
+                    return MutationResult::NoOp;
+                }
+                let generated = self.allocate_domain_constraint_name(
+                    &alter.id,
+                    name.as_deref(),
+                    "not_null",
+                    &mut reserved,
+                );
+                if self.namespace_constraint_name_is_taken(&alter.id.schema, &generated) {
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' for domain '{}' already exists",
+                        generated, alter.id
+                    ));
+                }
+                if let Some(message) = self.domain_container_validation_conflict(&alter.id) {
+                    return MutationResult::conflict(message);
+                }
+                self.taint_domain_validation_if_data_scanned(&alter.id);
+                let records_constraint = self.pg_version().satisfies(|version| version >= 180_000);
+                self.snapshot_type(&alter.id);
+                if let Some(TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Domain {
+                            not_null,
+                            not_null_constraint,
+                            ..
+                        },
+                    ..
+                })) = self.local.types.get_mut(&alter.id)
+                {
+                    *not_null = true;
+                    *not_null_constraint = records_constraint.then_some(generated);
+                }
+                MutationResult::Applied
+            }
+            DomainConstraintFact::Null => self.unresolved(EvidenceCode::UnsupportedSemantics),
+        }
+    }
+
+    fn apply_drop_domain_constraint(
+        &mut self,
+        alter: &AlterDomainMutation,
+        name: &str,
+        if_exists: bool,
+    ) -> MutationResult {
+        let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    constraints,
+                    not_null_constraint,
+                    ..
+                },
+            ..
+        })) = self.local.types.get(&alter.id)
+        else {
+            unreachable!("domain presence checked above");
+        };
+        let drops_not_null = not_null_constraint.as_deref() == Some(name);
+        if !drops_not_null && !constraints.contains_key(name) {
+            return if if_exists {
+                MutationResult::NoOp
+            } else {
+                MutationResult::conflict(format!(
+                    "constraint '{}' of domain '{}' does not exist",
+                    name, alter.id
+                ))
+            };
+        }
+        self.snapshot_type(&alter.id);
+        if let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    constraints,
+                    not_null,
+                    not_null_constraint,
+                    ..
+                },
+            ..
+        })) = self.local.types.get_mut(&alter.id)
+        {
+            if drops_not_null {
+                *not_null = false;
+                *not_null_constraint = None;
+            } else {
+                constraints.remove(name);
+            }
+        }
+        MutationResult::Applied
+    }
+
+    fn apply_rename_domain_constraint(
+        &mut self,
+        alter: &AlterDomainMutation,
+        old_name: &str,
+        new_name: &str,
+    ) -> MutationResult {
+        let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    constraints,
+                    not_null_constraint,
+                    ..
+                },
+            ..
+        })) = self.local.types.get(&alter.id)
+        else {
+            unreachable!("domain presence checked above");
+        };
+        let renames_not_null = not_null_constraint.as_deref() == Some(old_name);
+        if !renames_not_null && !constraints.contains_key(old_name) {
+            return MutationResult::conflict(format!(
+                "constraint '{}' for domain '{}' does not exist",
+                old_name, alter.id
+            ));
+        }
+        if constraints.contains_key(new_name) || not_null_constraint.as_deref() == Some(new_name) {
+            return MutationResult::conflict(format!(
+                "constraint '{}' for domain '{}' already exists",
+                new_name, alter.id
+            ));
+        }
+        self.snapshot_type(&alter.id);
+        if let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    constraints,
+                    not_null_constraint,
+                    ..
+                },
+            ..
+        })) = self.local.types.get_mut(&alter.id)
+        {
+            if renames_not_null {
+                *not_null_constraint = Some(new_name.to_string());
+            } else if let Some(mut constraint) = constraints.remove(old_name) {
+                constraint.name = new_name.to_string();
+                constraints.insert(new_name.to_string(), constraint);
+            }
+        }
+        MutationResult::Applied
+    }
+
+    fn taint_unproven_domain_default(&mut self, base_type: &str, default: &DomainDefaultFact) {
+        if default.is_null {
+            return;
+        }
+        if !domain_default_is_provably_coercible(
+            base_type,
+            &default.expression,
+            self.builtin_types(),
+        ) {
+            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+        }
+    }
+
+    fn apply_set_domain_default(
+        &mut self,
+        alter: &AlterDomainMutation,
+        default: &DomainDefaultFact,
+    ) -> MutationResult {
+        let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    base_type,
+                    default: existing,
+                    default_text,
+                    ..
+                },
+            ..
+        })) = self.local.types.get(&alter.id)
+        else {
+            unreachable!("domain presence checked above");
+        };
+        let base_type = base_type.clone();
+        if default.is_null {
+            if existing.is_none() && default_text.is_none() {
+                return MutationResult::NoOp;
+            }
+            self.snapshot_type(&alter.id);
+            if let Some(TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Domain {
+                        default,
+                        default_text,
+                        ..
+                    },
+                ..
+            })) = self.local.types.get_mut(&alter.id)
+            {
+                *default = None;
+                *default_text = None;
+            }
+            return MutationResult::Applied;
+        }
+        if existing.as_ref() == Some(&default.expression)
+            && default_text.as_deref() == Some(default.text.as_str())
+        {
+            return MutationResult::NoOp;
+        }
+        self.taint_unproven_domain_default(&base_type, default);
+        self.snapshot_type(&alter.id);
+        if let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    default: value,
+                    default_text: text,
+                    ..
+                },
+            ..
+        })) = self.local.types.get_mut(&alter.id)
+        {
+            *value = Some(default.expression.clone());
+            *text = Some(default.text.clone());
+        }
+        MutationResult::Applied
+    }
+
+    fn apply_validate_domain_constraint(
+        &mut self,
+        alter: &AlterDomainMutation,
+        name: &str,
+    ) -> MutationResult {
+        let Some(TypeOverlay::Present(TypeState {
+            kind:
+                TypeKind::Domain {
+                    constraints,
+                    not_null_constraint,
+                    ..
+                },
+            ..
+        })) = self.local.types.get(&alter.id)
+        else {
+            unreachable!("domain presence checked above");
+        };
+        if not_null_constraint.as_deref() == Some(name) {
+            return MutationResult::conflict(format!(
+                "constraint '{}' of domain '{}' is not a check constraint",
+                name, alter.id
+            ));
+        }
+        let Some(constraint) = constraints.get(name) else {
+            return MutationResult::conflict(format!(
+                "constraint '{}' of domain '{}' does not exist",
+                name, alter.id
+            ));
+        };
+        if let Some(message) = self.domain_container_validation_conflict(&alter.id) {
+            return MutationResult::conflict(message);
+        }
+        if constraint.validated {
+            return MutationResult::NoOp;
+        }
+        self.taint_domain_validation_if_data_scanned(&alter.id);
+        self.snapshot_type(&alter.id);
+        if let Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Domain { constraints, .. },
+            ..
+        })) = self.local.types.get_mut(&alter.id)
+            && let Some(constraint) = constraints.get_mut(name)
+        {
+            constraint.validated = true;
+        }
+        MutationResult::Applied
+    }
+
     pub(super) fn apply_drop_domain(&mut self, drop: &DropDomainMutation) -> MutationResult {
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Type,
+                id,
+                "type",
+            ) {
+                return result;
+            }
+        }
         let mut present = Vec::new();
         for id in &drop.ids {
             match self.type_lookup(id, |kind| matches!(kind, TypeKind::Domain { .. })) {
@@ -459,6 +2012,15 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_type(&mut self, drop: &DropTypeMutation) -> MutationResult {
+        for id in &drop.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Type,
+                id,
+                "type",
+            ) {
+                return result;
+            }
+        }
         let mut present = Vec::new();
         for id in &drop.ids {
             match self.type_lookup(id, |kind| !matches!(kind, TypeKind::Domain { .. })) {
@@ -525,9 +2087,29 @@ impl AnalysisState {
                 );
             }
         } else {
+            let mut implicit = present.to_vec();
             for id in present {
-                self.snapshot_type(id);
-                self.local.types.insert(id.clone(), TypeOverlay::Dropped);
+                if let Some(TypeOverlay::Present(state)) = self.local.types.get(id)
+                    && let TypeKind::Range { multirange, .. } = &state.kind
+                {
+                    let companion = multirange
+                        .clone()
+                        .unwrap_or_else(|| Self::multirange_companion_id(id));
+                    if self.type_is_present(&companion) {
+                        implicit.push(companion);
+                    }
+                }
+            }
+            let implicit_set: HashSet<ObjectId> = implicit.iter().cloned().collect();
+            for routine in self.routine_cascade_victims(&implicit_set) {
+                self.snapshot_function(&routine);
+                self.local
+                    .functions
+                    .insert(routine, FunctionOverlay::Dropped);
+            }
+            for id in implicit {
+                self.snapshot_type(&id);
+                self.local.types.insert(id, TypeOverlay::Dropped);
             }
         }
         MutationResult::Applied
@@ -538,59 +2120,233 @@ impl AnalysisState {
     /// column as a dependent of the range.
     fn type_dependent_ids(&self, id: &ObjectId) -> Vec<ObjectId> {
         let mut ids = vec![id.clone()];
-        if matches!(
-            self.local.types.get(id),
-            Some(TypeOverlay::Present(state)) if matches!(state.kind, TypeKind::Range { .. })
-        ) {
-            ids.push(Self::multirange_companion_id(id));
+        if let Some(TypeOverlay::Present(state)) = self.local.types.get(id)
+            && let TypeKind::Range { multirange, .. } = &state.kind
+        {
+            ids.push(
+                multirange
+                    .clone()
+                    .unwrap_or_else(|| Self::multirange_companion_id(id)),
+            );
         }
         ids
     }
 
-    fn has_type_dependents(&self, id: &ObjectId) -> bool {
+    pub(super) fn has_type_dependents(&self, id: &ObjectId) -> bool {
+        // Extension drops call this after seeding co_dropped_objects, so a
+        // dependent member scheduled in the same statement is not external.
         let ids = self.type_dependent_ids(id);
         let matches_id = |reference: Option<&ObjectId>| {
             ids.iter()
                 .any(|id| Self::type_reference_matches(reference, id))
         };
-        self.local.relations.values().any(|overlay| {
-            matches!(overlay, RelationOverlay::Present(relation)
-                if relation.of_type.as_ref() == Some(id)
-                    || relation.columns.iter().any(|column| matches_id(column.type_id.as_ref())))
-        }) || self.local.functions.values().any(|overlay| {
-            matches!(overlay, FunctionOverlay::Present(function)
-                // A routine PostgreSQL created as an internal part of the type
-                // (a range constructor) is dropped with it, so it does not
-                // require CASCADE.
-                if function.internal_type_owner.as_ref() != Some(id)
-                    && (function.arg_type_ids.iter().flatten().any(|type_id| matches_id(Some(type_id)))
-                        || matches_id(function.return_type_id.as_ref())))
-        }) || self.local.types.values().any(|overlay| {
-            matches!(overlay, TypeOverlay::Present(TypeState {
-                kind: TypeKind::Domain { base_type_id: Some(base), .. },
-                ..
-            }) if matches_id(Some(base)))
-        }) || self.local.types.values().any(|overlay| {
-            matches!(overlay, TypeOverlay::Present(TypeState {
-                kind: TypeKind::Composite { fields },
-                ..
-            }) if fields.iter().any(|f| matches_id(f.data_type_id.as_ref())))
-        }) || self.local.types.values().any(|overlay| {
-            matches!(overlay, TypeOverlay::Present(TypeState {
-                kind: TypeKind::Range { subtype_id: Some(sub_id), .. },
-                ..
-            }) if matches_id(Some(sub_id)))
+        self.local.relations.iter().any(|(relation_id, overlay)| {
+            !self.co_dropped_objects.contains(relation_id)
+                && matches!(overlay, RelationOverlay::Present(relation)
+                    if relation.of_type.as_ref() == Some(id)
+                        || relation.columns.iter().any(|column| matches_id(column.type_id.as_ref())))
+        }) || self.local.functions.iter().any(|(function_id, overlay)| {
+            !self.co_dropped_objects.contains(function_id)
+                && matches!(overlay, FunctionOverlay::Present(function)
+                    // A routine PostgreSQL created as an internal part of the
+                    // type (a range or multirange constructor) is dropped with
+                    // the type it belongs to, so it does not require CASCADE.
+                    if !function.internal_type_owner.as_ref().is_some_and(|owner| {
+                        ids.iter()
+                            .any(|id| Self::type_reference_matches(Some(owner), id))
+                    })
+                        && (function.arg_type_ids.iter().flatten().any(|type_id| matches_id(Some(type_id)))
+                            || matches_id(function.return_type_id.as_ref())))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Domain { base_type_id: Some(base), .. },
+                    ..
+                }) if matches_id(Some(base)))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Composite { fields },
+                    ..
+                }) if fields.iter().any(|f| matches_id(f.data_type_id.as_ref())))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && type_id != id
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Range { multirange: Some(companion), .. },
+                    ..
+                }) if matches_id(Some(companion)))
+        }) || self.local.types.iter().any(|(type_id, overlay)| {
+            !self.co_dropped_objects.contains(type_id)
+                && matches!(overlay, TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Range { subtype_id: Some(sub_id), .. },
+                    ..
+                }) if matches_id(Some(sub_id)))
         }) || ids.iter().any(|blocking| {
             [blocking.clone(), Self::array_type_id(blocking)]
                 .iter()
                 .any(|probe| {
                     self.local.graph.views_for_type(probe).iter().any(|edge| {
-                        matches!(
-                            self.local.relations.get(&edge.dependent),
-                            Some(RelationOverlay::Present(_))
-                        )
+                        !self.co_dropped_objects.contains(&edge.dependent)
+                            && matches!(
+                                self.local.relations.get(&edge.dependent),
+                                Some(RelationOverlay::Present(_))
+                            )
                     })
                 })
         })
     }
+}
+
+fn base_type_option_conflict(options: &BaseTypeOptions) -> Option<MutationResult> {
+    options
+        .storage
+        .as_deref()
+        .and_then(|storage| base_type_storage_conflict(storage, options.internallength.as_ref()))
+}
+
+fn base_type_storage_conflict(
+    storage: &str,
+    internallength: Option<&BaseTypeLength>,
+) -> Option<MutationResult> {
+    if !matches!(
+        storage.to_ascii_lowercase().as_str(),
+        "plain" | "external" | "extended" | "main"
+    ) {
+        return Some(MutationResult::conflict(format!(
+            "storage \"{storage}\" not recognized"
+        )));
+    }
+    if !storage.eq_ignore_ascii_case("plain")
+        && matches!(internallength, Some(BaseTypeLength::Fixed(_)))
+    {
+        return Some(MutationResult::conflict(
+            "fixed-size types must have storage PLAIN",
+        ));
+    }
+    None
+}
+
+/// Options PostgreSQL only accepts at creation. `ALTER TYPE ... SET` may
+/// change the I/O support routines and storage, not the type's physical shape.
+fn immutable_base_type_option(options: &BaseTypeOptions) -> Option<&'static str> {
+    if options.input.is_some() {
+        return Some("input");
+    }
+    if options.output.is_some() {
+        return Some("output");
+    }
+    if options.internallength.is_some() {
+        return Some("internallength");
+    }
+    if options.passed_by_value.is_some() {
+        return Some("passedbyvalue");
+    }
+    if options.alignment.is_some() {
+        return Some("alignment");
+    }
+    if options.like.is_some() {
+        return Some("like");
+    }
+    if options.category.is_some() {
+        return Some("category");
+    }
+    if options.preferred.is_some() {
+        return Some("preferred");
+    }
+    if options.default.is_some() {
+        return Some("default");
+    }
+    if options.element.is_some() {
+        return Some("element");
+    }
+    if options.delimiter.is_some() {
+        return Some("delimiter");
+    }
+    if options.collatable.is_some() {
+        return Some("collatable");
+    }
+    None
+}
+
+fn default_collation() -> (Option<String>, Option<ObjectId>) {
+    (
+        Some("default".to_string()),
+        Some(ObjectId::new("pg_catalog", "default")),
+    )
+}
+
+fn domain_default_is_provably_coercible(
+    base_type: &str,
+    expression: &ExprIr,
+    catalogue: &BuiltinTypeCatalogue,
+) -> bool {
+    match expression {
+        ExprIr::Cast { target_type, .. } => {
+            let base = ParsedDataType::parse(base_type, catalogue);
+            let target = ParsedDataType::parse(target_type, catalogue);
+            TypeIdentity::from_syntax(&base) == TypeIdentity::from_syntax(&target)
+        }
+        ExprIr::UnaryOp { op, expr } if op == "+" || op == "-" => match expr.as_ref() {
+            ExprIr::Literal(literal) => {
+                literal_is_provably_assignable(base_type, &format!("{op}{literal}"), catalogue)
+            }
+            _ => false,
+        },
+        ExprIr::Literal(literal) => literal_is_provably_assignable(base_type, literal, catalogue),
+        _ => false,
+    }
+}
+
+fn literal_is_provably_assignable(
+    base_type: &str,
+    literal: &str,
+    catalogue: &BuiltinTypeCatalogue,
+) -> bool {
+    let base = ParsedDataType::parse(base_type, catalogue);
+    if base.array_dimensions > 0 {
+        return false;
+    }
+    let literal = literal.trim();
+    let Some(builtin) = base.builtin() else {
+        return false;
+    };
+    let name = builtin.typname.as_str();
+    if matches!(name, "text" | "varchar" | "bpchar" | "name") {
+        return true;
+    }
+    if is_string_literal(literal) {
+        return false;
+    }
+    if literal.eq_ignore_ascii_case("true") || literal.eq_ignore_ascii_case("false") {
+        return name == "bool";
+    }
+    if let Ok(value) = literal.parse::<i128>() {
+        return match name {
+            "int2" => i16::try_from(value).is_ok(),
+            "int4" => i32::try_from(value).is_ok(),
+            "int8" => i64::try_from(value).is_ok(),
+            "oid" => u32::try_from(value).is_ok(),
+            "numeric" => true,
+            "float4" => literal.parse::<f32>().is_ok_and(f32::is_finite),
+            "float8" => literal.parse::<f64>().is_ok_and(f64::is_finite),
+            _ => false,
+        };
+    }
+    match name {
+        "float4" => literal.parse::<f32>().is_ok_and(f32::is_finite),
+        "float8" => literal.parse::<f64>().is_ok_and(f64::is_finite),
+        _ => false,
+    }
+}
+
+fn is_string_literal(literal: &str) -> bool {
+    if literal.starts_with('\'') {
+        return true;
+    }
+    if let Some(tag) = literal.strip_prefix('$') {
+        return tag.contains('$');
+    }
+    let lower = literal.to_ascii_lowercase();
+    lower.starts_with("e'") || lower.starts_with("u&'") || lower.starts_with("n'")
 }

@@ -498,6 +498,8 @@ pub enum ObjectKind {
     Policy,
     /// A PostgreSQL type.
     Type,
+    /// An extension.
+    Extension,
     /// Object whose identity is opaque to the analyzer.
     Opaque,
     /// Unknown object category.
@@ -1870,6 +1872,7 @@ impl From<&InternalObjectKind> for ObjectKind {
             InternalObjectKind::Domain => Self::Domain,
             InternalObjectKind::Policy => Self::Policy,
             InternalObjectKind::Type => Self::Type,
+            InternalObjectKind::Extension => Self::Extension,
             InternalObjectKind::Opaque => Self::Opaque,
             InternalObjectKind::Unknown => Self::Unknown,
         }

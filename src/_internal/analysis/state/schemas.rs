@@ -1,4 +1,5 @@
 use super::*;
+use crate::_internal::model::extension::ExtensionOverlay;
 
 impl AnalysisState {
     pub(super) fn schema_is_present(&self, name: &str) -> bool {
@@ -236,6 +237,59 @@ impl AnalysisState {
             .collect();
 
         self.local.graph.remap_schema_namespace(old_name, new_name);
+        // Collation names are embedded in type and index definitions, so they
+        // move with the schema before extension membership is rewritten.
+        self.local.collations = self.local.collations.remap_schema(old_name, new_name);
+        self.local
+            .graph
+            .remap_index_collation_schema(old_name, new_name);
+        for overlay in self.local.extensions.values_mut() {
+            let ExtensionOverlay::Present(extension) = overlay else {
+                continue;
+            };
+            if extension.schema.as_deref() == Some(old_name) {
+                extension.schema = Some(new_name.to_string());
+            }
+            extension.members = std::mem::take(&mut extension.members)
+                .into_iter()
+                .map(|mut member| {
+                    if member.kind
+                        == crate::_internal::model::extension::ExtensionMemberKind::Schema
+                    {
+                        if member.id.name == old_name {
+                            member.id.name = new_name.to_string();
+                        }
+                    } else {
+                        Self::remap_schema_id(&mut member.id, old_name, new_name);
+                    }
+                    member
+                })
+                .collect();
+            for config in &mut extension.config_tables {
+                Self::remap_schema_id(&mut config.table, old_name, new_name);
+            }
+        }
+        for overlay in self.local.types.values_mut() {
+            let TypeOverlay::Present(state) = overlay else {
+                continue;
+            };
+            match &mut state.kind {
+                crate::_internal::model::types::TypeKind::Domain { collation_id, .. }
+                | crate::_internal::model::types::TypeKind::Range { collation_id, .. } => {
+                    if let Some(collation_id) = collation_id {
+                        Self::remap_schema_id(collation_id, old_name, new_name);
+                    }
+                }
+                crate::_internal::model::types::TypeKind::Composite { fields } => {
+                    for field in fields {
+                        if let Some(collation_id) = &mut field.collation_id {
+                            Self::remap_schema_id(collation_id, old_name, new_name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         for (old_id, new_id) in aliases {
             self.local.graph.add_edge(DependencyEdge::new(
                 old_id,

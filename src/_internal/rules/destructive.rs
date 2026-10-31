@@ -1,7 +1,10 @@
-use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
+use crate::_internal::analysis::mutations::{
+    AlterTableActionMutation, AlterTypeActionMutation, Mutation,
+};
 use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::model::types::TypeKind;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
     BASELINE_RELATION_CAPABILITIES, BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext,
@@ -643,6 +646,20 @@ impl Rule for GeneralCascadeRule {
             Mutation::DropPublication(d) if d.cascade => {
                 Some((ObjectKind::Publication, d.names.join(", ")))
             }
+            Mutation::DropExtension(d) if d.cascade => {
+                Some((ObjectKind::Extension, d.names.join(", ")))
+            }
+            Mutation::AlterType(a) => match &a.action {
+                crate::_internal::analysis::mutations::AlterTypeActionMutation::DropAttribute {
+                    cascade,
+                    ..
+                }
+                | crate::_internal::analysis::mutations::AlterTypeActionMutation::AlterAttributeType {
+                    cascade,
+                    ..
+                } if *cascade => Some((ObjectKind::Type, a.id.to_string())),
+                _ => None,
+            },
             _ => None,
         };
 
@@ -755,7 +772,12 @@ impl Rule for TypeChangeRewriteRule {
                 Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
                     action: AlterTableActionMutation::SetType { .. },
                     ..
-                })
+                }) | Mutation::AlterType(
+                    crate::_internal::analysis::mutations::AlterTypeMutation {
+                        action: AlterTypeActionMutation::AlterAttributeType { .. },
+                        ..
+                    }
+                )
             )
         {
             return vec![];
@@ -830,6 +852,71 @@ impl Rule for TypeChangeRewriteRule {
                             "Changing column {}.{} type from {} to {} causes a table rewrite",
                             alter.id, column, old_type_str, ty
                         ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                        sql: None,
+                    });
+                }
+            }
+        }
+
+        if let Mutation::AlterType(alter) = mutation
+            && let AlterTypeActionMutation::AlterAttributeType {
+                name, data_type, ..
+            } = &alter.action
+        {
+            let field_type = pre_state
+                .types
+                .get(&alter.id)
+                .and_then(|ty| match &ty.kind {
+                    TypeKind::Composite { fields } => fields
+                        .iter()
+                        .find(|field| field.name == *name)
+                        .map(|field| field.data_type.as_str()),
+                    _ => None,
+                });
+            let mut rows: Option<u64> = None;
+            let mut rewrites_typed_table = false;
+            if let Some(old_type) = field_type {
+                for relation in pre_state.relations.values() {
+                    if relation.of_type.as_ref() == Some(&alter.id) && relation.has_column(name) {
+                        rewrites_typed_table = true;
+                        let table_rows = relation.estimated_rows.unwrap_or(config.default_rows);
+                        rows = Some(rows.map_or(table_rows, |current| current.max(table_rows)));
+                    }
+                }
+                if rewrites_typed_table
+                    && !Self::is_type_change_safe(
+                        old_type,
+                        data_type,
+                        state.pg_version().conservative_num(),
+                        state.builtin_types(),
+                    )
+                {
+                    let rows = rows.unwrap_or(config.default_rows);
+                    let tier = if rows >= config.rule_tier1_threshold(self.id()) {
+                        ViolationTier::Tier1
+                    } else {
+                        ViolationTier::Tier2
+                    };
+                    let lossy = is_type_change_lossy(old_type, data_type, state.builtin_types());
+                    violations.push(Violation {
+                        source_range: None,
+                        rule_id: self.id(),
+                        object_kind: ObjectKind::Type,
+                        object_name: format!("{}.{}", alter.id, name),
+                        tier,
+                        reason: if lossy {
+                            format!(
+                                "Changing composite field {}.{} type from {} to {} truncates data (lossy narrowing) and rewrites every typed table",
+                                alter.id, name, old_type, data_type
+                            )
+                        } else {
+                            format!(
+                                "Changing composite field {}.{} type from {} to {} rewrites every typed table",
+                                alter.id, name, old_type, data_type
+                            )
+                        },
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,

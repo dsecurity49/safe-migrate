@@ -341,6 +341,9 @@ pub(super) fn snapshot_live_state(
     }
 
     if scope.contains(&ComparisonScope::Sequences) {
+        // Sequence runtime (last_value, is_called, log_cnt) is volatile and
+        // connection-state dependent, so the differential harness deliberately
+        // compares definition parameters rather than transaction runtime state.
         for (id, sequence) in &cache.sequences {
             state.sequences.insert(
                 qualified_name(&id.schema, &id.name),
@@ -711,6 +714,35 @@ pub(super) fn snapshot_live_state(
                 qualified_name(&view_schema, &view_name),
                 qualified_name(&table_schema, &table_name),
             ));
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Extensions) {
+        for (name, ext) in &cache.extensions {
+            state.extensions.insert(
+                name.clone(),
+                NormalizedExtension {
+                    owner: ext.owner.name.clone(),
+                    schema: ext.schema.clone(),
+                    version: ext.version.clone(),
+                    relocatable: ext.relocatable,
+                    members: ext
+                        .members
+                        .iter()
+                        .map(|m| {
+                            (
+                                format!("{:?}", m.kind),
+                                qualified_name(&m.id.schema, &m.id.name),
+                            )
+                        })
+                        .collect(),
+                    config_tables: ext
+                        .config_tables
+                        .iter()
+                        .map(|c| qualified_name(&c.table.schema, &c.table.name))
+                        .collect(),
+                },
+            );
         }
     }
 
@@ -1131,6 +1163,39 @@ pub(super) fn snapshot_simulator_state(
                     },
                 );
             }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Extensions) {
+        for (name, overlay) in &state.local.extensions {
+            let safe_migrate::_internal::model::extension::ExtensionOverlay::Present(ext) = overlay
+            else {
+                continue;
+            };
+            projection.extensions.insert(
+                name.clone(),
+                NormalizedExtension {
+                    owner: ext.owner.name.clone(),
+                    schema: ext.schema.clone(),
+                    version: ext.version.clone(),
+                    relocatable: ext.relocatable,
+                    members: ext
+                        .members
+                        .iter()
+                        .map(|m| {
+                            (
+                                format!("{:?}", m.kind),
+                                qualified_name(&m.id.schema, &m.id.name),
+                            )
+                        })
+                        .collect(),
+                    config_tables: ext
+                        .config_tables
+                        .iter()
+                        .map(|c| qualified_name(&c.table.schema, &c.table.name))
+                        .collect(),
+                },
+            );
         }
     }
 
@@ -1846,6 +1911,47 @@ pub(super) fn compare_states(
                 root_cause: RootCauseClassification::SimulatorBug,
                 note: format!("simulator kept view dependency {} -> {}", edge.0, edge.1),
             });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Extensions) {
+        for (name, live_ext) in &live.extensions {
+            match simulator.extensions.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingExtensionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "live PostgreSQL kept extension {name}, but simulator removed it"
+                    ),
+                }),
+                Some(simulator_ext) if simulator_ext != live_ext => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::ExtensionDefinitionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "extension {name} definition mismatch: live={live_ext:?}, simulator={simulator_ext:?}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for name in simulator.extensions.keys() {
+            if !live.extensions.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraExtensionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "simulator kept extension {name}, but live PostgreSQL removed it"
+                    ),
+                });
+            }
         }
     }
 

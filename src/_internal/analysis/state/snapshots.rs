@@ -29,6 +29,8 @@ impl AnalysisState {
                     types: self.local.types.clone(),
                     functions: self.local.functions.clone(),
                     sequences: self.local.sequences.clone(),
+                    collations: self.local.collations.clone(),
+                    extensions: self.local.extensions.clone(),
                     publications: self.local.publications.clone(),
                     triggers: self.local.triggers.clone(),
                     constraints: self.local.constraints.clone(),
@@ -69,6 +71,15 @@ impl AnalysisState {
         }
     }
 
+    pub(super) fn snapshot_extension(&mut self, name: &str) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::ExtensionSnapshot {
+                name: name.to_string(),
+                previous: self.local.extensions.get(name).cloned(),
+            });
+        }
+    }
+
     pub(super) fn move_function(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         self.snapshot_function(old_id);
         self.snapshot_function(new_id);
@@ -84,6 +95,7 @@ impl AnalysisState {
 
         self.snapshot_graph_full();
         self.local.graph.propagate_function_rename(old_id, new_id);
+        self.remap_range_routine_reference(old_id, new_id);
         self.local.graph.add_edge(DependencyEdge::new(
             old_id.clone(),
             new_id.clone(),

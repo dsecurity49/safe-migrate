@@ -1,4 +1,5 @@
 use super::*;
+use crate::_internal::model::relation::RelationState;
 
 impl AnalysisState {
     pub(super) fn resolve_type_reference_from_catalog(
@@ -94,6 +95,141 @@ impl AnalysisState {
             || self.resolve_type_reference(declared).is_some()
     }
 
+    fn strip_array_type_id(id: &ObjectId) -> (ObjectId, bool) {
+        let mut name = id.name.as_str();
+        let mut is_array = false;
+        while let Some(stripped) = name.strip_suffix("[]") {
+            name = stripped;
+            is_array = true;
+        }
+        (ObjectId::new(&id.schema, name), is_array)
+    }
+
+    pub(crate) fn domain_closure(&self, domain: &ObjectId) -> HashSet<ObjectId> {
+        let mut domains = HashSet::from([domain.clone()]);
+        loop {
+            let mut changed = false;
+            for (id, overlay) in &self.local.types {
+                if domains.contains(id) {
+                    continue;
+                }
+                let TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Domain {
+                            base_type_id: Some(base),
+                            ..
+                        },
+                    ..
+                }) = overlay
+                else {
+                    continue;
+                };
+                if domains.contains(base) {
+                    domains.insert(id.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                return domains;
+            }
+        }
+    }
+
+    /// Relations whose columns use the domain or a domain derived from it.
+    /// Container columns are reported separately because PostgreSQL refuses to
+    /// validate a domain that is stored inside an array, composite, or range.
+    pub(crate) fn relations_using_domain(&self, domain: &ObjectId) -> Vec<&RelationState> {
+        let domains = self.domain_closure(domain);
+        self.local
+            .relations
+            .values()
+            .filter_map(|overlay| {
+                let RelationOverlay::Present(relation) = overlay else {
+                    return None;
+                };
+                relation
+                    .columns
+                    .iter()
+                    .any(|column| {
+                        column.type_id.as_ref().is_some_and(|id| {
+                            let (element, is_array) = Self::strip_array_type_id(id);
+                            !is_array && domains.contains(&element)
+                        })
+                    })
+                    .then_some(relation)
+            })
+            .collect()
+    }
+
+    pub(crate) fn domain_container_validation_conflict(&self, domain: &ObjectId) -> Option<String> {
+        let domains = self.domain_closure(domain);
+        for overlay in self.local.relations.values() {
+            let RelationOverlay::Present(relation) = overlay else {
+                continue;
+            };
+            for column in &relation.columns {
+                let Some(type_id) = &column.type_id else {
+                    continue;
+                };
+                if self.type_stores_domain_in_container(type_id, &domains, &mut HashSet::new()) {
+                    return Some(format!(
+                        "cannot alter type '{}' because column '{}.{}' uses it",
+                        domain, relation.id, column.name
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn type_stores_domain_in_container(
+        &self,
+        id: &ObjectId,
+        domains: &HashSet<ObjectId>,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> bool {
+        if !visiting.insert(id.clone()) {
+            return false;
+        }
+        let (element, is_array) = Self::strip_array_type_id(id);
+        if is_array {
+            return self.type_contains_domain(&element, domains, visiting);
+        }
+        let Some(TypeOverlay::Present(TypeState { kind, .. })) = self.local.types.get(id) else {
+            return false;
+        };
+        match kind {
+            TypeKind::Domain { .. } => false,
+            TypeKind::Composite { fields } => fields.iter().any(|field| {
+                field
+                    .data_type_id
+                    .as_ref()
+                    .is_some_and(|id| self.type_contains_domain(id, domains, visiting))
+            }),
+            TypeKind::Range { subtype_id, .. } => subtype_id
+                .as_ref()
+                .is_some_and(|id| self.type_contains_domain(id, domains, visiting)),
+            TypeKind::Multirange { range } => range
+                .as_ref()
+                .is_some_and(|id| self.type_contains_domain(id, domains, visiting)),
+            TypeKind::Enum { .. } | TypeKind::Base { .. } => false,
+        }
+    }
+
+    fn type_contains_domain(
+        &self,
+        id: &ObjectId,
+        domains: &HashSet<ObjectId>,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> bool {
+        let (element, is_array) = Self::strip_array_type_id(id);
+        if is_array {
+            return self.type_contains_domain(&element, domains, visiting);
+        }
+        domains.contains(&element)
+            || self.type_stores_domain_in_container(&element, domains, visiting)
+    }
+
     pub(crate) fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
         // PostgreSQL searches the session temporary schema before every explicit
         // path entry for types as well as relations, so this must agree with
@@ -121,6 +257,7 @@ impl AnalysisState {
                     TypeKind::Domain {
                         base_type,
                         base_type_id,
+                        ..
                     },
                 ..
             })) = self.local.types.get(&current)

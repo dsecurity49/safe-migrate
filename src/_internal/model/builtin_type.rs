@@ -81,6 +81,8 @@ pub(crate) struct BuiltinType {
     pub array_oid: Option<u32>,
     /// Whether `pg_type.typmodout` exists, i.e. the type accepts a modifier.
     pub accepts_typmod: bool,
+    /// `pg_type.typcollation <> 0`: a value of this type carries a collation.
+    pub collatable: bool,
 }
 
 impl BuiltinType {}
@@ -224,6 +226,7 @@ mod tests {
             preferred: false,
             fixed_bits: None,
             accepts_typmod: false,
+            collatable: false,
         }
     }
 

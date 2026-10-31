@@ -176,6 +176,7 @@ impl AnalysisState {
                     TypeKind::Domain {
                         base_type,
                         base_type_id,
+                        ..
                     } => {
                         *base_type_id = Self::resolve_type_reference_from_catalog(
                             base_type,
@@ -197,6 +198,7 @@ impl AnalysisState {
                     TypeKind::Range {
                         subtype,
                         subtype_id,
+                        ..
                     } => {
                         if let Some(subtype) = subtype {
                             *subtype_id = Self::resolve_type_reference_from_catalog(
@@ -207,7 +209,8 @@ impl AnalysisState {
                             );
                         }
                     }
-                    TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange => {}
+                    TypeKind::Enum { .. } | TypeKind::Base { .. } | TypeKind::Multirange { .. } => {
+                    }
                 }
             }
         }
@@ -300,6 +303,18 @@ impl AnalysisState {
             .sequences
             .iter()
             .map(|(id, sequence)| (id.clone(), SequenceOverlay::Present(sequence.clone())))
+            .collect();
+        let extensions = cache
+            .extensions
+            .iter()
+            .map(|(name, extension)| {
+                (
+                    name.clone(),
+                    crate::_internal::model::extension::ExtensionOverlay::Present(
+                        extension.clone(),
+                    ),
+                )
+            })
             .collect();
         let baseline_sequences = cache.sequences.keys().cloned().collect();
         let scoped_external_dependencies =
@@ -645,12 +660,14 @@ impl AnalysisState {
             baseline_sequences,
             scoped_external_dependencies,
             external_referencing_schemas,
+            co_dropped_objects: HashSet::new(),
             local: LocalState {
                 schemas,
                 relations,
                 types,
                 functions,
                 sequences,
+                extensions,
                 publications,
                 subscriptions,
                 roles: cache

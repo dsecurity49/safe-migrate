@@ -23,13 +23,63 @@ impl CollationCatalogue {
         }
     }
 
-    fn lookup(&self, schema: &str, name: &str) -> Option<ResolvedName> {
+    pub(crate) fn has(&self, schema: &str, name: &str) -> bool {
+        // The built-in collations remain resolvable even when a scoped sync
+        // omits their pg_catalog rows.
         self.entries
-            .get(&ResolvedName {
-                schema: schema.to_string(),
-                name: name.to_string(),
-            })
-            .cloned()
+            .iter()
+            .any(|entry| entry.schema == schema && entry.name == name)
+            || (schema == "pg_catalog" && matches!(name, "C" | "POSIX" | "default"))
+    }
+
+    pub(crate) fn move_one(&self, old_schema: &str, name: &str, new_schema: &str) -> Self {
+        let mut entries = self.entries.clone();
+        entries.remove(&ResolvedName {
+            schema: old_schema.to_string(),
+            name: name.to_string(),
+        });
+        entries.insert(ResolvedName {
+            schema: new_schema.to_string(),
+            name: name.to_string(),
+        });
+        Self { entries }
+    }
+
+    pub(crate) fn drop_one(&self, schema: &str, name: &str) -> Self {
+        let mut entries = self.entries.clone();
+        entries.remove(&ResolvedName {
+            schema: schema.to_string(),
+            name: name.to_string(),
+        });
+        Self { entries }
+    }
+
+    pub(crate) fn remap_schema(&self, old_schema: &str, new_schema: &str) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| ResolvedName {
+                    schema: if entry.schema == old_schema {
+                        new_schema.to_string()
+                    } else {
+                        entry.schema.clone()
+                    },
+                    name: entry.name.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn lookup(&self, schema: &str, name: &str) -> Option<ResolvedName> {
+        let identity = ResolvedName {
+            schema: schema.to_string(),
+            name: name.to_string(),
+        };
+        self.entries.get(&identity).cloned().or_else(|| {
+            (schema == "pg_catalog" && matches!(name, "C" | "POSIX" | "default"))
+                .then_some(identity)
+        })
     }
 
     /// The collation a written name denotes, as PostgreSQL's lookup resolves it.

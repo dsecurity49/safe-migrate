@@ -14,6 +14,7 @@ use crate::_internal::model::function::{
     FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
 };
 use crate::_internal::model::trigger::TriggerOverlay;
+use crate::_internal::model::types::{TypeKind, TypeOverlay};
 use std::collections::HashSet;
 
 type RoutineLookup = ObjectLookup;
@@ -620,6 +621,33 @@ impl AnalysisState {
             })
     }
 
+    fn types_requiring_routine(&self, routine: &ObjectId) -> Vec<(ObjectId, &'static str)> {
+        self.local
+            .types
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let TypeOverlay::Present(state) = overlay else {
+                    return None;
+                };
+                match &state.kind {
+                    TypeKind::Range {
+                        canonical_id,
+                        subtype_diff_id,
+                        ..
+                    } => (canonical_id == &Some(routine.clone())
+                        || subtype_diff_id == &Some(routine.clone()))
+                        .then(|| (id.clone(), "range type")),
+                    TypeKind::Base { options, .. }
+                        if self.base_type_option_references_routine(options, routine) =>
+                    {
+                        Some((id.clone(), "base type"))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn apply_drop_function(
         &mut self,
         function: &DropFunctionMutation,
@@ -629,6 +657,7 @@ impl AnalysisState {
         // later signature cannot leave an earlier function dropped in the
         // simulator when the statement itself would fail.
         let mut targets: Vec<DropTarget> = Vec::new();
+        let mut cascade_types: Vec<ObjectId> = Vec::new();
         for signature in &function.signatures {
             let signature_name = format!(
                 "{}({})",
@@ -637,6 +666,13 @@ impl AnalysisState {
             );
             let schema = self.resolve_function_schema(&signature.name, &signature_name);
             let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "function",
+            ) {
+                return result;
+            }
             match self.routine_lookup(&id, |kind| {
                 matches!(kind, RoutineKind::Function | RoutineKind::Window)
             }) {
@@ -657,11 +693,25 @@ impl AnalysisState {
                     // PostgreSQL created this routine as an internal part of a
                     // type (a range constructor) and refuses to drop it while
                     // that type exists.
-                    if let Some(owner) = self.routine_internal_type_owner(&id) {
+                    if let Some(owner) = self.routine_internal_type_owner(&id)
+                        && self.type_is_present(owner)
+                        && !self.co_dropped_objects.contains(owner)
+                    {
                         return MutationResult::conflict(format!(
                             "function '{}' cannot be dropped because type '{}' requires it",
                             id, owner
                         ));
+                    }
+                    let dependent_types = self.types_requiring_routine(&id);
+                    if !dependent_types.is_empty() {
+                        if !function.cascade {
+                            return MutationResult::conflict(format!(
+                                "function '{}' is required by {} '{}'; use CASCADE",
+                                id, dependent_types[0].1, dependent_types[0].0
+                            ));
+                        }
+                        cascade_types
+                            .extend(dependent_types.into_iter().map(|(type_id, _)| type_id));
                     }
                     let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
                         .local
@@ -673,8 +723,11 @@ impl AnalysisState {
                             else {
                                 return None;
                             };
-                            (function_id == &id)
-                                .then(|| (edge.dependent.clone(), edge.referenced.clone()))
+                            // A DROP EXTENSION removes member triggers together
+                            // with the function, so they are not external here.
+                            (function_id == &id
+                                && !self.co_dropped_objects.contains(&edge.dependent))
+                            .then(|| (edge.dependent.clone(), edge.referenced.clone()))
                         })
                         .collect();
                     if !dependent_triggers.is_empty() && !function.cascade {
@@ -695,7 +748,8 @@ impl AnalysisState {
                             else {
                                 return None;
                             };
-                            Some((edge.dependent.clone(), unresolved_name.clone()))
+                            (!self.co_dropped_objects.contains(&edge.dependent))
+                                .then(|| (edge.dependent.clone(), unresolved_name.clone()))
                         })
                         .collect();
                     if !dependent_views.is_empty() && !function.cascade {
@@ -754,6 +808,16 @@ impl AnalysisState {
                 self.local
                     .functions
                     .insert(id.clone(), FunctionOverlay::Dropped);
+            }
+        }
+        if !cascade_types.is_empty() {
+            cascade_types.sort();
+            cascade_types.dedup();
+            if !self.apply_type_cascade(&cascade_types) {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
         }
         if surviving_reference {
@@ -977,6 +1041,13 @@ impl AnalysisState {
             );
             let schema = self.resolve_function_schema(&signature.name, &signature_name);
             let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "procedure",
+            ) {
+                return result;
+            }
             match self.routine_lookup(&id, |kind| kind == RoutineKind::Procedure) {
                 RoutineLookup::Present => {
                     if !targets.contains(&id) {
@@ -1319,6 +1390,13 @@ impl AnalysisState {
             );
             let schema = self.resolve_function_schema(&signature.name, &signature_name);
             let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "aggregate",
+            ) {
+                return result;
+            }
             match self.routine_lookup(&id, |kind| kind == RoutineKind::Aggregate) {
                 RoutineLookup::Present => {
                     if !targets.contains(&id) {
@@ -1360,7 +1438,8 @@ impl AnalysisState {
                         let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind else {
                             return None;
                         };
-                        Some((edge.dependent.clone(), unresolved_name.clone()))
+                        (!self.co_dropped_objects.contains(&edge.dependent))
+                            .then(|| (edge.dependent.clone(), unresolved_name.clone()))
                     })
             })
             .collect();

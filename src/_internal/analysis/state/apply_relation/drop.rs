@@ -9,6 +9,15 @@ impl AnalysisState {
         if drop_table.ids.is_empty() {
             return MutationResult::NoOp;
         }
+        for id in &drop_table.ids {
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Relation,
+                id,
+                "table",
+            ) {
+                return result;
+            }
+        }
 
         let renames: Vec<DependencyEdge> = self
             .local
@@ -181,12 +190,14 @@ impl AnalysisState {
                     && matches!(e.kind, DependencyKind::ViewDependency { .. })
                     && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
+                    && !self.co_dropped_objects.contains(&resolve(&e.dependent))
             });
             let has_fk_deps = self.local.graph.edges().iter().any(|e| {
                 self.dependency_edge_is_current(e)
                     && matches!(e.kind, DependencyKind::ForeignKey { .. })
                     && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
+                    && !self.co_dropped_objects.contains(&resolve(&e.dependent))
             });
             let has_inheritance_deps = self.local.graph.edges().iter().any(|e| {
                 matches!(
@@ -196,6 +207,7 @@ impl AnalysisState {
                         | DependencyKind::PartitionDetachPending
                 ) && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
+                    && !self.co_dropped_objects.contains(&resolve(&e.dependent))
             });
 
             if has_view_deps || has_fk_deps || has_inheritance_deps {

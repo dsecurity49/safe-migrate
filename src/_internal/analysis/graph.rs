@@ -1,5 +1,5 @@
 use crate::_internal::ast::identifiers::ObjectId;
-use crate::_internal::model::index::IndexDefinition;
+use crate::_internal::model::index::{IndexDefinition, KeyCollation, ResolvedName};
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -413,6 +413,53 @@ impl DependencyGraph {
                 {
                     apply(definition);
                     return;
+                }
+            }
+        });
+    }
+
+    // Index definitions cache resolved collation names, so collation moves and
+    // schema renames must rewrite those keys alongside the catalogue.
+    pub(crate) fn remap_index_collation(
+        &mut self,
+        old_schema: &str,
+        old_name: &str,
+        new_schema: &str,
+        new_name: &str,
+    ) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind else {
+                    continue;
+                };
+                for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                    let KeyCollation::Resolved(resolved) = &mut key.collation else {
+                        continue;
+                    };
+                    if resolved.schema == old_schema && resolved.name == old_name {
+                        *resolved = ResolvedName {
+                            schema: new_schema.to_string(),
+                            name: new_name.to_string(),
+                        };
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn remap_index_collation_schema(&mut self, old_schema: &str, new_schema: &str) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind else {
+                    continue;
+                };
+                for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                    let KeyCollation::Resolved(resolved) = &mut key.collation else {
+                        continue;
+                    };
+                    if resolved.schema == old_schema {
+                        resolved.schema = new_schema.to_string();
+                    }
                 }
             }
         });
