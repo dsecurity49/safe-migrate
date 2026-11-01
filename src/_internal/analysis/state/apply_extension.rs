@@ -111,13 +111,23 @@ impl AnalysisState {
         &mut self,
         alter: &AlterExtensionMutation,
     ) -> MutationResult {
-        let Some(ExtensionOverlay::Present(extension)) =
-            self.local.extensions.get(&alter.name).cloned()
-        else {
-            return MutationResult::conflict(format!(
-                "extension \"{}\" does not exist",
-                alter.name
-            ));
+        let extension = match self.local.extensions.get(&alter.name).cloned() {
+            Some(ExtensionOverlay::Present(extension)) => extension,
+            Some(ExtensionOverlay::Dropped) => {
+                return MutationResult::conflict(format!(
+                    "extension \"{}\" does not exist",
+                    alter.name
+                ));
+            }
+            None if self.baseline_is_available()
+                && self.baseline_has_coverage(CatalogFamily::Extensions) =>
+            {
+                return MutationResult::conflict(format!(
+                    "extension \"{}\" does not exist",
+                    alter.name
+                ));
+            }
+            None => return self.unresolved(EvidenceCode::UnknownObjectState),
         };
         match &alter.action {
             AlterExtensionActionMutation::Add(member) => {
@@ -558,12 +568,23 @@ impl AnalysisState {
 
     pub(super) fn apply_drop_extension(&mut self, drop: &DropExtensionMutation) -> MutationResult {
         for name in &drop.names {
-            let present = matches!(
-                self.local.extensions.get(name),
-                Some(ExtensionOverlay::Present(_))
-            );
-            if !present && !drop.if_exists {
-                return MutationResult::conflict(format!("extension \"{name}\" does not exist"));
+            match self.local.extensions.get(name) {
+                Some(ExtensionOverlay::Present(_)) => {}
+                Some(ExtensionOverlay::Dropped) if drop.if_exists => {}
+                Some(ExtensionOverlay::Dropped) => {
+                    return MutationResult::conflict(format!(
+                        "extension \"{name}\" does not exist"
+                    ));
+                }
+                None if drop.if_exists => {}
+                None if self.baseline_is_available()
+                    && self.baseline_has_coverage(CatalogFamily::Extensions) =>
+                {
+                    return MutationResult::conflict(format!(
+                        "extension \"{name}\" does not exist"
+                    ));
+                }
+                None => return self.unresolved(EvidenceCode::UnknownObjectState),
             }
         }
         let mut working = self.clone();
@@ -791,6 +812,7 @@ impl AnalysisState {
                 ExtensionMemberKind::Schema => {}
                 ExtensionMemberKind::Type => {
                     member_types.insert(member.id.clone());
+                    co_dropped.insert(member.id.clone());
                 }
                 ExtensionMemberKind::Constraint => {
                     if let Some((table_name, _)) = member.id.name.rsplit_once('.') {
@@ -1321,29 +1343,46 @@ impl AnalysisState {
         let member = self.resolve_extension_member(member);
         match &member.kind {
             ExtensionMemberKind::Relation | ExtensionMemberKind::Index => {
-                if self.local.relations.contains_key(&member.id) {
+                if self.relation_is_present(&member.id) {
                     ExtensionMemberPresence::Present
+                } else if matches!(
+                    self.local.relations.get(&member.id),
+                    Some(RelationOverlay::Dropped)
+                ) {
+                    ExtensionMemberPresence::Absent
                 } else {
                     self.absent_or_unknown(&member.id, CatalogFamily::Relations)
                 }
             }
             ExtensionMemberKind::Sequence => {
-                if self.local.sequences.contains_key(&member.id) {
+                if self.sequence_is_present(&member.id) {
                     ExtensionMemberPresence::Present
+                } else if matches!(
+                    self.local.sequences.get(&member.id),
+                    Some(SequenceOverlay::Dropped)
+                ) {
+                    ExtensionMemberPresence::Absent
                 } else {
                     self.absent_or_unknown(&member.id, CatalogFamily::Sequences)
                 }
             }
             ExtensionMemberKind::Type => {
-                if self.local.types.contains_key(&member.id) {
+                if self.type_is_present(&member.id) {
                     ExtensionMemberPresence::Present
+                } else if matches!(self.local.types.get(&member.id), Some(TypeOverlay::Dropped)) {
+                    ExtensionMemberPresence::Absent
                 } else {
                     self.absent_or_unknown(&member.id, CatalogFamily::Types)
                 }
             }
             ExtensionMemberKind::Routine => {
-                if self.local.functions.contains_key(&member.id) {
+                if self.routine_is_present(&member.id) {
                     ExtensionMemberPresence::Present
+                } else if matches!(
+                    self.local.functions.get(&member.id),
+                    Some(FunctionOverlay::Dropped)
+                ) {
+                    ExtensionMemberPresence::Absent
                 } else {
                     self.absent_or_unknown(&member.id, CatalogFamily::Routines)
                 }

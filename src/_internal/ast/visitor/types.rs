@@ -451,6 +451,7 @@ impl AstVisitor {
                 actions.push(AlterTypeActionFact::RenameAttribute {
                     old_name: Self::identifier_from_name(old_field.trim(), false),
                     new_name: Self::identifier_from_name(new_field.trim(), false),
+                    cascade: Self::is_cascade(rename_attr.drop_behavior()),
                 });
             }
             ast::AlterTypeAction::SetOptions(set_options) => {
@@ -480,6 +481,7 @@ impl AstVisitor {
                                 name,
                                 data_type,
                                 collation,
+                                cascade: Self::is_cascade(add.drop_behavior()),
                             });
                         }
                         ast::AlterTypeAttributeAction::DropAttribute(drop) => {

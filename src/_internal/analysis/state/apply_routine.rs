@@ -626,6 +626,9 @@ impl AnalysisState {
             .types
             .iter()
             .filter_map(|(id, overlay)| {
+                if self.co_dropped_objects.contains(id) {
+                    return None;
+                }
                 let TypeOverlay::Present(state) = overlay else {
                     return None;
                 };

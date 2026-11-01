@@ -35,19 +35,27 @@ fn sequence_bounds_narrowed(
 /// The runtime check PostgreSQL performs after merging sequence parameters.
 ///
 /// `RESTART` is checked separately by `init_sequence_parameters`; this covers
-/// the current value when the statement does not restart the sequence.
+/// the current value when the statement does not restart the sequence. An
+/// inexact cached value only proves a conflict when the old direction could
+/// not have moved it back inside the new bounds.
 fn sequence_runtime_bounds_conflict(
-    runtime: &crate::_internal::model::sequence::SequenceRuntime,
+    current: &SequenceState,
     parameters: &crate::_internal::model::sequence::SequenceParameters,
 ) -> Option<MutationResult> {
-    let last_value = runtime.last_value?;
-    if last_value < parameters.min_value {
+    let last_value = current.runtime.last_value?;
+    if last_value < parameters.min_value
+        && (current.runtime_exact
+            || (!current.parameters.cycle && current.parameters.increment < 0))
+    {
         return Some(MutationResult::conflict(format!(
             "RESTART value ({last_value}) cannot be less than MINVALUE ({})",
             parameters.min_value
         )));
     }
-    if last_value > parameters.max_value {
+    if last_value > parameters.max_value
+        && (current.runtime_exact
+            || (!current.parameters.cycle && current.parameters.increment > 0))
+    {
         return Some(MutationResult::conflict(format!(
             "RESTART value ({last_value}) cannot be greater than MAXVALUE ({})",
             parameters.max_value
@@ -665,7 +673,7 @@ impl AnalysisState {
             )
         });
         if restart_runtime.is_none() {
-            if let Some(conflict) = sequence_runtime_bounds_conflict(&current.runtime, &merged) {
+            if let Some(conflict) = sequence_runtime_bounds_conflict(&current, &merged) {
                 return conflict;
             }
             if sequence_bounds_narrowed(&current.parameters, &merged) && !current.runtime_exact {

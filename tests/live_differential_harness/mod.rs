@@ -596,6 +596,7 @@ fn live_postgres_differential_harness() {
         })
     };
     let enabled_rules = selected_rules().count();
+    let mut executed_fixtures = 0usize;
     let enabled_fixtures = selected_rules()
         .map(|rule| {
             rule.fixtures
@@ -701,6 +702,7 @@ fn live_postgres_differential_harness() {
                     continue;
                 }
             }
+            executed_fixtures += 1;
             let live_statements = if rule.fixture_autocommit.contains(fixture) {
                 split_fixture_statements(&sql).unwrap_or_else(|error| {
                     panic!(
@@ -1065,11 +1067,14 @@ fn live_postgres_differential_harness() {
     if !mismatches.is_empty() {
         panic!("{}", format_mismatch_report(&mismatches, &manifest_path));
     }
+    if let Some(error) = zero_execution_error(executed_fixtures, &rule_filter, &fixture_filter) {
+        panic!("{error}");
+    }
     verbose(
         verbosity,
         1,
         format!(
-            "result=match fixtures={enabled_fixtures} elapsed={}",
+            "result=match fixtures={executed_fixtures} elapsed={}",
             format_duration(harness_started.elapsed())
         ),
     );
@@ -1969,4 +1974,24 @@ fn format_mismatch_report(mismatches: &[Mismatch], manifest_path: &Path) -> Stri
         ));
     }
     lines.join("\n")
+}
+
+fn zero_execution_error(
+    executed: usize,
+    rule_filter: &Option<String>,
+    fixture_filter: &Option<String>,
+) -> Option<String> {
+    (executed == 0).then(|| {
+        format!(
+            "no differential fixture executed after skipping unavailable extensions ({}={:?}, {}={:?})",
+            RULE_FILTER_ENV, rule_filter, FIXTURE_FILTER_ENV, fixture_filter
+        )
+    })
+}
+
+#[test]
+fn a_run_that_executed_no_fixtures_is_a_failure() {
+    let filters = Some("rule_25_schema-drift".to_string());
+    assert!(zero_execution_error(1, &filters, &None).is_none());
+    assert!(zero_execution_error(0, &filters, &None).is_some());
 }

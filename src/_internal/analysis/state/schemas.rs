@@ -144,6 +144,15 @@ impl AnalysisState {
             if let crate::_internal::model::function::FunctionOverlay::Present(state) = &mut overlay
             {
                 Self::remap_schema_id(&mut state.id, old_name, new_name);
+                for type_id in state.arg_type_ids.iter_mut().flatten() {
+                    Self::remap_schema_id(type_id, old_name, new_name);
+                }
+                if let Some(type_id) = &mut state.return_type_id {
+                    Self::remap_schema_id(type_id, old_name, new_name);
+                }
+                if let Some(type_id) = &mut state.internal_type_owner {
+                    Self::remap_schema_id(type_id, old_name, new_name);
+                }
             }
             if id != old_id {
                 aliases.push((old_id, id.clone()));
@@ -274,16 +283,51 @@ impl AnalysisState {
                 continue;
             };
             match &mut state.kind {
-                crate::_internal::model::types::TypeKind::Domain { collation_id, .. }
-                | crate::_internal::model::types::TypeKind::Range { collation_id, .. } => {
-                    if let Some(collation_id) = collation_id {
-                        Self::remap_schema_id(collation_id, old_name, new_name);
+                crate::_internal::model::types::TypeKind::Domain {
+                    base_type_id,
+                    collation_id,
+                    ..
+                } => {
+                    if let Some(id) = base_type_id {
+                        Self::remap_schema_id(id, old_name, new_name);
                     }
+                    if let Some(id) = collation_id {
+                        Self::remap_schema_id(id, old_name, new_name);
+                    }
+                }
+                crate::_internal::model::types::TypeKind::Range {
+                    subtype_id,
+                    multirange,
+                    collation_id,
+                    opclass_id,
+                    canonical_id,
+                    subtype_diff_id,
+                    ..
+                } => {
+                    for id in [
+                        subtype_id,
+                        multirange,
+                        collation_id,
+                        opclass_id,
+                        canonical_id,
+                        subtype_diff_id,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        Self::remap_schema_id(id, old_name, new_name);
+                    }
+                }
+                crate::_internal::model::types::TypeKind::Multirange { range: Some(id) } => {
+                    Self::remap_schema_id(id, old_name, new_name)
                 }
                 crate::_internal::model::types::TypeKind::Composite { fields } => {
                     for field in fields {
-                        if let Some(collation_id) = &mut field.collation_id {
-                            Self::remap_schema_id(collation_id, old_name, new_name);
+                        if let Some(id) = &mut field.data_type_id {
+                            Self::remap_schema_id(id, old_name, new_name);
+                        }
+                        if let Some(id) = &mut field.collation_id {
+                            Self::remap_schema_id(id, old_name, new_name);
                         }
                     }
                 }

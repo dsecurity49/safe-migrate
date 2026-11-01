@@ -976,3 +976,104 @@ fn truncate_restart_identity_taints_unmodeled_sequence_resets() {
     assert_eq!(sequence.runtime.last_value, None);
     assert!(!sequence.runtime_exact);
 }
+
+#[test]
+fn cached_runtime_below_a_narrowed_minimum_taints_without_a_false_conflict() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        start_value: 10,
+        increment: 1,
+        min_value: 1,
+        max_value: 100,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime {
+            last_value: Some(5),
+            is_called: Some(true),
+        },
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    let findings = engine
+        .analyze("ALTER SEQUENCE s MINVALUE 10;", &mut state)
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert!(
+        state
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::BaselineStale)
+    );
+    assert_eq!(present_sequence(&state, &id).parameters.min_value, 10);
+    assert_eq!(present_sequence(&state, &id).runtime.last_value, Some(5));
+}
+
+#[test]
+fn cached_runtime_above_a_narrowed_maximum_is_a_certain_conflict() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        max_value: 100,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime {
+            last_value: Some(50),
+            is_called: Some(true),
+        },
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    let findings = engine
+        .analyze("ALTER SEQUENCE s MAXVALUE 40;", &mut state)
+        .unwrap();
+
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert_eq!(present_sequence(&state, &id).parameters.max_value, 100);
+}
+
+#[test]
+fn cached_runtime_inside_a_cycling_range_cannot_prove_a_conflict() {
+    let engine = setup_engine();
+    let parameters = safe_migrate::_internal::model::sequence::SequenceParameters {
+        min_value: 1,
+        max_value: 100,
+        cycle: true,
+        ..Default::default()
+    };
+    let (cache, id) = baseline_sequence_cache(
+        safe_migrate::_internal::model::sequence::SequenceRuntime {
+            last_value: Some(90),
+            is_called: Some(true),
+        },
+        parameters,
+    );
+    let mut state = AnalysisState::new(cache);
+
+    let findings = engine
+        .analyze("ALTER SEQUENCE s MAXVALUE 40;", &mut state)
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert_eq!(present_sequence(&state, &id).parameters.max_value, 40);
+}

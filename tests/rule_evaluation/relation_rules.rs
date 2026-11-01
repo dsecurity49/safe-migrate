@@ -191,6 +191,16 @@ fn domain_validation_uses_relations_that_store_the_domain() {
     );
 
     let violations = engine
+        .analyze("ALTER DOMAIN d VALIDATE CONSTRAINT c2;", &mut state)
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "an already validated constraint is a no-op: {violations:#?}"
+    );
+
+    let violations = engine
         .analyze("ALTER DOMAIN d SET NOT NULL;", &mut state)
         .unwrap();
     assert!(

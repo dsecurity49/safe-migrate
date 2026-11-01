@@ -317,7 +317,9 @@ impl Rule for DriftDetectionRule {
 
                 });
             }
-            Mutation::AlterSequence(a) if !pre_state.sequences.contains_key(&a.id) => {
+            Mutation::AlterSequence(a)
+                if !a.if_exists && !pre_state.sequences.contains_key(&a.id) =>
+            {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
 

@@ -661,6 +661,7 @@ pub(crate) enum AlterTypeActionFact {
         name: Ident,
         data_type: String,
         collation: Option<String>,
+        cascade: bool,
     },
     DropAttribute {
         name: Ident,
@@ -676,6 +677,7 @@ pub(crate) enum AlterTypeActionFact {
     RenameAttribute {
         old_name: Ident,
         new_name: Ident,
+        cascade: bool,
     },
     SetOptions {
         options: crate::_internal::model::types::BaseTypeOptions,

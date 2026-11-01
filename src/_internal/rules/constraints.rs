@@ -384,7 +384,7 @@ impl BlockingConstraintRule {
             AlterDomainActionFact::ValidateConstraint { .. } => true,
             _ => false,
         };
-        if !action_is_relevant {
+        if !action_is_relevant || context.result().is_noop() {
             return Vec::new();
         }
 

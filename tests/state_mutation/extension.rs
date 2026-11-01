@@ -1063,3 +1063,151 @@ fn schema_rename_remaps_extension_members() {
     )));
     assert!(state.relation_is_present(&object_id("renamed", "items")));
 }
+
+#[test]
+fn unavailable_baseline_does_not_invent_a_missing_extension() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
+        crate::common::unavailable_cache(),
+        false,
+    );
+
+    for sql in ["ALTER EXTENSION pg_trgm UPDATE;", "DROP EXTENSION hstore;"] {
+        let findings = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{sql} must not invent a conflict without evidence: {findings:?}"
+        );
+    }
+
+    assert_eq!(state.confidence(), &Confidence::Tainted);
+    assert!(state.local.extensions.is_empty());
+}
+
+#[test]
+fn authoritative_baseline_rejects_unknown_and_dropped_extensions() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let findings = engine
+        .analyze("DROP EXTENSION hstore;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+
+    engine
+        .analyze(
+            "CREATE EXTENSION hstore; DROP EXTENSION hstore;",
+            &mut state,
+        )
+        .unwrap();
+    let findings = engine
+        .analyze("ALTER EXTENSION hstore UPDATE;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn extension_membership_ignores_dropped_member_tombstones() {
+    let engine = setup_engine();
+    for sql in [
+        "ALTER EXTENSION ext ADD TABLE gone;",
+        "ALTER EXTENSION ext ADD SEQUENCE gone_seq;",
+        "ALTER EXTENSION ext ADD TYPE gone_type;",
+        "ALTER EXTENSION ext ADD FUNCTION gone_fn();",
+    ] {
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE gone (id integer);
+                 DROP TABLE gone;
+                 CREATE SEQUENCE gone_seq;
+                 DROP SEQUENCE gone_seq;
+                 CREATE TYPE gone_type AS ENUM ('x');
+                 DROP TYPE gone_type;
+                 CREATE FUNCTION gone_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+                 DROP FUNCTION gone_fn();",
+                &mut state,
+            )
+            .unwrap();
+        attach_extension(&mut state, "ext", "public", true, []);
+
+        let findings = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains("does not exist")
+            }),
+            "{sql} must reject a dropped member: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn drop_extension_ignores_a_type_that_requires_a_co_dropped_routine() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let range_id = object_id("public", "r");
+    let routine_id = object_id("public", "canonical(integer)");
+
+    state.local.functions.insert(
+        routine_id.clone(),
+        FunctionOverlay::Present(FunctionState::with_inputs(
+            routine_id.clone(),
+            RoutineKind::Function,
+            vec!["integer".to_string()],
+        )),
+    );
+    state.local.types.insert(
+        range_id.clone(),
+        TypeOverlay::Present(TypeState {
+            id: range_id.clone(),
+            generation: 0,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Range {
+                subtype: Some("integer".to_string()),
+                subtype_id: None,
+                multirange: None,
+                collation: None,
+                collation_id: None,
+                opclass: None,
+                opclass_id: None,
+                canonical: Some("canonical".to_string()),
+                canonical_id: Some(routine_id.clone()),
+                subtype_diff: None,
+                subtype_diff_id: None,
+            },
+        }),
+    );
+    attach_extension(
+        &mut state,
+        "ext",
+        "public",
+        true,
+        [
+            member(ExtensionMemberKind::Type, "public", "r"),
+            member(ExtensionMemberKind::Routine, "public", "canonical(integer)"),
+        ],
+    );
+
+    let findings = engine.analyze("DROP EXTENSION ext;", &mut state).unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert!(!state.type_is_present(&range_id));
+    assert!(!state.routine_is_present(&routine_id));
+}

@@ -2468,8 +2468,8 @@ fn composite_attribute_alterations_synchronize_typed_tables() {
         .analyze(
             "CREATE TYPE item_t AS (a integer, b text);
              CREATE TABLE typed_items OF item_t;
-             ALTER TYPE item_t ADD ATTRIBUTE c boolean;
-             ALTER TYPE item_t RENAME ATTRIBUTE b TO b_renamed;
+             ALTER TYPE item_t ADD ATTRIBUTE c boolean CASCADE;
+             ALTER TYPE item_t RENAME ATTRIBUTE b TO b_renamed CASCADE;
              ALTER TYPE item_t DROP ATTRIBUTE a CASCADE;",
             &mut state,
         )
@@ -2671,4 +2671,272 @@ fn base_type_shell_completion_and_options_work() {
     } else {
         panic!("expected Base type kind");
     }
+}
+
+#[test]
+fn typed_table_attribute_add_and_rename_require_cascade() {
+    let engine = setup_engine();
+    for sql in [
+        "ALTER TYPE item_t ADD ATTRIBUTE c boolean;",
+        "ALTER TYPE item_t RENAME ATTRIBUTE b TO renamed_b;",
+    ] {
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE item_t AS (a integer, b text);
+                 CREATE TABLE typed_items OF item_t;",
+                &mut state,
+            )
+            .unwrap();
+        let findings = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains("typed table")
+            }),
+            "{sql} must require CASCADE: {findings:?}"
+        );
+        let TypeOverlay::Present(TypeState {
+            kind: TypeKind::Composite { fields },
+            ..
+        }) = state
+            .local
+            .types
+            .get(&object_id("public", "item_t"))
+            .expect("item_t present")
+        else {
+            panic!("item_t should stay composite");
+        };
+        assert!(fields.iter().all(|field| field.name != "c"));
+        assert!(fields.iter().any(|field| field.name == "b"));
+    }
+}
+
+#[test]
+fn schema_rename_remaps_type_and_routine_identity_links() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine.analyze("CREATE SCHEMA legacy;", &mut state).unwrap();
+
+    let type_ids = [
+        "domain_base",
+        "domain_collation",
+        "range_subtype",
+        "range_multirange",
+        "range_collation",
+        "range_opclass",
+        "range_canonical",
+        "range_diff",
+        "multirange_range",
+        "composite_field",
+        "composite_collation",
+        "routine_arg",
+        "routine_return",
+        "routine_owner",
+    ]
+    .map(|name| object_id("legacy", name));
+
+    state.local.types.insert(
+        object_id("legacy", "d"),
+        TypeOverlay::Present(TypeState {
+            id: object_id("legacy", "d"),
+            generation: 0,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Domain {
+                base_type: "base".to_string(),
+                base_type_id: Some(type_ids[0].clone()),
+                collation: None,
+                collation_id: Some(type_ids[1].clone()),
+                default: None,
+                default_text: None,
+                not_null: false,
+                not_null_constraint: None,
+                constraints: Default::default(),
+            },
+        }),
+    );
+    state.local.types.insert(
+        object_id("legacy", "r"),
+        TypeOverlay::Present(TypeState {
+            id: object_id("legacy", "r"),
+            generation: 0,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Range {
+                subtype: None,
+                subtype_id: Some(type_ids[2].clone()),
+                multirange: Some(type_ids[3].clone()),
+                collation: None,
+                collation_id: Some(type_ids[4].clone()),
+                opclass: None,
+                opclass_id: Some(type_ids[5].clone()),
+                canonical: None,
+                canonical_id: Some(type_ids[6].clone()),
+                subtype_diff: None,
+                subtype_diff_id: Some(type_ids[7].clone()),
+            },
+        }),
+    );
+    state.local.types.insert(
+        object_id("legacy", "mr"),
+        TypeOverlay::Present(TypeState {
+            id: object_id("legacy", "mr"),
+            generation: 0,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Multirange {
+                range: Some(type_ids[8].clone()),
+            },
+        }),
+    );
+    state.local.types.insert(
+        object_id("legacy", "c"),
+        TypeOverlay::Present(TypeState {
+            id: object_id("legacy", "c"),
+            generation: 0,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Composite {
+                fields: vec![safe_migrate::_internal::model::types::CompositeFieldState {
+                    name: "f".to_string(),
+                    data_type: "base".to_string(),
+                    data_type_id: Some(type_ids[9].clone()),
+                    collation: None,
+                    collation_id: Some(type_ids[10].clone()),
+                }],
+            },
+        }),
+    );
+    let routine_id = object_id("legacy", "f(integer)");
+    let mut routine = FunctionState::with_inputs(
+        routine_id.clone(),
+        RoutineKind::Function,
+        vec!["integer".to_string()],
+    );
+    routine.arg_type_ids = vec![Some(type_ids[11].clone())];
+    routine.return_type_id = Some(type_ids[12].clone());
+    routine.internal_type_owner = Some(type_ids[13].clone());
+    state
+        .local
+        .functions
+        .insert(routine_id, FunctionOverlay::Present(routine));
+
+    let findings = engine
+        .analyze("ALTER SCHEMA legacy RENAME TO modern;", &mut state)
+        .unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+
+    let TypeOverlay::Present(TypeState {
+        kind:
+            TypeKind::Domain {
+                base_type_id,
+                collation_id,
+                ..
+            },
+        ..
+    }) = state
+        .local
+        .types
+        .get(&object_id("modern", "d"))
+        .expect("domain present")
+    else {
+        panic!("domain should be present");
+    };
+    assert_eq!(
+        base_type_id.as_ref().map(|id| id.schema.as_str()),
+        Some("modern")
+    );
+    assert_eq!(
+        collation_id.as_ref().map(|id| id.schema.as_str()),
+        Some("modern")
+    );
+    let TypeOverlay::Present(TypeState {
+        kind:
+            TypeKind::Range {
+                subtype_id,
+                multirange,
+                collation_id,
+                opclass_id,
+                canonical_id,
+                subtype_diff_id,
+                ..
+            },
+        ..
+    }) = state
+        .local
+        .types
+        .get(&object_id("modern", "r"))
+        .expect("range present")
+    else {
+        panic!("range should be present");
+    };
+    for id in [
+        subtype_id,
+        multirange,
+        collation_id,
+        opclass_id,
+        canonical_id,
+        subtype_diff_id,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!(id.schema, "modern", "{id} was not remapped");
+    }
+    let TypeOverlay::Present(TypeState {
+        kind: TypeKind::Multirange { range },
+        ..
+    }) = state
+        .local
+        .types
+        .get(&object_id("modern", "mr"))
+        .expect("multirange present")
+    else {
+        panic!("multirange should be present");
+    };
+    assert_eq!(range.as_ref().map(|id| id.schema.as_str()), Some("modern"));
+    let TypeOverlay::Present(TypeState {
+        kind: TypeKind::Composite { fields },
+        ..
+    }) = state
+        .local
+        .types
+        .get(&object_id("modern", "c"))
+        .expect("composite present")
+    else {
+        panic!("composite should be present");
+    };
+    assert_eq!(
+        fields[0].data_type_id.as_ref().map(|id| id.schema.as_str()),
+        Some("modern")
+    );
+    assert_eq!(
+        fields[0].collation_id.as_ref().map(|id| id.schema.as_str()),
+        Some("modern")
+    );
+    let Some(FunctionOverlay::Present(routine)) = state
+        .local
+        .functions
+        .get(&object_id("modern", "f(integer)"))
+    else {
+        panic!("routine should be present");
+    };
+    assert_eq!(
+        routine.arg_type_ids[0]
+            .as_ref()
+            .map(|id| id.schema.as_str()),
+        Some("modern")
+    );
+    assert_eq!(
+        routine.return_type_id.as_ref().map(|id| id.schema.as_str()),
+        Some("modern")
+    );
+    assert_eq!(
+        routine
+            .internal_type_owner
+            .as_ref()
+            .map(|id| id.schema.as_str()),
+        Some("modern")
+    );
 }

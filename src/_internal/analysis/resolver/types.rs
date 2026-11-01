@@ -181,12 +181,14 @@ impl Resolver {
                     name,
                     data_type,
                     collation,
+                    cascade,
                 } => Mutation::AlterType(AlterTypeMutation {
                     id: id.clone(),
                     action: AlterTypeActionMutation::AddAttribute {
                         name: name.resolve(),
                         data_type: data_type.clone(),
                         collation: collation.clone(),
+                        cascade: *cascade,
                     },
                 }),
                 AlterTypeActionFact::DropAttribute {
@@ -215,15 +217,18 @@ impl Resolver {
                         cascade: *cascade,
                     },
                 }),
-                AlterTypeActionFact::RenameAttribute { old_name, new_name } => {
-                    Mutation::AlterType(AlterTypeMutation {
-                        id: id.clone(),
-                        action: AlterTypeActionMutation::RenameAttribute {
-                            old_name: old_name.resolve(),
-                            new_name: new_name.resolve(),
-                        },
-                    })
-                }
+                AlterTypeActionFact::RenameAttribute {
+                    old_name,
+                    new_name,
+                    cascade,
+                } => Mutation::AlterType(AlterTypeMutation {
+                    id: id.clone(),
+                    action: AlterTypeActionMutation::RenameAttribute {
+                        old_name: old_name.resolve(),
+                        new_name: new_name.resolve(),
+                        cascade: *cascade,
+                    },
+                }),
                 AlterTypeActionFact::SetOptions { options } => {
                     Mutation::AlterType(AlterTypeMutation {
                         id: id.clone(),

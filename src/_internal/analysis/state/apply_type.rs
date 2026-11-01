@@ -723,6 +723,8 @@ impl AnalysisState {
         match &alter.action {
             AlterTypeActionMutation::DropAttribute { cascade, .. }
             | AlterTypeActionMutation::AlterAttributeType { cascade, .. }
+            | AlterTypeActionMutation::AddAttribute { cascade, .. }
+            | AlterTypeActionMutation::RenameAttribute { cascade, .. }
                 if !typed_tables.is_empty() && !cascade =>
             {
                 return MutationResult::conflict(format!(
@@ -845,7 +847,9 @@ impl AnalysisState {
                         field.collation_id = collation_id;
                     }
                 }
-                AlterTypeActionMutation::RenameAttribute { old_name, new_name } => {
+                AlterTypeActionMutation::RenameAttribute {
+                    old_name, new_name, ..
+                } => {
                     if let TypeKind::Composite { fields } = &mut existing.kind {
                         if fields.iter().any(|f| f.name == *new_name) {
                             return MutationResult::conflict(format!(
@@ -951,7 +955,9 @@ impl AnalysisState {
                             col.type_id = resolved_attr_type_id.clone();
                         }
                     }
-                    AlterTypeActionMutation::RenameAttribute { old_name, new_name } => {
+                    AlterTypeActionMutation::RenameAttribute {
+                        old_name, new_name, ..
+                    } => {
                         if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *old_name) {
                             col.name = new_name.clone();
                         }

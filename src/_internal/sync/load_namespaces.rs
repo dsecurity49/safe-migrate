@@ -111,6 +111,14 @@ pub(super) fn load_sequences(
     let rows = client
         .query(&query, &[schema_values])
         .context("Failed to load sequences and ownership from pg_class/pg_depend")?;
+    // Unlogged relations are unavailable on a standby: before PostgreSQL 18
+    // their sequence relation cannot be read at all, and 18 reports NULL
+    // runtime columns. Their values are unknown rather than zero.
+    let in_recovery: bool = client
+        .query_one("SELECT pg_catalog.pg_is_in_recovery()", &[])
+        .context("Failed to read recovery state while loading sequences")?
+        .try_get(0)
+        .context("recovery state")?;
     let mut sequences = std::collections::HashMap::new();
     for row in rows {
         let id = ObjectId::new(
@@ -156,7 +164,8 @@ pub(super) fn load_sequences(
         let can_read_runtime: bool = row
             .try_get("can_read_runtime")
             .context("sequence runtime read privilege")?;
-        let runtime = if can_read_runtime {
+        let runtime = if can_read_runtime && sequence_runtime_is_readable(in_recovery, persistence)
+        {
             load_sequence_runtime(client, &id, pg_version_num)?
         } else {
             crate::_internal::model::sequence::SequenceRuntime::unknown()
@@ -212,12 +221,64 @@ fn load_sequence_runtime(
             )
             .context("Failed to read sequence runtime data")?
     };
-    Ok(crate::_internal::model::sequence::SequenceRuntime {
-        last_value: Some(row.try_get("last_value").context("sequence last value")?),
-        is_called: Some(row.try_get("is_called").context("sequence is_called")?),
-    })
+    let last_value: Option<i64> = row.try_get("last_value").context("sequence last value")?;
+    let is_called: Option<bool> = row.try_get("is_called").context("sequence is_called")?;
+    Ok(sequence_runtime(last_value, is_called))
+}
+
+fn sequence_runtime_is_readable(
+    in_recovery: bool,
+    persistence: crate::_internal::model::sequence::SequencePersistence,
+) -> bool {
+    !(in_recovery
+        && persistence == crate::_internal::model::sequence::SequencePersistence::Unlogged)
+}
+
+fn sequence_runtime(
+    last_value: Option<i64>,
+    is_called: Option<bool>,
+) -> crate::_internal::model::sequence::SequenceRuntime {
+    match (last_value, is_called) {
+        (Some(last_value), Some(is_called)) => crate::_internal::model::sequence::SequenceRuntime {
+            last_value: Some(last_value),
+            is_called: Some(is_called),
+        },
+        _ => crate::_internal::model::sequence::SequenceRuntime::unknown(),
+    }
 }
 
 fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlogged_sequences_have_no_readable_runtime_during_recovery() {
+        use crate::_internal::model::sequence::SequencePersistence;
+        assert!(!sequence_runtime_is_readable(
+            true,
+            SequencePersistence::Unlogged
+        ));
+        assert!(sequence_runtime_is_readable(
+            true,
+            SequencePersistence::Permanent
+        ));
+        assert!(sequence_runtime_is_readable(
+            false,
+            SequencePersistence::Unlogged
+        ));
+    }
+
+    #[test]
+    fn a_null_runtime_row_remains_unknown() {
+        let runtime = sequence_runtime(None, None);
+        assert_eq!(runtime.last_value, None);
+        assert_eq!(runtime.is_called, None);
+        let runtime = sequence_runtime(Some(7), Some(true));
+        assert_eq!(runtime.last_value, Some(7));
+        assert_eq!(runtime.is_called, Some(true));
+    }
 }

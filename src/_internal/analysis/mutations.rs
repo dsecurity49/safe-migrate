@@ -502,6 +502,7 @@ pub(crate) enum AlterTypeActionMutation {
         name: String,
         data_type: String,
         collation: Option<String>,
+        cascade: bool,
     },
     DropAttribute {
         name: String,
@@ -517,6 +518,7 @@ pub(crate) enum AlterTypeActionMutation {
     RenameAttribute {
         old_name: String,
         new_name: String,
+        cascade: bool,
     },
     SetOptions {
         options: crate::_internal::model::types::BaseTypeOptions,
