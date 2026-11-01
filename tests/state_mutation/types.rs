@@ -2940,3 +2940,103 @@ fn schema_rename_remaps_type_and_routine_identity_links() {
         Some("modern")
     );
 }
+
+#[test]
+fn alter_type_owner_rejects_an_absent_role_with_a_complete_catalog() {
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    let owner = object_id("", "existing_owner");
+    cache.roles.insert(
+        owner.clone(),
+        RoleState {
+            id: owner.clone(),
+            can_login: false,
+            is_superuser: false,
+            inherits: true,
+            member_of: Vec::new(),
+            can_administer_membership: Vec::new(),
+            can_inherit_from: Vec::new(),
+            can_set_role_to: Vec::new(),
+        },
+    );
+    cache.metadata.source_role = Some("existing_owner".to_string());
+    cache.metadata.source_session_role = Some("existing_owner".to_string());
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("CREATE TYPE ownership_probe AS ENUM ('x');", &mut state)
+        .unwrap();
+    let findings = engine
+        .analyze(
+            "ALTER TYPE ownership_probe OWNER TO absent_owner;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        findings.iter().any(|finding| {
+            finding.rule_id == "chain-conflict"
+                && finding
+                    .reason
+                    .contains("role 'absent_owner' does not exist")
+        }),
+        "{findings:?}"
+    );
+    let TypeOverlay::Present(probe) = state
+        .local
+        .types
+        .get(&object_id("public", "ownership_probe"))
+        .expect("ownership_probe present")
+    else {
+        panic!("ownership_probe should be present");
+    };
+    assert_eq!(probe.owner, owner);
+}
+
+#[test]
+fn alter_type_owner_taints_when_the_role_catalog_is_incomplete() {
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    cache.coverage = CatalogCoverage::for_families(
+        SchemaCoverage::from_sync_scope(None),
+        &CatalogFamily::ALL
+            .iter()
+            .copied()
+            .filter(|family| *family != CatalogFamily::Roles)
+            .collect::<Vec<_>>(),
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze("CREATE TYPE ownership_probe AS ENUM ('x');", &mut state)
+        .unwrap();
+    let findings = engine
+        .analyze(
+            "ALTER TYPE ownership_probe OWNER TO unverified_owner;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+    assert!(
+        state
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::CatalogCoverageIncomplete)
+    );
+    let TypeOverlay::Present(probe) = state
+        .local
+        .types
+        .get(&object_id("public", "ownership_probe"))
+        .expect("ownership_probe present")
+    else {
+        panic!("ownership_probe should be present");
+    };
+    assert_eq!(probe.owner, object_id("", "unverified_owner"));
+}

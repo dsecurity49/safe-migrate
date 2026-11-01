@@ -768,17 +768,34 @@ impl AnalysisState {
             _ => None,
         };
 
+        let resolved_owner = match &alter.action {
+            AlterTypeActionMutation::OwnerTo { new_owner } => {
+                let Some((owner_name, known)) = self.role_fact_identity(new_owner) else {
+                    return self.unresolved(EvidenceCode::UnresolvedReference);
+                };
+                if known && self.local.roles_known && self.present_role(&owner_name).is_none() {
+                    return MutationResult::conflict(format!(
+                        "role '{}' does not exist",
+                        owner_name
+                    ));
+                }
+                if known && !self.local.roles_known {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                }
+                Some(owner_name)
+            }
+            _ => None,
+        };
+
         self.snapshot_type(&alter.id);
         if let Some(TypeOverlay::Present(existing)) = self.local.types.get_mut(&alter.id) {
             match &alter.action {
-                AlterTypeActionMutation::OwnerTo { new_owner } => {
-                    let owner_id = Self::resolve_role_name(
-                        new_owner,
-                        &self.local.current_role,
-                        &self.local.session_role,
-                    )
-                    .unwrap_or_else(|| ObjectId::new("", "unknown"));
-                    existing.owner = owner_id;
+                AlterTypeActionMutation::OwnerTo { .. } => {
+                    existing.owner =
+                        ObjectId::new("", resolved_owner.expect("owner resolved above"));
                 }
                 AlterTypeActionMutation::SetOptions { .. } => {
                     if let TypeKind::Base {
