@@ -158,6 +158,7 @@ impl<'a> CallTypeResolver<'a> {
             TypeKind::Domain {
                 base_type,
                 base_type_id,
+                ..
             } => {
                 let base = self.resolve(Some(base_type), base_type_id.as_ref());
                 match base {
@@ -170,7 +171,7 @@ impl<'a> CallTypeResolver<'a> {
             }
             TypeKind::Enum { .. } => (TypeCategory::Enum, None),
             TypeKind::Composite { .. } => (TypeCategory::Composite, None),
-            TypeKind::Range { .. } | TypeKind::Multirange => (TypeCategory::Range, None),
+            TypeKind::Range { .. } | TypeKind::Multirange { .. } => (TypeCategory::Range, None),
             TypeKind::Base { .. } => (TypeCategory::User, None),
         };
         Some(KnownCallType {

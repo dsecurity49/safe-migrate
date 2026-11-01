@@ -38,6 +38,8 @@ impl AnalysisState {
                     self.local.types = snapshot.types;
                     self.local.functions = snapshot.functions;
                     self.local.sequences = snapshot.sequences;
+                    self.local.collations = snapshot.collations;
+                    self.local.extensions = snapshot.extensions;
                     self.local.publications = snapshot.publications;
                     self.local.triggers = snapshot.triggers;
                     self.local.constraints = snapshot.constraints;
@@ -73,6 +75,13 @@ impl AnalysisState {
                         self.local.sequences.insert(id, prev);
                     } else {
                         self.local.sequences.remove(&id);
+                    }
+                }
+                StateChange::ExtensionSnapshot { name, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.extensions.insert(name, prev);
+                    } else {
+                        self.local.extensions.remove(&name);
                     }
                 }
                 StateChange::FunctionSnapshot { id, previous } => {

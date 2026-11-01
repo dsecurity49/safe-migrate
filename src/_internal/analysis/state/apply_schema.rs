@@ -160,6 +160,11 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_schema(&mut self, drop_schema: &DropSchemaMutation) -> MutationResult {
+        for name in &drop_schema.names {
+            if let Some(result) = self.extension_schema_drop_conflict(name) {
+                return result;
+            }
+        }
         let mut unknown_target = false;
         for name in &drop_schema.names {
             match self.schema_lookup(name) {

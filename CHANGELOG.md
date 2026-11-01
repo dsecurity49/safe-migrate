@@ -5,6 +5,20 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.12.0 — 2026-10-31
+
+- Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled
+  end to end, including defaults, constraints, ownership, renames, dependency
+  tracking, and cascading drops. Typed-table attribute changes require
+  `CASCADE`.
+- `schema-drift`, `missing-idempotency`, and destructive-cascade checks cover
+  domain, sequence, extension, composite, and base-type changes. Invalid
+  base-type option changes are reported as conflicts; offline analysis leaves
+  unprovable extension and sequence-runtime state unknown rather than guessing.
+- Cache V11 adds domain, sequence-runtime, extension, and expanded type state.
+  Re-run `safe-migrate sync`; older caches are rejected rather than misread, and
+  unlogged-sequence runtime values stay unknown on a standby.
+
 ## v0.11.2 — 2026-10-24
 
 - Upgraded the pinned Squawk parser stack from 2.65.0 to 2.70.0, raising the

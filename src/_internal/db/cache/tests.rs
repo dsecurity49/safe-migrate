@@ -74,10 +74,10 @@ fn every_legacy_cache_variant_is_rejected_generically() {
 }
 
 #[test]
-fn current_cache_format_is_v10() {
-    assert_eq!(CACHE_FORMAT_VERSION, 10);
-    assert_eq!(DbCacheVersioned::V10(Box::default()).format_version(), 10);
-    assert_eq!(CACHE_MAGIC, b"SMCACHE10");
+fn current_cache_format_is_v11() {
+    assert_eq!(CACHE_FORMAT_VERSION, 11);
+    assert_eq!(DbCacheVersioned::V11(Box::default()).format_version(), 11);
+    assert_eq!(CACHE_MAGIC, b"SMCACHE11");
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn current_cache_rejects_mismatched_embedded_identity() {
         },
     );
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("schema cache key 'app'"));
@@ -262,7 +262,7 @@ fn current_cache_rejects_mismatched_schema_coverage() {
     let mut cache = synced_cache();
     cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("schema coverage disagrees"));
@@ -288,11 +288,14 @@ fn current_cache_rejects_typed_table_with_missing_or_mismatched_type() {
         TypeState {
             id: ObjectId::new("public", "address"),
             generation: 0,
+            owner: ObjectId::new("", "postgres"),
             kind: TypeKind::Composite {
                 fields: vec![crate::_internal::model::types::CompositeFieldState {
                     name: "street".to_string(),
                     data_type: "text".to_string(),
                     data_type_id: None,
+                    collation: None,
+                    collation_id: None,
                 }],
             },
         },
@@ -796,7 +799,7 @@ fn current_cache_rejects_malformed_publication_scope_metadata() {
         },
     );
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("empty or duplicate table column"));
@@ -832,7 +835,7 @@ fn current_cache_rejects_subscription_owner_outside_role_catalog() {
         },
     );
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("owner 'missing_owner' is absent"));
@@ -1159,7 +1162,7 @@ fn current_cache_rejects_dangling_index_relationship() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("references missing relation 'public.items'"));
@@ -1191,7 +1194,7 @@ fn current_cache_rejects_index_in_a_different_schema_than_relation() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("must be in the same schema as indexed relation"));
@@ -1225,7 +1228,7 @@ fn current_cache_rejects_index_colliding_with_relation_namespace_object() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("collides with another relation-namespace object"));
@@ -1246,11 +1249,13 @@ fn current_cache_rejects_sequence_colliding_with_relation_namespace_object() {
             owned_by: None,
             kind: crate::_internal::model::sequence::SequenceKind::Owned,
             parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("collides with another relation-namespace object"));
@@ -1270,7 +1275,7 @@ fn current_cache_rejects_trigger_in_a_different_schema_than_table() {
         enabled_mode: TriggerEnableMode::Origin,
     });
 
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("must be in the same schema as trigger table"));
@@ -1332,7 +1337,7 @@ fn current_cache_validates_stable_direct_inheritance() {
     );
 
     cache.inheritances[0].detach_pending = true;
-    let error = DbCacheVersioned::V10(Box::new(cache))
+    let error = DbCacheVersioned::V11(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("pending detach requires"));
@@ -1388,6 +1393,8 @@ fn current_cache_rejects_cross_catalog_contradictions() {
             owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
             kind: crate::_internal::model::sequence::SequenceKind::Owned,
             parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -1409,6 +1416,8 @@ fn current_cache_rejects_cross_catalog_contradictions() {
             owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
             kind: crate::_internal::model::sequence::SequenceKind::Owned,
             parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -1454,5 +1463,69 @@ fn current_cache_rejects_cross_catalog_contradictions() {
             .validate_semantics()
             .unwrap_err()
             .contains("references a missing relation")
+    );
+}
+
+#[test]
+fn current_cache_validates_extension_membership_and_configuration_tables() {
+    let mut cache = synced_cache();
+    cache.extensions.insert(
+        "hstore".to_string(),
+        ExtensionState {
+            name: "hstore".to_string(),
+            schema: Some("public".to_string()),
+            version: Some("1.8".to_string()),
+            relocatable: Some(true),
+            owner: ObjectId::new("", "postgres"),
+            members: [
+                crate::_internal::model::extension::ExtensionMember {
+                    kind: crate::_internal::model::extension::ExtensionMemberKind::Type,
+                    id: ObjectId::new("public", "hstore"),
+                },
+                crate::_internal::model::extension::ExtensionMember {
+                    kind: crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                    id: ObjectId::new("public", "hstore(record)"),
+                },
+            ]
+            .into_iter()
+            .collect(),
+            members_complete: true,
+            config_tables: vec![crate::_internal::model::extension::ExtensionConfigTable {
+                table: ObjectId::new("public", "hstore_config"),
+                condition: Some("id > 0".to_string()),
+            }],
+            generation: 0,
+        },
+    );
+    cache.validate_semantics().unwrap();
+}
+
+#[test]
+fn current_cache_rejects_extension_member_with_empty_identity() {
+    let mut cache = synced_cache();
+    cache.extensions.insert(
+        "hstore".to_string(),
+        ExtensionState {
+            name: "hstore".to_string(),
+            schema: None,
+            version: None,
+            relocatable: None,
+            owner: ObjectId::new("", "postgres"),
+            members: [crate::_internal::model::extension::ExtensionMember {
+                kind: crate::_internal::model::extension::ExtensionMemberKind::Type,
+                id: ObjectId::new("", ""),
+            }]
+            .into_iter()
+            .collect(),
+            members_complete: true,
+            config_tables: Vec::new(),
+            generation: 0,
+        },
+    );
+    assert!(
+        cache
+            .validate_semantics()
+            .unwrap_err()
+            .contains("empty object name")
     );
 }

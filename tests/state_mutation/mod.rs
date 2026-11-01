@@ -82,6 +82,7 @@ fn attach_fixture(sql: &str) -> (AnalysisState, Vec<Violation>) {
     (state, violations)
 }
 
+mod extension;
 mod indexes;
 mod partitions;
 mod roles;

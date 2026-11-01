@@ -592,6 +592,7 @@ mod atomic_write_tests {
 
 mod load_constraints;
 mod load_dependencies;
+mod load_extensions;
 mod load_indexes;
 mod load_namespaces;
 mod load_relations;
@@ -603,6 +604,7 @@ mod populate;
 mod writer;
 use load_constraints::*;
 use load_dependencies::*;
+use load_extensions::*;
 use load_indexes::*;
 use load_namespaces::*;
 use load_relations::*;

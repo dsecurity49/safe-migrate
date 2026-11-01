@@ -31,7 +31,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.11.2'
+VERSION='v0.12.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
@@ -52,7 +52,9 @@ Run `safe-migrate cache inspect` to view its provenance and redacted contents.
 
 ## What it checks
 
-The built-in rules cover:
+The simulator models tables, indexes, constraints, partitions, views,
+materialized views, sequences, routines, domains, extensions, and PostgreSQL
+type lifecycles. The built-in rules cover:
 
 - blocking locks, table rewrites, constraints, indexes, partitions, and
   materialized-view refreshes;

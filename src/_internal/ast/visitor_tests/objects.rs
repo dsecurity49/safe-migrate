@@ -1328,16 +1328,64 @@ fn create_materialized_view_carries_its_population_and_guard() {
 }
 
 #[test]
-fn unsupported_create_domain_constraints_are_not_silent() {
+fn create_domain_extracts_constraints_collation_default_and_not_null() {
+    let fact = parse_and_extract_statement(
+        "CREATE DOMAIN bounded AS text COLLATE \"C\" DEFAULT 'x' NOT NULL
+             CONSTRAINT positive CHECK (VALUE <> '');",
+    )
+    .expect("create domain fact");
+    let StatementFact::CreateDomain(domain) = fact else {
+        panic!("expected create domain fact");
+    };
+    assert_eq!(domain.name.name.resolve(), "bounded");
+    assert_eq!(domain.base_type, "text");
+    assert_eq!(
+        domain.collation,
+        Some(crate::_internal::model::index::WrittenName {
+            schema: None,
+            name: "C".to_string(),
+        })
+    );
+    assert_eq!(
+        domain.default.as_ref().map(|default| default.text.as_str()),
+        Some("'x'")
+    );
+    assert_eq!(domain.constraints.len(), 2);
+    assert!(matches!(
+        &domain.constraints[0],
+        crate::_internal::analysis::facts::DomainConstraintFact::NotNull { name: None }
+    ));
+    let crate::_internal::analysis::facts::DomainConstraintFact::Check(check) =
+        &domain.constraints[1]
+    else {
+        panic!("expected check constraint");
+    };
+    assert_eq!(check.name.as_deref(), Some("positive"));
+    assert_eq!(check.expression_text, "VALUE <> ''");
+    assert!(!check.not_valid);
+}
+
+#[test]
+fn alter_domain_extracts_actions_and_rename_is_a_type_rename() {
     for sql in [
-        "CREATE DOMAIN bounded AS integer CHECK (VALUE > 0);",
-        "CREATE DOMAIN collated AS text COLLATE \"C\";",
+        "ALTER DOMAIN d SET DEFAULT 1;",
+        "ALTER DOMAIN d SET DEFAULT NULL;",
+        "ALTER DOMAIN d DROP DEFAULT;",
+        "ALTER DOMAIN d SET NOT NULL;",
+        "ALTER DOMAIN d DROP NOT NULL;",
+        "ALTER DOMAIN d ADD CONSTRAINT ck CHECK (VALUE > 0) NOT VALID;",
+        "ALTER DOMAIN d DROP CONSTRAINT IF EXISTS ck CASCADE;",
+        "ALTER DOMAIN d RENAME CONSTRAINT old TO new;",
+        "ALTER DOMAIN d VALIDATE CONSTRAINT ck;",
+        "ALTER DOMAIN d OWNER TO app;",
+        "ALTER DOMAIN d SET SCHEMA app;",
+        "ALTER DOMAIN d RENAME TO e;",
     ] {
         let parsed = SourceFile::parse(sql);
         let statement = parsed.tree().stmts().next().expect("statement");
         assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unmodeled CREATE DOMAIN semantics must use the opaque engine path: {sql}"
+            AstVisitor::extract(&statement).is_some(),
+            "supported ALTER DOMAIN action must be modeled: {sql}"
         );
     }
 }
@@ -1351,18 +1399,34 @@ fn range_and_base_types_match_the_synced_catalog_kinds() {
             "CREATE TYPE floatrange AS RANGE (subtype = float8);",
             TypeCreationKind::Range {
                 subtype: Some("float8".to_string()),
+                multirange_type_name: None,
+                collation: None,
+                opclass: None,
+                canonical: None,
+                subtype_diff: None,
             },
         ),
         (
             "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
-            TypeCreationKind::Base { element: None },
+            TypeCreationKind::Base {
+                options: crate::_internal::model::types::BaseTypeOptions {
+                    input: Some("int4in".to_string()),
+                    output: Some("int4out".to_string()),
+                    ..Default::default()
+                },
+            },
         ),
         (
             // PostgreSQL spells the base-type element `ELEMENT`; `typelem`
             // is only the catalog column name.
             "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out, ELEMENT = int4);",
             TypeCreationKind::Base {
-                element: Some("int4".to_string()),
+                options: crate::_internal::model::types::BaseTypeOptions {
+                    input: Some("int4in".to_string()),
+                    output: Some("int4out".to_string()),
+                    element: Some("int4".to_string()),
+                    ..Default::default()
+                },
             },
         ),
     ] {
@@ -1402,18 +1466,39 @@ fn unsupported_create_policy_semantics_are_not_silent() {
 }
 
 #[test]
-fn unsupported_alter_type_actions_are_not_silent_noops() {
+fn supported_alter_type_actions_produce_typed_facts() {
     for sql in [
         "ALTER TYPE mood OWNER TO app_user;",
         "ALTER TYPE mood ADD ATTRIBUTE label text;",
+        "ALTER TYPE mood DROP ATTRIBUTE label;",
+        "ALTER TYPE mood ALTER ATTRIBUTE label TYPE varchar(50);",
+        "ALTER TYPE mood RENAME ATTRIBUTE label TO new_label;",
     ] {
         let parsed = SourceFile::parse(sql);
         let statement = parsed.tree().stmts().next().expect("statement");
         assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unsupported ALTER TYPE action must use the opaque engine path: {sql}"
+            AstVisitor::extract(&statement).is_some(),
+            "supported ALTER TYPE action must produce a typed fact: {sql}"
         );
     }
+}
+
+#[test]
+fn alter_attribute_type_retains_explicit_collation() {
+    let parsed =
+        SourceFile::parse("ALTER TYPE mood ALTER ATTRIBUTE label TYPE varchar(50) COLLATE \"C\";");
+    let statement = parsed.tree().stmts().next().expect("statement");
+    let Some(StatementFact::AlterType(fact)) = AstVisitor::extract(&statement) else {
+        panic!("expected ALTER TYPE fact");
+    };
+    assert!(matches!(
+        fact.actions.as_slice(),
+        [AlterTypeActionFact::AlterAttributeType {
+            data_type,
+            collation: Some(collation),
+            ..
+        }] if data_type == "varchar(50)" && collation == "C"
+    ));
 }
 
 #[test]

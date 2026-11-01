@@ -25,6 +25,7 @@ use squawk_syntax::{SyntaxKind, ast};
 
 mod alter_table;
 mod databases;
+mod extensions;
 mod grants;
 mod indexes;
 mod names;
@@ -289,6 +290,15 @@ impl AstVisitor {
         }
         if let Some(node) = DropSequence::cast(syntax.clone()) {
             return Self::extract_drop_sequence(&node);
+        }
+        if let Some(node) = ast::CreateExtension::cast(syntax.clone()) {
+            return Self::extract_create_extension(&node);
+        }
+        if let Some(node) = ast::AlterExtension::cast(syntax.clone()) {
+            return Self::extract_alter_extension(&node);
+        }
+        if let Some(node) = ast::DropExtension::cast(syntax.clone()) {
+            return Self::extract_drop_extension(&node);
         }
         if let Some(node) = CreateType::cast(syntax.clone()) {
             return Self::extract_create_type(&node);

@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.11.2's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.12.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -194,14 +194,16 @@ PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V10 supplies typed evidence for:
+Cache V11 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
   foreign-key equality operators;
 - indexes, including included and expression/predicate dependency columns;
 - inheritance and partition topology, view dependencies, sequence ownership,
-  and standalone sequence references;
+  bounds, runtime state, and standalone sequence references;
+- domain defaults, constraints, and collations, plus extension membership and
+  owned members;
 - every `pg_proc.prokind` with the columns that make a routine's identity
   (`proretset`, parameter names and modes, and `pronargdefaults`), plus
   publications and redacted subscriptions;
@@ -234,7 +236,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V10, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V11, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -252,15 +254,15 @@ report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V10 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V11 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V10 carries an explicit header, coverage and scope-completion markers,
+`sync`. V11 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V9 and unheadered caches are rejected with resync guidance. V10 remains
+V1–V10 and unheadered caches are rejected with resync guidance. V11 remains
 pre-1.0: a cache written by an earlier release may be rejected after a layout
 change, so rerun `sync`.
 

@@ -151,11 +151,14 @@ pub(super) fn normalize_column_storage(
                 TypeKind::Domain {
                     base_type,
                     base_type_id,
+                    ..
                 } => {
                     data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
                     continue;
                 }
-                TypeKind::Composite { .. } | TypeKind::Range { .. } | TypeKind::Multirange => {
+                TypeKind::Composite { .. }
+                | TypeKind::Range { .. }
+                | TypeKind::Multirange { .. } => {
                     return Some("EXTENDED".into());
                 }
                 TypeKind::Enum { .. } => return Some("PLAIN".into()),
@@ -293,13 +296,66 @@ pub(super) fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Enum { variants } => NormalizedType::Enum {
             variants: variants.clone(),
         },
-        TypeKind::Domain { base_type, .. } => NormalizedType::Domain {
+        TypeKind::Domain {
+            base_type,
+            collation,
+            default_text,
+            not_null,
+            constraints,
+            ..
+        } => NormalizedType::Domain {
             base_type: normalize_data_type(base_type),
+            collation: collation.clone(),
+            default: default_text.clone(),
+            not_null: *not_null,
+            constraints: constraints
+                .iter()
+                .map(|(name, constraint)| {
+                    (
+                        name.clone(),
+                        (
+                            canonical_constraint_expression(
+                                constraint
+                                    .expression_text
+                                    .as_deref()
+                                    .unwrap_or(&constraint.definition),
+                            ),
+                            constraint.validated,
+                        ),
+                    )
+                })
+                .collect(),
         },
-        TypeKind::Base { .. } => NormalizedType::Base,
-        TypeKind::Composite { .. } => NormalizedType::Composite,
-        TypeKind::Range { .. } => NormalizedType::Range,
-        TypeKind::Multirange => NormalizedType::Multirange,
+        TypeKind::Base { shell, .. } => NormalizedType::Base { shell: *shell },
+        TypeKind::Composite { fields } => NormalizedType::Composite {
+            fields: fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        normalize_data_type(&field.data_type),
+                        field.collation.clone(),
+                    )
+                })
+                .collect(),
+        },
+        TypeKind::Range {
+            subtype,
+            multirange,
+            collation,
+            ..
+        } => NormalizedType::Range {
+            subtype: subtype.as_ref().map(|s| normalize_data_type(s)),
+            multirange: multirange
+                .as_ref()
+                .map(|id| format!("{}.{}", id.schema, id.name)),
+            collation: collation.clone(),
+        },
+        TypeKind::Multirange { range } => NormalizedType::Multirange {
+            range: range
+                .as_ref()
+                .map(|id| format!("{}.{}", id.schema, id.name)),
+        },
     }
 }
 

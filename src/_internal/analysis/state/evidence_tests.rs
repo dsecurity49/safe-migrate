@@ -349,6 +349,8 @@ fn baseline_sequence_drop_requires_dependency_coverage() {
             owned_by: None,
             kind: crate::_internal::model::sequence::SequenceKind::Standalone,
             parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -398,6 +400,8 @@ fn scoped_baseline_sequence_drop_requires_cross_schema_dependency_proof() {
             owned_by: None,
             kind: crate::_internal::model::sequence::SequenceKind::Standalone,
             parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
             generation: 0,
         },
     );
@@ -480,7 +484,11 @@ fn scoped_baseline_type_drop_applies_and_taints() {
         crate::_internal::model::types::TypeState {
             id: type_id.clone(),
             generation: 0,
-            kind: crate::_internal::model::types::TypeKind::Base { element: None },
+            owner: ObjectId::new("", "postgres"),
+            kind: crate::_internal::model::types::TypeKind::Base {
+                shell: false,
+                options: crate::_internal::model::types::BaseTypeOptions::default(),
+            },
         },
     );
     let mut state = AnalysisState::new(cache);

@@ -131,3 +131,32 @@ fn object_created_earlier_in_the_migration_is_never_drift() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn alter_sequence_if_exists_does_not_claim_drift_for_an_absent_sequence() {
+    let engine = SafeMigrateEngine::new(Config::default());
+    let mut state = AnalysisState::with_baseline(synced_empty_baseline(), true);
+
+    let violations = engine
+        .analyze(
+            "ALTER SEQUENCE IF EXISTS absent_seq MAXVALUE 10;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "schema-drift"),
+        "the statement is a no-op, so absence is not drift: {violations:#?}"
+    );
+
+    let violations = engine
+        .analyze("ALTER SEQUENCE absent_seq MAXVALUE 10;", &mut state)
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "schema-drift"),
+        "without IF EXISTS the statement is drift: {violations:#?}"
+    );
+}

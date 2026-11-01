@@ -10,6 +10,7 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationKind;
+use std::collections::HashSet;
 
 /// Smallest statistics target PostgreSQL accepts; -1 means the server default.
 const SET_STATISTICS_MIN: i32 = -1;
@@ -59,9 +60,44 @@ impl AnalysisState {
                 return result;
             }
         }
-        // Row contents and sequence counters are runtime data rather than
-        // schema catalog state.  The operation remains fully typed for rules;
-        // no invented relation or sequence metadata is written here.
+        // Row contents are runtime data rather than schema catalog state. A
+        // `RESTART IDENTITY` also resets owned sequence counters, including
+        // tables reached through `CASCADE`, which this model does not expand.
+        // Forget every owned runtime rather than leave a value that a later
+        // bound check could treat as exact.
+        if truncate.restart_identity {
+            let targets = truncate
+                .targets
+                .iter()
+                .map(|target| &target.id)
+                .collect::<HashSet<_>>();
+            let owned = self
+                .local
+                .sequences
+                .iter()
+                .filter_map(|(id, overlay)| match overlay {
+                    crate::_internal::model::sequence::SequenceOverlay::Present(sequence)
+                        if sequence.owned_by.as_ref().is_some_and(|(table, _)| {
+                            truncate.cascade || targets.contains(table)
+                        }) =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for id in owned {
+                self.snapshot_sequence(&id);
+                if let Some(crate::_internal::model::sequence::SequenceOverlay::Present(sequence)) =
+                    self.local.sequences.get_mut(&id)
+                {
+                    sequence.runtime =
+                        crate::_internal::model::sequence::SequenceRuntime::unknown();
+                    sequence.runtime_exact = false;
+                }
+            }
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        }
         MutationResult::Applied
     }
 

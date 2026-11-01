@@ -1598,6 +1598,8 @@ impl AnalysisState {
             self.snapshot_sequence(&sequence_id);
             self.snapshot_generation_counter();
             self.local.generation_counter += 1;
+            let runtime =
+                crate::_internal::model::sequence::SequenceRuntime::fresh(parameters.start_value);
             self.local.sequences.insert(
                 sequence_id.clone(),
                 SequenceOverlay::Present(SequenceState {
@@ -1606,6 +1608,8 @@ impl AnalysisState {
                     owned_by: Some((create.id.clone(), column_name.clone())),
                     kind,
                     parameters,
+                    runtime,
+                    runtime_exact: true,
                     generation: self.local.generation_counter,
                 }),
             );

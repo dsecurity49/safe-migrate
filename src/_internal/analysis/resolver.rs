@@ -7,6 +7,7 @@ use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 use crate::_internal::report::violations::ObjectKind;
 
+mod extension;
 mod relation;
 mod relation_aux;
 mod replication;
@@ -527,8 +528,21 @@ impl Resolver {
             StatementFact::AlterType(alter_type) => {
                 mutations.extend(Self::resolve_alter_type(alter_type, state));
             }
-            StatementFact::CreateDomain { name, base_type } => {
-                mutations.push(Self::resolve_create_domain(name, base_type, state));
+            StatementFact::CreateExtension(create) => {
+                mutations.push(Self::resolve_create_extension(create));
+            }
+            StatementFact::AlterExtension(alter) => {
+                mutations.push(Self::resolve_alter_extension(alter, state));
+            }
+            StatementFact::DropExtension(drop) => {
+                mutations.push(Self::resolve_drop_extension(
+                    &drop.names,
+                    drop.if_exists,
+                    drop.cascade,
+                ));
+            }
+            StatementFact::CreateDomain(create) => {
+                mutations.push(Self::resolve_create_domain(create, state));
             }
             StatementFact::AlterDomain { name, action } => {
                 mutations.push(Self::resolve_alter_domain(name, action, state));

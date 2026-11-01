@@ -19,6 +19,7 @@ pub(crate) enum ObjectKind {
     Domain,
     Policy,
     Type,
+    Extension,
     Opaque,
     Unknown,
 }
@@ -42,6 +43,7 @@ impl std::fmt::Display for ObjectKind {
             ObjectKind::Domain => write!(f, "domain"),
             ObjectKind::Policy => write!(f, "policy"),
             ObjectKind::Type => write!(f, "type"),
+            ObjectKind::Extension => write!(f, "extension"),
             ObjectKind::Opaque => write!(f, "opaque"),
             ObjectKind::Unknown => write!(f, "object"),
         }

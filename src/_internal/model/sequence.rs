@@ -44,12 +44,39 @@ impl Default for SequenceParameters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SequenceRuntime {
+    pub last_value: Option<i64>,
+    pub is_called: Option<bool>,
+}
+
+impl SequenceRuntime {
+    pub(crate) fn unknown() -> Self {
+        Self {
+            last_value: None,
+            is_called: None,
+        }
+    }
+
+    pub(crate) fn fresh(start_value: i64) -> Self {
+        Self {
+            last_value: Some(start_value),
+            is_called: Some(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SequenceState {
     pub id: ObjectId,
     pub owner: ObjectId,
     pub owned_by: Option<(ObjectId, String)>,
     pub kind: SequenceKind,
     pub parameters: SequenceParameters,
+    pub runtime: SequenceRuntime,
+    /// True when `runtime` was established by DDL in this migration. A
+    /// synchronized runtime may have advanced since the cache was written, so
+    /// only an exact runtime can justify an exact narrowing.
+    pub runtime_exact: bool,
     pub generation: u64,
 }
 

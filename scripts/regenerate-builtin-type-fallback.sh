@@ -40,9 +40,9 @@ entry_count="$(psql "$DATABASE_URL" -X -A -t -c "
 
 use super::builtin_type::{BuiltinType, BuiltinTypeCatalogue, TypeCategory};
 
-/// \`(typname, canonical, category, preferred, fixed_bits, accepts_typmod)\`.
+/// \`(typname, canonical, category, preferred, fixed_bits, accepts_typmod, collatable)\`.
 #[allow(clippy::type_complexity)]
-const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool)] = &[
+const TYPES: &[(&str, &str, TypeCategory, bool, Option<i32>, bool, bool)] = &[
 HEADER
 
   # Pin the path at the connection level so `format_type` does not schema-
@@ -54,7 +54,8 @@ HEADER
       t.typcategory::text,
       t.typispreferred::text,
       CASE WHEN t.typlen > 0 THEN (t.typlen * 8)::text ELSE '' END,
-      (t.typmodout <> 0)::text
+      (t.typmodout <> 0)::text,
+      (t.typcollation <> 0)::text
     FROM pg_catalog.pg_type t
     JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
     WHERE n.nspname = 'pg_catalog' AND t.typtype IN ('b','r','m') AND t.typcategory <> 'A'
@@ -78,14 +79,15 @@ for line in sys.stdin:
     line = line.rstrip("\n")
     if not line:
         continue
-    typname, canonical, category, preferred, typlen, typmod = line.split("|")
+    typname, canonical, category, preferred, typlen, typmod, collatable = line.split("|")
     preferred = "true" if preferred in ("t", "true") else "false"
     fixed = "None" if not typlen else f"Some({typlen})"
-    typmod = "true" if typmod == "t" else "false"
+    typmod = "true" if typmod in ("t", "true") else "false"
+    collatable = "true" if collatable in ("t", "true") else "false"
     print(
         f"    ({rust_string(typname)}, {rust_string(canonical)}, "
         f"TypeCategory::{CATEGORY.get(category, chr(85)+chr(110)+chr(107)+chr(110)+chr(111)+chr(119)+chr(110))}, "
-        f"{preferred}, {fixed}, {typmod}),"
+        f"{preferred}, {fixed}, {typmod}, {collatable}),"
     )
 '
 
@@ -97,7 +99,7 @@ pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
         TYPES
             .iter()
             .map(
-                |(typname, canonical, category, preferred, fixed_bits, accepts_typmod)| {
+                |(typname, canonical, category, preferred, fixed_bits, accepts_typmod, collatable)| {
                     BuiltinType {
                         oid: None,
                         typname: (*typname).to_string(),
@@ -107,6 +109,7 @@ pub(crate) fn catalogue() -> BuiltinTypeCatalogue {
                         fixed_bits: *fixed_bits,
                         array_oid: None,
                         accepts_typmod: *accepts_typmod,
+                        collatable: *collatable,
                     }
                 },
             )
@@ -142,6 +145,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_snapshot_records_collatability_and_typmod_support() {
+        let text = TYPES
+            .iter()
+            .find(|entry| entry.0 == "text")
+            .expect("text must be present");
+        assert!(text.6, "text carries a collation");
+        let varchar = TYPES
+            .iter()
+            .find(|entry| entry.0 == "varchar")
+            .expect("varchar must be present");
+        assert!(varchar.5, "varchar accepts a typmod");
+        assert!(varchar.6, "varchar carries a collation");
+        let int4 = TYPES
+            .iter()
+            .find(|entry| entry.0 == "int4")
+            .expect("int4 must be present");
+        assert!(!int4.6, "int4 is not collatable");
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub(crate) struct ResolvedBuiltinType {
     pub category: TypeCategory,
     pub fixed_bits: Option<i32>,
     pub accepts_typmod: bool,
+    pub collatable: bool,
 }
 
 impl ResolvedBuiltinType {
@@ -25,6 +26,7 @@ impl ResolvedBuiltinType {
             category: entry.category,
             fixed_bits: entry.fixed_bits,
             accepts_typmod: entry.accepts_typmod,
+            collatable: entry.collatable,
         }
     }
 
@@ -44,6 +46,11 @@ impl ResolvedBuiltinType {
     /// integers and floats widen by an entirely different route.
     pub(crate) fn is_exact_numeric(&self) -> bool {
         self.typname == "numeric"
+    }
+
+    /// Whether the catalog gives values of this type a collation.
+    pub(crate) fn is_collatable(&self) -> bool {
+        self.collatable
     }
 
     /// The one type whose values need an explicit `::text` cast to compare
