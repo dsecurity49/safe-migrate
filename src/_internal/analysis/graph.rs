@@ -127,6 +127,7 @@ pub(crate) struct DependencyGraph {
 struct GraphIndexes {
     rename_by_source: HashMap<ObjectId, usize>,
     by_resolved_referenced: HashMap<ObjectId, Vec<usize>>,
+    by_resolved_dependent: HashMap<ObjectId, Vec<usize>>,
 }
 
 impl Clone for DependencyGraph {
@@ -244,6 +245,12 @@ impl DependencyGraph {
                 .entry(referenced)
                 .or_default()
                 .push(index);
+            let dependent = Self::resolve_rename_with(edges, &indexes, &edge.dependent).clone();
+            indexes
+                .by_resolved_dependent
+                .entry(dependent)
+                .or_default()
+                .push(index);
         }
         indexes
     }
@@ -270,6 +277,16 @@ impl DependencyGraph {
         let target = self.resolve_rename(id);
         self.indexes()
             .by_resolved_referenced
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.edges[*index])
+    }
+
+    fn resolved_dependent_edges(&self, id: &ObjectId) -> impl Iterator<Item = &DependencyEdge> {
+        let target = self.resolve_rename(id);
+        self.indexes()
+            .by_resolved_dependent
             .get(target)
             .into_iter()
             .flatten()
@@ -514,12 +531,21 @@ impl DependencyGraph {
                 // attachment instead of looping or extending the cycle.
                 return true;
             }
-            let maybe_edge = self.edges.iter().find(|edge| {
-                matches!(
-                    edge.kind,
-                    DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
-                ) && self.resolve_rename(&edge.dependent) == current_parent
-            });
+            let maybe_edge = if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+                self.resolved_dependent_edges(current_parent).find(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                })
+            } else {
+                self.edges.iter().find(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    ) && self.resolve_rename(&edge.dependent) == current_parent
+                })
+            };
             if let Some(edge) = maybe_edge {
                 let p = self.resolve_rename(&edge.referenced);
                 if p == resolved_child {
@@ -549,15 +575,28 @@ impl DependencyGraph {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            for edge in self.edges.iter().filter(|edge| {
-                matches!(edge.kind, DependencyKind::InheritanceOf)
-                    && self.resolve_rename(&edge.dependent) == current
-            }) {
-                let ancestor = self.resolve_rename(&edge.referenced);
-                if ancestor == resolved_child {
-                    return true;
+            if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+                for edge in self
+                    .resolved_dependent_edges(current)
+                    .filter(|edge| matches!(edge.kind, DependencyKind::InheritanceOf))
+                {
+                    let ancestor = self.resolve_rename(&edge.referenced);
+                    if ancestor == resolved_child {
+                        return true;
+                    }
+                    pending.push(ancestor);
                 }
-                pending.push(ancestor);
+            } else {
+                for edge in self.edges.iter().filter(|edge| {
+                    matches!(edge.kind, DependencyKind::InheritanceOf)
+                        && self.resolve_rename(&edge.dependent) == current
+                }) {
+                    let ancestor = self.resolve_rename(&edge.referenced);
+                    if ancestor == resolved_child {
+                        return true;
+                    }
+                    pending.push(ancestor);
+                }
             }
         }
         false
@@ -1436,5 +1475,23 @@ mod tests {
         assert!(graph.cascade_edges(&parent).iter().any(|edge| {
             edge.dependent == child && matches!(edge.kind, DependencyKind::InheritanceOf)
         }));
+    }
+
+    #[test]
+    fn large_graph_cycle_checks_use_indexes_and_match_unindexed() {
+        let mut graph = DependencyGraph::new();
+        for index in 0..DependencyGraph::CASCADE_INDEX_MIN_EDGES {
+            let child = id(&format!("part_child_{index}"));
+            let parent = id(&format!("part_parent_{index}"));
+            graph.add_edge(DependencyEdge::new(
+                child,
+                parent,
+                DependencyKind::PartitionOf,
+            ));
+        }
+        assert!(graph.cascade_index_is_worthwhile());
+        // part_parent_0 has child part_child_0; attaching part_parent_0 to part_child_0 creates a cycle
+        assert!(graph.check_partition_cycle(&id("part_child_0"), &id("part_parent_0")));
+        assert!(!graph.check_partition_cycle(&id("part_parent_0"), &id("unrelated")));
     }
 }
