@@ -1558,6 +1558,11 @@ pub(crate) enum AlterTableActionFact {
         column: String,
         default: Option<ExprIr>,
     },
+    AddIdentity {
+        column: String,
+        generation: ColumnGeneration,
+        identity_sequence: Box<IdentitySequenceOptionsFact>,
+    },
     SetExpression {
         column: String,
         expr: ExprIr,

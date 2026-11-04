@@ -978,6 +978,11 @@ pub(crate) enum AlterTableActionMutation {
         column: String,
         default: Option<ExprIr>,
     },
+    AddIdentity {
+        column: String,
+        generation: crate::_internal::analysis::facts::ColumnGeneration,
+        identity_sequence: IdentitySequenceOptionsMutation,
+    },
     SetGeneratedExpression {
         column: String,
         expr: ExprIr,

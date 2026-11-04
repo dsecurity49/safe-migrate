@@ -282,4 +282,20 @@ impl AnalysisState {
             });
         }
     }
+
+    pub(super) fn snapshot_not_evaluated(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::NotEvaluatedSnapshot {
+                previous: self.not_evaluated.clone(),
+            });
+        }
+    }
+
+    pub(super) fn snapshot_co_dropped_objects(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::CoDroppedObjectsSnapshot {
+                previous: self.co_dropped_objects.clone(),
+            });
+        }
+    }
 }

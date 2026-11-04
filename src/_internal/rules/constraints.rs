@@ -72,8 +72,9 @@ impl Rule for BlockingConstraintRule {
                     | AlterTableActionMutation::AddExcludeConstraint { .. }
                     | AlterTableActionMutation::SetStorage { .. }
                     | AlterTableActionMutation::SetAccessMethod { .. }
+                    | AlterTableActionMutation::ValidateConstraint { .. }
             );
-            if !action_is_relevant {
+            if !action_is_relevant || context.result().is_noop() {
                 return violations;
             }
 
@@ -318,6 +319,28 @@ impl Rule for BlockingConstraintRule {
                         tier,
                         reason,
                         recipe: "Changing column storage requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
+                        dedup_key: None,
+                                    sql: None,
+
+                    });
+                }
+                AlterTableActionMutation::ValidateConstraint { constraint_name } => {
+                    let mut reason = format!(
+                        "Validating constraint '{}' on {} scans the table",
+                        constraint_name, alter.id
+                    );
+                    if is_stale {
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
+                    }
+
+                    violations.push(Violation { source_range: None,
+                        rule_id: self.id(),
+
+                        object_kind: ObjectKind::Table,
+                        object_name: alter.id.to_string(),
+                        tier,
+                        reason,
+                        recipe: "VALIDATE CONSTRAINT scans every row while holding SHARE UPDATE EXCLUSIVE. Run it during a low-traffic window with a bounded `lock_timeout`; an interrupted validation can be resumed.",
                         dedup_key: None,
                                     sql: None,
 

@@ -1492,11 +1492,14 @@ impl AnalysisState {
     }
 
     fn function_option_unmodeled(option: &FuncOptionFact) -> bool {
+        // `AS` bodies create no catalog dependencies; PostgreSQL parses
+        // string bodies lazily.
         !matches!(
             option,
             FuncOptionFact::Language(_)
                 | FuncOptionFact::Volatility(_)
                 | FuncOptionFact::Security(_)
+                | FuncOptionFact::As { .. }
                 | FuncOptionFact::Window
         )
     }

@@ -90,6 +90,7 @@ impl AnalysisState {
             .iter()
             .any(|entry| entry.rule_id == record.rule_id && entry.cause == record.cause)
         {
+            self.snapshot_not_evaluated();
             self.not_evaluated.push(record);
         }
     }

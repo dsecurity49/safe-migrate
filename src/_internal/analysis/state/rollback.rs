@@ -194,6 +194,12 @@ impl AnalysisState {
                 StateChange::EvidenceSnapshot { previous } => {
                     self.local.evidence = previous;
                 }
+                StateChange::NotEvaluatedSnapshot { previous } => {
+                    self.not_evaluated = previous;
+                }
+                StateChange::CoDroppedObjectsSnapshot { previous } => {
+                    self.co_dropped_objects = previous;
+                }
             }
         }
         debug_assert!(self.local.graph.indexes_are_valid());

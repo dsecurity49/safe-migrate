@@ -627,6 +627,7 @@ fn alter_table_action_permits(
             table || partitioned_table || (using_index.is_none() && foreign)
         }
         Action::SetDefault { .. } => table || partitioned_table || view || foreign,
+        Action::AddIdentity { .. } => table || partitioned_table,
         Action::SetColumnOptions { .. }
         | Action::ResetColumnOptions { .. }
         | Action::SetStorage { .. } => table || partitioned_table || matview || foreign,

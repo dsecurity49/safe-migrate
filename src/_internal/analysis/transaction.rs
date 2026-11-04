@@ -127,6 +127,12 @@ pub(crate) enum StateChange {
     EvidenceSnapshot {
         previous: crate::_internal::analysis::evidence::EvidenceLog,
     },
+    NotEvaluatedSnapshot {
+        previous: Vec<crate::_internal::report::violations::NotEvaluated>,
+    },
+    CoDroppedObjectsSnapshot {
+        previous: HashSet<ObjectId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

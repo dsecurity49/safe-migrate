@@ -870,6 +870,7 @@ impl AnalysisState {
         for config in &extension.config_tables {
             co_dropped.insert(self.local.graph.resolve_rename(&config.table).clone());
         }
+        self.snapshot_co_dropped_objects();
         self.co_dropped_objects = co_dropped;
         if !cascade && self.extension_has_external_dependents(&members, &self.co_dropped_objects) {
             self.co_dropped_objects.clear();
