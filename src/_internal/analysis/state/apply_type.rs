@@ -990,7 +990,11 @@ impl AnalysisState {
     /// Resolve a range's canonical or subtype-diff routine by its written name
     /// and the exact argument identity PostgreSQL records for it. The routine
     /// must already exist when the range type is created.
-    fn resolve_internal_routine_id(&self, written: &str, signature: &str) -> Option<ObjectId> {
+    pub(crate) fn resolve_internal_routine_id(
+        &self,
+        written: &str,
+        signature: &str,
+    ) -> Option<ObjectId> {
         let (schema_hint, function_name) = match written.rsplit_once('.') {
             Some((schema, name)) => (Some(schema.trim_matches('"')), name.trim_matches('"')),
             None => (None, written.trim_matches('"')),

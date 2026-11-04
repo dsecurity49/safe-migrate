@@ -263,6 +263,73 @@ pub(crate) struct PreState {
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
 }
 
+impl PreState {
+    /// Relations whose columns or typed table use the composite type (or a composite container).
+    pub(crate) fn relations_using_composite(
+        &self,
+        composite: &ObjectId,
+    ) -> Vec<&crate::_internal::model::relation::RelationState> {
+        let mut visiting = HashSet::new();
+        self.relations
+            .values()
+            .filter(|relation| {
+                if relation.of_type.as_ref() == Some(composite) {
+                    return true;
+                }
+                relation.columns.iter().any(|column| {
+                    column.type_id.as_ref().is_some_and(|id| {
+                        self.type_stores_composite_in_container(id, composite, &mut visiting)
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn type_stores_composite_in_container(
+        &self,
+        id: &ObjectId,
+        target: &ObjectId,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> bool {
+        let (element, _) = AnalysisState::strip_array_type_id(id);
+        if element == *target {
+            return true;
+        }
+        if !visiting.insert(element.clone()) {
+            return false;
+        }
+        let Some(type_state) = self.types.get(&element) else {
+            return false;
+        };
+        match &type_state.kind {
+            crate::_internal::model::types::TypeKind::Composite { fields } => {
+                fields.iter().any(|field| {
+                    field.data_type_id.as_ref().is_some_and(|f_id| {
+                        self.type_stores_composite_in_container(f_id, target, visiting)
+                    })
+                })
+            }
+            crate::_internal::model::types::TypeKind::Range { subtype_id, .. } => {
+                subtype_id.as_ref().is_some_and(|s_id| {
+                    self.type_stores_composite_in_container(s_id, target, visiting)
+                })
+            }
+            crate::_internal::model::types::TypeKind::Multirange { range } => {
+                range.as_ref().is_some_and(|r_id| {
+                    self.type_stores_composite_in_container(r_id, target, visiting)
+                })
+            }
+            crate::_internal::model::types::TypeKind::Domain { base_type_id, .. } => {
+                base_type_id.as_ref().is_some_and(|b_id| {
+                    self.type_stores_composite_in_container(b_id, target, visiting)
+                })
+            }
+            crate::_internal::model::types::TypeKind::Enum { .. }
+            | crate::_internal::model::types::TypeKind::Base { .. } => false,
+        }
+    }
+}
+
 struct HydratedRelationTypes {
     relations: HashMap<ObjectId, RelationOverlay>,
     baseline_relations: HashSet<ObjectId>,

@@ -305,6 +305,54 @@ impl DbCache {
             .find_map(|role_id| visit(role_id, &self.roles, &mut visiting, &mut visited))
     }
 
+    /// A partition child inherits the parent's identity property but not the
+    /// sequence ownership, which stays on the ancestor that owns the sequence.
+    fn identity_is_inherited_from_partition_ancestor(
+        &self,
+        relation: &RelationState,
+        column: &str,
+    ) -> bool {
+        let mut pending: Vec<ObjectId> = self
+            .inheritances
+            .iter()
+            .filter(|inheritance| inheritance.is_partition && inheritance.child == relation.id)
+            .map(|inheritance| inheritance.parent.clone())
+            .collect();
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = pending.pop() {
+            if !visited.insert(parent_id.clone()) {
+                continue;
+            }
+            let Some(parent) = self.relations.get(&parent_id) else {
+                let omitted_schema = self.metadata.schemas.as_ref().is_some_and(|schemas| {
+                    !schemas.iter().any(|schema| schema == &parent_id.schema)
+                });
+                if omitted_schema {
+                    return true;
+                }
+                continue;
+            };
+            if parent.identity_columns.contains_key(column)
+                && self.sequences.values().any(|sequence| {
+                    matches!(sequence.kind, SequenceKind::Identity)
+                        && sequence.owned_by.as_ref()
+                            == Some(&(parent_id.clone(), column.to_string()))
+                })
+            {
+                return true;
+            }
+            pending.extend(
+                self.inheritances
+                    .iter()
+                    .filter(|inheritance| {
+                        inheritance.is_partition && inheritance.child == parent_id
+                    })
+                    .map(|inheritance| inheritance.parent.clone()),
+            );
+        }
+        false
+    }
+
     /// Validate cross-record identity, relationship, and catalog-coverage
     /// invariants before a cache is used as an authoritative baseline.
     pub(crate) fn validate_semantics(&self) -> Result<(), String> {
@@ -1217,7 +1265,10 @@ impl DbCache {
                                 == Some(&(relation.id.clone(), column.clone()))
                     })
                     .count();
-                if owners != 1 {
+                if owners > 1
+                    || (owners == 0
+                        && !self.identity_is_inherited_from_partition_ancestor(relation, column))
+                {
                     return Err(format!(
                         "identity column '{}.{}' must have exactly one owned identity sequence",
                         relation.id, column

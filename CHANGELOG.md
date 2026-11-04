@@ -5,6 +5,47 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## Unreleased (v0.13.0)
+
+- `ALTER TYPE ... DROP ATTRIBUTE` on composite types used by table columns now
+  reports an `irreversible-migration` data-loss warning.
+- Range types restored from cache re-hydrate their operator class, canonical
+  routine, and subtype-diff routine identities so routine renames and drops
+  track dependencies with full fidelity.
+- `EXECUTE '...'` normalization now understands statement boundaries, string
+  literals, comments, and dollar-quoted bodies, so `EXECUTE` on the same line as
+  another statement is analyzed and text inside literals or comments is left
+  unchanged.
+- `ALTER TABLE ... VALIDATE CONSTRAINT` is now checked by `blocking-constraint`:
+  validating a large table reports the full scan, and re-validating an already
+  valid constraint stays silent.
+- Attaching a partition now clones the parent's foreign keys onto it, and adding
+  a foreign key to a partitioned table clones it onto existing partitions. A
+  detached partition keeps that reference, so a later `DROP TABLE ... RESTRICT`
+  of the referenced table is no longer reported as safe.
+- `ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ... AS IDENTITY` now creates
+  the backing identity sequence (with PostgreSQL's collision suffixing),
+  validates the NOT NULL/default/type preconditions, and propagates the
+  identity to existing and newly attached partitions.
+- Synchronizing a partitioned table with identity columns no longer fails cache
+  validation: partitions inherit the parent's identity sequence ownership
+  instead of being required to own a sequence themselves.
+- Function and procedure definitions with a string-literal `AS $$...$$` body no
+  longer mark the analysis chain as unsupported. PostgreSQL records no catalog
+  dependencies for those bodies, so later dependency checks are not weakened.
+- A compound statement that fails and rolls back no longer leaves its skipped
+  checks in the report, so an aborted statement cannot pollute later statements
+  or the final summary.
+- `lint` and `lint-chain` accept `--report-dir` to write the JSON and Markdown
+  reports from a single analysis pass; the GitHub Action now uses it instead of
+  analyzing every migration twice.
+- `init github-actions` now uploads the JSON, Markdown, and diagnostic reports
+  as workflow artifacts, so a failing check leaves inspectable evidence.
+- Unevaluated check lists in the terminal and Markdown reports now compact into
+  a summary count with tier breakdown when more than 3 rules are skipped.
+- Reminders for unevaluated checks now name the missing schema and provide a
+  union-aware sync command so re-syncing does not overwrite existing scope.
+
 ## v0.12.0 — 2026-10-31
 
 - Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled

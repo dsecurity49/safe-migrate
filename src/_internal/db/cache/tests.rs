@@ -1366,6 +1366,73 @@ fn current_cache_accepts_pending_partition_detach() {
 }
 
 #[test]
+fn current_cache_accepts_partition_identity_inherited_through_nested_partitions() {
+    let root = ObjectId::new("public", "events");
+    let middle = ObjectId::new("public", "events_2026");
+    let leaf = ObjectId::new("public", "events_2026_01");
+    let sequence_id = ObjectId::new("public", "events_id_seq");
+    let mut cache = synced_cache();
+    cache.search_path.clear();
+
+    for id in [&root, &middle, &leaf] {
+        let mut relation = table(id.clone(), &["id"]);
+        relation.identity_columns.insert(
+            "id".to_string(),
+            crate::_internal::model::relation::IdentityGeneration::Always,
+        );
+        cache.insert_baseline(id.clone(), relation);
+    }
+    cache.sequences.insert(
+        sequence_id.clone(),
+        SequenceState {
+            id: sequence_id,
+            owner: ObjectId::new("", "postgres"),
+            owned_by: Some((root.clone(), "id".to_string())),
+            kind: SequenceKind::Identity,
+            parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
+            generation: 0,
+        },
+    );
+    cache.inheritances.push(InheritanceCache {
+        child: middle.clone(),
+        parent: root.clone(),
+        sequence: 1,
+        is_partition: true,
+        detach_pending: false,
+    });
+    cache.inheritances.push(InheritanceCache {
+        child: leaf.clone(),
+        parent: middle.clone(),
+        sequence: 1,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    assert!(cache.validate_semantics().is_ok());
+}
+
+#[test]
+fn current_cache_rejects_identity_without_owned_sequence_on_non_partition() {
+    let id = ObjectId::new("public", "items");
+    let mut cache = synced_cache();
+    cache.search_path.clear();
+    let mut relation = table(id.clone(), &["id"]);
+    relation.identity_columns.insert(
+        "id".to_string(),
+        crate::_internal::model::relation::IdentityGeneration::Always,
+    );
+    cache.insert_baseline(id, relation);
+
+    let error = cache.validate_semantics().unwrap_err();
+    assert!(
+        error.contains("must have exactly one owned identity sequence"),
+        "{error}"
+    );
+}
+
+#[test]
 fn current_cache_rejects_cross_catalog_contradictions() {
     let mut missing_search_schema = synced_cache();
     missing_search_schema.schemas.insert(

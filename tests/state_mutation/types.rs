@@ -3040,3 +3040,96 @@ fn alter_type_owner_taints_when_the_role_catalog_is_incomplete() {
     };
     assert_eq!(probe.owner, object_id("", "unverified_owner"));
 }
+
+#[test]
+fn dropping_composite_attribute_warns_of_data_loss_on_dependent_tables() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let violations = engine
+        .analyze(
+            "CREATE TYPE user_profile AS (username text, bio text);
+             CREATE TABLE users (id int, profile user_profile);
+             ALTER TYPE user_profile DROP ATTRIBUTE bio;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.rule_id == "irreversible-migration"
+                && v.object_name.starts_with("public.user_profile")
+                && v.reason
+                    .contains("Dropping attribute 'bio' from a composite type in use by tables")),
+        "expected irreversible-migration rule on ALTER TYPE DROP ATTRIBUTE for table column: {violations:#?}"
+    );
+}
+
+#[test]
+fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
+    let mut cache = crate::_internal::db::cache::DbCache::new();
+    let diff_id = object_id("public", "my_diff(integer,integer)");
+    cache.functions.insert(
+        diff_id.clone(),
+        crate::_internal::model::function::FunctionState {
+            id: diff_id.clone(),
+            arg_types: vec!["integer".into(), "integer".into()],
+            arg_type_ids: vec![
+                Some(object_id("pg_catalog", "int4")),
+                Some(object_id("pg_catalog", "int4")),
+            ],
+            parameters: vec![],
+            default_count: 0,
+            return_type: "double precision".into(),
+            return_type_id: Some(object_id("pg_catalog", "float8")),
+            volatility: crate::_internal::model::function::Volatility::Immutable,
+            language: "sql".into(),
+            returns_set: false,
+            routine_kind: crate::_internal::model::function::RoutineKind::Function,
+            internal_type_owner: None,
+            security: crate::_internal::model::function::SecurityMode::Invoker,
+            aggregate: None,
+        },
+    );
+
+    let range_id = object_id("public", "custom_range");
+    cache.types.insert(
+        range_id.clone(),
+        TypeState {
+            id: range_id.clone(),
+            generation: 1,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Range {
+                subtype: Some("integer".into()),
+                subtype_id: None,
+                multirange: None,
+                collation: None,
+                collation_id: None,
+                opclass: None,
+                opclass_id: None,
+                canonical: None,
+                canonical_id: None,
+                subtype_diff: Some("my_diff".into()),
+                subtype_diff_id: None,
+            },
+        },
+    );
+
+    let state = AnalysisState::with_baseline(cache, true);
+    let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Range {
+            subtype_diff_id, ..
+        },
+        ..
+    })) = state.local.types.get(&range_id)
+    else {
+        panic!("custom_range must be present");
+    };
+
+    assert_eq!(
+        subtype_diff_id.as_ref(),
+        Some(&diff_id),
+        "subtype_diff_id must be hydrated from baseline cache"
+    );
+}

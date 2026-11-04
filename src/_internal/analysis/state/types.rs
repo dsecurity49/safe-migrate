@@ -95,7 +95,7 @@ impl AnalysisState {
             || self.resolve_type_reference(declared).is_some()
     }
 
-    fn strip_array_type_id(id: &ObjectId) -> (ObjectId, bool) {
+    pub(crate) fn strip_array_type_id(id: &ObjectId) -> (ObjectId, bool) {
         let mut name = id.name.as_str();
         let mut is_array = false;
         while let Some(stripped) = name.strip_suffix("[]") {
