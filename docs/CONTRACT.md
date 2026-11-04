@@ -47,9 +47,11 @@ object counts. Treat that output as infrastructure metadata.
 | Human | The human-readable report. |
 | `--json` | Exactly one JSON document, without progress text, ANSI escapes, or a preamble. |
 | `--markdown` | One deterministic Markdown report, with source locations when available. |
+| `--report-dir <dir>` | Writes `safe-migrate-report.json` and `safe-migrate-report.md` from one analysis pass; standard output stays empty. |
 
-Diagnostics always use standard error. JSON, Markdown, and interactive output
-are mutually exclusive; conflicts exit `2`. Both lint commands support JSON.
+Diagnostics always use standard error. JSON, Markdown, interactive, and
+report-directory output are mutually exclusive; conflicts exit `2`. Both lint
+commands support JSON and report-directory output.
 
 ## JSON report
 

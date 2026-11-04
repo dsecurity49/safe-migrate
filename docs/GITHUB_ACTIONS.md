@@ -52,6 +52,9 @@ The command creates two files:
 | `.github/workflows/safe-migrate-baseline.yml` | Refresh and publish the encrypted baseline from a trusted job. |
 | `.github/workflows/safe-migrate.yml` | Restore the baseline and analyze pull requests without database access. |
 
+The pull-request workflow uploads the JSON, Markdown, and diagnostic reports as
+the `safe-migrate-reports` artifact even when the check fails.
+
 It asks GitHub CLI for the database URL, generates a random 32-byte cache key,
 and sends both directly to GitHub. Neither value is printed or written to a
 workflow file. Before setting the database URL, it checks the environment and

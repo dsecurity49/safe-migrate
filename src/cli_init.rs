@@ -165,10 +165,22 @@ jobs:
         with:
           persist-credentials: false
       - uses: dsecurity49/safe-migrate@{action_ref}
+        id: safe-migrate
         env:
           SAFE_MIGRATE_CACHE_KEY: ${{{{ secrets.SAFE_MIGRATE_CACHE_KEY }}}}
         with:
           path: {path}
+      - name: Upload analysis reports
+        if: ${{{{ always() }}}}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: safe-migrate-reports
+          path: |
+            ${{{{ steps.safe-migrate.outputs.json-report }}}}
+            ${{{{ steps.safe-migrate.outputs.markdown-report }}}}
+            ${{{{ steps.safe-migrate.outputs.diagnostic-log }}}}
+          if-no-files-found: warn
+          retention-days: 14
 "#
     );
     let baseline = format!(
@@ -430,6 +442,20 @@ fn run_github_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_analysis_workflow_uploads_reports_from_one_action_run() {
+        let (analysis, _) = github_actions_workflows("migrations", "main");
+        assert_eq!(analysis.matches("dsecurity49/safe-migrate@").count(), 1);
+        assert!(analysis.contains("id: safe-migrate"));
+        assert!(
+            analysis.contains("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+        );
+        assert!(analysis.contains("if: ${{ always() }}"));
+        assert!(analysis.contains("steps.safe-migrate.outputs.json-report"));
+        assert!(analysis.contains("steps.safe-migrate.outputs.markdown-report"));
+        assert!(analysis.contains("steps.safe-migrate.outputs.diagnostic-log"));
+    }
 
     #[test]
     fn database_secret_is_scoped_to_the_baseline_environment() {

@@ -416,20 +416,11 @@ runs:
           fi
 
           set +e
-          env -u DATABASE_URL "$binary" "${command[@]}" --json \
-            > "$json_report" 2> >(tee -a "$diagnostic_log" >&2)
-          json_status=$?
-          env -u DATABASE_URL "$binary" "${command[@]}" --markdown \
-            > "$markdown_report" 2> >(tee -a "$diagnostic_log" >&2)
-          markdown_status=$?
+          env -u DATABASE_URL "$binary" "${command[@]}" --report-dir "$INPUT_OUTPUT_DIR" \
+            >> "$diagnostic_log" 2> >(tee -a "$diagnostic_log" >&2)
+          final_status=$?
           set -e
 
-          final_status="$json_status"
-          if [ "$json_status" -ne "$markdown_status" ]; then
-            final_status=1
-            echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" \
-              | tee -a "$diagnostic_log" >&2
-          fi
           if [ "$operational_failed" = true ]; then
             final_status=1
           fi
