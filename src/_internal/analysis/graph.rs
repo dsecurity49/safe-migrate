@@ -916,7 +916,10 @@ impl DependencyGraph {
                     .chain(&mut definition.included)
                     .filter_map(|key| match &mut key.kind {
                         crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
-                        crate::_internal::model::index::IndexKeyKind::Expression(_) => None,
+                        crate::_internal::model::index::IndexKeyKind::Expression(_)
+                        | crate::_internal::model::index::IndexKeyKind::CatalogExpression(_) => {
+                            None
+                        }
                     })
                     .collect::<Vec<&mut String>>();
                 for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {

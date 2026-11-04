@@ -2,6 +2,7 @@ use crate::common::database_hosts_are_local;
 use std::fs;
 use std::io::Read;
 
+use safe_migrate::_internal::analysis::expr_ir::ExprIr;
 use safe_migrate::_internal::analysis::facts::{
     ConnectionTarget, PublicationObjectFact, PublicationRowFilter, PublicationScope,
 };
@@ -14,6 +15,7 @@ use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{
     FunctionOverlay, RoutineKind, SecurityMode, Volatility,
 };
+use safe_migrate::_internal::model::index::{IndexKeyKind, IndexPredicate};
 use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
 use safe_migrate::_internal::model::types::TypeKind;
 use safe_migrate::_internal::sync::sync_cache;
@@ -90,7 +92,7 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V11(cache) = versioned else {
+    let DbCacheVersioned::V12(cache) = versioned else {
         panic!("catalog sync must encode the V8 cache variant");
     };
     (*cache, payload)
@@ -484,10 +486,13 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         .iter()
         .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_partial_key"))
         .expect("synchronized partial index");
-    // The catalog states a predicate exists but carries no parsed identity.
     assert_eq!(
         partial.definition.predicate,
-        safe_migrate::_internal::model::index::IndexPredicate::Opaque
+        IndexPredicate::Catalog(ExprIr::BinaryOp {
+            left: Box::new(ExprIr::ColumnRef("note".into())),
+            op: "IS NOT".into(),
+            right: Box::new(ExprIr::Literal("NULL".into())),
+        })
     );
     assert_eq!(partial.definition.key_column_names(), ["id"]);
     assert_eq!(partial.dependency_columns, ["id", "note"]);
@@ -504,6 +509,13 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert!(
         expression.definition.keys.len() > expression.definition.key_column_names().len(),
         "expression keys must still occupy key positions"
+    );
+    assert_eq!(
+        expression.definition.keys[0].kind,
+        IndexKeyKind::CatalogExpression(ExprIr::FunctionCall {
+            name: "lower".into(),
+            args: vec![ExprIr::ColumnRef("note".into())],
+        })
     );
     assert_eq!(expression.dependency_columns, ["note"]);
     assert!(expression.dependency_columns_known);

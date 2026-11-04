@@ -45,6 +45,10 @@ notes are available on the
   a summary count with tier breakdown when more than 3 rules are skipped.
 - Reminders for unevaluated checks now name the missing schema and provide a
   union-aware sync command so re-syncing does not overwrite existing scope.
+- Catalog synchronization now parses `pg_get_expr` index predicates and
+  expression keys back into the same expression IR used for migrations. Exact
+  matches are comparable, while statement/catalog differences stay unknown
+  instead of becoming false differences; the cache format is now 12.
 
 ## v0.12.0 — 2026-10-31
 

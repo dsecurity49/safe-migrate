@@ -113,6 +113,68 @@ impl ExprVisitor {
         Some(result)
     }
 
+    /// Parse one deparsed SQL expression into the same IR used for statements.
+    ///
+    /// The catalog's `pg_get_expr` output is not promised to round-trip, so
+    /// callers must keep the result distinct from a statement-parsed
+    /// expression. `None` means the text did not parse into a complete IR.
+    pub(crate) fn parse_expression(source: &str) -> Option<ExprIr> {
+        let mut expressions = Self::parse_expression_list(source)?;
+        if expressions.len() != 1 {
+            return None;
+        }
+        expressions.pop()
+    }
+
+    /// Parse a comma-separated `pg_get_expr` expression list.
+    ///
+    /// `SELECT` accepts the same target-list syntax the catalog deparses, and
+    /// parsing the whole list avoids splitting on commas inside calls or
+    /// literals.
+    pub(crate) fn parse_expression_list(source: &str) -> Option<Vec<ExprIr>> {
+        use squawk_syntax::ast::{SourceFile, Stmt};
+        let parsed = SourceFile::parse(&format!("SELECT {source}"));
+        if !parsed.errors().is_empty() {
+            return None;
+        }
+        let mut statements = parsed.tree().stmts();
+        let Some(Stmt::Select(select)) = statements.next() else {
+            return None;
+        };
+        if statements.next().is_some()
+            || select.from_clause().is_some()
+            || select.where_clause().is_some()
+            || select.group_by_clause().is_some()
+            || select.having_clause().is_some()
+            || select.window_clause().is_some()
+            || select.with_clause().is_some()
+            || select.filter_clause().is_some()
+            || select.tail_clauses().next().is_some()
+        {
+            return None;
+        }
+        let select_clause = select.select_clause()?;
+        if select_clause.select_quantifier().is_some() || select_clause.perform_token().is_some() {
+            return None;
+        }
+        let targets = select_clause.target_list()?;
+        let mut expressions = Vec::new();
+        for target in targets.targets() {
+            if target.as_name().is_some() || target.star_token().is_some() {
+                return None;
+            }
+            let ir = Self::convert(target.expr()?);
+            if ir.contains_opaque() {
+                return None;
+            }
+            expressions.push(ir);
+        }
+        if expressions.is_empty() {
+            return None;
+        }
+        Some(expressions)
+    }
+
     fn can_render_unquoted_identifier(identifier: &str) -> bool {
         use squawk_syntax::ast::{NameRef, SourceFile, Stmt};
 
@@ -385,5 +447,48 @@ impl ExprVisitor {
             name: "<postfix>".into(),
             args,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_catalog_predicate_into_the_statement_ir() {
+        assert_eq!(
+            ExprVisitor::parse_expression("(note IS NOT NULL)"),
+            Some(ExprIr::BinaryOp {
+                left: Box::new(ExprIr::ColumnRef("note".into())),
+                op: "IS NOT".into(),
+                right: Box::new(ExprIr::Literal("NULL".into())),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_catalog_expression_list() {
+        assert_eq!(
+            ExprVisitor::parse_expression_list("lower(note), (score + 1)"),
+            Some(vec![
+                ExprIr::FunctionCall {
+                    name: "lower".into(),
+                    args: vec![ExprIr::ColumnRef("note".into())],
+                },
+                ExprIr::BinaryOp {
+                    left: Box::new(ExprIr::ColumnRef("score".into())),
+                    op: "+".into(),
+                    right: Box::new(ExprIr::Literal("1".into())),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_non_expression_sources() {
+        assert_eq!(ExprVisitor::parse_expression("note IS"), None);
+        assert_eq!(ExprVisitor::parse_expression("1, 2"), None);
+        assert_eq!(ExprVisitor::parse_expression("1 FROM items"), None);
+        assert_eq!(ExprVisitor::parse_expression_list(""), None);
     }
 }

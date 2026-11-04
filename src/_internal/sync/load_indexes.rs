@@ -1,4 +1,6 @@
 use super::*;
+use crate::_internal::analysis::expr_ir::ExprIr;
+use crate::_internal::analysis::expr_visitor::ExprVisitor;
 
 pub(super) fn load_indexes(
     client: &mut impl GenericClient,
@@ -24,7 +26,7 @@ pub(super) fn load_indexes(
             x.indislive AS is_live,
             x.indisunique AS is_unique,
             x.indimmediate AS is_immediate,
-            x.indpred IS NOT NULL AS has_predicate,
+            pg_get_expr(x.indpred, x.indrelid) AS predicate_sql,
             ARRAY(
                 SELECT a.attname
                 FROM unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, ordinality)
@@ -142,12 +144,7 @@ pub(super) fn load_indexes(
                   AND d.refobjsubid > 0
                 ORDER BY a.attnum
             ) AS dependency_columns,
-            EXISTS (
-                SELECT 1
-                FROM unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, ordinality)
-                WHERE key_part.ordinality <= x.indnkeyatts
-                  AND key_part.attnum = 0
-            ) AS has_expression_keys,
+            pg_get_expr(x.indexprs, x.indrelid) AS expression_sql,
             COALESCE(
                 (
                     SELECT array_agg(o.flags ORDER BY o.ord)
@@ -210,12 +207,35 @@ pub(super) fn load_indexes(
             .context("index key collation names")?;
         let indoption_bits: Vec<i16> = row.try_get("indoption_bits").context("index sort bits")?;
         let am_can_order: bool = row.try_get("am_can_order").context("index access method")?;
+        let predicate = match row
+            .try_get::<_, Option<String>>("predicate_sql")
+            .context("index predicate deparse")?
+        {
+            Some(sql) => ExprVisitor::parse_expression(&sql)
+                .map(IndexPredicate::Catalog)
+                .unwrap_or(IndexPredicate::Opaque),
+            None => IndexPredicate::None,
+        };
+        let expression_count = key_attnames.iter().filter(|name| name.is_none()).count();
+        let parsed_expressions = row
+            .try_get::<_, Option<String>>("expression_sql")
+            .context("index expression deparse")?
+            .as_deref()
+            .and_then(ExprVisitor::parse_expression_list)
+            .filter(|expressions| expressions.len() == expression_count);
+        let mut parsed_expressions = parsed_expressions.into_iter().flatten();
         let keys = key_attnames
             .iter()
             .enumerate()
             .map(|(ord, attname)| {
+                let catalog_expression = if attname.is_none() {
+                    parsed_expressions.next()
+                } else {
+                    None
+                };
                 synced_index_key(
                     attname.as_ref(),
+                    catalog_expression,
                     key_opclass_defaults.get(ord).copied().unwrap_or(false),
                     key_opfamily_schemas.get(ord).and_then(Option::as_deref),
                     key_opfamily_names.get(ord).and_then(Option::as_deref),
@@ -232,8 +252,7 @@ pub(super) fn load_indexes(
             keys,
             &included_columns,
             row.try_get("is_unique").context("index uniqueness")?,
-            row.try_get("has_predicate")
-                .context("index predicate flag")?,
+            predicate,
             row.try_get("nulls_not_distinct")
                 .context("index null treatment")?,
             row.try_get("is_valid").context("index validity flag")?,
@@ -340,12 +359,13 @@ pub(super) fn synced_collation(
 
 /// Build a key's description from the parallel catalog arrays.
 ///
-/// A NULL attname is an expression: `indkey` records it as 0 and PostgreSQL
-/// stores no identity for it, so the key is recorded as an expression and
-/// never compared by content.
+/// A NULL attname is an expression: `indkey` records it as 0. The catalog's
+/// deparsed expression is parsed back when available; otherwise the key keeps
+/// no identity.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn synced_index_key(
     attname: Option<&String>,
+    catalog_expression: Option<ExprIr>,
     opclass_default: bool,
     opfamily_schema: Option<&str>,
     opfamily_name: Option<&str>,
@@ -356,9 +376,10 @@ pub(super) fn synced_index_key(
     can_order: bool,
 ) -> IndexKey {
     IndexKey {
-        kind: match attname {
-            Some(name) => IndexKeyKind::Column(name.clone()),
-            None => IndexKeyKind::Expression(None),
+        kind: match (attname, catalog_expression) {
+            (Some(name), _) => IndexKeyKind::Column(name.clone()),
+            (None, Some(expression)) => IndexKeyKind::CatalogExpression(expression),
+            (None, None) => IndexKeyKind::Expression(None),
         },
         opclass: synced_opclass(opclass_default, opfamily_schema, opfamily_name),
         collation: synced_collation(collation_kind, collation_schema, collation_name),
@@ -372,7 +393,7 @@ pub(super) fn build_index_definition(
     keys: Vec<IndexKey>,
     included_attnames: &[String],
     unique: bool,
-    predicate: bool,
+    predicate: IndexPredicate,
     nulls_not_distinct: bool,
     valid: bool,
     ready: bool,
@@ -380,7 +401,12 @@ pub(super) fn build_index_definition(
 ) -> IndexDefinition {
     let expression_keys = keys
         .iter()
-        .filter(|key| matches!(key.kind, IndexKeyKind::Expression(_)))
+        .filter(|key| {
+            matches!(
+                key.kind,
+                IndexKeyKind::Expression(_) | IndexKeyKind::CatalogExpression(_)
+            )
+        })
         .count();
     IndexDefinition {
         method: Some(method),
@@ -392,11 +418,7 @@ pub(super) fn build_index_definition(
         expression_keys,
         unique,
         nulls_not_distinct: Some(nulls_not_distinct),
-        predicate: if predicate {
-            IndexPredicate::Opaque
-        } else {
-            IndexPredicate::None
-        },
+        predicate,
         unestablished: false,
         valid,
         ready,

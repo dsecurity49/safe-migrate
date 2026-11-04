@@ -74,15 +74,18 @@ fn every_legacy_cache_variant_is_rejected_generically() {
 }
 
 #[test]
-fn current_cache_format_is_v11() {
-    assert_eq!(CACHE_FORMAT_VERSION, 11);
-    assert_eq!(DbCacheVersioned::V11(Box::default()).format_version(), 11);
-    assert_eq!(CACHE_MAGIC, b"SMCACHE11");
+fn current_cache_format_is_v12() {
+    assert_eq!(CACHE_FORMAT_VERSION, 12);
+    assert_eq!(DbCacheVersioned::V12(Box::default()).format_version(), 12);
+    assert_eq!(CACHE_MAGIC, b"SMCACHE12");
 }
 
 #[test]
 fn legacy_cache_versions_are_rejected_before_validation() {
     assert!(DbCacheVersioned::V9(Box::default()).into_cache().is_err());
+    let v11 = DbCacheVersioned::V11(Box::default());
+    assert_eq!(v11.format_version(), 11);
+    assert!(v11.into_cache().is_err());
     assert!(DbCacheVersioned::V1.into_cache().is_err());
 }
 
@@ -251,7 +254,7 @@ fn current_cache_rejects_mismatched_embedded_identity() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("schema cache key 'app'"));
@@ -262,7 +265,7 @@ fn current_cache_rejects_mismatched_schema_coverage() {
     let mut cache = synced_cache();
     cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("schema coverage disagrees"));
@@ -799,7 +802,7 @@ fn current_cache_rejects_malformed_publication_scope_metadata() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("empty or duplicate table column"));
@@ -835,7 +838,7 @@ fn current_cache_rejects_subscription_owner_outside_role_catalog() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("owner 'missing_owner' is absent"));
@@ -1162,7 +1165,7 @@ fn current_cache_rejects_dangling_index_relationship() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("references missing relation 'public.items'"));
@@ -1194,7 +1197,7 @@ fn current_cache_rejects_index_in_a_different_schema_than_relation() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("must be in the same schema as indexed relation"));
@@ -1228,7 +1231,7 @@ fn current_cache_rejects_index_colliding_with_relation_namespace_object() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("collides with another relation-namespace object"));
@@ -1255,7 +1258,7 @@ fn current_cache_rejects_sequence_colliding_with_relation_namespace_object() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("collides with another relation-namespace object"));
@@ -1275,7 +1278,7 @@ fn current_cache_rejects_trigger_in_a_different_schema_than_table() {
         enabled_mode: TriggerEnableMode::Origin,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("must be in the same schema as trigger table"));
@@ -1337,7 +1340,7 @@ fn current_cache_validates_stable_direct_inheritance() {
     );
 
     cache.inheritances[0].detach_pending = true;
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("pending detach requires"));

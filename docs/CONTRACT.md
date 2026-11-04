@@ -196,7 +196,7 @@ PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V11 supplies typed evidence for:
+Cache V12 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
@@ -209,9 +209,10 @@ Cache V11 supplies typed evidence for:
 - every `pg_proc.prokind` with the columns that make a routine's identity
   (`proretset`, parameter names and modes, and `pronargdefaults`), plus
   publications and redacted subscriptions;
-- every `pg_type.typtype` a user can name, including range types and the
-  multirange PostgreSQL creates beside them, plus the range constructors it
-  records as internally owned by that type.
+- every `pg_type.typtype` a user can name, including composite-type attributes
+  and data-loss dependencies, range types and the multirange companion types
+  PostgreSQL creates beside them, plus the range constructors it records as
+  internally owned by that type.
 
 Catalog coverage is recorded by the loader that produced it, so a family is
 claimed only once its catalog query has completed. Missing required evidence
@@ -238,7 +239,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V11, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V12, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -256,15 +257,15 @@ report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V11 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V12 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V11 carries an explicit header, coverage and scope-completion markers,
+`sync`. V12 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V10 and unheadered caches are rejected with resync guidance. V11 remains
+V1–V11 and unheadered caches are rejected with resync guidance. V12 remains
 pre-1.0: a cache written by an earlier release may be rejected after a layout
 change, so rerun `sync`.
 

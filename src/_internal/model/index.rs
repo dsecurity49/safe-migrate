@@ -2,8 +2,9 @@
 //! PostgreSQL asks whether one can serve as a partition of the other.
 //!
 //! Every identity here comes from `pg_index`, `pg_opfamily` and
-//! `pg_collation`; nothing requires deparsing an expression tree, which
-//! PostgreSQL does not promise round-trips.
+//! `pg_collation`. Catalog expression and predicate deparses are parsed back
+//! with their provenance recorded, so only exact structural matches are
+//! claimed; a statement/catalog mismatch stays unknown.
 
 use serde::{Deserialize, Serialize};
 
@@ -100,25 +101,31 @@ mod tests {
 
 /// What a key sorts on.
 ///
-/// An expression key records only that it *is* one. PostgreSQL does not
-/// guarantee that deparsing an expression reproduces its input, so the text is
-/// never kept as identity.
+/// A statement-parsed expression keeps its identity. A catalog expression is
+/// deparsed and parsed back; PostgreSQL does not promise the deparse
+/// round-trips, so its identity is kept separately and only an exact match
+/// against a statement expression is claimed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum IndexKeyKind {
     Column(String),
     /// The payload is the parsed expression when the simulator parsed the
     /// statement itself, and `None` when only the catalog reported an
-    /// expression. `indkey = 0` names no expression, and deparsing one back is
-    /// not round-trip safe, so a catalog-sourced key has no identity to compare.
+    /// expression and the deparse could not be parsed back. `indkey = 0`
+    /// names no expression.
     Expression(Option<ExprIr>),
+    /// A catalog expression that was deparsed and parsed back. Kept separate
+    /// from [`Self::Expression`] because a statement may omit casts the
+    /// catalog records; unequal cross-source expressions are not evidence of
+    /// different trees.
+    CatalogExpression(ExprIr),
 }
 
 impl IndexKeyKind {
     pub(crate) fn as_column(&self) -> Option<&str> {
         match self {
             Self::Column(name) => Some(name),
-            Self::Expression(_) => None,
+            Self::Expression(_) | Self::CatalogExpression(_) => None,
         }
     }
 }
@@ -240,8 +247,13 @@ pub(crate) enum IndexPredicate {
     /// Parsed from the statement, so its identity is available.
     Parsed(ExprIr),
     /// Present, but with no identity to compare: only the catalog stated it,
-    /// and a deparse is not promised to reproduce the input.
+    /// and the deparse could not be parsed back into a complete expression.
     Opaque,
+    /// Deparsed by the catalog and parsed back. Kept separate from
+    /// [`Self::Parsed`] because a statement may omit casts the catalog
+    /// records; unequal cross-source predicates are not evidence of different
+    /// trees.
+    Catalog(ExprIr),
 }
 
 impl IndexPredicate {
@@ -408,31 +420,53 @@ impl IndexDefinition {
                 verdict = verdict.and(compare_keys(left, right));
             }
         }
-        verdict = verdict.and(match (&self.predicate, &other.predicate) {
-            (IndexPredicate::None, IndexPredicate::None) => IndexEquivalence::Identical,
-            (IndexPredicate::Parsed(left), IndexPredicate::Parsed(right)) => {
-                IndexEquivalence::from_equal(left == right)
-            }
-            (IndexPredicate::None, _) | (_, IndexPredicate::None) => IndexEquivalence::Different,
-            _ => IndexEquivalence::Unknown,
-        });
+        verdict = verdict.and(compare_predicates(&self.predicate, &other.predicate));
         verdict
     }
 }
 
+fn compare_predicates(left: &IndexPredicate, right: &IndexPredicate) -> IndexEquivalence {
+    use IndexPredicate::{Catalog, None, Opaque, Parsed};
+    match (left, right) {
+        (None, None) => IndexEquivalence::Identical,
+        (None, _) | (_, None) => IndexEquivalence::Different,
+        (Opaque, _) | (_, Opaque) => IndexEquivalence::Unknown,
+        (Parsed(left), Parsed(right)) | (Catalog(left), Catalog(right)) => {
+            IndexEquivalence::from_equal(left == right)
+        }
+        (Parsed(left), Catalog(right)) | (Catalog(left), Parsed(right)) => {
+            if left == right {
+                IndexEquivalence::Identical
+            } else {
+                IndexEquivalence::Unknown
+            }
+        }
+    }
+}
+
 fn compare_keys(left: &IndexKey, right: &IndexKey) -> IndexEquivalence {
+    use IndexKeyKind::{CatalogExpression, Column, Expression};
     let kind = match (&left.kind, &right.kind) {
-        (IndexKeyKind::Column(left), IndexKeyKind::Column(right)) => {
+        (Column(left), Column(right)) => IndexEquivalence::from_equal(left == right),
+        (Expression(Some(left)), Expression(Some(right)))
+        | (CatalogExpression(left), CatalogExpression(right)) => {
             IndexEquivalence::from_equal(left == right)
         }
-        (IndexKeyKind::Expression(Some(left)), IndexKeyKind::Expression(Some(right))) => {
-            IndexEquivalence::from_equal(left == right)
+        (Expression(Some(left)), CatalogExpression(right))
+        | (CatalogExpression(left), Expression(Some(right))) => {
+            if left == right {
+                IndexEquivalence::Identical
+            } else {
+                IndexEquivalence::Unknown
+            }
         }
-        // An expression the catalog reported without identity. PostgreSQL
-        // compares parsed trees; without one, neither equality nor difference
-        // can be claimed.
-        (IndexKeyKind::Expression(_), IndexKeyKind::Expression(_)) => IndexEquivalence::Unknown,
-        _ => IndexEquivalence::Different,
+        // An expression the catalog reported without identity, or one side's
+        // deparse did not parse back. PostgreSQL compares parsed trees;
+        // without both, neither equality nor difference can be claimed.
+        (Expression(_), Expression(_))
+        | (Expression(_), CatalogExpression(_))
+        | (CatalogExpression(_), Expression(_)) => IndexEquivalence::Unknown,
+        (Column(_), _) | (_, Column(_)) => IndexEquivalence::Different,
     };
     kind.and(compare_opclasses(&left.opclass, &right.opclass))
         .and(compare_collations(&left.collation, &right.collation))
@@ -628,6 +662,82 @@ mod definition_tests {
         assert_eq!(
             opaque.attach_equivalence(&opaque),
             IndexEquivalence::Unknown
+        );
+    }
+
+    #[test]
+    fn catalog_predicates_compare_with_provenance() {
+        let mut base = IndexDefinition::new(vec![IndexKey::column("a")]);
+        base.method = Some("btree".to_string());
+        let mut parsed = base.clone();
+        parsed.predicate = IndexPredicate::Parsed(ExprIr::Literal("(a > 1)".to_string()));
+        let mut same_catalog = base.clone();
+        same_catalog.predicate = IndexPredicate::Catalog(ExprIr::Literal("(a > 1)".to_string()));
+        let mut other_catalog = base.clone();
+        other_catalog.predicate = IndexPredicate::Catalog(ExprIr::Literal("(a > 2)".to_string()));
+        assert_eq!(
+            same_catalog.attach_equivalence(&same_catalog),
+            IndexEquivalence::Identical
+        );
+        assert_eq!(
+            same_catalog.attach_equivalence(&other_catalog),
+            IndexEquivalence::Different
+        );
+        assert_eq!(
+            parsed.attach_equivalence(&same_catalog),
+            IndexEquivalence::Identical
+        );
+        assert_eq!(
+            parsed.attach_equivalence(&other_catalog),
+            IndexEquivalence::Unknown
+        );
+        let mut opaque = base;
+        opaque.predicate = IndexPredicate::Opaque;
+        assert_eq!(
+            same_catalog.attach_equivalence(&opaque),
+            IndexEquivalence::Unknown
+        );
+    }
+
+    #[test]
+    fn catalog_expression_keys_compare_with_provenance() {
+        let mut parsed = on("(a + 1)");
+        let mut same_catalog = on("(a + 1)");
+        same_catalog.keys[0].kind =
+            IndexKeyKind::CatalogExpression(ExprIr::Literal("(a + 1)".to_string()));
+        let mut other_catalog = on("(a + 1)");
+        other_catalog.keys[0].kind =
+            IndexKeyKind::CatalogExpression(ExprIr::Literal("(a + 2)".to_string()));
+        assert_eq!(
+            same_catalog.attach_equivalence(&same_catalog),
+            IndexEquivalence::Identical
+        );
+        assert_eq!(
+            same_catalog.attach_equivalence(&other_catalog),
+            IndexEquivalence::Different
+        );
+        assert_eq!(
+            parsed.attach_equivalence(&same_catalog),
+            IndexEquivalence::Identical
+        );
+        assert_eq!(
+            parsed.attach_equivalence(&other_catalog),
+            IndexEquivalence::Unknown
+        );
+        let mut no_identity = on("(a + 1)");
+        no_identity.keys[0].kind = IndexKeyKind::Expression(None);
+        assert_eq!(
+            no_identity.attach_equivalence(&same_catalog),
+            IndexEquivalence::Unknown
+        );
+        assert_eq!(
+            no_identity.attach_equivalence(&no_identity),
+            IndexEquivalence::Unknown
+        );
+        parsed.keys[0].kind = IndexKeyKind::Column("a".to_string());
+        assert_eq!(
+            parsed.attach_equivalence(&same_catalog),
+            IndexEquivalence::Different
         );
     }
 
