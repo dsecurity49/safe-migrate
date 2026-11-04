@@ -108,19 +108,45 @@ pub(crate) struct NotEvaluated {
 
 impl NotEvaluated {
     /// The command or setting that would supply the missing evidence.
+    #[cfg(test)]
     pub(crate) fn recipe_for(
         cause: crate::_internal::analysis::evidence::EvidenceCode,
         missing_schemas: &[String],
+    ) -> String {
+        Self::recipe_with_scope(cause, missing_schemas, None)
+    }
+
+    /// Union-aware recipe that provides concrete sync CLI flags without overwriting existing scope.
+    pub(crate) fn recipe_with_scope(
+        cause: crate::_internal::analysis::evidence::EvidenceCode,
+        missing_schemas: &[String],
+        existing_scope: Option<&[String]>,
     ) -> String {
         use crate::_internal::analysis::evidence::EvidenceCode;
         match cause {
             EvidenceCode::BaselineUnavailable => {
                 "Run `safe-migrate sync` to build a baseline.".to_string()
             }
-            EvidenceCode::CatalogCoverageIncomplete if !missing_schemas.is_empty() => {
+            EvidenceCode::CatalogCoverageIncomplete | EvidenceCode::UnknownObjectState
+                if !missing_schemas.is_empty() =>
+            {
+                let mut union = Vec::new();
+                if let Some(existing) = existing_scope {
+                    for s in existing {
+                        if !union.contains(s) {
+                            union.push(s.clone());
+                        }
+                    }
+                }
+                for s in missing_schemas {
+                    if !union.contains(s) {
+                        union.push(s.clone());
+                    }
+                }
                 format!(
-                    "Add {} to `schemas` in safe-migrate.toml, then re-sync.",
-                    quote_schema_list(missing_schemas)
+                    "Add {} to `schemas` in safe-migrate.toml and re-sync, or run: safe-migrate sync --schemas {}",
+                    quote_schema_list(missing_schemas),
+                    union.join(",")
                 )
             }
             EvidenceCode::CatalogCoverageIncomplete => {

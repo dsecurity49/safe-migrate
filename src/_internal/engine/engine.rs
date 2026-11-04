@@ -438,18 +438,38 @@ impl SafeMigrateEngine {
                     if let Some(cause) = result.unresolved_cause()
                         && !rule.evaluates_when_unresolved(&transition)
                     {
+                        let mut missing_schemas = state.external_referenced_schemas();
+                        if missing_schemas.is_empty()
+                            && let Some((_, obj_name)) = mutation.primary_object()
+                            && let Some(schema) =
+                                state.baseline_scope_omits_displayed_object(&obj_name)
+                        {
+                            missing_schemas.push(schema.to_string());
+                        }
+
+                        let configured_or_synced_scope =
+                            self.config.schema_scope().map(|s| s.to_vec()).or_else(|| {
+                                state
+                                    .baseline_schemas
+                                    .as_ref()
+                                    .map(|s| s.iter().cloned().collect::<Vec<_>>())
+                            });
+
+                        let recipe =
+                            crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                cause,
+                                &missing_schemas,
+                                configured_or_synced_scope.as_deref(),
+                            );
+
                         state.record_not_evaluated(
                             crate::_internal::report::violations::NotEvaluated {
                                 rule_id: rule.id(),
                                 tier: rule.default_tier(),
                                 cause,
                                 sql: Some(stmt_text.trim().to_string()),
-                                recipe:
-                                    crate::_internal::report::violations::NotEvaluated::recipe_for(
-                                        cause,
-                                        &state.external_referenced_schemas(),
-                                    ),
-                                missing_schemas: state.external_referenced_schemas(),
+                                recipe,
+                                missing_schemas,
                             },
                         );
                         continue;
@@ -580,26 +600,59 @@ impl SafeMigrateEngine {
     /// string literal). Rewriting to DO lets the parser produce a proper
     /// DoBlock node. Keep the replacement byte-for-byte the same length so
     /// source ranges still point into the original migration text.
+    ///
+    /// The scan is lexical rather than line-based so string literals, quoted
+    /// identifiers, dollar-quoted bodies, and comments cannot be mistaken for
+    /// statement starts.
     fn normalize_execute(sql: &str) -> String {
-        let mut out = String::with_capacity(sql.len());
-        for line in sql.split_inclusive('\n') {
-            let trimmed = line.trim_start();
-            let bytes = trimmed.as_bytes();
-            if bytes.len() > 9 && bytes[..9].eq_ignore_ascii_case(b"EXECUTE '") {
-                let indent = &line[..line.len() - trimmed.len()];
-                out.push_str(indent);
-                out.push_str("DO      '");
-                out.push_str(&trimmed[9..]);
-            } else if bytes.len() > 10 && bytes[..10].eq_ignore_ascii_case(b"EXECUTE $$") {
-                let indent = &line[..line.len() - trimmed.len()];
-                out.push_str(indent);
-                out.push_str("DO      $$");
-                out.push_str(&trimmed[10..]);
-            } else {
-                out.push_str(line);
+        let mut bytes = sql.as_bytes().to_vec();
+        let mut index = 0;
+        let mut at_statement_start = true;
+
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\'' => {
+                    index = skip_quoted_string(&bytes, index);
+                    at_statement_start = false;
+                }
+                b'"' => {
+                    index = skip_quoted_identifier(&bytes, index);
+                    at_statement_start = false;
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    index = skip_line_comment(&bytes, index);
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index = skip_block_comment(&bytes, index);
+                }
+                b'$' if !preceded_by_identifier(&bytes, index) => {
+                    if let Some(end) = dollar_quote_end(&bytes, index) {
+                        index = end;
+                        at_statement_start = false;
+                    } else {
+                        index += 1;
+                        at_statement_start = false;
+                    }
+                }
+                b';' => {
+                    index += 1;
+                    at_statement_start = true;
+                }
+                byte if byte.is_ascii_whitespace() => index += 1,
+                _ => {
+                    if at_statement_start
+                        && starts_with_keyword(&bytes, index, b"EXECUTE")
+                        && next_token_is_string(&bytes, index + b"EXECUTE".len())
+                    {
+                        bytes[index..index + b"EXECUTE".len()].copy_from_slice(b"DO     ");
+                    }
+                    index += 1;
+                    at_statement_start = false;
+                }
             }
         }
-        out
+
+        String::from_utf8(bytes).expect("normalization replaces ASCII bytes with ASCII bytes")
     }
 
     fn parse_directives(
@@ -661,5 +714,205 @@ impl SafeMigrateEngine {
             break;
         }
         s[pos..].to_string()
+    }
+}
+
+fn starts_with_keyword(bytes: &[u8], start: usize, word: &[u8]) -> bool {
+    let end = start + word.len();
+    end <= bytes.len()
+        && bytes[start..end].eq_ignore_ascii_case(word)
+        && bytes.get(end).is_none_or(|byte| !is_identifier_byte(*byte))
+}
+
+fn next_token_is_string(bytes: &[u8], mut index: usize) -> bool {
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
+            index = skip_line_comment(bytes, index);
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_block_comment(bytes, index);
+            continue;
+        }
+        break;
+    }
+
+    match bytes.get(index) {
+        Some(b'\'') => true,
+        Some(b'$') => dollar_quote_end(bytes, index).is_some(),
+        _ => false,
+    }
+}
+
+fn skip_quoted_string(bytes: &[u8], start: usize) -> usize {
+    let backslash_escapes = is_escape_string_quote(bytes, start);
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if backslash_escapes => index += 2,
+            b'\'' if bytes.get(index + 1) == Some(&b'\'') => index += 2,
+            b'\'' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn is_escape_string_quote(bytes: &[u8], quote: usize) -> bool {
+    if quote == 0 {
+        return false;
+    }
+    quote > 0
+        && bytes[quote - 1].eq_ignore_ascii_case(&b'E')
+        && (quote < 2 || !is_identifier_byte(bytes[quote - 2]))
+}
+
+fn skip_quoted_identifier(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            if bytes.get(index + 1) == Some(&b'"') {
+                index += 2;
+            } else {
+                return index + 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'/' && bytes[index + 1] == b'*' {
+            depth += 1;
+            index += 2;
+        } else if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+            depth = depth.saturating_sub(1);
+            index += 2;
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut tag_end = start + 1;
+    if bytes.get(tag_end).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    while tag_end < bytes.len() && is_dollar_tag_byte(bytes[tag_end]) {
+        tag_end += 1;
+    }
+    if bytes.get(tag_end) != Some(&b'$') {
+        return None;
+    }
+    let tag = &bytes[start..=tag_end];
+    let mut index = tag_end + 1;
+    while index + tag.len() <= bytes.len() {
+        if &bytes[index..index + tag.len()] == tag {
+            return Some(index + tag.len());
+        }
+        index += 1;
+    }
+    Some(bytes.len())
+}
+
+fn is_dollar_tag_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+fn preceded_by_identifier(bytes: &[u8], index: usize) -> bool {
+    index > 0 && is_identifier_byte(bytes[index - 1])
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || !byte.is_ascii()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SafeMigrateEngine;
+
+    #[test]
+    fn normalize_execute_rewrites_statement_after_same_line_statement() {
+        let sql = "SELECT 1; EXECUTE 'DROP TABLE x';";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "SELECT 1; DO      'DROP TABLE x';"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_leaves_execute_text_inside_multiline_literal() {
+        let sql = "INSERT INTO logs (msg) VALUES ('first line\nEXECUTE ''second line'');";
+        assert_eq!(SafeMigrateEngine::normalize_execute(sql), sql);
+    }
+
+    #[test]
+    fn normalize_execute_leaves_execute_text_inside_comments() {
+        let sql = "/*\nEXECUTE 'DROP TABLE x';\n-- EXECUTE 'DROP TABLE y';\n*/\nSELECT 1;";
+        assert_eq!(SafeMigrateEngine::normalize_execute(sql), sql);
+    }
+
+    #[test]
+    fn normalize_execute_rewrites_after_preceding_comment() {
+        let sql = "-- leading comment\nEXECUTE 'DROP TABLE x';";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "-- leading comment\nDO      'DROP TABLE x';"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_rewrites_dollar_quoted_body_with_tag() {
+        let sql = "EXECUTE $body$SELECT 'EXECUTE ''x'';'$body$;";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "DO      $body$SELECT 'EXECUTE ''x'';'$body$;"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_leaves_prepared_statement_and_identifier_dollars() {
+        let sql = "EXECUTE my_plan; SELECT a$b$ FROM t; EXECUTE format('SELECT 1');";
+        assert_eq!(SafeMigrateEngine::normalize_execute(sql), sql);
+    }
+
+    #[test]
+    fn normalize_execute_respects_escape_string_quotes() {
+        let sql = "SELECT E'it\\'s; EXECUTE ''x'''; EXECUTE 'DROP TABLE t';";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "SELECT E'it\\'s; EXECUTE ''x'''; DO      'DROP TABLE t';"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_preserves_byte_length_and_non_ascii_text() {
+        let sql = "SELECT 'é'; EXECUTE 'DROP TABLE x';";
+        let normalized = SafeMigrateEngine::normalize_execute(sql);
+        assert_eq!(normalized.len(), sql.len());
+        assert_eq!(normalized, "SELECT 'é'; DO      'DROP TABLE x';");
     }
 }
