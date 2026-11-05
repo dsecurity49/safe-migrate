@@ -152,10 +152,13 @@ impl SafeMigrateEngine {
                     .into_iter()
                     .map(|violation| {
                         let statement_index = violation.source_range.and_then(|range| {
-                            statement_ranges
-                                .iter()
-                                .position(|statement| statement.contains_range(range))
-                                .map(|index| index + 1)
+                            // Statement ranges are sorted and non-overlapping; use
+                            // partition_point to find the candidate in O(log n).
+                            let i =
+                                statement_ranges.partition_point(|s| s.start() <= range.start());
+                            i.checked_sub(1)
+                                .filter(|&i| statement_ranges[i].contains_range(range))
+                                .map(|i| i + 1)
                         });
                         let certainty =
                             crate::_internal::report::violations::certainty_for_statement(

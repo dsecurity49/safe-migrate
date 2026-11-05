@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -96,6 +100,9 @@ jobs:
         with:
           toolchain: 1.99.0
 
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
       - name: Check all targets with the MSRV
         run: cargo check --all-targets --locked
 
@@ -116,6 +123,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build runtime
         run: cargo build --locked
@@ -326,7 +336,7 @@ jobs:
         run: |
           test "$SYNC_STATUS" = "refreshed"
           test "$BASELINE_SOURCE" = "synced"
-          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v11.cache"
+          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v12.cache"
           test -z "$JSON_REPORT"
           rm -f -- "$CACHE_PATH"
 
