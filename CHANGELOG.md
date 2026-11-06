@@ -56,6 +56,10 @@ notes are available on the
 - `init github-actions` now fails with recovery guidance when `origin/HEAD`
   cannot identify the default branch instead of silently assuming `main`; pass
   `--branch` to override detection.
+- `init github-actions --configure-secrets` now verifies GitHub CLI
+  authentication before writing either workflow, stages each file before
+  replacement, and reports when the database URL was configured but the cache
+  key was not.
 - The GitHub Action now caches the Cargo registry and build artifacts for
   SHA-pinned source installs, so repeat runs reuse compiled dependencies.
 

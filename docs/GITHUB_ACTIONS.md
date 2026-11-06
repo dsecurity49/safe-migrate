@@ -55,6 +55,13 @@ The command creates two files:
 The pull-request workflow uploads the JSON, Markdown, and diagnostic reports as
 the `safe-migrate-reports` artifact even when the check fails.
 
+Before writing either workflow, it verifies that GitHub CLI is installed and
+authenticated and fails with recovery guidance when it is not. Each workflow is
+written to a temporary file in the output directory and then moved into place,
+so a failed preparation leaves existing files untouched. If the database URL is
+configured but the cache key is not, the error names the completed secret and
+the remaining command.
+
 It asks GitHub CLI for the database URL, generates a random 32-byte cache key,
 and sends both directly to GitHub. Neither value is printed or written to a
 workflow file. Before setting the database URL, it checks the environment and
