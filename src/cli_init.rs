@@ -54,7 +54,10 @@ pub(crate) fn run(command: InitCommands) -> Result<()> {
             force,
             configure_secrets,
         } => {
-            let branch = branch.unwrap_or_else(detect_default_branch);
+            let branch = match branch {
+                Some(branch) => branch,
+                None => detect_default_branch()?,
+            };
             run_github_actions(&path, &branch, &output_dir, force, configure_secrets)
         }
     }
@@ -113,7 +116,7 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn detect_default_branch() -> String {
+fn detect_default_branch() -> Result<String> {
     Command::new("git")
         .args([
             "symbolic-ref",
@@ -133,7 +136,11 @@ fn detect_default_branch() -> String {
                 .filter(|branch| !branch.is_empty())
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| "main".to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "Could not detect the default branch from origin/HEAD. Run `git remote set-head origin --auto` or pass --branch explicitly."
+            )
+        })
 }
 
 fn github_actions_workflows(migration_path: &str, branch: &str) -> (String, String) {

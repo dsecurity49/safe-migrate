@@ -62,10 +62,10 @@ warns if GitHub reports no required reviewers or deployment-branch restriction,
 or if the environment cannot be found or verified. The warning is non-blocking;
 stop and protect the environment before answering GitHub CLI's secret prompt.
 
-The default branch is detected from `origin/HEAD`, with `main` as the fallback.
-Use `--branch <name>` when detection is wrong. This must be the default or PR
-base branch because GitHub cannot restore a cache from an arbitrary sibling
-branch.
+The default branch is detected from `origin/HEAD`; generation fails with
+recovery guidance when detection is unavailable. Use `--branch <name>` to
+override detection. This must be the default or PR base branch because GitHub
+cannot restore a cache from an arbitrary sibling branch.
 
 ### 3. Connect and bootstrap
 

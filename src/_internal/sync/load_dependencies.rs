@@ -68,6 +68,7 @@ pub(super) fn load_view_object_dependencies(
         .context("Failed to load view object dependencies from pg_rewrite/pg_depend")?;
 
     let mut dependencies: Vec<crate::_internal::db::cache::ViewObjectDependencyCache> = Vec::new();
+    let mut seen = HashSet::with_capacity(rows.len());
     for row in rows {
         let dependent = ObjectId::new(
             row.try_get::<_, String>("obj_schema")
@@ -108,7 +109,7 @@ pub(super) fn load_view_object_dependencies(
         };
         let dependency =
             crate::_internal::db::cache::ViewObjectDependencyCache { dependent, target };
-        if !dependencies.contains(&dependency) {
+        if seen.insert(dependency.clone()) {
             dependencies.push(dependency);
         }
     }

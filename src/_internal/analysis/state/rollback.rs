@@ -191,8 +191,8 @@ impl AnalysisState {
                 StateChange::ConfidenceSnapshot { previous } => {
                     self.local.confidence = previous;
                 }
-                StateChange::EvidenceSnapshot { previous } => {
-                    self.local.evidence = previous;
+                StateChange::EvidenceLengthMarker { len } => {
+                    self.local.evidence.truncate(len);
                 }
                 StateChange::NotEvaluatedSnapshot { previous } => {
                     self.not_evaluated = previous;

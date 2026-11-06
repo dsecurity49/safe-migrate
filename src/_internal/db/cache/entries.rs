@@ -190,7 +190,7 @@ pub(crate) struct ViewDependencyCache {
 }
 
 /// The non-relation object a view depends on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum ViewDependencyTarget {
     Routine { routine: ObjectId },
     Type { ty: ObjectId },
@@ -201,7 +201,7 @@ pub(crate) enum ViewDependencyTarget {
 /// PostgreSQL records these from the rewrite rules of the view, so a synced
 /// view carries the same obligations as one built from the statements in this
 /// migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ViewObjectDependencyCache {
     pub dependent: ObjectId,
     pub target: ViewDependencyTarget,

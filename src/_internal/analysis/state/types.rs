@@ -106,33 +106,38 @@ impl AnalysisState {
     }
 
     pub(crate) fn domain_closure(&self, domain: &ObjectId) -> HashSet<ObjectId> {
+        let mut derived_by_base: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for (id, overlay) in &self.local.types {
+            let TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Domain {
+                        base_type_id: Some(base),
+                        ..
+                    },
+                ..
+            }) = overlay
+            else {
+                continue;
+            };
+            derived_by_base
+                .entry(base.clone())
+                .or_default()
+                .push(id.clone());
+        }
+
         let mut domains = HashSet::from([domain.clone()]);
-        loop {
-            let mut changed = false;
-            for (id, overlay) in &self.local.types {
-                if domains.contains(id) {
-                    continue;
+        let mut pending = vec![domain.clone()];
+        while let Some(base) = pending.pop() {
+            let Some(derived) = derived_by_base.get(&base) else {
+                continue;
+            };
+            for id in derived {
+                if domains.insert(id.clone()) {
+                    pending.push(id.clone());
                 }
-                let TypeOverlay::Present(TypeState {
-                    kind:
-                        TypeKind::Domain {
-                            base_type_id: Some(base),
-                            ..
-                        },
-                    ..
-                }) = overlay
-                else {
-                    continue;
-                };
-                if domains.contains(base) {
-                    domains.insert(id.clone());
-                    changed = true;
-                }
-            }
-            if !changed {
-                return domains;
             }
         }
+        domains
     }
 
     /// Relations whose columns use the domain or a domain derived from it.

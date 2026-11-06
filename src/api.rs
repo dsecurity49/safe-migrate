@@ -64,7 +64,7 @@ use crate::_internal::report::reporter::{
 };
 use crate::_internal::report::violations::{
     ObjectKind as InternalObjectKind, ReportFinding as InternalFinding,
-    Violation as InternalViolation, ViolationTier as InternalTier,
+    ViolationTier as InternalTier,
 };
 use crate::_internal::rules::registry::{
     self, RuleConfigurationField as InternalRuleConfigurationField,
@@ -776,8 +776,8 @@ impl AnalysisOutcome {
 
     /// Return the overall deployment verdict.
     pub fn verdict(&self) -> Verdict {
-        crate::_internal::report::reporter::compute_verdict_with(
-            &self.violations(),
+        crate::_internal::report::reporter::compute_verdict_with_iter(
+            self.inner.findings.iter().map(|finding| &finding.violation),
             &self.not_evaluated,
         )
         .into()
@@ -785,8 +785,8 @@ impl AnalysisOutcome {
 
     /// Return the canonical deployment recommendation for this result.
     pub fn recommendation(&self) -> &'static str {
-        crate::_internal::report::reporter::compute_verdict_with(
-            &self.violations(),
+        crate::_internal::report::reporter::compute_verdict_with_iter(
+            self.inner.findings.iter().map(|finding| &finding.violation),
             &self.not_evaluated,
         )
         .recommendation(&self.inner.confidence)
@@ -893,14 +893,6 @@ impl AnalysisOutcome {
     pub fn with_auto_sync_status(mut self, status: AutoSyncStatus) -> Self {
         self.baseline.auto_sync = status;
         self
-    }
-
-    fn violations(&self) -> Vec<InternalViolation> {
-        self.inner
-            .findings
-            .iter()
-            .map(|finding| finding.violation.clone())
-            .collect()
     }
 }
 

@@ -124,8 +124,8 @@ pub(crate) enum StateChange {
     ConfidenceSnapshot {
         previous: crate::_internal::analysis::state::Confidence,
     },
-    EvidenceSnapshot {
-        previous: crate::_internal::analysis::evidence::EvidenceLog,
+    EvidenceLengthMarker {
+        len: usize,
     },
     NotEvaluatedSnapshot {
         previous: Vec<crate::_internal::report::violations::NotEvaluated>,

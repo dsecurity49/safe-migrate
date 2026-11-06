@@ -60,6 +60,14 @@ pub(crate) fn compute_verdict_with(
     violations: &[Violation],
     not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
 ) -> Verdict {
+    compute_verdict_with_iter(violations.iter(), not_evaluated)
+}
+
+/// As [`compute_verdict_with`], borrowing violations from any source.
+pub(crate) fn compute_verdict_with_iter<'a>(
+    violations: impl Iterator<Item = &'a Violation>,
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) -> Verdict {
     let verdict = verdict_from_violations(violations);
     let blocked_by_gap = matches!(verdict, Verdict::Safe | Verdict::SafeWithRisk)
         && not_evaluated
@@ -72,12 +80,16 @@ pub(crate) fn compute_verdict_with(
     }
 }
 
-fn verdict_from_violations(violations: &[Violation]) -> Verdict {
-    let has_tier1 = violations.iter().any(|v| v.tier == ViolationTier::Tier1);
-    let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
-    let has_irreversible_tier3 = violations
-        .iter()
-        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == IRREVERSIBLE_MIGRATION_RULE_ID);
+fn verdict_from_violations<'a>(violations: impl Iterator<Item = &'a Violation>) -> Verdict {
+    let mut has_tier1 = false;
+    let mut has_tier2 = false;
+    let mut has_irreversible_tier3 = false;
+    for violation in violations {
+        has_tier1 |= violation.tier == ViolationTier::Tier1;
+        has_tier2 |= violation.tier == ViolationTier::Tier2;
+        has_irreversible_tier3 |= violation.tier == ViolationTier::Tier3
+            && violation.rule_id == IRREVERSIBLE_MIGRATION_RULE_ID;
+    }
 
     match (has_tier1, has_tier2, has_irreversible_tier3) {
         (true, _, _) => Verdict::Halt,

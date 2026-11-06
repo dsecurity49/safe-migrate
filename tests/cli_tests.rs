@@ -144,7 +144,14 @@ fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
 
     let mut cmd = crate::common::safe_migrate_command();
     cmd.current_dir(project.path())
-        .args(["init", "github-actions", "--path", "migrations"])
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "migrations",
+            "--branch",
+            "main",
+        ])
         .assert()
         .success();
 
@@ -179,7 +186,14 @@ fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
     let mut overwrite = crate::common::safe_migrate_command();
     let assertion = overwrite
         .current_dir(project.path())
-        .args(["init", "github-actions", "--path", "migrations"])
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "migrations",
+            "--branch",
+            "main",
+        ])
         .assert()
         .failure();
     assert!(
@@ -228,6 +242,8 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
             "github-actions",
             "--path",
             "migrations",
+            "--branch",
+            "main",
             "--configure-secrets",
         ])
         .assert()
@@ -246,6 +262,29 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
         !project
             .path()
             .join(".github/workflows/safe-migrate-baseline.yml")
+            .exists()
+    );
+}
+
+#[test]
+fn init_github_actions_requires_a_detectable_default_branch() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("migrations")).unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assertion = cmd
+        .current_dir(project.path())
+        .args(["init", "github-actions", "--path", "migrations"])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+            .contains("Could not detect the default branch")
+    );
+    assert!(
+        !project
+            .path()
+            .join(".github/workflows/safe-migrate.yml")
             .exists()
     );
 }

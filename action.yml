@@ -212,12 +212,26 @@ runs:
         DATABASE_URL: ""
         SAFE_MIGRATE_CACHE_KEY: ""
 
+    - name: Cache source-build dependencies
+      if: ${{ steps.action-install.outputs.install-mode == 'source' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ${{ runner.temp }}/safe-migrate-action-target
+        key: safe-migrate-source-${{ runner.os }}-${{ runner.arch }}-${{ github.action_ref }}
+
     - name: Install safe-migrate
       id: install
       shell: bash
       env:
         INSTALL_MODE: ${{ steps.action-install.outputs.install-mode }}
         RELEASE_VERSION: ${{ steps.action-install.outputs.release-version }}
+        CARGO_TARGET_DIR: ${{ runner.temp }}/safe-migrate-action-target
         DATABASE_URL: ""
         SAFE_MIGRATE_CACHE_KEY: ""
       run: |

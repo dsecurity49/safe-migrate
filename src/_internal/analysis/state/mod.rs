@@ -269,13 +269,16 @@ impl PreState {
         &self,
         composite: &ObjectId,
     ) -> Vec<&crate::_internal::model::relation::RelationState> {
-        let mut visiting = HashSet::new();
         self.relations
             .values()
             .filter(|relation| {
                 if relation.of_type.as_ref() == Some(composite) {
                     return true;
                 }
+                // The set is a cycle guard, not a memo: a successful traversal
+                // leaves partially explored containers behind that would hide
+                // the same container for the next relation.
+                let mut visiting = HashSet::new();
                 relation.columns.iter().any(|column| {
                     column.type_id.as_ref().is_some_and(|id| {
                         self.type_stores_composite_in_container(id, composite, &mut visiting)
@@ -433,6 +436,9 @@ pub(crate) fn bare_routine_name(identity: &str) -> &str {
 
 #[cfg(test)]
 mod pre_state_tests;
+
+#[cfg(test)]
+mod types_tests;
 
 #[cfg(test)]
 mod evidence_tests;

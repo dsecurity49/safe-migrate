@@ -49,6 +49,15 @@ notes are available on the
   expression keys back into the same expression IR used for migrations. Exact
   matches are comparable, while statement/catalog differences stay unknown
   instead of becoming false differences; the cache format is now 12.
+- Composite-type dependency analysis now reports every table that reaches the
+  type through a shared container. Previously a second table could be omitted
+  from the finding, lowering the reported severity when it had the larger row
+  estimate.
+- `init github-actions` now fails with recovery guidance when `origin/HEAD`
+  cannot identify the default branch instead of silently assuming `main`; pass
+  `--branch` to override detection.
+- The GitHub Action now caches the Cargo registry and build artifacts for
+  SHA-pinned source installs, so repeat runs reuse compiled dependencies.
 
 ## v0.12.0 — 2026-10-31
 

@@ -25,7 +25,8 @@ database.
 
 `init github-actions --configure-secrets` sends the database URL and generated
 key through authenticated GitHub CLI without printing them. It detects the
-default branch from `origin/HEAD`, falls back to `main`, and accepts `--branch`.
+default branch from `origin/HEAD` and accepts `--branch`; it fails with
+recovery guidance when detection is unavailable.
 `init cache-key --set-github-secret` sends the key instead of printing it.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or

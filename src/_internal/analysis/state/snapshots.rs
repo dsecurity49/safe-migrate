@@ -277,8 +277,8 @@ impl AnalysisState {
 
     pub(super) fn snapshot_evidence(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::EvidenceSnapshot {
-                previous: self.local.evidence.clone(),
+            frame.undo_log.push(StateChange::EvidenceLengthMarker {
+                len: self.local.evidence.records().len(),
             });
         }
     }
