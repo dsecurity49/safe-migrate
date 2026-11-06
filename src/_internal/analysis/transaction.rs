@@ -63,6 +63,10 @@ pub(crate) enum StateChange {
         previous_template: Vec<String>,
         previous_session_template: Vec<String>,
     },
+    TempNamespaceSnapshot {
+        previous: bool,
+        previous_search_path: Vec<SearchPathEntry>,
+    },
     TimeoutSettingsSnapshot {
         lock_timeout: crate::_internal::analysis::settings::ScopedSetting<Option<u64>>,
         statement_timeout: crate::_internal::analysis::settings::ScopedSetting<Option<u64>>,

@@ -175,6 +175,13 @@ impl AnalysisState {
                     self.local.search_path_template = previous_template;
                     self.local.session_search_path_template = previous_session_template;
                 }
+                StateChange::TempNamespaceSnapshot {
+                    previous,
+                    previous_search_path,
+                } => {
+                    self.local.temp_namespace_created = previous;
+                    self.local.search_path = previous_search_path;
+                }
                 StateChange::TimeoutSettingsSnapshot {
                     lock_timeout,
                     statement_timeout,

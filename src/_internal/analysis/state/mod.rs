@@ -203,10 +203,12 @@ pub(crate) struct LocalState {
     /// Collations of the synchronized cluster, used to resolve written
     /// `COLLATE` names. Empty only when no baseline supplied one.
     pub collations: crate::_internal::model::collation::CollationCatalogue,
-    /// Performance hint: a temporary object has been created in this session.
-    /// `temp_namespace_exists` derives the real answer, so this only has to be
-    /// a superset to stay correct across rollback and `ON COMMIT DROP`.
-    pub saw_temp_object: bool,
+    /// Whether the session temporary namespace has been created.
+    ///
+    /// PostgreSQL creates it with the first temporary object and keeps it after
+    /// that object is dropped, but a rollback that undoes the creation removes
+    /// it again. The flag is therefore snapshotted with the transaction.
+    pub temp_namespace_created: bool,
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
     pub default_search_path_template: Vec<String>,
@@ -436,6 +438,9 @@ pub(crate) fn bare_routine_name(identity: &str) -> &str {
 
 #[cfg(test)]
 mod pre_state_tests;
+
+#[cfg(test)]
+mod temp_namespace_tests;
 
 #[cfg(test)]
 mod types_tests;

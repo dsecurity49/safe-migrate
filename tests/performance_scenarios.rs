@@ -212,6 +212,66 @@ mod performance_scenarios {
 
     #[test]
     #[ignore = "manual performance scenario; run with --ignored --nocapture"]
+    fn large_baseline_type_resolution_after_temp_rollback() {
+        const RESOLUTIONS: usize = 10_000;
+
+        let engine = setup_engine();
+        let mut state =
+            crate::_internal::analysis::state::AnalysisState::with_baseline(large_baseline(), true);
+        let findings = engine
+            .analyze(
+                "BEGIN;\nCREATE TEMP TABLE pg_temp.perf_temp (id bigint NOT NULL);\nROLLBACK;",
+                &mut state,
+            )
+            .expect("temp rollback scenario should analyze");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "chain-conflict"),
+            "unexpected state conflict: {findings:?}"
+        );
+        assert!(
+            !state.temp_namespace_exists(),
+            "rollback must remove the temp namespace created by the transaction"
+        );
+
+        fn measure(label: &str, state: &mut crate::_internal::analysis::state::AnalysisState) {
+            for _ in 0..100 {
+                std::hint::black_box(state.resolve_type_reference("integer"));
+            }
+            let started = Instant::now();
+            for _ in 0..RESOLUTIONS {
+                std::hint::black_box(state.resolve_type_reference("integer"));
+            }
+            eprintln!(
+                "scenario=large_baseline_type_resolution_temp_state={label} resolutions={RESOLUTIONS} relations={LARGE_BASELINE_RELATIONS} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
+
+        measure("after_rollback", &mut state);
+
+        let findings = engine
+            .analyze(
+                "CREATE TEMP TABLE pg_temp.perf_temp (id bigint NOT NULL);",
+                &mut state,
+            )
+            .expect("temp creation should analyze");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "chain-conflict"),
+            "unexpected state conflict: {findings:?}"
+        );
+        assert!(
+            state.temp_namespace_exists(),
+            "creating a temp table must establish the session temp namespace"
+        );
+        measure("namespace_present", &mut state);
+    }
+
+    #[test]
+    #[ignore = "manual performance scenario; run with --ignored --nocapture"]
     fn large_synchronized_baseline_hydration() {
         let started = Instant::now();
         let state =

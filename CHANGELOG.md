@@ -60,6 +60,10 @@ notes are available on the
   authentication before writing either workflow, stages each file before
   replacement, and reports when the database URL was configured but the cache
   key was not.
+- Name resolution no longer scans every relation and type to decide whether a
+  rolled-back temporary namespace exists, removing a per-resolution scan of
+  the whole schema model from chains that create and roll back temporary
+  tables.
 - The GitHub Action now caches the Cargo registry and build artifacts for
   SHA-pinned source installs, so repeat runs reuse compiled dependencies.
 

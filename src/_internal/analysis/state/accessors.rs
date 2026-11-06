@@ -180,17 +180,7 @@ impl AnalysisState {
     /// Whether this session has a temporary schema, which is searched before
     /// every explicit path entry for relations and types.
     pub(crate) fn temp_namespace_exists(&self) -> bool {
-        self.local.saw_temp_object
-            && (self
-                .local
-                .relations
-                .keys()
-                .any(|id| is_session_temp_schema(&id.schema))
-                || self
-                    .local
-                    .types
-                    .keys()
-                    .any(|id| is_session_temp_schema(&id.schema)))
+        self.local.temp_namespace_created
     }
 
     /// Entries to search for an unqualified relation or type, implicit first.
@@ -229,7 +219,10 @@ impl AnalysisState {
     }
 
     pub(crate) fn note_temp_object_created(&mut self) {
-        self.local.saw_temp_object = true;
+        if !self.local.temp_namespace_created {
+            self.snapshot_temp_namespace();
+            self.local.temp_namespace_created = true;
+        }
         // A path that names the temporary alias could not search it before the
         // namespace existed; now it can, at its written position.
         self.refresh_role_sensitive_search_path();

@@ -698,7 +698,7 @@ impl AnalysisState {
                     .aggregates
                     .clone()
                     .unwrap_or_else(AggregateCatalogue::fallback),
-                saw_temp_object: false,
+                temp_namespace_created: false,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
                 default_search_path_template,

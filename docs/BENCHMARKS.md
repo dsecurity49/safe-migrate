@@ -145,3 +145,24 @@ Run the isolated comparison with:
 ```sh
 cargo test --locked --jobs 1 --lib internal_tests::performance_scenarios::large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
 ```
+
+## Temporary-namespace resolution (2026-11-06)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. A 1,000-relation synchronized baseline resolves `integer`
+10,000 times after a temporary table is created and the creating transaction is
+rolled back. The old implementation scanned every relation and type on each
+resolution to prove the namespace was gone. The measurement was 1,978 ms; the
+same process measured 154 ms with the scan hint forced off, so the scan
+accounted for most of the difference.
+
+The exact namespace flag removes that scan. Five runs after the change measured
+62, 62, 62, 65, and 61 ms after the rollback (median **62 ms**) and 93, 92, 92,
+92, and 93 ms with the namespace present (median **92 ms**). PostgreSQL was
+checked directly for the lifecycle the flag models: a rollback removes a
+namespace created in that transaction, while dropping the last temporary object
+or committing `ON COMMIT DROP` keeps it.
+
+```sh
+cargo test --locked --lib large_baseline_type_resolution_after_temp_rollback -- --ignored --nocapture --test-threads=1
+```
