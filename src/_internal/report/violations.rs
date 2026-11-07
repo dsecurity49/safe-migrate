@@ -91,6 +91,7 @@ pub(crate) struct SourceLocation {
 
 /// A rule that could not state a finding for want of evidence. Reported apart
 /// from findings, because nothing is wrong with the migration.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct NotEvaluated {
     pub rule_id: &'static str,

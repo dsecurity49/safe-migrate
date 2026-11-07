@@ -200,3 +200,39 @@ full-family capture and requires identical findings, including the
 cargo test --locked --lib pre_state_capture_against_large_baselines -- --ignored --nocapture --test-threads=1
 cargo test --locked --lib thousand_alter_mutations_against_large_baselines -- --ignored --nocapture --test-threads=1
 ```
+
+## Autocommit statement undo journal (2026-11-07)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. Ordinary autocommit statements previously cloned the whole
+`AnalysisState` before applying their mutations. They now record the same typed
+state deltas as the transaction undo log and discard them on success. The
+transaction-shape clone at `COMMIT`/`ROLLBACK` is also replaced by a statement
+journal plus a transaction-shape check, so the accumulated undo history is no
+longer cloned.
+
+| Scenario | Before | After |
+| --- | ---: | ---: |
+| 50 `ALTER TABLE` statements, 1,000 relations | 462,883 allocations / 130.0 MB / 640 ms | 13,208 allocations / 1.6 MB / 54-69 ms |
+| 1,000-statement create chain | 9,000 ms | 1,192 ms |
+| 503-statement transaction rollback | 400-450 ms | 382-385 ms |
+| 50 rename statements, 1,000 relations | not measured | 497,767 allocations / 134.6 MB / 746 ms |
+
+The rename row is the remaining bounded-copy target: `ALTER TABLE ... RENAME`
+still records a `NamespaceSnapshot`, which copies nearly the whole schema model.
+The journal does not make that path worse, but it does not remove that copy.
+
+A differential test runs every statement twice, once with the full state
+checkpoint and once with the journal, and requires identical findings plus
+identical complete `AnalysisState` after each statement. The chain includes a
+compound statement that applies one action and conflicts on the next, failed and
+successful savepoint operations, transaction-control conflicts, and autocommit
+DDL.
+
+```sh
+cargo test --locked --lib large_baseline_short_chain_allocations -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib large_baseline_rename_chain_allocations -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib ordered_thousand_statement_chain -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib long_transaction_rollback -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib statement_undo_journal_matches_full_checkpoint_after_every_statement
+```

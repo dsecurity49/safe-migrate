@@ -7,7 +7,9 @@ use crate::_internal::analysis::namespace::{
     SESSION_TEMP_SCHEMA, SYSTEM_CATALOG_SCHEMA, SearchPathEntry, is_session_temp_schema,
 };
 use crate::_internal::analysis::settings::ScopedSetting;
-use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
+use crate::_internal::analysis::transaction::{
+    NamespaceSnapshot, StateChange, TransactionFrame, TransactionFrameKind,
+};
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
@@ -175,6 +177,7 @@ pub(crate) struct CascadeResult {
     pub dropped_constraints: HashSet<(ObjectId, String)>,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone)]
 pub(crate) struct LocalState {
     pub schemas: HashMap<String, SchemaOverlay>,
@@ -247,6 +250,9 @@ pub(crate) struct LocalState {
     pub evidence: EvidenceLog,
     pub current_evidence_location: Option<EvidenceLocation>,
     pub transactions: Vec<TransactionFrame>,
+    /// Undo log for the autocommit statement currently being applied. `None`
+    /// outside a statement; explicit transactions use the innermost frame.
+    pub statement_undo_log: Option<Vec<StateChange>>,
     pub transaction_aborted: bool,
     pub pending_validation: HashSet<(ObjectId, String)>,
     pub generation_counter: u64,
@@ -343,6 +349,7 @@ struct HydratedRelationTypes {
     types: HashMap<ObjectId, TypeOverlay>,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone)]
 pub(crate) struct AnalysisState {
     pub pg_version_num: Option<u32>,

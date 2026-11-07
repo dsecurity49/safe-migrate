@@ -329,6 +329,64 @@ fn selective_capture_matches_full_capture_for_every_pre_state_reader() {
     );
 }
 
+#[test]
+fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
+    let mut journal_state = AnalysisState::new(differential_cache());
+    let mut full_state = AnalysisState::new(differential_cache());
+    let journal = SafeMigrateEngine::new(Config::default());
+    let full = SafeMigrateEngine::new(Config::default()).with_full_statement_checkpoint_for_tests();
+
+    let statements = [
+        "CREATE TABLE users (id integer PRIMARY KEY, name text);",
+        "ALTER TABLE users ADD COLUMN retained text, ADD COLUMN also_retained integer;",
+        "ALTER TABLE users ADD COLUMN rolled_back text, DROP COLUMN missing_column;",
+        "ALTER TABLE users ADD COLUMN after_conflict integer;",
+        "CREATE INDEX users_after_conflict_idx ON users (after_conflict);",
+        "DROP INDEX users_after_conflict_idx;",
+        "SAVEPOINT outside_transaction;",
+        "COMMIT AND CHAIN;",
+        "BEGIN;",
+        "SAVEPOINT sp;",
+        "ROLLBACK TO missing;",
+        "ROLLBACK;",
+        "BEGIN;",
+        "SAVEPOINT sp;",
+        "CREATE TABLE control_table (id integer);",
+        "ROLLBACK TO sp;",
+        "RELEASE sp;",
+        "COMMIT;",
+        "ALTER TABLE users RENAME TO users_renamed;",
+        "DROP TABLE users_renamed;",
+    ];
+    let mut saw_conflict = false;
+
+    for statement in statements {
+        let journal_violations = journal
+            .analyze(statement, &mut journal_state)
+            .unwrap_or_else(|errors| panic!("journal failed on {statement}: {errors:?}"));
+        let full_violations = full
+            .analyze(statement, &mut full_state)
+            .unwrap_or_else(|errors| panic!("full failed on {statement}: {errors:?}"));
+        assert_eq!(
+            comparable(&journal_violations),
+            comparable(&full_violations),
+            "journal findings diverged from full checkpoint after: {statement}"
+        );
+        assert_eq!(
+            journal_state, full_state,
+            "statement journal state diverged after: {statement}"
+        );
+        saw_conflict |= journal_violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict");
+    }
+
+    assert!(
+        saw_conflict,
+        "chain did not exercise a rolled-back statement"
+    );
+}
+
 fn differential_cache() -> DbCache {
     let mut cache = crate::common::synced_cache();
     for (name, rows) in [("baseline_orders", 5_000_u64), ("baseline_users", 25)] {

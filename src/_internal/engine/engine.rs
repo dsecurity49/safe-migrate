@@ -5,6 +5,7 @@ use crate::_internal::analysis::resolver::Resolver;
 #[cfg(test)]
 use crate::_internal::analysis::state::PreStateReadSet;
 use crate::_internal::analysis::state::{AnalysisState, PreState};
+use crate::_internal::analysis::transaction::TransactionFrameKind;
 use crate::_internal::ast::visitor::AstVisitor;
 use crate::_internal::engine::pre_state_footprint;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
@@ -23,33 +24,66 @@ enum StatementCheckpoint {
         transaction_depth: usize,
         undo_len: usize,
     },
+    StatementUndo,
+    TransactionControl {
+        shape: Vec<(TransactionFrameKind, usize)>,
+    },
+}
+
+fn is_transaction_control(mutation: &Mutation) -> bool {
+    matches!(
+        mutation,
+        Mutation::BeginTransaction
+            | Mutation::CommitTransaction
+            | Mutation::CommitAndChain
+            | Mutation::RollbackTransaction
+            | Mutation::RollbackAndChain
+            | Mutation::RollbackToSavepoint(_)
+            | Mutation::Savepoint(_)
+            | Mutation::ReleaseSavepoint(_)
+    )
+}
+
+fn is_pure_transaction_control(mutations: &[Mutation]) -> bool {
+    let mut control = false;
+    for mutation in mutations {
+        if is_transaction_control(mutation) {
+            if control {
+                return false;
+            }
+            control = true;
+        } else if !matches!(mutation, Mutation::CheckTimeouts { .. }) {
+            return false;
+        }
+    }
+    control
 }
 
 impl StatementCheckpoint {
-    fn capture(state: &AnalysisState, mutations: &[Mutation]) -> Self {
-        let changes_transaction_structure = mutations.iter().any(|mutation| {
-            matches!(
-                mutation,
-                Mutation::BeginTransaction
-                    | Mutation::CommitTransaction
-                    | Mutation::CommitAndChain
-                    | Mutation::RollbackTransaction
-                    | Mutation::RollbackAndChain
-                    | Mutation::RollbackToSavepoint(_)
-                    | Mutation::Savepoint(_)
-                    | Mutation::ReleaseSavepoint(_)
-            )
-        });
-        if !changes_transaction_structure
-            && let Some((transaction_depth, undo_len)) = state.transaction_undo_checkpoint()
-        {
-            Self::TransactionUndo {
-                transaction_depth,
-                undo_len,
+    fn capture(state: &mut AnalysisState, mutations: &[Mutation], force_full: bool) -> Self {
+        debug_assert!(
+            state.local.statement_undo_log.is_none(),
+            "the previous statement's undo journal must be closed before the next checkpoint"
+        );
+        if !force_full {
+            if is_pure_transaction_control(mutations) {
+                let shape = state.transaction_shape();
+                state.begin_statement_undo();
+                return Self::TransactionControl { shape };
             }
-        } else {
-            Self::Full(Some(Box::new(state.clone())))
+            let changes_transaction_structure = mutations.iter().any(is_transaction_control);
+            if !changes_transaction_structure {
+                if let Some((transaction_depth, undo_len)) = state.transaction_undo_checkpoint() {
+                    return Self::TransactionUndo {
+                        transaction_depth,
+                        undo_len,
+                    };
+                }
+                state.begin_statement_undo();
+                return Self::StatementUndo;
+            }
         }
+        Self::Full(Some(Box::new(state.clone())))
     }
 
     fn restore(&mut self, state: &mut AnalysisState) -> Result<(), String> {
@@ -67,8 +101,31 @@ impl StatementCheckpoint {
             } => state
                 .rollback_to_transaction_undo_checkpoint(*transaction_depth, *undo_len)
                 .map_err(str::to_string),
+            Self::StatementUndo => state.rollback_statement_undo().map_err(str::to_string),
+            Self::TransactionControl { shape } => {
+                if state.transaction_shape() != *shape {
+                    return Err(
+                        "transaction-control statement changed transaction structure before failing"
+                            .to_string(),
+                    );
+                }
+                state.rollback_statement_undo().map_err(str::to_string)
+            }
         }
     }
+
+    fn finish(self, state: &mut AnalysisState) {
+        if matches!(self, Self::StatementUndo | Self::TransactionControl { .. }) {
+            state.commit_statement_undo();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatementCheckpointMode {
+    Journal,
+    Full,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,6 +140,8 @@ pub(crate) struct SafeMigrateEngine {
     rules: Vec<Box<dyn Rule>>,
     #[cfg(test)]
     pre_state_mode: PreStateCaptureMode,
+    #[cfg(test)]
+    statement_checkpoint_mode: StatementCheckpointMode,
 }
 
 impl SafeMigrateEngine {
@@ -92,6 +151,8 @@ impl SafeMigrateEngine {
             rules: registry::build_primary_rules(),
             #[cfg(test)]
             pre_state_mode: PreStateCaptureMode::Selective,
+            #[cfg(test)]
+            statement_checkpoint_mode: StatementCheckpointMode::Journal,
         }
     }
 
@@ -100,6 +161,24 @@ impl SafeMigrateEngine {
     pub(crate) fn with_full_pre_state_for_tests(mut self) -> Self {
         self.pre_state_mode = PreStateCaptureMode::Full;
         self
+    }
+
+    /// Verifies the statement undo journal against the full checkpoint in tests.
+    #[cfg(test)]
+    pub(crate) fn with_full_statement_checkpoint_for_tests(mut self) -> Self {
+        self.statement_checkpoint_mode = StatementCheckpointMode::Full;
+        self
+    }
+
+    fn force_full_statement_checkpoint(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.statement_checkpoint_mode == StatementCheckpointMode::Full
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Returns primary rule IDs in evaluation order.
@@ -395,7 +474,9 @@ impl SafeMigrateEngine {
                         | Mutation::ReleaseSavepoint(_)
                 )
             });
-            let mut statement_checkpoint = StatementCheckpoint::capture(state, &mutations);
+            let force_full = self.force_full_statement_checkpoint();
+            let mut statement_checkpoint =
+                StatementCheckpoint::capture(state, &mutations, force_full);
             let mut statement_failed = false;
 
             for mutation in mutations {
@@ -587,6 +668,8 @@ impl SafeMigrateEngine {
                     break;
                 }
             }
+
+            statement_checkpoint.finish(state);
 
             if !statement_failed
                 && !started_in_transaction

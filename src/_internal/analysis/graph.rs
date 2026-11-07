@@ -143,6 +143,13 @@ impl Clone for DependencyGraph {
     }
 }
 
+#[cfg(test)]
+impl PartialEq for DependencyGraph {
+    fn eq(&self, other: &Self) -> bool {
+        self.edges == other.edges
+    }
+}
+
 impl DependencyGraph {
     const CASCADE_INDEX_MIN_EDGES: usize = 1_024;
 

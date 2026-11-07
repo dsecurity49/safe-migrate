@@ -7,6 +7,7 @@ use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::types::TypeOverlay;
 use std::collections::{HashMap, HashSet};
 
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceSnapshot {
     pub schemas: HashMap<String, SchemaOverlay>,
@@ -35,6 +36,7 @@ pub(crate) struct NamespaceSnapshot {
 }
 
 #[allow(clippy::large_enum_variant)] // Undo entries stay allocation-free in the hot state path.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) enum StateChange {
     SchemaSnapshot {
@@ -145,6 +147,7 @@ pub(crate) enum TransactionFrameKind {
     Savepoint(String),
 }
 
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) struct TransactionFrame {
     pub kind: TransactionFrameKind,

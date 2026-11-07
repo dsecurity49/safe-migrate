@@ -720,6 +720,7 @@ impl AnalysisState {
                 evidence: EvidenceLog::default(),
                 current_evidence_location: None,
                 transactions: Vec::new(),
+                statement_undo_log: None,
                 transaction_aborted: false,
                 pending_validation: HashSet::new(),
                 generation_counter: 0,

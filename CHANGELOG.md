@@ -71,6 +71,12 @@ notes are available on the
   searches an entire family. A recorded 1,000-mutation `ALTER TABLE` chain
   against 10,000 baseline relations drops from about 83 s to 0.13 s in the
   debug benchmark.
+- Autocommit statements now roll back through a typed statement undo journal
+  instead of cloning the entire analysis state, and `COMMIT`/`ROLLBACK` no
+  longer clone the accumulated transaction undo history. A 1,000-relation
+  baseline with 50 `ALTER TABLE` statements drops from 462,883 allocations and
+  640 ms to 13,208 allocations and about 60 ms in the debug benchmark; a
+  1,000-statement chain drops from about 9 s to 1.2 s.
 
 ## v0.12.0 — 2026-10-31
 

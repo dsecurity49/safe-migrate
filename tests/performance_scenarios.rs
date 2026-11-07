@@ -186,6 +186,44 @@ mod performance_scenarios {
     }
 
     #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_baseline_rename_chain_allocations() {
+        let engine = setup_engine();
+        let mut state =
+            crate::_internal::analysis::state::AnalysisState::with_baseline(large_baseline(), true);
+        let files = (0..50)
+            .map(|index| {
+                (
+                    format!("V{index:04}__rename.sql"),
+                    format!("ALTER TABLE perf_baseline_{index} RENAME TO perf_renamed_{index};"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let before = allocation_snapshot();
+        let findings = engine
+            .analyze_chain(&files, &mut state)
+            .expect("large-baseline rename chain should analyze");
+        let allocations = allocation_delta(before);
+        let elapsed = started.elapsed();
+
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "chain-conflict"),
+            "unexpected state conflict: {findings:?}"
+        );
+        assert!(state.relation_is_present(&object_id("public", "perf_renamed_49")));
+        eprintln!(
+            "scenario=large_baseline_rename_chain statements=50 relations={LARGE_BASELINE_RELATIONS} allocations={} allocated_bytes={} elapsed_ms={}",
+            allocations.0,
+            allocations.1,
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
     #[ignore = "manual performance scenario; run with --ignored --nocapture"]
     fn pre_state_capture_against_large_baselines() {
         use crate::_internal::analysis::mutations::{

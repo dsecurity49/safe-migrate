@@ -2,19 +2,20 @@ use super::*;
 
 impl AnalysisState {
     pub(super) fn snapshot_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::GraphLengthMarker {
-                len: self.local.graph.edge_count(),
-            });
+        if !self.local.records_undo() {
+            return;
         }
+        let len = self.local.graph.edge_count();
+        self.local.push_undo(StateChange::GraphLengthMarker { len });
     }
 
     pub(super) fn snapshot_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::GraphSnapshot {
-                previous: self.local.graph.edges().to_vec(),
-            });
+        if !self.local.records_undo() {
+            return;
         }
+        let previous = self.local.graph.edges().to_vec();
+        self.local
+            .push_undo(StateChange::GraphSnapshot { previous });
     }
 
     pub(super) fn rollback_frame(&mut self, mut frame: TransactionFrame) {
@@ -210,6 +211,31 @@ impl AnalysisState {
             }
         }
         debug_assert!(self.local.graph.indexes_are_valid());
+    }
+
+    pub(crate) fn begin_statement_undo(&mut self) {
+        debug_assert!(self.local.statement_undo_log.is_none());
+        self.local.statement_undo_log = Some(Vec::new());
+    }
+
+    pub(crate) fn commit_statement_undo(&mut self) {
+        self.local.statement_undo_log = None;
+    }
+
+    pub(crate) fn transaction_shape(&self) -> Vec<(TransactionFrameKind, usize)> {
+        self.local
+            .transactions
+            .iter()
+            .map(|frame| (frame.kind.clone(), frame.undo_log.len()))
+            .collect()
+    }
+
+    pub(crate) fn rollback_statement_undo(&mut self) -> Result<(), &'static str> {
+        let Some(undo_log) = self.local.statement_undo_log.take() else {
+            return Err("statement undo journal was already closed");
+        };
+        self.rollback_undo_log(undo_log);
+        Ok(())
     }
 
     pub(crate) fn transaction_undo_checkpoint(&self) -> Option<(usize, usize)> {
