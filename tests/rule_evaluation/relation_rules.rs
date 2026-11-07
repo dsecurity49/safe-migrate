@@ -99,6 +99,98 @@ fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
     assert!(!v2.iter().any(|v| v.rule_id == "blocking-constraint"));
 }
 
+#[test]
+fn test_rule_blocking_constraint_validate_scans_large_table() {
+    let engine = setup_engine();
+    let mut cache = crate::common::synced_cache();
+    cache.insert_baseline(
+        object_id("public", "t"),
+        RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500_000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        ),
+    );
+    let mut state = AnalysisState::new(cache);
+
+    let added = engine
+        .analyze(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !added
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "NOT VALID must not be reported as blocking: {added:#?}"
+    );
+
+    let validated = engine
+        .analyze("ALTER TABLE t VALIDATE CONSTRAINT c;", &mut state)
+        .unwrap();
+    let finding = validated
+        .iter()
+        .find(|violation| violation.rule_id == "blocking-constraint")
+        .expect("validating a large table must be reported");
+    assert_eq!(finding.tier, ViolationTier::Tier1);
+    assert_eq!(finding.object_kind, ObjectKind::Table);
+    assert!(
+        finding.reason.contains("'c'") && finding.reason.contains("scans the table"),
+        "{finding:#?}"
+    );
+
+    let again = engine
+        .analyze("ALTER TABLE t VALIDATE CONSTRAINT c;", &mut state)
+        .unwrap();
+    assert!(
+        !again
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "re-validating a valid constraint scans nothing: {again:#?}"
+    );
+}
+
+#[test]
+fn test_rule_blocking_constraint_validate_small_table_is_silent() {
+    let engine = setup_engine();
+    let mut cache = crate::common::synced_cache();
+    cache.insert_baseline(
+        object_id("public", "t"),
+        RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        ),
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    let violations = engine
+        .analyze("ALTER TABLE t VALIDATE CONSTRAINT c;", &mut state)
+        .unwrap();
+
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "{violations:#?}"
+    );
+}
+
 fn domain_rule_state(column_type: &str, relation_rows: u64) -> AnalysisState {
     let mut cache = crate::common::synced_cache();
     let domain = object_id("public", "d");

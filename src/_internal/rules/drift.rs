@@ -1,5 +1,4 @@
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
     BASELINE_RELATION_CAPABILITIES, Rule, RuleCapability, RuleContext, TransitionRecord,
@@ -172,9 +171,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropFunction(d) => {
                 for sig in &d.signatures {
-                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
-                    let schema = state.resolve_function_schema(&sig.name, &sig_str);
-                    let id = ObjectId::new(schema, sig_str);
+                    let id = state.routine_signature_id(sig);
                     if !d.if_exists && !pre_state.functions.contains_key(&id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
@@ -393,13 +390,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropProcedure(d) => {
                 for signature in &d.signatures {
-                    let signature_name = format!(
-                        "{}({})",
-                        signature.name.name.resolve(),
-                        signature.params.join(",")
-                    );
-                    let schema = state.resolve_function_schema(&signature.name, &signature_name);
-                    let id = ObjectId::new(schema, signature_name);
+                    let id = state.routine_signature_id(signature);
                     let procedure_exists = pre_state.functions.get(&id).is_some_and(|routine| {
                         routine.routine_kind
                             == crate::_internal::model::function::RoutineKind::Procedure

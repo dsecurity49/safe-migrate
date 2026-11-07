@@ -140,11 +140,12 @@ pub(crate) struct DbCache {
 // this: bincode carries no field names, so bytes are laid out exactly as the
 // current definitions describe. The header encodes the same number, and the
 // magic must stay one digit wide or the fixed-size prefix read breaks.
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 11;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 12;
 
-/// Current durable cache header. V11 adds extension membership and the full
-/// type/domain/sequence state introduced by Batch 3.
-pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE11";
+/// Current durable cache header. V12 adds parsed catalog index predicates and
+/// expression keys; V11 added extension membership and the full
+/// type/domain/sequence state.
+pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE12";
 
 // The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
 // must stay the same width as the version grows. Two version digits fit.
@@ -169,13 +170,14 @@ pub(crate) enum DbCacheVersioned {
     V9(Box<DbCache>),
     V10(Box<DbCache>),
     V11(Box<DbCache>),
+    V12(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
     /// The variant this build writes. Naming it in one place keeps a format
     /// bump from silently leaving a writer or a fixture on a stale layout.
     pub(crate) fn current(cache: DbCache) -> Self {
-        DbCacheVersioned::V11(Box::new(cache))
+        DbCacheVersioned::V12(Box::new(cache))
     }
 
     pub(crate) fn format_version(&self) -> u32 {
@@ -191,6 +193,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V9(_) => 9,
             DbCacheVersioned::V10(_) => 10,
             DbCacheVersioned::V11(_) => 11,
+            DbCacheVersioned::V12(_) => 12,
         }
     }
 
@@ -205,11 +208,12 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V7(_)
             | DbCacheVersioned::V8(_)
             | DbCacheVersioned::V9(_)
-            | DbCacheVersioned::V10(_) => Err(
+            | DbCacheVersioned::V10(_)
+            | DbCacheVersioned::V11(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V11(c) => {
+            DbCacheVersioned::V12(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -303,6 +307,54 @@ impl DbCache {
         self.roles
             .keys()
             .find_map(|role_id| visit(role_id, &self.roles, &mut visiting, &mut visited))
+    }
+
+    /// A partition child inherits the parent's identity property but not the
+    /// sequence ownership, which stays on the ancestor that owns the sequence.
+    fn identity_is_inherited_from_partition_ancestor(
+        &self,
+        relation: &RelationState,
+        column: &str,
+    ) -> bool {
+        let mut pending: Vec<ObjectId> = self
+            .inheritances
+            .iter()
+            .filter(|inheritance| inheritance.is_partition && inheritance.child == relation.id)
+            .map(|inheritance| inheritance.parent.clone())
+            .collect();
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = pending.pop() {
+            if !visited.insert(parent_id.clone()) {
+                continue;
+            }
+            let Some(parent) = self.relations.get(&parent_id) else {
+                let omitted_schema = self.metadata.schemas.as_ref().is_some_and(|schemas| {
+                    !schemas.iter().any(|schema| schema == &parent_id.schema)
+                });
+                if omitted_schema {
+                    return true;
+                }
+                continue;
+            };
+            if parent.identity_columns.contains_key(column)
+                && self.sequences.values().any(|sequence| {
+                    matches!(sequence.kind, SequenceKind::Identity)
+                        && sequence.owned_by.as_ref()
+                            == Some(&(parent_id.clone(), column.to_string()))
+                })
+            {
+                return true;
+            }
+            pending.extend(
+                self.inheritances
+                    .iter()
+                    .filter(|inheritance| {
+                        inheritance.is_partition && inheritance.child == parent_id
+                    })
+                    .map(|inheritance| inheritance.parent.clone()),
+            );
+        }
+        false
     }
 
     /// Validate cross-record identity, relationship, and catalog-coverage
@@ -1217,7 +1269,10 @@ impl DbCache {
                                 == Some(&(relation.id.clone(), column.clone()))
                     })
                     .count();
-                if owners != 1 {
+                if owners > 1
+                    || (owners == 0
+                        && !self.identity_is_inherited_from_partition_ancestor(relation, column))
+                {
                     return Err(format!(
                         "identity column '{}.{}' must have exactly one owned identity sequence",
                         relation.id, column

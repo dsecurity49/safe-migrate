@@ -13,8 +13,9 @@ impl<T> AnalysisOutcome<T> {
     pub(crate) fn new(
         findings: Vec<T>,
         confidence: Confidence,
-        evidence: Vec<EvidenceRecord>,
+        mut evidence: Vec<EvidenceRecord>,
     ) -> Self {
+        evidence.sort_unstable();
         Self {
             findings,
             confidence,

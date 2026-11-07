@@ -12,7 +12,7 @@ inputs:
     required: false
     default: ""
   cache:
-    description: Explicit trusted Cache V11 path; disables managed GitHub cache restore and save.
+    description: Explicit trusted Cache V12 path; disables managed GitHub cache restore and save.
     required: false
     default: ""
   config:
@@ -112,6 +112,7 @@ runs:
           "$INPUT_PATH" "$INPUT_CONFIG" "$INPUT_OUTPUT_DIR")"
         printf '%s\n' "analysis-mode=${analysis_mode}" >> "$GITHUB_OUTPUT"
 
+        cache_format_version=12
         cache_transport_path=""
         if [ -n "$INPUT_CACHE" ]; then
           cache_path="$INPUT_CACHE"
@@ -135,13 +136,13 @@ runs:
           cache_dir="${baseline_root}/${INPUT_BASELINE}"
           rm -rf -- "$cache_dir"
           mkdir -p -- "$cache_dir"
-          cache_path="${cache_dir}/baseline-v11.cache"
-          cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v11.cache"
+          cache_path="${cache_dir}/baseline-v${cache_format_version}.cache"
+          cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v${cache_format_version}.cache"
         else
           cache_root="${RUNNER_TEMP}/safe-migrate-action"
           mkdir -p "$cache_root"
           cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"
-          cache_path="${cache_dir}/baseline-v11.cache"
+          cache_path="${cache_dir}/baseline-v${cache_format_version}.cache"
         fi
 
         printf '%s\n' "cache-path=${cache_path}" >> "$GITHUB_OUTPUT"
@@ -158,7 +159,7 @@ runs:
           else
             cache_mode=plaintext
           fi
-          cache_prefix="safe-migrate-v11-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
+          cache_prefix="safe-migrate-v${cache_format_version}-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
           printf '%s\n' "cache-prefix=${cache_prefix}" >> "$GITHUB_OUTPUT"
           printf '%s\n' \
             "cache-primary-key=${cache_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
@@ -211,12 +212,26 @@ runs:
         DATABASE_URL: ""
         SAFE_MIGRATE_CACHE_KEY: ""
 
+    - name: Cache source-build dependencies
+      if: ${{ steps.action-install.outputs.install-mode == 'source' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ${{ runner.temp }}/safe-migrate-action-target
+        key: safe-migrate-source-${{ runner.os }}-${{ runner.arch }}-${{ github.action_ref }}
+
     - name: Install safe-migrate
       id: install
       shell: bash
       env:
         INSTALL_MODE: ${{ steps.action-install.outputs.install-mode }}
         RELEASE_VERSION: ${{ steps.action-install.outputs.release-version }}
+        CARGO_TARGET_DIR: ${{ runner.temp }}/safe-migrate-action-target
         DATABASE_URL: ""
         SAFE_MIGRATE_CACHE_KEY: ""
       run: |
@@ -416,20 +431,11 @@ runs:
           fi
 
           set +e
-          env -u DATABASE_URL "$binary" "${command[@]}" --json \
-            > "$json_report" 2> >(tee -a "$diagnostic_log" >&2)
-          json_status=$?
-          env -u DATABASE_URL "$binary" "${command[@]}" --markdown \
-            > "$markdown_report" 2> >(tee -a "$diagnostic_log" >&2)
-          markdown_status=$?
+          env -u DATABASE_URL "$binary" "${command[@]}" --report-dir "$INPUT_OUTPUT_DIR" \
+            >> "$diagnostic_log" 2> >(tee -a "$diagnostic_log" >&2)
+          final_status=$?
           set -e
 
-          final_status="$json_status"
-          if [ "$json_status" -ne "$markdown_status" ]; then
-            final_status=1
-            echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" \
-              | tee -a "$diagnostic_log" >&2
-          fi
           if [ "$operational_failed" = true ]; then
             final_status=1
           fi

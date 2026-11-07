@@ -190,6 +190,7 @@ impl AnalysisState {
         };
         let relation_columns_known =
             !relation.columns.is_empty() || relation.estimated_rows.is_some();
+        let mut identity_descendant_evidence_incomplete = false;
         if let AlterTableActionMutation::SetRuleMode { rule_name, mode } = &alter.action {
             let Some(rule_name) = rule_name else {
                 return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
@@ -221,6 +222,7 @@ impl AnalysisState {
                     | AlterTableActionMutation::DropNotNull { .. }
                     | AlterTableActionMutation::SetType { .. }
                     | AlterTableActionMutation::SetDefault { .. }
+                    | AlterTableActionMutation::AddIdentity { .. }
                     | AlterTableActionMutation::SetStorage { .. }
                     | AlterTableActionMutation::SetCompression { .. }
                     | AlterTableActionMutation::SetStatistics { .. }
@@ -294,6 +296,85 @@ impl AnalysisState {
                     return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 }
             }
+            AlterTableActionMutation::AddIdentity { column, .. } => {
+                let Some(column_state) = relation.get_column(column) else {
+                    return MutationResult::conflict(format!(
+                        "column '{}' does not exist on relation '{}'",
+                        column, alter.id
+                    ));
+                };
+                if self.local.graph.edges().iter().any(|edge| {
+                    edge.dependent == alter.id
+                        && matches!(
+                            edge.kind,
+                            DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                        )
+                }) {
+                    return MutationResult::conflict(
+                        "cannot add identity to a column of a partition",
+                    );
+                }
+                if column_state.is_nullable {
+                    return MutationResult::conflict(format!(
+                        "column '{}' of relation '{}' must be declared NOT NULL before identity can be added",
+                        column, alter.id
+                    ));
+                }
+                if relation.identity_columns.contains_key(column) {
+                    return MutationResult::conflict(format!(
+                        "column '{}' of relation '{}' is already an identity column",
+                        column, alter.id
+                    ));
+                }
+                // PostgreSQL records generated columns in pg_attrdef, so the
+                // default check fires before its generated-column check.
+                let has_default = column_state.default.is_some()
+                    || relation.generated_columns.contains_key(column)
+                    || column_state.generated == Some(true);
+                let data_type = column_state.data_type.clone();
+                if has_default {
+                    return MutationResult::conflict(format!(
+                        "column '{}' of relation '{}' already has a default value",
+                        column, alter.id
+                    ));
+                }
+                let Some(data_type) = data_type else {
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+                };
+                if crate::_internal::analysis::state::apply_sequence::sequence_type(&data_type)
+                    .is_none()
+                {
+                    return MutationResult::conflict(
+                        "identity column type must be smallint, integer, or bigint".to_string(),
+                    );
+                }
+                // Adding identity to a partitioned table recurses into every
+                // existing partition, where a local default aborts the whole
+                // statement (PostgreSQL's ATExecAddIdentity).
+                let mut descendant_evidence_incomplete = false;
+                for descendant in self.partition_descendants(&alter.id) {
+                    let Some(RelationOverlay::Present(child)) =
+                        self.local.relations.get(&descendant)
+                    else {
+                        descendant_evidence_incomplete = true;
+                        continue;
+                    };
+                    let Some(child_column) = child.get_column(column) else {
+                        descendant_evidence_incomplete = true;
+                        continue;
+                    };
+                    if child_column.default.is_some()
+                        || child.generated_columns.contains_key(column)
+                        || child_column.generated == Some(true)
+                    {
+                        return MutationResult::conflict(format!(
+                            "column '{}' of relation '{}' already has a default value",
+                            column, descendant
+                        ));
+                    }
+                }
+                identity_descendant_evidence_incomplete = descendant_evidence_incomplete;
+            }
             AlterTableActionMutation::SetNotNull { column }
             | AlterTableActionMutation::DropNotNull { column }
             | AlterTableActionMutation::SetType { column, .. }
@@ -309,6 +390,15 @@ impl AnalysisState {
             {
                 return MutationResult::conflict(format!(
                     "column '{}' does not exist on relation '{}'",
+                    column, alter.id
+                ));
+            }
+            AlterTableActionMutation::SetDefault { column, .. }
+            | AlterTableActionMutation::DropNotNull { column }
+                if relation.identity_columns.contains_key(column) =>
+            {
+                return MutationResult::conflict(format!(
+                    "column \"{}\" of relation \"{}\" is an identity column",
                     column, alter.id
                 ));
             }
@@ -397,15 +487,20 @@ impl AnalysisState {
             AlterTableActionMutation::ValidateConstraint {
                 constraint_name: name,
             } => {
-                if !self
+                let Some(constraint) = self
                     .local
                     .constraints
-                    .contains_key(&(alter.id.clone(), name.clone()))
-                {
+                    .get(&(alter.id.clone(), name.clone()))
+                else {
                     return MutationResult::conflict(format!(
                         "constraint '{}' does not exist on relation '{}'",
                         name, alter.id
                     ));
+                };
+                // PostgreSQL returns without a scan when the constraint is
+                // already valid.
+                if constraint.validated {
+                    return MutationResult::NoOp;
                 }
             }
             AlterTableActionMutation::RenameConstraint { old_name, new_name } => {
@@ -672,6 +767,15 @@ impl AnalysisState {
                     return MutationResult::conflict(format!(
                         "partition '{}' is already attached to '{}'",
                         child, existing_parent
+                    ));
+                }
+                if let Some(RelationOverlay::Present(child_relation)) =
+                    self.local.relations.get(child)
+                    && let Some(identity_column) = child_relation.identity_columns.keys().min()
+                {
+                    return MutationResult::conflict(format!(
+                        "table '{}' being attached contains an identity column '{}'",
+                        child, identity_column
                     ));
                 }
                 match self.partition_attachment_is_compatible(&alter.id, child) {
@@ -1012,6 +1116,12 @@ impl AnalysisState {
             }
             _ => {}
         }
+        if identity_descendant_evidence_incomplete {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+        }
 
         let trigger_mode = match &alter.action {
             AlterTableActionMutation::DisableTrigger { trigger_name } => Some((
@@ -1260,6 +1370,27 @@ impl AnalysisState {
                 | crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored
                 | crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual => None,
             },
+            AlterTableActionMutation::AddIdentity {
+                column,
+                identity_sequence,
+                ..
+            } => {
+                if let Some(explicit_id) = &identity_sequence.sequence_name
+                    && explicit_id.schema != alter.id.schema
+                {
+                    return MutationResult::conflict(
+                        "sequence must be in the same schema as the table".to_string(),
+                    );
+                }
+                Some((
+                    identity_sequence.sequence_name.clone().unwrap_or_else(|| {
+                        self.next_implicit_sequence_id(&alter.id, column, &HashSet::new())
+                    }),
+                    column.clone(),
+                    SequenceKind::Identity,
+                    Some(identity_sequence.clone()),
+                ))
+            }
             _ => None,
         };
         if let Some((sequence_id, _, _, _)) = &implicit_add

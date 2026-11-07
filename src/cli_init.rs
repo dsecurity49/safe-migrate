@@ -54,7 +54,15 @@ pub(crate) fn run(command: InitCommands) -> Result<()> {
             force,
             configure_secrets,
         } => {
-            let branch = branch.unwrap_or_else(detect_default_branch);
+            if configure_secrets && !std::io::stdin().is_terminal() {
+                return Err(anyhow!(
+                    "--configure-secrets requires an interactive terminal; use `gh secret set` directly in automation"
+                ));
+            }
+            let branch = match branch {
+                Some(branch) => branch,
+                None => detect_default_branch()?,
+            };
             run_github_actions(&path, &branch, &output_dir, force, configure_secrets)
         }
     }
@@ -113,7 +121,7 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn detect_default_branch() -> String {
+fn detect_default_branch() -> Result<String> {
     Command::new("git")
         .args([
             "symbolic-ref",
@@ -133,7 +141,11 @@ fn detect_default_branch() -> String {
                 .filter(|branch| !branch.is_empty())
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| "main".to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "Could not detect the default branch from origin/HEAD. Run `git remote set-head origin --auto` or pass --branch explicitly."
+            )
+        })
 }
 
 fn github_actions_workflows(migration_path: &str, branch: &str) -> (String, String) {
@@ -165,10 +177,22 @@ jobs:
         with:
           persist-credentials: false
       - uses: dsecurity49/safe-migrate@{action_ref}
+        id: safe-migrate
         env:
           SAFE_MIGRATE_CACHE_KEY: ${{{{ secrets.SAFE_MIGRATE_CACHE_KEY }}}}
         with:
           path: {path}
+      - name: Upload analysis reports
+        if: ${{{{ always() }}}}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: safe-migrate-reports
+          path: |
+            ${{{{ steps.safe-migrate.outputs.json-report }}}}
+            ${{{{ steps.safe-migrate.outputs.markdown-report }}}}
+            ${{{{ steps.safe-migrate.outputs.diagnostic-log }}}}
+          if-no-files-found: warn
+          retention-days: 14
 "#
     );
     let baseline = format!(
@@ -274,6 +298,22 @@ fn warn_if_github_environment_is_unprotected(environment: &str) {
     }
 }
 
+fn ensure_github_cli_ready() -> Result<()> {
+    let status = Command::new("gh")
+        .args(["auth", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Could not run `gh`; install GitHub CLI first")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "GitHub CLI is not authenticated; run `gh auth login` before using --configure-secrets"
+        ));
+    }
+    Ok(())
+}
+
 fn set_github_secret(name: &str, value: Option<&str>, environment: Option<&str>) -> Result<()> {
     let mut command = Command::new("gh");
     command.args(github_secret_args(name, environment));
@@ -331,11 +371,6 @@ fn run_github_actions(
     force: bool,
     configure_secrets: bool,
 ) -> Result<()> {
-    if configure_secrets && !std::io::stdin().is_terminal() {
-        return Err(anyhow!(
-            "--configure-secrets requires an interactive terminal; use `gh secret set` directly in automation"
-        ));
-    }
     if migration_path.is_absolute()
         || migration_path
             .components()
@@ -357,6 +392,16 @@ fn run_github_actions(
     validate_single_line("migration path", migration_path)?;
     validate_single_line("branch", branch)?;
 
+    install_github_actions(migration_path, branch, output_dir, force, configure_secrets)
+}
+
+fn install_github_actions(
+    migration_path: &str,
+    branch: &str,
+    output_dir: &Path,
+    force: bool,
+    configure_secrets: bool,
+) -> Result<()> {
     reject_symlink_components(output_dir)?;
     if output_dir.exists() && !output_dir.is_dir() {
         return Err(anyhow!(
@@ -389,32 +434,29 @@ fn run_github_actions(
             ));
         }
     }
+    if configure_secrets {
+        ensure_github_cli_ready()?;
+    }
     fs::create_dir_all(output_dir)
         .with_context(|| format!("Could not create {}", output_dir.display()))?;
 
     let (analysis_workflow, baseline_workflow) = github_actions_workflows(migration_path, branch);
-    fs::write(&analysis_output, analysis_workflow)
-        .with_context(|| format!("Could not write {}", analysis_output.display()))?;
-    fs::write(&baseline_output, baseline_workflow)
-        .with_context(|| format!("Could not write {}", baseline_output.display()))?;
+    let analysis_temp = prepare_workflow_file(&analysis_output, &analysis_workflow)?;
+    let baseline_temp = prepare_workflow_file(&baseline_output, &baseline_workflow)?;
+    persist_workflow(analysis_temp, &analysis_output)?;
+    persist_workflow(baseline_temp, &baseline_output).with_context(|| {
+        format!(
+            "Replaced {} but could not replace {}; inspect both files before retrying",
+            display_path(&analysis_output),
+            display_path(&baseline_output)
+        )
+    })?;
 
     println!("Created {}", display_path(&analysis_output));
     println!("Created {}", display_path(&baseline_output));
     if configure_secrets {
-        warn_if_github_environment_is_unprotected(BASELINE_ENVIRONMENT);
-        println!(
-            "Enter SAFE_MIGRATE_DATABASE_URL for the {BASELINE_ENVIRONMENT} environment when GitHub CLI prompts for it."
-        );
-        set_github_secret(
-            "SAFE_MIGRATE_DATABASE_URL",
-            None,
-            Some(BASELINE_ENVIRONMENT),
-        )?;
-        let key = generate_cache_key()?;
-        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(key.as_str()), None)?;
-        println!(
-            "Configured the database URL as an environment secret and the generated cache key as a repository secret."
-        );
+        configure_github_secrets()
+            .context("Workflow files were created, but secret configuration is incomplete")?;
     } else {
         println!(
             "Create the {BASELINE_ENVIRONMENT} environment, store SAFE_MIGRATE_DATABASE_URL in it, and store SAFE_MIGRATE_CACHE_KEY as a repository secret."
@@ -427,9 +469,83 @@ fn run_github_actions(
     Ok(())
 }
 
+fn prepare_workflow_file(destination: &Path, contents: &str) -> Result<tempfile::NamedTempFile> {
+    let output_dir = destination
+        .parent()
+        .context("Workflow output has no parent directory")?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".safe-migrate-workflow-")
+        .suffix(".tmp")
+        .tempfile_in(output_dir)
+        .with_context(|| {
+            format!(
+                "Could not create a temporary workflow file in {}",
+                output_dir.display()
+            )
+        })?;
+    file.write_all(contents.as_bytes()).with_context(|| {
+        format!(
+            "Could not write temporary workflow for {}",
+            destination.display()
+        )
+    })?;
+    file.as_file().sync_all().with_context(|| {
+        format!(
+            "Could not flush temporary workflow for {}",
+            destination.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn persist_workflow(temporary: tempfile::NamedTempFile, destination: &Path) -> Result<()> {
+    temporary
+        .persist(destination)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("Could not replace {}", destination.display()))
+}
+
+fn configure_github_secrets() -> Result<()> {
+    warn_if_github_environment_is_unprotected(BASELINE_ENVIRONMENT);
+    println!(
+        "Enter SAFE_MIGRATE_DATABASE_URL for the {BASELINE_ENVIRONMENT} environment when GitHub CLI prompts for it."
+    );
+    set_github_secret(
+        "SAFE_MIGRATE_DATABASE_URL",
+        None,
+        Some(BASELINE_ENVIRONMENT),
+    )
+    .context("No secrets were configured: GitHub CLI could not set SAFE_MIGRATE_DATABASE_URL")?;
+    let key = generate_cache_key().context(
+        "SAFE_MIGRATE_DATABASE_URL was configured, but the cache key could not be generated; run `safe-migrate init cache-key --set-github-secret`",
+    )?;
+    set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(key.as_str()), None).context(
+        "SAFE_MIGRATE_DATABASE_URL was configured, but SAFE_MIGRATE_CACHE_KEY was not; run `safe-migrate init cache-key --set-github-secret`",
+    )?;
+    println!(
+        "Configured the database URL as an environment secret and the generated cache key as a repository secret."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_analysis_workflow_uploads_reports_from_one_action_run() {
+        let (analysis, _) = github_actions_workflows("migrations", "main");
+        assert_eq!(analysis.matches("dsecurity49/safe-migrate@").count(), 1);
+        assert!(analysis.contains("id: safe-migrate"));
+        assert!(
+            analysis.contains("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+        );
+        assert!(analysis.contains("if: ${{ always() }}"));
+        assert!(analysis.contains("steps.safe-migrate.outputs.json-report"));
+        assert!(analysis.contains("steps.safe-migrate.outputs.markdown-report"));
+        assert!(analysis.contains("steps.safe-migrate.outputs.diagnostic-log"));
+    }
 
     #[test]
     fn database_secret_is_scoped_to_the_baseline_environment() {
@@ -498,6 +614,179 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(!workflow_target.join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    struct PathGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathGuard {
+        fn prepend(directory: &Path) -> Self {
+            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+            let lock = LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("PATH");
+            let mut paths = vec![directory.to_path_buf()];
+            if let Some(previous) = &previous {
+                paths.extend(std::env::split_paths(previous));
+            }
+            let path = std::env::join_paths(paths).expect("the test PATH is valid");
+            unsafe {
+                std::env::set_var("PATH", path);
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("PATH", value),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_github_cli(directory: &Path, script: &str) -> PathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let gh = directory.join("gh");
+        fs::write(&gh, script).unwrap();
+        let mut permissions = fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&gh, permissions).unwrap();
+        PathGuard::prepend(directory)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_actions_preflights_github_authentication_before_writing_workflows() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_dir = workspace.path().join("workflows");
+        let _gh = fake_github_cli(
+            workspace.path(),
+            "#!/bin/sh\nif [ \"$1\" = auth ]; then exit 1; fi\nexit 1\n",
+        );
+
+        let error = install_github_actions("migrations", "main", &output_dir, false, true)
+            .expect_err("unauthenticated GitHub CLI must fail setup");
+        assert!(
+            format!("{error:#}").contains("not authenticated"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!output_dir.join(ANALYSIS_WORKFLOW).exists());
+        assert!(!output_dir.join(BASELINE_WORKFLOW).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_actions_reports_completed_secret_when_cache_key_fails() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_dir = workspace.path().join("workflows");
+        let _gh = fake_github_cli(
+            workspace.path(),
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+  auth) exit 0 ;;
+  api) printf '%s\n' '{"protection_rules":[{"type":"required_reviewers"}]}'; exit 0 ;;
+  secret)
+    case "$2" in
+      set)
+        case "$3" in
+          SAFE_MIGRATE_DATABASE_URL) exit 0 ;;
+          SAFE_MIGRATE_CACHE_KEY) exit 1 ;;
+        esac
+        ;;
+    esac
+    ;;
+esac
+exit 1
+"#,
+        );
+
+        let error = install_github_actions("migrations", "main", &output_dir, false, true)
+            .expect_err("failed cache-key configuration must fail setup");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("SAFE_MIGRATE_DATABASE_URL was configured"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("SAFE_MIGRATE_CACHE_KEY"),
+            "unexpected error: {rendered}"
+        );
+        assert!(output_dir.join(ANALYSIS_WORKFLOW).exists());
+        assert!(output_dir.join(BASELINE_WORKFLOW).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_write_failure_leaves_existing_files_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let output_dir = workspace.path().join("workflows");
+        fs::create_dir(&output_dir).unwrap();
+        let analysis_output = output_dir.join(ANALYSIS_WORKFLOW);
+        let baseline_output = output_dir.join(BASELINE_WORKFLOW);
+        fs::write(&analysis_output, "old analysis").unwrap();
+        fs::write(&baseline_output, "old baseline").unwrap();
+
+        let mut permissions = fs::metadata(&output_dir).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&output_dir, permissions).unwrap();
+
+        let probe = output_dir.join("probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            permissions = fs::metadata(&output_dir).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&output_dir, permissions).unwrap();
+            return;
+        }
+
+        let error = install_github_actions("migrations", "main", &output_dir, true, false)
+            .expect_err("an unwritable output directory must fail the write");
+        permissions = fs::metadata(&output_dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&output_dir, permissions).unwrap();
+
+        assert!(
+            format!("{error:#}").contains("temporary"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&analysis_output).unwrap(),
+            "old analysis"
+        );
+        assert_eq!(
+            fs::read_to_string(&baseline_output).unwrap(),
+            "old baseline"
+        );
+        let leftovers = fs::read_dir(&output_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".safe-migrate-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

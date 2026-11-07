@@ -145,3 +145,58 @@ Run the isolated comparison with:
 ```sh
 cargo test --locked --jobs 1 --lib internal_tests::performance_scenarios::large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
 ```
+
+## Temporary-namespace resolution (2026-11-06)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. A 1,000-relation synchronized baseline resolves `integer`
+10,000 times after a temporary table is created and the creating transaction is
+rolled back. The old implementation scanned every relation and type on each
+resolution to prove the namespace was gone. The measurement was 1,978 ms; the
+same process measured 154 ms with the scan hint forced off, so the scan
+accounted for most of the difference.
+
+The exact namespace flag removes that scan. Five runs after the change measured
+62, 62, 62, 65, and 61 ms after the rollback (median **62 ms**) and 93, 92, 92,
+92, and 93 ms with the namespace present (median **92 ms**). PostgreSQL was
+checked directly for the lifecycle the flag models: a rollback removes a
+namespace created in that transaction, while dropping the last temporary object
+or committing `ON COMMIT DROP` keeps it.
+
+```sh
+cargo test --locked --lib large_baseline_type_resolution_after_temp_rollback -- --ignored --nocapture --test-threads=1
+```
+
+## Pre-state read footprint (2026-11-06)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. Before this change every transition copied all ten
+pre-state catalog families; a transition analysis now copies only the families
+and identities its rules can read. Composite-type actions that inspect every
+relation still use the full family, and routine drops keep the whole function
+family because drift resolves an unqualified signature after the drop has run.
+
+The first table measures 1,000 capture calls against a synchronized baseline.
+The second measures 1,000 `ALTER TABLE ... DROP COLUMN ... IF EXISTS` mutations
+and includes building each mutation's read footprint.
+
+| Relations | Capture, full | Capture, selective |
+| ---: | ---: | ---: |
+| 100 | 572 ms | 7 ms |
+| 1,000 | 8,438 ms | 14 ms |
+| 10,000 | 87,972 ms | 89 ms |
+
+| Relations | Mutations, full | Mutations, selective |
+| ---: | ---: | ---: |
+| 100 | 522 ms | 16 ms |
+| 1,000 | 7,322 ms | 28 ms |
+| 10,000 | 83,117 ms | 128 ms |
+
+A differential test runs the same 24-statement chain with selective and
+full-family capture and requires identical findings, including the
+`type-change-rewrite` and `require-concurrent-drop-index` diagnostics.
+
+```sh
+cargo test --locked --lib pre_state_capture_against_large_baselines -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib thousand_alter_mutations_against_large_baselines -- --ignored --nocapture --test-threads=1
+```

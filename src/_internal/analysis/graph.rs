@@ -126,7 +126,9 @@ pub(crate) struct DependencyGraph {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GraphIndexes {
     rename_by_source: HashMap<ObjectId, usize>,
+    by_dependent: HashMap<ObjectId, Vec<usize>>,
     by_resolved_referenced: HashMap<ObjectId, Vec<usize>>,
+    by_resolved_dependent: HashMap<ObjectId, Vec<usize>>,
 }
 
 impl Clone for DependencyGraph {
@@ -238,14 +240,39 @@ impl DependencyGraph {
         }
 
         for (index, edge) in edges.iter().enumerate() {
+            indexes
+                .by_dependent
+                .entry(edge.dependent.clone())
+                .or_default()
+                .push(index);
             let referenced = Self::resolve_rename_with(edges, &indexes, &edge.referenced).clone();
             indexes
                 .by_resolved_referenced
                 .entry(referenced)
                 .or_default()
                 .push(index);
+            let dependent = Self::resolve_rename_with(edges, &indexes, &edge.dependent).clone();
+            indexes
+                .by_resolved_dependent
+                .entry(dependent)
+                .or_default()
+                .push(index);
         }
         indexes
+    }
+
+    pub(crate) fn edges_for_dependents<'a>(
+        &'a self,
+        dependents: &HashSet<ObjectId>,
+    ) -> impl Iterator<Item = &'a DependencyEdge> {
+        let indexes = self.indexes();
+        let mut positions = dependents
+            .iter()
+            .flat_map(|id| indexes.by_dependent.get(id).into_iter().flatten().copied())
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        positions.into_iter().map(|index| &self.edges[index])
     }
 
     fn resolve_rename_with<'a>(
@@ -270,6 +297,16 @@ impl DependencyGraph {
         let target = self.resolve_rename(id);
         self.indexes()
             .by_resolved_referenced
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.edges[*index])
+    }
+
+    fn resolved_dependent_edges(&self, id: &ObjectId) -> impl Iterator<Item = &DependencyEdge> {
+        let target = self.resolve_rename(id);
+        self.indexes()
+            .by_resolved_dependent
             .get(target)
             .into_iter()
             .flatten()
@@ -514,12 +551,21 @@ impl DependencyGraph {
                 // attachment instead of looping or extending the cycle.
                 return true;
             }
-            let maybe_edge = self.edges.iter().find(|edge| {
-                matches!(
-                    edge.kind,
-                    DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
-                ) && self.resolve_rename(&edge.dependent) == current_parent
-            });
+            let maybe_edge = if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+                self.resolved_dependent_edges(current_parent).find(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                })
+            } else {
+                self.edges.iter().find(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    ) && self.resolve_rename(&edge.dependent) == current_parent
+                })
+            };
             if let Some(edge) = maybe_edge {
                 let p = self.resolve_rename(&edge.referenced);
                 if p == resolved_child {
@@ -549,15 +595,28 @@ impl DependencyGraph {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            for edge in self.edges.iter().filter(|edge| {
-                matches!(edge.kind, DependencyKind::InheritanceOf)
-                    && self.resolve_rename(&edge.dependent) == current
-            }) {
-                let ancestor = self.resolve_rename(&edge.referenced);
-                if ancestor == resolved_child {
-                    return true;
+            if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+                for edge in self
+                    .resolved_dependent_edges(current)
+                    .filter(|edge| matches!(edge.kind, DependencyKind::InheritanceOf))
+                {
+                    let ancestor = self.resolve_rename(&edge.referenced);
+                    if ancestor == resolved_child {
+                        return true;
+                    }
+                    pending.push(ancestor);
                 }
-                pending.push(ancestor);
+            } else {
+                for edge in self.edges.iter().filter(|edge| {
+                    matches!(edge.kind, DependencyKind::InheritanceOf)
+                        && self.resolve_rename(&edge.dependent) == current
+                }) {
+                    let ancestor = self.resolve_rename(&edge.referenced);
+                    if ancestor == resolved_child {
+                        return true;
+                    }
+                    pending.push(ancestor);
+                }
             }
         }
         false
@@ -910,15 +969,18 @@ impl DependencyGraph {
                 else {
                     continue;
                 };
-                let index_keys = definition
-                    .keys
-                    .iter_mut()
-                    .chain(&mut definition.included)
-                    .filter_map(|key| match &mut key.kind {
-                        crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
-                        crate::_internal::model::index::IndexKeyKind::Expression(_) => None,
-                    })
-                    .collect::<Vec<&mut String>>();
+                let mut index_keys = Vec::new();
+                for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                    match &mut key.kind {
+                        crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                            index_keys.push(name);
+                        }
+                        crate::_internal::model::index::IndexKeyKind::CatalogExpression(expr) => {
+                            expr.rename_column(old_name, new_name);
+                        }
+                        crate::_internal::model::index::IndexKeyKind::Expression(_) => {}
+                    }
+                }
                 for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {
                     if column == old_name {
                         *column = new_name.to_string();
@@ -1433,5 +1495,46 @@ mod tests {
         assert!(graph.cascade_edges(&parent).iter().any(|edge| {
             edge.dependent == child && matches!(edge.kind, DependencyKind::InheritanceOf)
         }));
+    }
+
+    #[test]
+    fn large_graph_cycle_checks_use_indexes_and_match_unindexed() {
+        let mut graph = DependencyGraph::new();
+        for index in 0..DependencyGraph::CASCADE_INDEX_MIN_EDGES {
+            let child = id(&format!("part_child_{index}"));
+            let parent = id(&format!("part_parent_{index}"));
+            graph.add_edge(DependencyEdge::new(
+                child,
+                parent,
+                DependencyKind::PartitionOf,
+            ));
+        }
+        assert!(graph.cascade_index_is_worthwhile());
+        // part_parent_0 has child part_child_0; attaching part_parent_0 to part_child_0 creates a cycle
+        assert!(graph.check_partition_cycle(&id("part_child_0"), &id("part_parent_0")));
+        assert!(!graph.check_partition_cycle(&id("part_parent_0"), &id("unrelated")));
+
+        // Multi-parent inheritance cycle check with indexed vs unindexed comparison
+        let multi_child = id("multi_child");
+        let first_parent = id("first_parent");
+        let second_parent = id("second_parent");
+        let ancestor = id("ancestor_via_second");
+        graph.add_edge(DependencyEdge::new(
+            second_parent.clone(),
+            ancestor.clone(),
+            DependencyKind::InheritanceOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            multi_child.clone(),
+            first_parent,
+            DependencyKind::InheritanceOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            multi_child.clone(),
+            second_parent,
+            DependencyKind::InheritanceOf,
+        ));
+        assert!(graph.check_inheritance_cycle(&multi_child, &ancestor));
+        assert!(!graph.check_inheritance_cycle(&ancestor, &multi_child));
     }
 }

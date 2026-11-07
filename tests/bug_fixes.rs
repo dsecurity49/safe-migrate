@@ -88,6 +88,39 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
+    fn execute_string_after_same_line_statement_is_analyzed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze("SELECT 1; EXECUTE 'DROP DATABASE production';", &mut state)
+            .expect("EXECUTE after another same-line statement must parse");
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "opaque-dynamic-sql"),
+            "the normalized EXECUTE statement must remain opaque"
+        );
+    }
+
+    #[test]
+    fn execute_text_inside_multiline_string_literal_is_analyzed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let result = engine.analyze(
+            "INSERT INTO logs (msg) VALUES ('first line\nEXECUTE ''second line''');",
+            &mut state,
+        );
+
+        assert!(
+            result.is_ok(),
+            "EXECUTE text inside a string literal must not be rewritten: {result:?}"
+        );
+    }
+
+    #[test]
     fn test_bug008_index_not_in_baseline_relations() {
         let mut cache = synced_cache();
         cache.indexes.push(baseline_index(
@@ -666,6 +699,17 @@ mod phase10_bug_fixes_and_sorting_tests {
         assert!(recipe.contains("\"Billing\""), "{recipe}");
         assert!(recipe.contains("audit_log"), "{recipe}");
         assert!(recipe.contains("audit_log and reporting"), "{recipe}");
+
+        // Union with existing scope prevents cache overwrite trap.
+        let scoped_recipe = NotEvaluated::recipe_with_scope(
+            EvidenceCode::CatalogCoverageIncomplete,
+            &["billing".to_string()],
+            Some(&["public".to_string(), "orders".to_string()]),
+        );
+        assert!(
+            scoped_recipe.contains("safe-migrate sync --schemas public,orders,billing"),
+            "{scoped_recipe}"
+        );
 
         // With nothing to name, the recipe falls back to describing the fix.
         let generic_recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &[]);

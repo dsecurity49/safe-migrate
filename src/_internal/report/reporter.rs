@@ -60,6 +60,14 @@ pub(crate) fn compute_verdict_with(
     violations: &[Violation],
     not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
 ) -> Verdict {
+    compute_verdict_with_iter(violations.iter(), not_evaluated)
+}
+
+/// As [`compute_verdict_with`], borrowing violations from any source.
+pub(crate) fn compute_verdict_with_iter<'a>(
+    violations: impl Iterator<Item = &'a Violation>,
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) -> Verdict {
     let verdict = verdict_from_violations(violations);
     let blocked_by_gap = matches!(verdict, Verdict::Safe | Verdict::SafeWithRisk)
         && not_evaluated
@@ -72,12 +80,16 @@ pub(crate) fn compute_verdict_with(
     }
 }
 
-fn verdict_from_violations(violations: &[Violation]) -> Verdict {
-    let has_tier1 = violations.iter().any(|v| v.tier == ViolationTier::Tier1);
-    let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
-    let has_irreversible_tier3 = violations
-        .iter()
-        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == IRREVERSIBLE_MIGRATION_RULE_ID);
+fn verdict_from_violations<'a>(violations: impl Iterator<Item = &'a Violation>) -> Verdict {
+    let mut has_tier1 = false;
+    let mut has_tier2 = false;
+    let mut has_irreversible_tier3 = false;
+    for violation in violations {
+        has_tier1 |= violation.tier == ViolationTier::Tier1;
+        has_tier2 |= violation.tier == ViolationTier::Tier2;
+        has_irreversible_tier3 |= violation.tier == ViolationTier::Tier3
+            && violation.rule_id == IRREVERSIBLE_MIGRATION_RULE_ID;
+    }
 
     match (has_tier1, has_tier2, has_irreversible_tier3) {
         (true, _, _) => Verdict::Halt,
@@ -611,6 +623,70 @@ fn group_not_evaluated(not_evaluated: &[NotEvaluated]) -> Vec<NotEvaluatedGroup<
     groups
 }
 
+fn format_rule_summary_markdown(rules: &[(&'static str, &ViolationTier)]) -> String {
+    if rules.len() <= 3 {
+        rules
+            .iter()
+            .map(|(rule_id, tier)| format!("`{}` ({:?})", markdown_code(rule_id), tier))
+            .collect::<Vec<_>>()
+            .join("<br>")
+    } else {
+        let mut t1 = 0;
+        let mut t2 = 0;
+        let mut t3 = 0;
+        for (_, tier) in rules {
+            match tier {
+                ViolationTier::Tier1 => t1 += 1,
+                ViolationTier::Tier2 => t2 += 1,
+                ViolationTier::Tier3 => t3 += 1,
+            }
+        }
+        let mut parts = Vec::new();
+        if t1 > 0 {
+            parts.push(format!("{t1} Tier 1"));
+        }
+        if t2 > 0 {
+            parts.push(format!("{t2} Tier 2"));
+        }
+        if t3 > 0 {
+            parts.push(format!("{t3} Tier 3"));
+        }
+        format!("{} rules ({})", rules.len(), parts.join(", "))
+    }
+}
+
+fn format_rule_summary_terminal(rules: &[(&'static str, &ViolationTier)]) -> String {
+    if rules.len() <= 3 {
+        rules
+            .iter()
+            .map(|(rule_id, tier)| format!("{} [{:?}]", terminal_inline(rule_id), tier))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        let mut t1 = 0;
+        let mut t2 = 0;
+        let mut t3 = 0;
+        for (_, tier) in rules {
+            match tier {
+                ViolationTier::Tier1 => t1 += 1,
+                ViolationTier::Tier2 => t2 += 1,
+                ViolationTier::Tier3 => t3 += 1,
+            }
+        }
+        let mut parts = Vec::new();
+        if t1 > 0 {
+            parts.push(format!("{t1} Tier 1"));
+        }
+        if t2 > 0 {
+            parts.push(format!("{t2} Tier 2"));
+        }
+        if t3 > 0 {
+            parts.push(format!("{t3} Tier 3"));
+        }
+        format!("{} rules skipped ({})", rules.len(), parts.join(", "))
+    }
+}
+
 fn append_markdown_not_evaluated(output: &mut String, not_evaluated: &[NotEvaluated]) {
     if not_evaluated.is_empty() {
         return;
@@ -630,12 +706,7 @@ causes, rules, and remedies.</summary>\n\n"
     ));
     output.push_str("| Cause | Rules | Remedy |\n| --- | --- | --- |\n");
     for group in groups {
-        let rules = group
-            .rules
-            .iter()
-            .map(|(rule_id, tier)| format!("`{}` ({:?})", markdown_code(rule_id), tier))
-            .collect::<Vec<_>>()
-            .join("<br>");
+        let rules = format_rule_summary_markdown(&group.rules);
         output.push_str(&format!(
             "| `{}` | {} | {} |\n",
             markdown_code(group.cause),
@@ -655,12 +726,7 @@ pub(crate) fn human_not_evaluated(not_evaluated: &[NotEvaluated]) -> String {
     let mut output = format!(" Checks not evaluated ({}):\n", not_evaluated.len());
     for group in groups {
         output.push_str(&format!("   - {}\n", terminal_inline(group.cause)));
-        let rules = group
-            .rules
-            .iter()
-            .map(|(rule_id, tier)| format!("{} [{:?}]", terminal_inline(rule_id), tier))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let rules = format_rule_summary_terminal(&group.rules);
         output.push_str(&format!("       rules  : {rules}\n"));
         output.push_str(&format!(
             "       remedy : {}\n",

@@ -5,6 +5,73 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## Unreleased (v0.13.0)
+
+- `ALTER TYPE ... DROP ATTRIBUTE` on composite types used by table columns now
+  reports an `irreversible-migration` data-loss warning.
+- Range types restored from cache re-hydrate their operator class, canonical
+  routine, and subtype-diff routine identities so routine renames and drops
+  track dependencies with full fidelity.
+- `EXECUTE '...'` normalization now understands statement boundaries, string
+  literals, comments, and dollar-quoted bodies, so `EXECUTE` on the same line as
+  another statement is analyzed and text inside literals or comments is left
+  unchanged.
+- `ALTER TABLE ... VALIDATE CONSTRAINT` is now checked by `blocking-constraint`:
+  validating a large table reports the full scan, and re-validating an already
+  valid constraint stays silent.
+- Attaching a partition now clones the parent's foreign keys onto it, and adding
+  a foreign key to a partitioned table clones it onto existing partitions. A
+  detached partition keeps that reference, so a later `DROP TABLE ... RESTRICT`
+  of the referenced table is no longer reported as safe.
+- `ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ... AS IDENTITY` now creates
+  the backing identity sequence (with PostgreSQL's collision suffixing),
+  validates the NOT NULL/default/type preconditions, and propagates the
+  identity to existing and newly attached partitions.
+- Synchronizing a partitioned table with identity columns no longer fails cache
+  validation: partitions inherit the parent's identity sequence ownership
+  instead of being required to own a sequence themselves.
+- Function and procedure definitions with a string-literal `AS $$...$$` body no
+  longer mark the analysis chain as unsupported. PostgreSQL records no catalog
+  dependencies for those bodies, so later dependency checks are not weakened.
+- A compound statement that fails and rolls back no longer leaves its skipped
+  checks in the report, so an aborted statement cannot pollute later statements
+  or the final summary.
+- `lint` and `lint-chain` accept `--report-dir` to write the JSON and Markdown
+  reports from a single analysis pass; the GitHub Action now uses it instead of
+  analyzing every migration twice.
+- `init github-actions` now uploads the JSON, Markdown, and diagnostic reports
+  as workflow artifacts, so a failing check leaves inspectable evidence.
+- Unevaluated check lists in the terminal and Markdown reports now compact into
+  a summary count with tier breakdown when more than 3 rules are skipped.
+- Reminders for unevaluated checks now name the missing schema and provide a
+  union-aware sync command so re-syncing does not overwrite existing scope.
+- Catalog synchronization now parses `pg_get_expr` index predicates and
+  expression keys back into the same expression IR used for migrations. Exact
+  matches are comparable, while statement/catalog differences stay unknown
+  instead of becoming false differences; the cache format is now 12.
+- Composite-type dependency analysis now reports every table that reaches the
+  type through a shared container. Previously a second table could be omitted
+  from the finding, lowering the reported severity when it had the larger row
+  estimate.
+- `init github-actions` now fails with recovery guidance when `origin/HEAD`
+  cannot identify the default branch instead of silently assuming `main`; pass
+  `--branch` to override detection.
+- `init github-actions --configure-secrets` now verifies GitHub CLI
+  authentication before writing either workflow, stages each file before
+  replacement, and reports when the database URL was configured but the cache
+  key was not.
+- Name resolution no longer scans every relation and type to decide whether a
+  rolled-back temporary namespace exists, removing a per-resolution scan of
+  the whole schema model from chains that create and roll back temporary
+  tables.
+- The GitHub Action now caches the Cargo registry and build artifacts for
+  SHA-pinned source installs, so repeat runs reuse compiled dependencies.
+- Each transition now captures only the pre-state catalog families and
+  identities its rules can read, with whole-family fallback where a rule
+  searches an entire family. A recorded 1,000-mutation `ALTER TABLE` chain
+  against 10,000 baseline relations drops from about 83 s to 0.13 s in the
+  debug benchmark.
+
 ## v0.12.0 — 2026-10-31
 
 - Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled

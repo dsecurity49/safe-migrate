@@ -52,6 +52,16 @@ The command creates two files:
 | `.github/workflows/safe-migrate-baseline.yml` | Refresh and publish the encrypted baseline from a trusted job. |
 | `.github/workflows/safe-migrate.yml` | Restore the baseline and analyze pull requests without database access. |
 
+The pull-request workflow uploads the JSON, Markdown, and diagnostic reports as
+the `safe-migrate-reports` artifact even when the check fails.
+
+Before writing either workflow, it verifies that GitHub CLI is installed and
+authenticated and fails with recovery guidance when it is not. Each workflow is
+written to a temporary file in the output directory and then moved into place,
+so a failed preparation leaves existing files untouched. If the database URL is
+configured but the cache key is not, the error names the completed secret and
+the remaining command.
+
 It asks GitHub CLI for the database URL, generates a random 32-byte cache key,
 and sends both directly to GitHub. Neither value is printed or written to a
 workflow file. Before setting the database URL, it checks the environment and
@@ -59,10 +69,10 @@ warns if GitHub reports no required reviewers or deployment-branch restriction,
 or if the environment cannot be found or verified. The warning is non-blocking;
 stop and protect the environment before answering GitHub CLI's secret prompt.
 
-The default branch is detected from `origin/HEAD`, with `main` as the fallback.
-Use `--branch <name>` when detection is wrong. This must be the default or PR
-base branch because GitHub cannot restore a cache from an arbitrary sibling
-branch.
+The default branch is detected from `origin/HEAD`; generation fails with
+recovery guidance when detection is unavailable. Use `--branch <name>` to
+override detection. This must be the default or PR base branch because GitHub
+cannot restore a cache from an arbitrary sibling branch.
 
 ### 3. Connect and bootstrap
 
@@ -89,7 +99,7 @@ match your schema-change rate and runner availability.
 | Merge queue | Never available | Restore only | Offline |
 
 A refresh reads the PostgreSQL catalogs in one read-only, repeatable-read
-transaction. A PR check decrypts and validates Cache V11, parses the proposed
+transaction. A PR check decrypts and validates Cache V12, parses the proposed
 SQL, and simulates its state changes.
 
 Neither path applies the migration.
@@ -158,7 +168,7 @@ The baseline contains:
 It does not contain `DATABASE_URL`, role password hashes, or subscription
 connection strings.
 
-Cache V11 uses authenticated XChaCha20-Poly1305 encryption. Without the key, a
+Cache V12 uses authenticated XChaCha20-Poly1305 encryption. Without the key, a
 modified cache, forged PR cache, or cache encrypted under another key fails
 authentication. The decrypted payload is size-bounded, version-checked, and
 semantically validated before use.

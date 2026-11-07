@@ -489,6 +489,47 @@ impl Rule for ReversibilityRule {
             }
         }
 
+        // Dropping an attribute from a composite type in use by tables causes data loss.
+        if let Mutation::AlterType(a) = mutation
+            && let crate::_internal::analysis::mutations::AlterTypeActionMutation::DropAttribute {
+                name: attr_name,
+                ..
+            } = &a.action
+        {
+            let dependent_relations = pre_state.relations_using_composite(&a.id);
+            if !dependent_relations.is_empty() {
+                let max_rows = dependent_relations
+                    .iter()
+                    .map(|r| r.estimated_rows.unwrap_or(config.default_rows))
+                    .max()
+                    .unwrap_or(config.default_rows);
+                let tier = if max_rows == 0 {
+                    ViolationTier::Tier3
+                } else {
+                    ViolationTier::Tier1
+                };
+                let table_names = dependent_relations
+                    .iter()
+                    .map(|r| r.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    object_kind: ObjectKind::Type,
+                    object_name: a.id.to_string(),
+                    tier,
+                    reason: format!(
+                        "Dropping attribute '{}' from a composite type in use by tables ({}) causes irreversible data loss",
+                        attr_name, table_names
+                    ),
+                    recipe: "Avoid dropping attributes from composite types in production when tables contain data of this type.",
+                    dedup_key: None,
+                    sql: None,
+                });
+            }
+        }
+
         if let Reversibility::Irreversible = classify(mutation) {
             // DropDatabaseRule owns this finding.
             if matches!(mutation, Mutation::DropDatabase(_)) {

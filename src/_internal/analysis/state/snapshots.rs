@@ -232,6 +232,15 @@ impl AnalysisState {
         }
     }
 
+    pub(super) fn snapshot_temp_namespace(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::TempNamespaceSnapshot {
+                previous: self.local.temp_namespace_created,
+                previous_search_path: self.local.search_path.clone(),
+            });
+        }
+    }
+
     pub(super) fn snapshot_search_path(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::SearchPathSnapshot {
@@ -277,8 +286,24 @@ impl AnalysisState {
 
     pub(super) fn snapshot_evidence(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::EvidenceSnapshot {
-                previous: self.local.evidence.clone(),
+            frame.undo_log.push(StateChange::EvidenceLengthMarker {
+                len: self.local.evidence.records().len(),
+            });
+        }
+    }
+
+    pub(super) fn snapshot_not_evaluated(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::NotEvaluatedSnapshot {
+                previous: self.not_evaluated.clone(),
+            });
+        }
+    }
+
+    pub(super) fn snapshot_co_dropped_objects(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::CoDroppedObjectsSnapshot {
+                previous: self.co_dropped_objects.clone(),
             });
         }
     }

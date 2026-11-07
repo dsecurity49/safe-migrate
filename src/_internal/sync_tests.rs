@@ -340,7 +340,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V11(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V12(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
@@ -446,7 +446,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V11(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V12(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         let rel = deserialized.relations.get(&id).unwrap();

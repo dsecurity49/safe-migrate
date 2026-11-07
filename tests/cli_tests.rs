@@ -144,7 +144,14 @@ fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
 
     let mut cmd = crate::common::safe_migrate_command();
     cmd.current_dir(project.path())
-        .args(["init", "github-actions", "--path", "migrations"])
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "migrations",
+            "--branch",
+            "main",
+        ])
         .assert()
         .success();
 
@@ -179,7 +186,14 @@ fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
     let mut overwrite = crate::common::safe_migrate_command();
     let assertion = overwrite
         .current_dir(project.path())
-        .args(["init", "github-actions", "--path", "migrations"])
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "migrations",
+            "--branch",
+            "main",
+        ])
         .assert()
         .failure();
     assert!(
@@ -228,6 +242,8 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
             "github-actions",
             "--path",
             "migrations",
+            "--branch",
+            "main",
             "--configure-secrets",
         ])
         .assert()
@@ -246,6 +262,29 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
         !project
             .path()
             .join(".github/workflows/safe-migrate-baseline.yml")
+            .exists()
+    );
+}
+
+#[test]
+fn init_github_actions_requires_a_detectable_default_branch() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("migrations")).unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assertion = cmd
+        .current_dir(project.path())
+        .args(["init", "github-actions", "--path", "migrations"])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+            .contains("Could not detect the default branch")
+    );
+    assert!(
+        !project
+            .path()
+            .join(".github/workflows/safe-migrate.yml")
             .exists()
     );
 }
@@ -730,7 +769,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 11);
+    assert_eq!(report["format_version"], 12);
     assert_eq!(report["encrypted"], false);
     assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
     assert!(report["coverage"]["families"].is_array());
@@ -1228,6 +1267,210 @@ fn test_cli_rejects_json_and_markdown_together() {
         .arg("--markdown")
         .assert()
         .failure();
+}
+
+#[test]
+fn test_cli_tier2_findings_exit_zero_in_every_output_mode() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("baseline.cache");
+    write_fresh_cache(&cache_path);
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "LOCK TABLE test_table IN EXCLUSIVE MODE;").unwrap();
+
+    for mode in [None, Some("--json"), Some("--markdown")] {
+        let mut cmd = crate::common::safe_migrate_command();
+        cmd.arg("lint")
+            .arg("--file")
+            .arg(sql_file.path())
+            .arg("--cache")
+            .arg(&cache_path)
+            .arg("--no-auto-sync");
+        if let Some(mode) = mode {
+            cmd.arg(mode);
+        }
+        let assert = cmd.assert().success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+        assert!(
+            stdout.contains("CAUTIOUS"),
+            "{mode:?} output should keep the Tier 2 verdict: {stdout}"
+        );
+    }
+
+    let reports = tempfile::tempdir().unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--cache")
+        .arg(&cache_path)
+        .arg("--no-auto-sync")
+        .arg("--report-dir")
+        .arg(reports.path())
+        .assert()
+        .success();
+    assert!(assert.get_output().stdout.is_empty());
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(reports.path().join("safe-migrate-report.json")).unwrap())
+            .expect("valid JSON report");
+    assert_eq!(report["verdict"], "CAUTIOUS");
+}
+
+#[test]
+fn test_cli_report_dir_writes_both_reports_in_one_pass() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "DROP DATABASE production;").unwrap();
+    let reports = tempfile::tempdir().unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--no-cache")
+        .arg("--report-dir")
+        .arg(reports.path())
+        .assert()
+        .code(2);
+
+    let output = assert.get_output();
+    assert!(
+        output.stdout.is_empty(),
+        "report-dir mode must not duplicate reports on stdout"
+    );
+
+    let json_path = reports.path().join("safe-migrate-report.json");
+    let markdown_path = reports.path().join("safe-migrate-report.md");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&json_path).unwrap()).expect("valid JSON report");
+    let markdown = fs::read_to_string(&markdown_path).unwrap();
+
+    assert_eq!(report["verdict"], "HALT");
+    let violations = report["violations"].as_array().unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation["rule_id"] == "drop-database")
+    );
+    assert!(markdown.contains("**Verdict:** HALT"));
+    assert_eq!(
+        markdown.matches("### HALT").count(),
+        violations
+            .iter()
+            .filter(|violation| violation["tier"] == "Tier1")
+            .count()
+    );
+}
+
+#[test]
+fn test_cli_output_modes_agree_on_findings_and_skipped_checks() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        sql_file,
+        "DROP TABLE missing_table;\nDROP DATABASE production;"
+    )
+    .unwrap();
+
+    let run = |mode: Option<&str>| {
+        let mut cmd = crate::common::safe_migrate_command();
+        cmd.arg("lint")
+            .arg("--file")
+            .arg(sql_file.path())
+            .arg("--no-cache");
+        if let Some(mode) = mode {
+            cmd.arg(mode);
+        }
+        cmd.output().unwrap()
+    };
+    let human = run(None);
+    let json = run(Some("--json"));
+    let markdown = run(Some("--markdown"));
+
+    let report = parse_json_stdout(&json);
+    let human = String::from_utf8_lossy(&human.stdout);
+    let markdown = String::from_utf8_lossy(&markdown.stdout);
+    let violations = report["violations"].as_array().unwrap();
+
+    let rule_ids: std::collections::BTreeSet<&str> = violations
+        .iter()
+        .map(|violation| violation["rule_id"].as_str().unwrap())
+        .collect();
+    for rule_id in &rule_ids {
+        assert!(
+            human.contains(&format!("({rule_id})")) || human.contains(&format!("] {rule_id}")),
+            "human output is missing rule '{rule_id}': {human}"
+        );
+        assert!(
+            markdown.contains(&format!("`{rule_id}`")),
+            "markdown output is missing rule '{rule_id}': {markdown}"
+        );
+    }
+
+    for (tier, label) in [("Tier1", "HALT"), ("Tier2", "WARN"), ("Tier3", "SAFE")] {
+        let count = violations
+            .iter()
+            .filter(|violation| violation["tier"] == tier)
+            .count();
+        assert!(
+            human.contains(&format!("{label}: {count}")),
+            "human output disagrees on {tier} count: {human}"
+        );
+        assert!(
+            markdown.contains(&format!("| {label} (Tier {}) | {count} |", &tier[4..])),
+            "markdown output disagrees on {tier} count: {markdown}"
+        );
+    }
+
+    let skipped = report["not_evaluated"].as_array().unwrap();
+    assert!(
+        human.contains(&format!("Checks not evaluated ({})", skipped.len())),
+        "human output disagrees on skipped-check count: {human}"
+    );
+    assert!(
+        markdown.contains(&format!("{} checks were not evaluated", skipped.len())),
+        "markdown output disagrees on skipped-check count: {markdown}"
+    );
+    let causes: std::collections::BTreeSet<&str> = skipped
+        .iter()
+        .map(|entry| entry["cause"].as_str().unwrap())
+        .collect();
+    for cause in causes {
+        assert!(
+            human.contains(&format!("   - {cause}")),
+            "human output is missing skip cause '{cause}': {human}"
+        );
+        assert!(
+            markdown.contains(&format!("| `{cause}` |")),
+            "markdown output is missing skip cause '{cause}': {markdown}"
+        );
+    }
+}
+
+#[test]
+fn test_cli_rejects_report_dir_with_stdout_modes() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();
+    let reports = tempfile::tempdir().unwrap();
+
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--json")
+        .arg("--report-dir")
+        .arg(reports.path())
+        .assert()
+        .code(2);
+
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used together")
+            || stderr.contains("conflict")
+            || stderr.contains("cannot be used with"),
+        "expected mutual exclusion error in stderr: {stderr}"
+    );
 }
 
 #[test]
