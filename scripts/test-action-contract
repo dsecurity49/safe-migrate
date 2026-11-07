@@ -206,6 +206,7 @@ if grep -F 'safe-migrate-redacted."*' "$manifest" >/dev/null; then
   exit 1
 fi
 grep -F "steps.action-install.outputs.install-mode == 'source'" "$manifest" >/dev/null
+grep -F 'safe-migrate-cargo-deps-${{ runner.os }}-${{ runner.arch }}-' "$manifest" >/dev/null
 grep -F 'safe-migrate-source-${{ runner.os }}-${{ runner.arch }}-${{ github.action_ref }}' "$manifest" >/dev/null
 grep -F 'CARGO_TARGET_DIR: ${{ runner.temp }}/safe-migrate-action-target' "$manifest" >/dev/null
 grep -F 'Windows ARM64 runners are not supported' "$manifest" >/dev/null

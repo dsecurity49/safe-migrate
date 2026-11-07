@@ -64,8 +64,9 @@ notes are available on the
   rolled-back temporary namespace exists, removing a per-resolution scan of
   the whole schema model from chains that create and roll back temporary
   tables.
-- The GitHub Action now caches the Cargo registry and build artifacts for
-  SHA-pinned source installs, so repeat runs reuse compiled dependencies.
+- The GitHub Action now separates Cargo dependency caching (keyed by lockfile)
+  from commit-exact target caching for SHA-pinned source installs, allowing
+  dependency reuse across Action updates.
 - Each transition now captures only the pre-state catalog families and
   identities its rules can read, with whole-family fallback where a rule
   searches an entire family. A recorded 1,000-mutation `ALTER TABLE` chain
@@ -91,6 +92,8 @@ notes are available on the
 - Transition records and unresolved missing-schema context are now reused across
   rules in the evaluation loop, and fallback syntax ranges are cached per
   statement instead of recomputed per finding.
+- Added a scheduled and manual benchmark workflow to track allocation and
+  throughput metrics across large baseline scenarios.
 
 ## v0.12.0 — 2026-10-31
 
