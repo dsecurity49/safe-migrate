@@ -93,7 +93,7 @@ impl AnalysisState {
         )
     }
 
-    /// Record a configured version, used only when the cache carries none.
+    /// Record a rule finding that could not be evaluated due to incomplete evidence.
     pub(crate) fn record_not_evaluated(
         &mut self,
         record: crate::_internal::report::violations::NotEvaluated,

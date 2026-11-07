@@ -448,6 +448,7 @@ impl SafeMigrateEngine {
             // ignoring it would claim exact confidence for later SQL.
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
+            let mut fallback_source_range: Option<rowan::TextRange> = None;
             let mut mutations = match AstVisitor::extract(&stmt) {
                 Some(fact) => Resolver::resolve(&fact, state),
                 None => vec![Mutation::Opaque(
@@ -522,6 +523,10 @@ impl SafeMigrateEngine {
                     continue;
                 }
 
+                let transition =
+                    TransitionRecord::new(&mutation, &result, &pre_state, pre_cascade.as_ref());
+                let mut unresolved_context: Option<(Vec<String>, String)> = None;
+
                 for rule in &self.rules {
                     let is_inline_ignored =
                         file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
@@ -548,34 +553,36 @@ impl SafeMigrateEngine {
                         continue;
                     }
 
-                    let transition =
-                        TransitionRecord::new(&mutation, &result, &pre_state, pre_cascade.as_ref());
                     if let Some(cause) = result.unresolved_cause()
                         && !rule.evaluates_when_unresolved(&transition)
                     {
-                        let mut missing_schemas = state.external_referenced_schemas();
-                        if let Some((_, obj_name)) = mutation.primary_object()
-                            && let Some(schema) =
-                                state.baseline_scope_omits_displayed_object(&obj_name)
-                            && !missing_schemas.iter().any(|s| s == schema)
-                        {
-                            missing_schemas.push(schema.to_string());
-                        }
+                        let (missing_schemas, recipe) =
+                            unresolved_context.get_or_insert_with(|| {
+                                let mut missing_schemas = state.external_referenced_schemas();
+                                if let Some((_, obj_name)) = mutation.primary_object()
+                                    && let Some(schema) =
+                                        state.baseline_scope_omits_displayed_object(&obj_name)
+                                    && !missing_schemas.iter().any(|s| s == schema)
+                                {
+                                    missing_schemas.push(schema.to_string());
+                                }
 
-                        let configured_or_synced_scope =
-                            self.config.schema_scope().map(|s| s.to_vec()).or_else(|| {
-                                state
-                                    .baseline_schemas
-                                    .as_ref()
-                                    .map(|s| s.iter().cloned().collect::<Vec<_>>())
+                                let configured_or_synced_scope =
+                                    self.config.schema_scope().map(|s| s.to_vec()).or_else(|| {
+                                        state
+                                            .baseline_schemas
+                                            .as_ref()
+                                            .map(|s| s.iter().cloned().collect::<Vec<_>>())
+                                    });
+
+                                let recipe =
+                                    crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                        cause,
+                                        &missing_schemas,
+                                        configured_or_synced_scope.as_deref(),
+                                    );
+                                (missing_schemas, recipe)
                             });
-
-                        let recipe =
-                            crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
-                                cause,
-                                &missing_schemas,
-                                configured_or_synced_scope.as_deref(),
-                            );
 
                         state.record_not_evaluated(
                             crate::_internal::report::violations::NotEvaluated {
@@ -583,21 +590,15 @@ impl SafeMigrateEngine {
                                 tier: rule.default_tier(),
                                 cause,
                                 sql: Some(stmt_text.trim().to_string()),
-                                recipe,
-                                missing_schemas,
+                                recipe: recipe.clone(),
+                                missing_schemas: missing_schemas.clone(),
                             },
                         );
                         continue;
                     }
 
-                    let rule_context = RuleContext::new(
-                        &mutation,
-                        &result,
-                        &pre_state,
-                        state,
-                        &self.config,
-                        pre_cascade.as_ref(),
-                    );
+                    let rule_context =
+                        RuleContext::from_transition(transition, state, &self.config);
                     let violations = rule.evaluate(&rule_context);
 
                     // A capability is relevant only when this rule actually
@@ -630,20 +631,23 @@ impl SafeMigrateEngine {
                         }
                         let mut v = v;
                         if v.source_range.is_none() {
-                            let start = stmt
-                                .syntax()
-                                .descendants_with_tokens()
-                                .filter_map(|element| element.into_token())
-                                .find(|token| {
-                                    let text = token.text().trim();
-                                    !text.is_empty()
-                                        && !text.starts_with("--")
-                                        && !text.starts_with("/*")
-                                })
-                                .map(|token| token.text_range().start())
-                                .unwrap_or_else(|| stmt.syntax().text_range().start());
-                            let end = stmt.syntax().text_range().end();
-                            v.source_range = Some(rowan::TextRange::new(start, end));
+                            let fallback = *fallback_source_range.get_or_insert_with(|| {
+                                let start = stmt
+                                    .syntax()
+                                    .descendants_with_tokens()
+                                    .filter_map(|element| element.into_token())
+                                    .find(|token| {
+                                        let text = token.text().trim();
+                                        !text.is_empty()
+                                            && !text.starts_with("--")
+                                            && !text.starts_with("/*")
+                                    })
+                                    .map(|token| token.text_range().start())
+                                    .unwrap_or_else(|| stmt.syntax().text_range().start());
+                                let end = stmt.syntax().text_range().end();
+                                rowan::TextRange::new(start, end)
+                            });
+                            v.source_range = Some(fallback);
                         }
                         if v.sql.is_none() {
                             if let Some(range) = v.source_range {

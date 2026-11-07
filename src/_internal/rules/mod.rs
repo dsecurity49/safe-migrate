@@ -26,6 +26,7 @@ use crate::api::config::Config;
 /// Keeping this bundle immutable prevents the engine from accidentally
 /// evaluating a rule against state from a different statement and provides a
 /// single extension point for evidence/capability metadata.
+#[derive(Clone, Copy)]
 pub(crate) struct TransitionRecord<'a> {
     mutation: &'a Mutation,
     result: &'a MutationResult,
@@ -208,6 +209,7 @@ pub(crate) const BASELINE_STATS_DEPENDENCY_CAPABILITIES: &[RuleCapability] = &[
 pub(crate) const TRANSACTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::TransactionState];
 
 impl<'a> RuleContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         mutation: &'a Mutation,
         result: &'a MutationResult,
@@ -216,8 +218,20 @@ impl<'a> RuleContext<'a> {
         config: &'a Config,
         cascade_closure: Option<&'a CascadeResult>,
     ) -> Self {
+        Self::from_transition(
+            TransitionRecord::new(mutation, result, pre_state, cascade_closure),
+            state,
+            config,
+        )
+    }
+
+    pub(crate) fn from_transition(
+        transition: TransitionRecord<'a>,
+        state: &'a AnalysisState,
+        config: &'a Config,
+    ) -> Self {
         Self {
-            transition: TransitionRecord::new(mutation, result, pre_state, cascade_closure),
+            transition,
             state,
             config,
         }

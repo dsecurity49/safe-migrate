@@ -88,6 +88,9 @@ notes are available on the
   incrementally instead of rebuilding hash membership and invalidating the
   derived index for the whole graph. On a 10,100-edge graph, 1,000 definition
   updates take 24,000 allocations and 32 ms in the debug benchmark.
+- Transition records and unresolved missing-schema context are now reused across
+  rules in the evaluation loop, and fallback syntax ranges are cached per
+  statement instead of recomputed per finding.
 
 ## v0.12.0 — 2026-10-31
 

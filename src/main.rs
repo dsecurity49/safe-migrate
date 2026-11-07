@@ -25,7 +25,7 @@ fn terminal_inline(value: &str) -> String {
     output
 }
 
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     terminal_inline(&path.display().to_string())
 }
 

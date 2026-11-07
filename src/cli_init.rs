@@ -1,3 +1,4 @@
+use super::display_path;
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::{
     XChaCha20Poly1305,
@@ -79,19 +80,6 @@ fn validate_single_line(name: &str, value: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn display_path(path: &Path) -> String {
-    let value = path.display().to_string();
-    let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        if character.is_control() {
-            output.extend(character.escape_default());
-        } else {
-            output.push(character);
-        }
-    }
-    output
 }
 
 fn reject_symlink_components(path: &Path) -> Result<()> {
