@@ -35,6 +35,14 @@ pub(crate) struct NamespaceSnapshot {
     pub session_search_path_template: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaselineSet {
+    Relations,
+    Indexes,
+    FkDependencies,
+    Sequences,
+}
+
 #[allow(clippy::large_enum_variant)] // Undo entries stay allocation-free in the hot state path.
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
@@ -48,6 +56,11 @@ pub(crate) enum StateChange {
         id: ObjectId,
         previous: Box<Option<RelationOverlay>>,
     },
+    RelationRename {
+        old_id: ObjectId,
+        new_id: ObjectId,
+        previous_new: Box<Option<RelationOverlay>>,
+    },
     TypeSnapshot {
         id: ObjectId,
         previous: Option<TypeOverlay>,
@@ -55,6 +68,11 @@ pub(crate) enum StateChange {
     SequenceSnapshot {
         id: ObjectId,
         previous: Option<SequenceOverlay>,
+    },
+    SequenceRename {
+        old_id: ObjectId,
+        new_id: ObjectId,
+        previous_new: Box<Option<SequenceOverlay>>,
     },
     ExtensionSnapshot {
         name: String,
@@ -116,6 +134,13 @@ pub(crate) enum StateChange {
     },
     BaselineForeignKeysSnapshot {
         previous: HashSet<(ObjectId, String)>,
+    },
+    BaselineSetRenameSnapshot {
+        set: BaselineSet,
+        old: ObjectId,
+        new: ObjectId,
+        old_present: bool,
+        new_present: bool,
     },
     RoleContextSnapshot {
         current_role: String,

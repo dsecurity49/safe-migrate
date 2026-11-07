@@ -8,7 +8,7 @@ use crate::_internal::analysis::namespace::{
 };
 use crate::_internal::analysis::settings::ScopedSetting;
 use crate::_internal::analysis::transaction::{
-    NamespaceSnapshot, StateChange, TransactionFrame, TransactionFrameKind,
+    BaselineSet, NamespaceSnapshot, StateChange, TransactionFrame, TransactionFrameKind,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;

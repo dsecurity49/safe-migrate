@@ -64,6 +64,26 @@ impl AnalysisState {
                         self.local.relations.remove(&id);
                     }
                 }
+                StateChange::RelationRename {
+                    old_id,
+                    new_id,
+                    previous_new,
+                } => {
+                    if let Some(mut overlay) = self.local.relations.remove(&new_id) {
+                        if let RelationOverlay::Present(state) = &mut overlay {
+                            state.id = old_id.clone();
+                        }
+                        self.local.relations.insert(old_id, overlay);
+                    }
+                    match *previous_new {
+                        Some(overlay) => {
+                            self.local.relations.insert(new_id, overlay);
+                        }
+                        None => {
+                            self.local.relations.remove(&new_id);
+                        }
+                    }
+                }
                 StateChange::TypeSnapshot { id, previous } => {
                     if let Some(prev) = previous {
                         self.local.types.insert(id, prev);
@@ -76,6 +96,26 @@ impl AnalysisState {
                         self.local.sequences.insert(id, prev);
                     } else {
                         self.local.sequences.remove(&id);
+                    }
+                }
+                StateChange::SequenceRename {
+                    old_id,
+                    new_id,
+                    previous_new,
+                } => {
+                    if let Some(mut overlay) = self.local.sequences.remove(&new_id) {
+                        if let SequenceOverlay::Present(state) = &mut overlay {
+                            state.id = old_id.clone();
+                        }
+                        self.local.sequences.insert(old_id, overlay);
+                    }
+                    match *previous_new {
+                        Some(overlay) => {
+                            self.local.sequences.insert(new_id, overlay);
+                        }
+                        None => {
+                            self.local.sequences.remove(&new_id);
+                        }
                     }
                 }
                 StateChange::ExtensionSnapshot { name, previous } => {
@@ -141,6 +181,26 @@ impl AnalysisState {
                 }
                 StateChange::BaselineForeignKeysSnapshot { previous } => {
                     self.baseline_foreign_keys = previous;
+                }
+                StateChange::BaselineSetRenameSnapshot {
+                    set,
+                    old,
+                    new,
+                    old_present,
+                    new_present,
+                } => {
+                    let target = match set {
+                        BaselineSet::Relations => &mut self.baseline_relations,
+                        BaselineSet::Indexes => &mut self.baseline_indexes,
+                        BaselineSet::FkDependencies => &mut self.baseline_fk_dependencies,
+                        BaselineSet::Sequences => &mut self.baseline_sequences,
+                    };
+                    if !new_present {
+                        target.remove(&new);
+                    }
+                    if old_present {
+                        target.insert(old);
+                    }
                 }
                 StateChange::GraphLengthMarker { len } => {
                     self.local.graph.truncate(len);

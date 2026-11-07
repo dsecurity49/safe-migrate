@@ -216,11 +216,12 @@ longer cloned.
 | 50 `ALTER TABLE` statements, 1,000 relations | 462,883 allocations / 130.0 MB / 640 ms | 13,208 allocations / 1.6 MB / 54-69 ms |
 | 1,000-statement create chain | 9,000 ms | 1,192 ms |
 | 503-statement transaction rollback | 400-450 ms | 382-385 ms |
-| 50 rename statements, 1,000 relations | not measured | 497,767 allocations / 134.6 MB / 746 ms |
+| 50 rename statements, 1,000 relations | 497,767 allocations / 134.6 MB / 746 ms | 97,467 allocations / 9.2 MB / 216 ms |
 
-The rename row is the remaining bounded-copy target: `ALTER TABLE ... RENAME`
-still records a `NamespaceSnapshot`, which copies nearly the whole schema model.
-The journal does not make that path worse, but it does not remove that copy.
+`ALTER TABLE ... RENAME` and `ALTER SEQUENCE ... RENAME` now record a key move
+plus the affected metadata instead of a `NamespaceSnapshot`. Schema and type
+renames still use the full namespace snapshot, and relation renames still copy
+the dependency-edge list when it is non-empty.
 
 A differential test runs every statement twice, once with the full state
 checkpoint and once with the journal, and requires identical findings plus

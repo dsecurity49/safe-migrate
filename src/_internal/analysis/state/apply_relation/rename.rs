@@ -1,4 +1,5 @@
 use super::*;
+use crate::_internal::analysis::transaction::BaselineSet;
 
 impl AnalysisState {
     /// Return the key definitions that can be proved for a relation.
@@ -227,7 +228,14 @@ impl AnalysisState {
             })
             .collect();
 
-        self.snapshot_namespace();
+        // A rename is a localized key move, not a namespace-wide rewrite.
+        // Existing edges are remapped in place, so the graph still needs a
+        // full snapshot; the overlay maps are restored per object below.
+        self.snapshot_graph_full();
+        if renames_relation {
+            self.snapshot_relation_rename(&rename.old_id, &rename.new_id);
+            self.snapshot_pending_validation();
+        }
         if let Some(RelationOverlay::Present(mut state)) =
             self.local.relations.remove(&rename.old_id)
         {
@@ -309,6 +317,8 @@ impl AnalysisState {
                 .collect();
         for (old_trigger_id, mut trigger) in triggers_to_move {
             let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
+            self.snapshot_trigger(&old_trigger_id);
+            self.snapshot_trigger(&new_trigger_id);
             self.local.triggers.remove(&old_trigger_id);
             trigger.id = new_trigger_id.clone();
             trigger.table_id = rename.new_id.clone();
@@ -402,12 +412,23 @@ impl AnalysisState {
         }
 
         if renames_relation {
+            self.snapshot_baseline_set_rename(
+                BaselineSet::Relations,
+                &rename.old_id,
+                &rename.new_id,
+            );
             if self.baseline_relations.remove(&rename.old_id) {
                 self.baseline_relations.insert(rename.new_id.clone());
             }
+            self.snapshot_baseline_set_rename(
+                BaselineSet::FkDependencies,
+                &rename.old_id,
+                &rename.new_id,
+            );
             if self.baseline_fk_dependencies.remove(&rename.old_id) {
                 self.baseline_fk_dependencies.insert(rename.new_id.clone());
             }
+            self.snapshot_baseline_foreign_keys();
             self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
                 .into_iter()
                 .map(|(table, name)| {
@@ -419,15 +440,24 @@ impl AnalysisState {
                 })
                 .collect();
         }
-        if renames_index && self.baseline_indexes.remove(&rename.old_id) {
-            self.baseline_indexes.insert(rename.new_id.clone());
+        if renames_index {
+            self.snapshot_baseline_set_rename(BaselineSet::Indexes, &rename.old_id, &rename.new_id);
+            if self.baseline_indexes.remove(&rename.old_id) {
+                self.baseline_indexes.insert(rename.new_id.clone());
+            }
         }
         for (old_sequence_id, new_sequence_id) in &associated_sequence_moves {
+            self.snapshot_baseline_set_rename(
+                BaselineSet::Sequences,
+                old_sequence_id,
+                new_sequence_id,
+            );
             if self.baseline_sequences.remove(old_sequence_id) {
                 self.baseline_sequences.insert(new_sequence_id.clone());
             }
         }
         for (old_index_id, new_index_id) in &associated_index_moves {
+            self.snapshot_baseline_set_rename(BaselineSet::Indexes, old_index_id, new_index_id);
             if self.baseline_indexes.remove(old_index_id) {
                 self.baseline_indexes.insert(new_index_id.clone());
             }
@@ -454,6 +484,10 @@ impl AnalysisState {
             if owns_index && old.name != new.name {
                 constraint.name = new.name.clone();
             }
+            self.snapshot_constraint(&constraint.table_id, &old_name);
+            if constraint.name != old_name {
+                self.snapshot_constraint(&constraint.table_id, &constraint.name);
+            }
             self.local
                 .constraints
                 .remove(&(constraint.table_id.clone(), old_name.clone()));
@@ -474,13 +508,29 @@ impl AnalysisState {
             return;
         }
         let old_replica = format!("USING INDEX {}", old.name);
-        for (id, overlay) in &mut self.local.relations {
-            let RelationOverlay::Present(relation) = overlay else {
+        let affected_relations: Vec<ObjectId> = self
+            .local
+            .relations
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let RelationOverlay::Present(relation) = overlay else {
+                    return None;
+                };
+                if id.schema != old.schema {
+                    return None;
+                }
+                (relation.cluster_index.as_deref() == Some(old.name.as_str())
+                    || relation.replica_identity.as_deref() == Some(old_replica.as_str()))
+                .then_some(id.clone())
+            })
+            .collect();
+        for id in &affected_relations {
+            self.snapshot_relation(id);
+        }
+        for id in affected_relations {
+            let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(&id) else {
                 continue;
             };
-            if id.schema != old.schema {
-                continue;
-            }
             if relation.cluster_index.as_deref() == Some(old.name.as_str()) {
                 relation.cluster_index = Some(new.name.clone());
             }

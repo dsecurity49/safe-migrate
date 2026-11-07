@@ -30,6 +30,25 @@ impl AnalysisState {
         });
     }
 
+    pub(super) fn snapshot_relation_rename(&mut self, old: &ObjectId, new: &ObjectId) {
+        if !self.local.records_undo() || old == new {
+            return;
+        }
+        debug_assert!(
+            !matches!(
+                self.local.relations.get(new),
+                Some(RelationOverlay::Present(_))
+            ),
+            "rename target must be absent or a tombstone"
+        );
+        let previous_new = self.local.relations.get(new).cloned();
+        self.local.push_undo(StateChange::RelationRename {
+            old_id: old.clone(),
+            new_id: new.clone(),
+            previous_new: Box::new(previous_new),
+        });
+    }
+
     pub(super) fn snapshot_schema(&mut self, name: &str) {
         if !self.local.records_undo() {
             return;
@@ -81,6 +100,25 @@ impl AnalysisState {
         self.local.push_undo(StateChange::TypeSnapshot {
             id: id.clone(),
             previous,
+        });
+    }
+
+    pub(super) fn snapshot_sequence_rename(&mut self, old: &ObjectId, new: &ObjectId) {
+        if !self.local.records_undo() || old == new {
+            return;
+        }
+        debug_assert!(
+            !matches!(
+                self.local.sequences.get(new),
+                Some(SequenceOverlay::Present(_))
+            ),
+            "rename target must be absent or a tombstone"
+        );
+        let previous_new = self.local.sequences.get(new).cloned();
+        self.local.push_undo(StateChange::SequenceRename {
+            old_id: old.clone(),
+            new_id: new.clone(),
+            previous_new: Box::new(previous_new),
         });
     }
 
@@ -321,6 +359,43 @@ impl AnalysisState {
         let previous = self.local.pending_validation.clone();
         self.local
             .push_undo(StateChange::PendingValidationSnapshot { previous });
+    }
+
+    pub(super) fn snapshot_baseline_set_rename(
+        &mut self,
+        set: BaselineSet,
+        old: &ObjectId,
+        new: &ObjectId,
+    ) {
+        if !self.local.records_undo() {
+            return;
+        }
+        let (old_present, new_present) = match set {
+            BaselineSet::Relations => (
+                self.baseline_relations.contains(old),
+                self.baseline_relations.contains(new),
+            ),
+            BaselineSet::Indexes => (
+                self.baseline_indexes.contains(old),
+                self.baseline_indexes.contains(new),
+            ),
+            BaselineSet::FkDependencies => (
+                self.baseline_fk_dependencies.contains(old),
+                self.baseline_fk_dependencies.contains(new),
+            ),
+            BaselineSet::Sequences => (
+                self.baseline_sequences.contains(old),
+                self.baseline_sequences.contains(new),
+            ),
+        };
+        self.local
+            .push_undo(StateChange::BaselineSetRenameSnapshot {
+                set,
+                old: old.clone(),
+                new: new.clone(),
+                old_present,
+                new_present,
+            });
     }
 
     pub(super) fn snapshot_confidence(&mut self) {
