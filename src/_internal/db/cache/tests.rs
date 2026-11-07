@@ -127,7 +127,13 @@ fn current_cache_rejects_an_unsupported_postgresql_version() {
     cache.pg_version_num = Some(130_000);
 
     let error = cache.validate_semantics().unwrap_err();
-    assert!(error.contains("PostgreSQL 14 or newer"));
+    assert!(error.contains("PostgreSQL 14 through 18 is required"));
+
+    let mut cache = synced_cache();
+    cache.pg_version_num = Some(190_000);
+
+    let error = cache.validate_semantics().unwrap_err();
+    assert!(error.contains("PostgreSQL 14 through 18 is required"));
 }
 
 #[test]

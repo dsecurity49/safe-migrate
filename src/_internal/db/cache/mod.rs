@@ -392,8 +392,11 @@ impl DbCache {
             Ok(())
         };
 
-        if self.pg_version_num.is_some_and(|version| version < 140_000) {
-            return Err("This cache was synchronized from an unsupported PostgreSQL version; PostgreSQL 14 or newer is required".to_string());
+        if self
+            .pg_version_num
+            .is_some_and(|version| !(140_000..=189_999).contains(&version))
+        {
+            return Err("This cache was synchronized from an unsupported PostgreSQL version; PostgreSQL 14 through 18 is required".to_string());
         }
 
         if let Some(schemas) = &self.metadata.schemas {

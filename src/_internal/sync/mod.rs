@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 use std::fs;
 
 const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
+const MAX_POSTGRES_VERSION_NUM: u32 = 189_999;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn sync_cache(
@@ -128,9 +129,9 @@ pub(crate) fn database_config_is_local(config: &PostgresConfig) -> bool {
 }
 
 pub(crate) fn ensure_supported_postgres_version(version: u32) -> Result<()> {
-    if version < MIN_POSTGRES_VERSION_NUM {
+    if !(MIN_POSTGRES_VERSION_NUM..=MAX_POSTGRES_VERSION_NUM).contains(&version) {
         anyhow::bail!(
-            "PostgreSQL {} is unsupported; safe-migrate sync requires PostgreSQL 14 or newer",
+            "PostgreSQL {} is unsupported; safe-migrate sync requires PostgreSQL 14 through 18",
             version / 10_000
         );
     }
@@ -169,12 +170,26 @@ pub(crate) fn cache_search_path(
 }
 
 /// Parse PostgreSQL's canonical `SHOW search_path` representation while
-/// preserving the special `$user` placeholder and quoted identifier casing.
+/// preserving the special `$user` placeholder, quoted identifier casing, and
+/// intentional leading/trailing whitespace inside quoted identifiers.
 pub(crate) fn parse_search_path_setting(setting: &str) -> Vec<String> {
     let mut entries = Vec::new();
     let mut current = String::new();
     let mut chars = setting.chars().peekable();
     let mut quoted = false;
+    let mut was_quoted = false;
+
+    let flush = |entries: &mut Vec<String>, current: &mut String, was_quoted: bool| {
+        let entry = if was_quoted {
+            current.as_str()
+        } else {
+            current.trim()
+        };
+        if !entry.is_empty() {
+            entries.push(entry.to_string());
+        }
+        current.clear();
+    };
 
     while let Some(ch) = chars.next() {
         match ch {
@@ -182,22 +197,20 @@ pub(crate) fn parse_search_path_setting(setting: &str) -> Vec<String> {
                 current.push('"');
                 chars.next();
             }
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                let entry = current.trim();
-                if !entry.is_empty() {
-                    entries.push(entry.to_string());
-                }
-                current.clear();
+            '"' => {
+                quoted = !quoted;
+                was_quoted = true;
             }
+            ',' if !quoted => {
+                flush(&mut entries, &mut current, was_quoted);
+                was_quoted = false;
+            }
+            ch if !quoted && current.is_empty() && ch.is_whitespace() => {}
             _ => current.push(ch),
         }
     }
 
-    let entry = current.trim();
-    if !entry.is_empty() {
-        entries.push(entry.to_string());
-    }
+    flush(&mut entries, &mut current, was_quoted);
     entries
 }
 

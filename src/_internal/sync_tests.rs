@@ -125,14 +125,22 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_requires_postgresql_14_or_newer() {
-        let error = ensure_supported_postgres_version(130_012).unwrap_err();
+    fn test_sync_requires_postgresql_14_through_18() {
+        let low_error = ensure_supported_postgres_version(130_012).unwrap_err();
         assert!(
-            error
+            low_error
                 .to_string()
-                .contains("requires PostgreSQL 14 or newer")
+                .contains("requires PostgreSQL 14 through 18")
+        );
+        let high_error = ensure_supported_postgres_version(190_000).unwrap_err();
+        assert!(
+            high_error
+                .to_string()
+                .contains("requires PostgreSQL 14 through 18")
         );
         assert!(ensure_supported_postgres_version(140_000).is_ok());
+        assert!(ensure_supported_postgres_version(180_006).is_ok());
+        assert!(ensure_supported_postgres_version(189_999).is_ok());
     }
 
     #[test]
@@ -172,6 +180,10 @@ mod tests {
         assert_eq!(
             parse_search_path_setting("\"$user\", public, \"Mixed,Schema\", \"a\"\"b\""),
             ["$user", "public", "Mixed,Schema", "a\"b"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" leading\", \"trailing \", \" both \",  normal  , public"),
+            [" leading", "trailing ", " both ", "normal", "public"]
         );
     }
 

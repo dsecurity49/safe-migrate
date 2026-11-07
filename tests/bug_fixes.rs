@@ -711,6 +711,23 @@ mod phase10_bug_fixes_and_sorting_tests {
             "{scoped_recipe}"
         );
 
+        // A schema containing a comma cannot be passed safely to `--schemas` CLI argument;
+        // only safe-migrate.toml remedy is provided.
+        let comma_schema_recipe = NotEvaluated::recipe_with_scope(
+            EvidenceCode::CatalogCoverageIncomplete,
+            &["customer,data".to_string()],
+            Some(&["public".to_string()]),
+        );
+        assert!(
+            comma_schema_recipe
+                .contains("Add \"customer,data\" to `schemas` in safe-migrate.toml and re-sync."),
+            "{comma_schema_recipe}"
+        );
+        assert!(
+            !comma_schema_recipe.contains("--schemas"),
+            "comma-bearing schema must not generate a --schemas command"
+        );
+
         // With nothing to name, the recipe falls back to describing the fix.
         let generic_recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &[]);
         assert!(
