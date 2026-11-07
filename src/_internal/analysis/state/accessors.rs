@@ -31,6 +31,19 @@ impl AnalysisState {
             .to_string()
     }
 
+    pub(crate) fn routine_signature_id(
+        &self,
+        signature: &crate::_internal::analysis::facts::FunctionSigFact,
+    ) -> ObjectId {
+        let signature_name = format!(
+            "{}({})",
+            signature.name.name.resolve(),
+            signature.params.join(",")
+        );
+        let schema = self.resolve_function_schema(&signature.name, &signature_name);
+        ObjectId::new(schema, signature_name)
+    }
+
     pub(crate) fn resolve_relation_id(
         &self,
         name: &crate::_internal::ast::identifiers::QualifiedName,

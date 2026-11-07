@@ -69,10 +69,10 @@ mod performance_scenarios {
         );
     }
 
-    fn large_baseline() -> DbCache {
+    fn baseline_with_relations(relations: usize) -> DbCache {
         let mut cache = crate::common::synced_cache();
         cache.search_path = vec!["public".to_string()];
-        for index in 0..LARGE_BASELINE_RELATIONS {
+        for index in 0..relations {
             let id = object_id("public", &format!("perf_baseline_{index}"));
             cache.insert_baseline(
                 id.clone(),
@@ -88,6 +88,10 @@ mod performance_scenarios {
             );
         }
         cache
+    }
+
+    fn large_baseline() -> DbCache {
+        baseline_with_relations(LARGE_BASELINE_RELATIONS)
     }
 
     fn allocation_snapshot() -> (usize, usize) {
@@ -179,6 +183,107 @@ mod performance_scenarios {
             allocations.1,
             elapsed.as_millis()
         );
+    }
+
+    #[test]
+    #[ignore = "manual performance scenario; run with --ignored --nocapture"]
+    fn pre_state_capture_against_large_baselines() {
+        use crate::_internal::analysis::mutations::{
+            AlterTable, AlterTableActionMutation, Mutation,
+        };
+        use crate::_internal::analysis::state::{PreState, PreStateReadSet};
+        use crate::_internal::ast::identifiers::ObjectId;
+        use crate::_internal::engine::pre_state_footprint;
+
+        const CAPTURES: usize = 1_000;
+
+        for relations in [100, 1_000, 10_000] {
+            let state = crate::_internal::analysis::state::AnalysisState::with_baseline(
+                baseline_with_relations(relations),
+                true,
+            );
+            let mutation = Mutation::AlterTable(AlterTable {
+                id: ObjectId::new("public", "perf_baseline_0"),
+                only: false,
+                action: AlterTableActionMutation::DropColumn {
+                    name: "unused".to_string(),
+                    if_exists: true,
+                    cascade: false,
+                },
+            });
+            let full = PreStateReadSet::full();
+            let selective = pre_state_footprint::for_mutation(&state, &mutation, None);
+            let mut pre_state = PreState::default();
+
+            state.capture_pre_state_into(&mut pre_state, &full);
+            let started = Instant::now();
+            for _ in 0..CAPTURES {
+                state.capture_pre_state_into(&mut pre_state, &full);
+            }
+            let full_ms = started.elapsed().as_millis();
+
+            let started = Instant::now();
+            for _ in 0..CAPTURES {
+                state.capture_pre_state_into(&mut pre_state, &selective);
+            }
+            let selective_ms = started.elapsed().as_millis();
+
+            eprintln!(
+                "scenario=pre_state_capture relations={relations} captures={CAPTURES} full_ms={full_ms} selective_ms={selective_ms}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual performance scenario; run with --ignored --nocapture"]
+    fn thousand_alter_mutations_against_large_baselines() {
+        use crate::_internal::analysis::mutations::{
+            AlterTable, AlterTableActionMutation, Mutation,
+        };
+        use crate::_internal::analysis::state::{PreState, PreStateReadSet};
+        use crate::_internal::ast::identifiers::ObjectId;
+        use crate::_internal::engine::pre_state_footprint;
+
+        const MUTATIONS: usize = 1_000;
+
+        for relations in [100, 1_000, 10_000] {
+            let state = crate::_internal::analysis::state::AnalysisState::with_baseline(
+                baseline_with_relations(relations),
+                true,
+            );
+            let mutations = (0..MUTATIONS)
+                .map(|index| {
+                    Mutation::AlterTable(AlterTable {
+                        id: ObjectId::new("public", format!("perf_baseline_{}", index % relations)),
+                        only: false,
+                        action: AlterTableActionMutation::DropColumn {
+                            name: "unused".to_string(),
+                            if_exists: true,
+                            cascade: false,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            let full = PreStateReadSet::full();
+            let mut pre_state = PreState::default();
+
+            let started = Instant::now();
+            for _ in &mutations {
+                state.capture_pre_state_into(&mut pre_state, &full);
+            }
+            let full_ms = started.elapsed().as_millis();
+
+            let started = Instant::now();
+            for mutation in &mutations {
+                let reads = pre_state_footprint::for_mutation(&state, mutation, None);
+                state.capture_pre_state_into(&mut pre_state, &reads);
+            }
+            let selective_ms = started.elapsed().as_millis();
+
+            eprintln!(
+                "scenario=pre_state_mutation_footprint relations={relations} mutations={MUTATIONS} full_ms={full_ms} selective_ms={selective_ms}"
+            );
+        }
     }
 
     #[test]

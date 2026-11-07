@@ -1,6 +1,7 @@
 use super::*;
 use crate::_internal::model::column::Column;
 use crate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
+use crate::_internal::model::relation::RelationState;
 use crate::_internal::model::types::CompositeFieldState;
 
 #[test]
@@ -21,7 +22,7 @@ fn incremental_capture_matches_a_fresh_public_pre_state() {
     );
 
     let mut reused = PreState::default();
-    state.capture_pre_state_into(&mut reused);
+    state.capture_pre_state_into(&mut reused, &PreStateReadSet::full());
     assert_eq!(reused, state.capture_pre_state());
 
     let Some(RelationOverlay::Present(relation)) = state.local.relations.get_mut(&table_id) else {
@@ -53,7 +54,7 @@ fn incremental_capture_matches_a_fresh_public_pre_state() {
             eligibility_known: true,
         },
     ));
-    state.capture_pre_state_into(&mut reused);
+    state.capture_pre_state_into(&mut reused, &PreStateReadSet::full());
     assert_eq!(reused, state.capture_pre_state());
     assert_eq!(reused.relations[&table_id].estimated_rows, Some(2));
     assert_eq!(reused.indexes.len(), 1);
@@ -63,7 +64,7 @@ fn incremental_capture_matches_a_fresh_public_pre_state() {
         .relations
         .insert(table_id.clone(), RelationOverlay::Dropped);
     state.local.graph.replace_edges(Vec::new());
-    state.capture_pre_state_into(&mut reused);
+    state.capture_pre_state_into(&mut reused, &PreStateReadSet::full());
     assert_eq!(reused, state.capture_pre_state());
     assert!(!reused.relations.contains_key(&table_id));
     assert!(reused.indexes.is_empty());
@@ -226,4 +227,111 @@ fn composite_containers_are_found_through_domains_and_arrays_for_every_relation(
     }
 
     assert_eq!(pre_state.relations_using_composite(&address).len(), 3);
+}
+
+#[test]
+fn selective_capture_keeps_only_the_requested_relations() {
+    let mut state = AnalysisState::new(DbCache::new());
+    let owner = ObjectId::new("public", "postgres");
+    for name in ["alpha", "beta", "gamma"] {
+        let id = ObjectId::new("public", name);
+        state.local.relations.insert(
+            id.clone(),
+            RelationOverlay::Present(RelationState::new(
+                id,
+                owner.clone(),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            )),
+        );
+    }
+    let alpha = ObjectId::new("public", "alpha");
+    let beta = ObjectId::new("public", "beta");
+    let gamma = ObjectId::new("public", "gamma");
+    let mut reads = PreStateReadSet::none();
+    reads.relations = ReadScope::selected([alpha.clone(), beta.clone()]);
+
+    let mut pre_state = PreState::default();
+    state.capture_pre_state_into(&mut pre_state, &reads);
+    assert_eq!(
+        pre_state.relations.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from([alpha.clone(), beta.clone()])
+    );
+
+    reads.relations = ReadScope::selected([alpha.clone()]);
+    state.capture_pre_state_into(&mut pre_state, &reads);
+    assert_eq!(
+        pre_state.relations.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from([alpha.clone()])
+    );
+
+    reads.relations = ReadScope::None;
+    state.capture_pre_state_into(&mut pre_state, &reads);
+    assert!(pre_state.relations.is_empty());
+
+    reads.relations = ReadScope::All;
+    state.capture_pre_state_into(&mut pre_state, &reads);
+    assert_eq!(pre_state.relations.len(), 3);
+    assert!(pre_state.relations.contains_key(&gamma));
+}
+
+#[test]
+fn selective_capture_filters_index_edges_and_baseline_constraints() {
+    let mut state = AnalysisState::new(DbCache::new());
+    let first_table = ObjectId::new("public", "first_table");
+    let second_table = ObjectId::new("public", "second_table");
+    let first_index = ObjectId::new("public", "first_idx");
+    let second_index = ObjectId::new("public", "second_idx");
+    for (table, index) in [(&first_table, &first_index), (&second_table, &second_index)] {
+        state.local.graph.add_edge(DependencyEdge::new(
+            index.clone(),
+            table.clone(),
+            DependencyKind::IndexOnRelation {
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
+                dependency_columns: vec!["id".into()],
+                dependency_columns_known: true,
+                is_concurrent: false,
+                is_immediate: true,
+                eligibility_known: true,
+            },
+        ));
+    }
+    let keep_constraint = (first_table.clone(), "first_fk".to_string());
+    let drop_constraint = (second_table, "second_fk".to_string());
+    state.baseline_foreign_keys.insert(keep_constraint.clone());
+    state.baseline_foreign_keys.insert(drop_constraint);
+
+    let mut reads = PreStateReadSet::none();
+    reads.indexes = ReadScope::selected([first_index.clone()]);
+    reads.baseline_foreign_keys = ReadScope::selected([keep_constraint.clone()]);
+
+    let mut pre_state = PreState::default();
+    state.capture_pre_state_into(&mut pre_state, &reads);
+    assert_eq!(pre_state.indexes.len(), 1);
+    assert_eq!(pre_state.indexes[0].dependent, first_index);
+    assert_eq!(
+        pre_state.baseline_foreign_keys,
+        HashSet::from([keep_constraint])
+    );
+
+    reads.indexes = ReadScope::None;
+    reads.baseline_foreign_keys = ReadScope::None;
+    state.capture_pre_state_into(&mut pre_state, &reads);
+    assert!(pre_state.indexes.is_empty());
+    assert!(pre_state.baseline_foreign_keys.is_empty());
 }

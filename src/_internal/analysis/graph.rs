@@ -126,6 +126,7 @@ pub(crate) struct DependencyGraph {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GraphIndexes {
     rename_by_source: HashMap<ObjectId, usize>,
+    by_dependent: HashMap<ObjectId, Vec<usize>>,
     by_resolved_referenced: HashMap<ObjectId, Vec<usize>>,
     by_resolved_dependent: HashMap<ObjectId, Vec<usize>>,
 }
@@ -239,6 +240,11 @@ impl DependencyGraph {
         }
 
         for (index, edge) in edges.iter().enumerate() {
+            indexes
+                .by_dependent
+                .entry(edge.dependent.clone())
+                .or_default()
+                .push(index);
             let referenced = Self::resolve_rename_with(edges, &indexes, &edge.referenced).clone();
             indexes
                 .by_resolved_referenced
@@ -253,6 +259,20 @@ impl DependencyGraph {
                 .push(index);
         }
         indexes
+    }
+
+    pub(crate) fn edges_for_dependents<'a>(
+        &'a self,
+        dependents: &HashSet<ObjectId>,
+    ) -> impl Iterator<Item = &'a DependencyEdge> {
+        let indexes = self.indexes();
+        let mut positions = dependents
+            .iter()
+            .flat_map(|id| indexes.by_dependent.get(id).into_iter().flatten().copied())
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        positions.into_iter().map(|index| &self.edges[index])
     }
 
     fn resolve_rename_with<'a>(

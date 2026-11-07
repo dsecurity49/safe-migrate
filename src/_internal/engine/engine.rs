@@ -2,8 +2,11 @@ use crate::_internal::analysis::evidence::EvidenceLocation;
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::outcome::AnalysisOutcome;
 use crate::_internal::analysis::resolver::Resolver;
+#[cfg(test)]
+use crate::_internal::analysis::state::PreStateReadSet;
 use crate::_internal::analysis::state::{AnalysisState, PreState};
 use crate::_internal::ast::visitor::AstVisitor;
+use crate::_internal::engine::pre_state_footprint;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::_internal::rules::registry;
 use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
@@ -68,9 +71,18 @@ impl StatementCheckpoint {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum PreStateCaptureMode {
+    Selective,
+    Full,
+}
+
 pub(crate) struct SafeMigrateEngine {
     config: Config,
     rules: Vec<Box<dyn Rule>>,
+    #[cfg(test)]
+    pre_state_mode: PreStateCaptureMode,
 }
 
 impl SafeMigrateEngine {
@@ -78,7 +90,16 @@ impl SafeMigrateEngine {
         Self {
             config,
             rules: registry::build_primary_rules(),
+            #[cfg(test)]
+            pre_state_mode: PreStateCaptureMode::Selective,
         }
+    }
+
+    /// Verifies selective capture against the full snapshot in tests.
+    #[cfg(test)]
+    pub(crate) fn with_full_pre_state_for_tests(mut self) -> Self {
+        self.pre_state_mode = PreStateCaptureMode::Full;
+        self
     }
 
     /// Returns primary rule IDs in evaluation order.
@@ -385,7 +406,17 @@ impl SafeMigrateEngine {
                     _ => None,
                 };
 
-                state.capture_pre_state_into(&mut pre_state);
+                #[cfg(not(test))]
+                let reads =
+                    pre_state_footprint::for_mutation(state, &mutation, pre_cascade.as_ref());
+                #[cfg(test)]
+                let reads = match self.pre_state_mode {
+                    PreStateCaptureMode::Selective => {
+                        pre_state_footprint::for_mutation(state, &mutation, pre_cascade.as_ref())
+                    }
+                    PreStateCaptureMode::Full => PreStateReadSet::full(),
+                };
+                state.capture_pre_state_into(&mut pre_state, &reads);
                 let result = state.apply(&mutation, pre_cascade.as_ref());
 
                 statement_failed = matches!(

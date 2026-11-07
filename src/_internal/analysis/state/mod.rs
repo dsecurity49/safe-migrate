@@ -54,6 +54,7 @@ mod hydrate;
 mod lookup;
 mod names;
 mod pre_state;
+pub(crate) use pre_state::{PreStateReadSet, ReadScope};
 mod publication;
 mod roles;
 mod rollback;
