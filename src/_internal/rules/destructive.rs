@@ -500,7 +500,7 @@ impl Rule for ReversibilityRule {
             if !dependent_relations.is_empty() {
                 let max_rows = dependent_relations
                     .iter()
-                    .filter_map(|r| r.estimated_rows)
+                    .map(|r| r.estimated_rows.unwrap_or(config.default_rows))
                     .max()
                     .unwrap_or(config.default_rows);
                 let tier = if max_rows == 0 {

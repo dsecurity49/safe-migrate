@@ -473,10 +473,10 @@ impl SafeMigrateEngine {
                         && !rule.evaluates_when_unresolved(&transition)
                     {
                         let mut missing_schemas = state.external_referenced_schemas();
-                        if missing_schemas.is_empty()
-                            && let Some((_, obj_name)) = mutation.primary_object()
+                        if let Some((_, obj_name)) = mutation.primary_object()
                             && let Some(schema) =
                                 state.baseline_scope_omits_displayed_object(&obj_name)
+                            && !missing_schemas.iter().any(|s| s == schema)
                         {
                             missing_schemas.push(schema.to_string());
                         }

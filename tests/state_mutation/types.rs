@@ -3094,6 +3094,23 @@ fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
     );
 
     let range_id = object_id("public", "custom_range");
+    let opclass_id = object_id("public", "custom_opclass");
+    cache.opclasses = Some(
+        crate::_internal::model::opclass::OpclassCatalogue::from_entries(vec![
+            crate::_internal::model::opclass::OpclassEntry {
+                name: "custom_opclass".into(),
+                namespace: "public".into(),
+                family: crate::_internal::model::index::ResolvedName {
+                    schema: "public".into(),
+                    name: "custom_family".into(),
+                },
+                intype: "int4".into(),
+                aliases: vec!["integer".into()],
+                method: "btree".into(),
+                is_default: false,
+            },
+        ]),
+    );
     cache.types.insert(
         range_id.clone(),
         TypeState {
@@ -3106,7 +3123,7 @@ fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
                 multirange: None,
                 collation: None,
                 collation_id: None,
-                opclass: None,
+                opclass: Some("custom_opclass".into()),
                 opclass_id: None,
                 canonical: None,
                 canonical_id: None,
@@ -3118,15 +3135,23 @@ fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
 
     let state = AnalysisState::with_baseline(cache, true);
     let Some(TypeOverlay::Present(TypeState {
-        kind: TypeKind::Range {
-            subtype_diff_id, ..
-        },
+        kind:
+            TypeKind::Range {
+                opclass_id: hydrated_opclass_id,
+                subtype_diff_id,
+                ..
+            },
         ..
     })) = state.local.types.get(&range_id)
     else {
         panic!("custom_range must be present");
     };
 
+    assert_eq!(
+        hydrated_opclass_id.as_ref(),
+        Some(&opclass_id),
+        "opclass_id must be hydrated from baseline cache"
+    );
     assert_eq!(
         subtype_diff_id.as_ref(),
         Some(&diff_id),

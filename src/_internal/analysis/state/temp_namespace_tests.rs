@@ -53,8 +53,10 @@ fn rollback_to_savepoint_removes_only_the_namespace_it_created() {
     analyze(
         &engine,
         &mut state,
-        "BEGIN;\nSAVEPOINT before_temp;\nCREATE TEMP TABLE pg_temp.savepoint_probe (id bigint NOT NULL);\nROLLBACK TO SAVEPOINT before_temp;\nROLLBACK;",
+        "BEGIN;\nSAVEPOINT before_temp;\nCREATE TEMP TABLE pg_temp.savepoint_probe (id bigint NOT NULL);\nROLLBACK TO SAVEPOINT before_temp;",
     );
+    assert_temp_schema_is_absent(&state);
+    analyze(&engine, &mut state, "ROLLBACK;");
     assert_temp_schema_is_absent(&state);
 
     analyze(

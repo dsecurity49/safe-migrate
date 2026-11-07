@@ -722,6 +722,24 @@ fn finish_analysis(
                 .with_context(|| format!("Failed to create report directory: {}", dir.display()))?;
             let json_path = dir.join("safe-migrate-report.json");
             let markdown_path = dir.join("safe-migrate-report.md");
+            if json_path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(anyhow::anyhow!(
+                    "Refusing to write JSON report to symlink destination: {}",
+                    json_path.display()
+                ));
+            }
+            if markdown_path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(anyhow::anyhow!(
+                    "Refusing to write Markdown report to symlink destination: {}",
+                    markdown_path.display()
+                ));
+            }
             fs::write(&json_path, serde_json::to_string_pretty(&outcome.json())?)
                 .with_context(|| format!("Failed to write JSON report: {}", json_path.display()))?;
             fs::write(&markdown_path, outcome.markdown()).with_context(|| {

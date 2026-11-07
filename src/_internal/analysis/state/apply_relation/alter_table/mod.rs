@@ -393,6 +393,15 @@ impl AnalysisState {
                     column, alter.id
                 ));
             }
+            AlterTableActionMutation::SetDefault { column, .. }
+            | AlterTableActionMutation::DropNotNull { column }
+                if relation.identity_columns.contains_key(column) =>
+            {
+                return MutationResult::conflict(format!(
+                    "column \"{}\" of relation \"{}\" is an identity column",
+                    column, alter.id
+                ));
+            }
             AlterTableActionMutation::SetCompression {
                 method: Some(method),
                 ..
@@ -1365,14 +1374,23 @@ impl AnalysisState {
                 column,
                 identity_sequence,
                 ..
-            } => Some((
-                identity_sequence.sequence_name.clone().unwrap_or_else(|| {
-                    self.next_implicit_sequence_id(&alter.id, column, &HashSet::new())
-                }),
-                column.clone(),
-                SequenceKind::Identity,
-                Some(identity_sequence.clone()),
-            )),
+            } => {
+                if let Some(explicit_id) = &identity_sequence.sequence_name
+                    && explicit_id.schema != alter.id.schema
+                {
+                    return MutationResult::conflict(
+                        "sequence must be in the same schema as the table".to_string(),
+                    );
+                }
+                Some((
+                    identity_sequence.sequence_name.clone().unwrap_or_else(|| {
+                        self.next_implicit_sequence_id(&alter.id, column, &HashSet::new())
+                    }),
+                    column.clone(),
+                    SequenceKind::Identity,
+                    Some(identity_sequence.clone()),
+                ))
+            }
             _ => None,
         };
         if let Some((sequence_id, _, _, _)) = &implicit_add

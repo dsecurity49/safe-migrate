@@ -587,6 +587,8 @@ impl AnalysisState {
         }
         let runtime =
             crate::_internal::model::sequence::SequenceRuntime::fresh(parameters.start_value);
+        let is_temp_sequence = parameters.persistence
+            == crate::_internal::model::sequence::SequencePersistence::Temporary;
         self.local.sequences.insert(
             create.id.clone(),
             SequenceOverlay::Present(SequenceState {
@@ -613,6 +615,9 @@ impl AnalysisState {
                     column: column.clone(),
                 },
             ));
+        }
+        if is_temp_sequence {
+            self.note_temp_object_created();
         }
         MutationResult::Applied
     }

@@ -969,18 +969,18 @@ impl DependencyGraph {
                 else {
                     continue;
                 };
-                let index_keys = definition
-                    .keys
-                    .iter_mut()
-                    .chain(&mut definition.included)
-                    .filter_map(|key| match &mut key.kind {
-                        crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
-                        crate::_internal::model::index::IndexKeyKind::Expression(_)
-                        | crate::_internal::model::index::IndexKeyKind::CatalogExpression(_) => {
-                            None
+                let mut index_keys = Vec::new();
+                for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                    match &mut key.kind {
+                        crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                            index_keys.push(name);
                         }
-                    })
-                    .collect::<Vec<&mut String>>();
+                        crate::_internal::model::index::IndexKeyKind::CatalogExpression(expr) => {
+                            expr.rename_column(old_name, new_name);
+                        }
+                        crate::_internal::model::index::IndexKeyKind::Expression(_) => {}
+                    }
+                }
                 for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {
                     if column == old_name {
                         *column = new_name.to_string();
@@ -1513,5 +1513,28 @@ mod tests {
         // part_parent_0 has child part_child_0; attaching part_parent_0 to part_child_0 creates a cycle
         assert!(graph.check_partition_cycle(&id("part_child_0"), &id("part_parent_0")));
         assert!(!graph.check_partition_cycle(&id("part_parent_0"), &id("unrelated")));
+
+        // Multi-parent inheritance cycle check with indexed vs unindexed comparison
+        let multi_child = id("multi_child");
+        let first_parent = id("first_parent");
+        let second_parent = id("second_parent");
+        let ancestor = id("ancestor_via_second");
+        graph.add_edge(DependencyEdge::new(
+            second_parent.clone(),
+            ancestor.clone(),
+            DependencyKind::InheritanceOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            multi_child.clone(),
+            first_parent,
+            DependencyKind::InheritanceOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            multi_child.clone(),
+            second_parent,
+            DependencyKind::InheritanceOf,
+        ));
+        assert!(graph.check_inheritance_cycle(&multi_child, &ancestor));
+        assert!(!graph.check_inheritance_cycle(&ancestor, &multi_child));
     }
 }

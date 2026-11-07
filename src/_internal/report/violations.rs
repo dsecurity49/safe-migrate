@@ -143,10 +143,16 @@ impl NotEvaluated {
                         union.push(s.clone());
                     }
                 }
+                let raw_arg = union.join(",");
+                let shell_arg = if raw_arg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ',' | '.')) {
+                    raw_arg
+                } else {
+                    format!("'{}'", raw_arg.replace('\'', "'\\''"))
+                };
                 format!(
                     "Add {} to `schemas` in safe-migrate.toml and re-sync, or run: safe-migrate sync --schemas {}",
                     quote_schema_list(missing_schemas),
-                    union.join(",")
+                    shell_arg
                 )
             }
             EvidenceCode::CatalogCoverageIncomplete => {

@@ -1453,14 +1453,24 @@ fn test_cli_rejects_report_dir_with_stdout_modes() {
     let reports = tempfile::tempdir().unwrap();
 
     let mut cmd = crate::common::safe_migrate_command();
-    cmd.arg("lint")
+    let assert = cmd
+        .arg("lint")
         .arg("--file")
         .arg(sql_file.path())
         .arg("--json")
         .arg("--report-dir")
         .arg(reports.path())
         .assert()
-        .failure();
+        .code(2);
+
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used together")
+            || stderr.contains("conflict")
+            || stderr.contains("cannot be used with"),
+        "expected mutual exclusion error in stderr: {stderr}"
+    );
 }
 
 #[test]

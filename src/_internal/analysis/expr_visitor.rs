@@ -269,6 +269,13 @@ impl ExprVisitor {
             })
             .unwrap_or_else(|| "<fn>".into());
 
+        let has_named_arg = ce
+            .arg_list()
+            .is_some_and(|al| al.args().any(|arg| arg.expr().is_none()));
+        if has_named_arg {
+            return ExprIr::Sentinel("<named_arg>".into());
+        }
+
         let args = ce
             .arg_list()
             .map(|al| {

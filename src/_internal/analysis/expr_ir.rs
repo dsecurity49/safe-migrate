@@ -96,6 +96,29 @@ impl ExprIr {
         }
     }
 
+    pub(crate) fn rename_column(&mut self, from: &str, to: &str) {
+        match self {
+            Self::ColumnRef(name) => {
+                if name == from {
+                    *name = to.to_string();
+                }
+            }
+            Self::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.rename_column(from, to);
+                }
+            }
+            Self::BinaryOp { left, right, .. } => {
+                left.rename_column(from, to);
+                right.rename_column(from, to);
+            }
+            Self::Cast { expr, .. } | Self::UnaryOp { expr, .. } => {
+                expr.rename_column(from, to);
+            }
+            Self::Literal(_) | Self::Sentinel(_) | Self::Omitted => {}
+        }
+    }
+
     pub(crate) fn is_volatile(&self) -> bool {
         match self {
             ExprIr::FunctionCall { name, args } => {

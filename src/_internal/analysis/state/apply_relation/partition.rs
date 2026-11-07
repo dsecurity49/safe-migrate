@@ -1012,9 +1012,13 @@ impl AnalysisState {
             })
             .cloned()
             .collect();
-        let existing = self.partition_foreign_keys(child);
-        for edge in parent_foreign_keys {
-            self.clone_partition_foreign_key(&edge, child, &existing);
+        let mut targets = vec![child.clone()];
+        targets.extend(self.partition_descendants(child));
+        for target in targets {
+            let existing = self.partition_foreign_keys(&target);
+            for edge in &parent_foreign_keys {
+                self.clone_partition_foreign_key(edge, &target, &existing);
+            }
         }
     }
 
@@ -1227,19 +1231,39 @@ impl AnalysisState {
     }
 
     fn owned_identity_sequence(&self, table: &ObjectId, column: &str) -> Option<ObjectId> {
-        self.local
-            .sequences
-            .iter()
-            .find_map(|(id, overlay)| match overlay {
-                SequenceOverlay::Present(sequence)
-                    if sequence.kind == SequenceKind::Identity
-                        && sequence.owned_by.as_ref()
-                            == Some(&(table.clone(), column.to_string())) =>
+        let mut pending = vec![table.clone()];
+        let mut visited = HashSet::from([table.clone()]);
+        while let Some(current) = pending.pop() {
+            let sequence = self
+                .local
+                .sequences
+                .iter()
+                .find_map(|(id, overlay)| match overlay {
+                    SequenceOverlay::Present(sequence)
+                        if sequence.kind == SequenceKind::Identity
+                            && sequence.owned_by.as_ref()
+                                == Some(&(current.clone(), column.to_string())) =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                });
+            if sequence.is_some() {
+                return sequence;
+            }
+            for edge in self.local.graph.edges() {
+                if edge.dependent == current
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                    && visited.insert(edge.referenced.clone())
                 {
-                    Some(id.clone())
+                    pending.push(edge.referenced.clone());
                 }
-                _ => None,
-            })
+            }
+        }
+        None
     }
 
     fn partition_foreign_keys(&self, table: &ObjectId) -> Vec<DependencyEdge> {
