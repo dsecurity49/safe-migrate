@@ -12,11 +12,12 @@ use crate::_internal::analysis::mutations::{
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::model::extension::{ExtensionMemberKind, ExtensionOverlay};
 use crate::_internal::model::function::FunctionOverlay;
 use crate::_internal::model::types::{
     BaseTypeLength, BaseTypeOptions, DomainConstraintState, TypeKind, TypeOverlay, TypeState,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 type TypeLookup = ObjectLookup;
 
@@ -66,6 +67,38 @@ impl AnalysisState {
         }
         (current == &Self::array_type_id(&rename.old_id))
             .then(|| Self::array_type_id(&rename.new_id))
+    }
+
+    fn type_kind_references_rename(kind: &TypeKind, rename: &Rename) -> bool {
+        match kind {
+            TypeKind::Domain { base_type_id, .. } => base_type_id
+                .as_ref()
+                .and_then(|id| Self::renamed_type_id(id, rename))
+                .is_some(),
+            TypeKind::Composite { fields } => fields.iter().any(|field| {
+                field
+                    .data_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .is_some()
+            }),
+            TypeKind::Range {
+                subtype_id,
+                multirange,
+                ..
+            } => {
+                subtype_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .is_some()
+                    || multirange.as_ref() == Some(&rename.old_id)
+            }
+            TypeKind::Multirange { range } => range.as_ref() == Some(&rename.old_id),
+            TypeKind::Base { options, .. } => options.element.as_ref().is_some_and(|element| {
+                element == &rename.old_id.name || element == &rename.old_id.to_string()
+            }),
+            TypeKind::Enum { .. } => false,
+        }
     }
 
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
@@ -450,8 +483,100 @@ impl AnalysisState {
                 ));
             }
         }
+        // Keep graph edge insertion independent of hash-map iteration order.
+        remapped_functions.sort_by(|left, right| left.0.cmp(&right.0));
 
-        self.snapshot_namespace();
+        let mut affected_relations: Vec<ObjectId> = self
+            .local
+            .relations
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let RelationOverlay::Present(relation) = overlay else {
+                    return None;
+                };
+                relation
+                    .columns
+                    .iter()
+                    .any(|column| {
+                        column
+                            .type_id
+                            .as_ref()
+                            .and_then(|type_id| Self::renamed_type_id(type_id, rename))
+                            .is_some()
+                    })
+                    .then_some(id.clone())
+            })
+            .collect();
+        affected_relations.sort();
+        let mut affected_types: Vec<ObjectId> = self
+            .local
+            .types
+            .iter()
+            .filter_map(|(id, overlay)| {
+                if id == &rename.old_id || id == &rename.new_id {
+                    return None;
+                }
+                let TypeOverlay::Present(state) = overlay else {
+                    return None;
+                };
+                Self::type_kind_references_rename(&state.kind, rename).then_some(id.clone())
+            })
+            .collect();
+        affected_types.sort();
+        let mut affected_functions: BTreeSet<ObjectId> = BTreeSet::new();
+        for (old_id, new_id, _, _) in &remapped_functions {
+            affected_functions.insert(old_id.clone());
+            affected_functions.insert(new_id.clone());
+        }
+        for (id, overlay) in &self.local.functions {
+            let FunctionOverlay::Present(function) = overlay else {
+                continue;
+            };
+            if function
+                .internal_type_owner
+                .as_ref()
+                .and_then(|owner| Self::renamed_type_id(owner, rename))
+                .is_some()
+            {
+                affected_functions.insert(id.clone());
+            }
+        }
+        let mut affected_extensions: Vec<String> = self
+            .local
+            .extensions
+            .iter()
+            .filter_map(|(name, overlay)| {
+                let ExtensionOverlay::Present(extension) = overlay else {
+                    return None;
+                };
+                extension
+                    .members
+                    .iter()
+                    .any(|member| {
+                        member.kind == ExtensionMemberKind::Type && member.id == rename.old_id
+                    })
+                    .then(|| name.clone())
+            })
+            .collect();
+        affected_extensions.sort();
+
+        // A type rename touches the type, its dependents, and the graph; the
+        // rest of the namespace is untouched, so snapshot only that write set.
+        self.snapshot_graph_full();
+        self.snapshot_type(&rename.old_id);
+        self.snapshot_type(&rename.new_id);
+        for id in &affected_types {
+            self.snapshot_type(id);
+        }
+        for id in &affected_relations {
+            self.snapshot_relation(id);
+        }
+        for id in &affected_functions {
+            self.snapshot_function(id);
+        }
+        for name in &affected_extensions {
+            self.snapshot_extension(name);
+        }
         self.local
             .graph
             .propagate_type_rename(&rename.old_id, &rename.new_id);

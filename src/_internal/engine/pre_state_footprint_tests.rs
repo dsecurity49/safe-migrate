@@ -11,8 +11,10 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::DbCache;
 use crate::_internal::engine::engine::SafeMigrateEngine;
 use crate::_internal::model::column::Column;
+use crate::_internal::model::function::{FunctionOverlay, FunctionState};
 use crate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use crate::_internal::model::types::{TypeKind, TypeOverlay};
 use crate::_internal::report::violations::Violation;
 use crate::api::config::Config;
 use std::collections::HashSet;
@@ -390,6 +392,23 @@ fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
         "ALTER SEQUENCE move_seq SET SCHEMA seq_target;",
         "ROLLBACK;",
         "ALTER SEQUENCE move_seq INCREMENT BY 2;",
+        "CREATE TYPE rename_type AS (id integer);",
+        "CREATE DOMAIN rename_domain AS rename_type;",
+        "CREATE TABLE rename_type_owner (value rename_type, values rename_type[]);",
+        "CREATE FUNCTION rename_type_fn(value rename_type) RETURNS rename_type LANGUAGE sql AS 'SELECT value';",
+        "BEGIN;",
+        "ALTER TYPE rename_type RENAME TO rename_type_moved;",
+        "ROLLBACK;",
+        "CREATE SCHEMA type_target;",
+        "BEGIN;",
+        "ALTER TYPE rename_type SET SCHEMA type_target;",
+        "ROLLBACK;",
+        "ALTER TYPE rename_type ADD ATTRIBUTE extra text;",
+        "ALTER TABLE rename_type_owner ADD COLUMN still_here text;",
+        "DROP TABLE rename_type_owner;",
+        "DROP FUNCTION rename_type_fn(rename_type);",
+        "DROP DOMAIN rename_domain;",
+        "DROP TYPE rename_type;",
     ];
     let mut saw_conflict = false;
 
@@ -418,6 +437,122 @@ fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
         saw_conflict,
         "chain did not exercise a rolled-back statement"
     );
+}
+
+fn column_type_ids(state: &AnalysisState) -> Vec<Option<ObjectId>> {
+    let RelationOverlay::Present(relation) = state
+        .local
+        .relations
+        .get(&relation_id("rename_type_owner"))
+        .expect("relation exists")
+    else {
+        panic!("relation is present");
+    };
+    relation
+        .columns
+        .iter()
+        .map(|column| column.type_id.clone())
+        .collect()
+}
+
+fn renamed_function(state: &AnalysisState) -> (&ObjectId, &FunctionState) {
+    state
+        .local
+        .functions
+        .iter()
+        .find_map(|(id, overlay)| {
+            let FunctionOverlay::Present(function) = overlay else {
+                return None;
+            };
+            id.name
+                .starts_with("rename_type_fn(")
+                .then_some((id, function))
+        })
+        .expect("function exists")
+}
+
+fn domain_base_type(state: &AnalysisState, id: &ObjectId) -> Option<ObjectId> {
+    let TypeOverlay::Present(domain) = state.local.types.get(id).expect("domain exists") else {
+        panic!("domain is present");
+    };
+    let TypeKind::Domain { base_type_id, .. } = &domain.kind else {
+        panic!("domain kind");
+    };
+    base_type_id.clone()
+}
+
+#[test]
+fn type_rename_rollback_restores_dependents() {
+    let mut state = AnalysisState::new(differential_cache());
+    let engine = SafeMigrateEngine::new(Config::default());
+    for statement in [
+        "CREATE TYPE rename_type AS (id integer);",
+        "CREATE DOMAIN rename_domain AS rename_type;",
+        "CREATE TABLE rename_type_owner (value rename_type, values rename_type[]);",
+        "CREATE FUNCTION rename_type_fn(value rename_type) RETURNS rename_type LANGUAGE sql AS 'SELECT value';",
+        "BEGIN;",
+        "ALTER TYPE rename_type RENAME TO rename_type_moved;",
+    ] {
+        let violations = engine
+            .analyze(statement, &mut state)
+            .unwrap_or_else(|errors| panic!("failed on {statement}: {errors:?}"));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "unexpected conflict on {statement}: {violations:?}"
+        );
+    }
+
+    let old = ObjectId::new("public", "rename_type");
+    let moved = ObjectId::new("public", "rename_type_moved");
+    let old_array = AnalysisState::array_type_id(&old);
+    let moved_array = AnalysisState::array_type_id(&moved);
+    let domain_id = ObjectId::new("public", "rename_domain");
+
+    assert!(matches!(
+        state.local.types.get(&moved),
+        Some(TypeOverlay::Present(_))
+    ));
+    assert!(!state.local.types.contains_key(&old));
+    let columns = column_type_ids(&state);
+    assert!(columns.contains(&Some(moved.clone())));
+    assert!(columns.contains(&Some(moved_array.clone())));
+    let (function_id, function) = renamed_function(&state);
+    assert!(function_id.name.contains("_moved"));
+    assert!(
+        function
+            .arg_type_ids
+            .iter()
+            .flatten()
+            .any(|id| id == &moved)
+    );
+    assert_eq!(function.return_type_id.as_ref(), Some(&moved));
+    assert_eq!(domain_base_type(&state, &domain_id), Some(moved.clone()));
+
+    let violations = engine
+        .analyze("ROLLBACK;", &mut state)
+        .unwrap_or_else(|errors| panic!("rollback failed: {errors:?}"));
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "unexpected conflict on ROLLBACK: {violations:?}"
+    );
+
+    assert!(matches!(
+        state.local.types.get(&old),
+        Some(TypeOverlay::Present(_))
+    ));
+    assert!(!state.local.types.contains_key(&moved));
+    let columns = column_type_ids(&state);
+    assert!(columns.contains(&Some(old.clone())));
+    assert!(columns.contains(&Some(old_array.clone())));
+    let (function_id, function) = renamed_function(&state);
+    assert!(!function_id.name.contains("_moved"));
+    assert!(function.arg_type_ids.iter().flatten().any(|id| id == &old));
+    assert_eq!(function.return_type_id.as_ref(), Some(&old));
+    assert_eq!(domain_base_type(&state, &domain_id), Some(old.clone()));
 }
 
 fn differential_cache() -> DbCache {

@@ -141,7 +141,7 @@ impl AnalysisState {
         }
 
         let schema_move = rename.old_id.schema != rename.new_id.schema;
-        let associated_sequence_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
+        let mut associated_sequence_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
             self.local
                 .sequences
                 .iter()
@@ -164,7 +164,8 @@ impl AnalysisState {
         } else {
             Vec::new()
         };
-        let associated_index_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
+        associated_sequence_moves.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut associated_index_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
             self.local
                 .graph
                 .edges()
@@ -183,6 +184,7 @@ impl AnalysisState {
         } else {
             Vec::new()
         };
+        associated_index_moves.sort_by(|left, right| left.0.cmp(&right.0));
         for (old_id, new_id) in associated_sequence_moves
             .iter()
             .chain(&associated_index_moves)
@@ -195,7 +197,7 @@ impl AnalysisState {
             }
         }
 
-        let publication_scope_updates: Vec<(String, Vec<usize>)> = self
+        let mut publication_scope_updates: Vec<(String, Vec<usize>)> = self
             .local
             .publications
             .iter()
@@ -227,6 +229,7 @@ impl AnalysisState {
                 (!indexes.is_empty()).then(|| (publication_name.clone(), indexes))
             })
             .collect();
+        publication_scope_updates.sort_by(|left, right| left.0.cmp(&right.0));
 
         // A rename is a localized key move, not a namespace-wide rewrite.
         // Existing edges are remapped in place, so the graph still needs a
@@ -244,7 +247,7 @@ impl AnalysisState {
                 .relations
                 .insert(rename.new_id.clone(), RelationOverlay::Present(state));
         }
-        let owned_sequence_ids: Vec<ObjectId> = self
+        let mut owned_sequence_ids: Vec<ObjectId> = self
             .local
             .sequences
             .iter()
@@ -260,6 +263,7 @@ impl AnalysisState {
                 _ => None,
             })
             .collect();
+        owned_sequence_ids.sort();
         for sequence_id in owned_sequence_ids {
             self.snapshot_sequence(&sequence_id);
             if let Some(SequenceOverlay::Present(sequence)) =
@@ -304,7 +308,7 @@ impl AnalysisState {
                 DependencyKind::RenameTo,
             ));
         }
-        let triggers_to_move: Vec<(ObjectId, crate::_internal::model::trigger::TriggerState)> =
+        let mut triggers_to_move: Vec<(ObjectId, crate::_internal::model::trigger::TriggerState)> =
             self.local
                 .triggers
                 .iter()
@@ -315,6 +319,7 @@ impl AnalysisState {
                     _ => None,
                 })
                 .collect();
+        triggers_to_move.sort_by(|left, right| left.0.cmp(&right.0));
         for (old_trigger_id, mut trigger) in triggers_to_move {
             let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
             self.snapshot_trigger(&old_trigger_id);
@@ -334,13 +339,14 @@ impl AnalysisState {
                 DependencyKind::RenameTo,
             ));
         }
-        let constraints_to_move: Vec<(String, ConstraintState)> = self
+        let mut constraints_to_move: Vec<(String, ConstraintState)> = self
             .local
             .constraints
             .iter()
             .filter(|((table_id, _), _)| table_id == &rename.old_id)
             .map(|((_, name), constraint)| (name.clone(), constraint.clone()))
             .collect();
+        constraints_to_move.sort_by(|left, right| left.0.cmp(&right.0));
         for (name, mut constraint) in constraints_to_move {
             self.snapshot_constraint(&rename.old_id, &name);
             self.snapshot_constraint(&rename.new_id, &name);
@@ -466,15 +472,20 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
-    // The caller takes a namespace snapshot before changing these coupled identities.
+    // The caller snapshots the graph before changing these coupled identities.
     pub(super) fn rename_index_catalog_references(&mut self, old: &ObjectId, new: &ObjectId) {
-        let constraints = self
+        let mut constraints = self
             .local
             .constraints
             .values()
             .filter(|constraint| constraint.backing_index.as_ref() == Some(old))
             .cloned()
             .collect::<Vec<_>>();
+        constraints.sort_by(|left, right| {
+            left.table_id
+                .cmp(&right.table_id)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         for mut constraint in constraints {
             let old_name = constraint.name.clone();
             let owns_index = matches!(
@@ -508,7 +519,7 @@ impl AnalysisState {
             return;
         }
         let old_replica = format!("USING INDEX {}", old.name);
-        let affected_relations: Vec<ObjectId> = self
+        let mut affected_relations: Vec<ObjectId> = self
             .local
             .relations
             .iter()
@@ -524,6 +535,7 @@ impl AnalysisState {
                 .then_some(id.clone())
             })
             .collect();
+        affected_relations.sort();
         for id in &affected_relations {
             self.snapshot_relation(id);
         }
@@ -591,7 +603,7 @@ impl AnalysisState {
     /// together with the table. Keep this dependent metadata synchronized for
     /// both ALTER TABLE OWNER and the direct relation-owner mutation path.
     pub(super) fn transfer_owned_sequence_owners(&mut self, table: &ObjectId, owner: &ObjectId) {
-        let owned_sequence_ids: Vec<ObjectId> = self
+        let mut owned_sequence_ids: Vec<ObjectId> = self
             .local
             .sequences
             .iter()
@@ -606,6 +618,7 @@ impl AnalysisState {
                     .then_some(sequence_id.clone())
             })
             .collect();
+        owned_sequence_ids.sort();
         for sequence_id in owned_sequence_ids {
             self.snapshot_sequence(&sequence_id);
             if let Some(SequenceOverlay::Present(sequence)) =

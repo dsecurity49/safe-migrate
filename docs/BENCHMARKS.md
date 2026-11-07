@@ -218,10 +218,19 @@ longer cloned.
 | 503-statement transaction rollback | 400-450 ms | 382-385 ms |
 | 50 rename statements, 1,000 relations | 497,767 allocations / 134.6 MB / 746 ms | 97,467 allocations / 9.2 MB / 216 ms |
 
-`ALTER TABLE ... RENAME` and `ALTER SEQUENCE ... RENAME` now record a key move
-plus the affected metadata instead of a `NamespaceSnapshot`. Schema and type
-renames still use the full namespace snapshot, and relation renames still copy
-the dependency-edge list when it is non-empty.
+`ALTER TABLE ... RENAME`, `ALTER SEQUENCE ... RENAME`, and `ALTER TYPE ...
+RENAME`/`SET SCHEMA` now record only the affected overlays instead of a
+`NamespaceSnapshot`. Type renames snapshot the renamed type, its dependent
+relations, functions, and extension members; their dependent sets are scanned
+before the undo record is pushed. Schema renames still use the full namespace
+snapshot, and dependency-edge lists are still copied for rename and cascade
+operations pending the graph work.
+
+A schema rename is retained as a deliberate broad fallback: it rewrites every
+object family and the dependency graph, so a targeted delta would mirror the
+whole remap. A 1,000-relation baseline with one table in the renamed schema
+measured 10,346 allocations / 7.3 MB / 26 ms for the rename and rollback in the
+debug benchmark.
 
 A differential test runs every statement twice, once with the full state
 checkpoint and once with the journal, and requires identical findings plus
@@ -233,7 +242,34 @@ DDL.
 ```sh
 cargo test --locked --lib large_baseline_short_chain_allocations -- --ignored --nocapture --test-threads=1
 cargo test --locked --lib large_baseline_rename_chain_allocations -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib large_baseline_schema_rename_allocations -- --ignored --nocapture --test-threads=1
 cargo test --locked --lib ordered_thousand_statement_chain -- --ignored --nocapture --test-threads=1
 cargo test --locked --lib long_transaction_rollback -- --ignored --nocapture --test-threads=1
 cargo test --locked --lib statement_undo_journal_matches_full_checkpoint_after_every_statement
 ```
+
+## Graph index resolution and definition updates (2026-11-07)
+
+Captured on the same host and debug test profile. `build_indexes()` now
+memoizes rename-chain resolution per unique endpoint and compresses acyclic
+paths, instead of allocating a visited set for every edge endpoint. A single
+`IndexDefinition` update now maintains the edge set incrementally, keeps the
+warm derived index, and uses the cached `by_dependent` positions when they are
+available.
+
+| Scenario | Allocations | Allocated bytes | Elapsed |
+| --- | ---: | ---: | ---: |
+| build indexes: 10,000 index edges + 100-hop shared rename chain | 121,800 | 11.4 MB | 226 ms |
+| 1,000 definition updates against the same warm graph | 24,000 | 0.7 MB | 32 ms |
+
+Before this change each definition update cloned every edge into a new
+`HashSet` and invalidated the derived index, so the update cost scaled with the
+whole graph rather than with the one changed payload.
+
+```sh
+cargo test --locked --lib large_graph_index_and_definition_update_allocations -- --ignored --nocapture --test-threads=1
+```
+
+The graph tests include a differential check that the memoized index build
+matches the endpoint-walk resolver for rename chains, shared endpoints, missing
+targets, and a rename cycle.

@@ -354,7 +354,143 @@ mod performance_scenarios {
     }
 
     #[test]
-    #[ignore = "manual performance scenario; run with --ignored --nocapture"]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_baseline_schema_rename_allocations() {
+        let engine = setup_engine();
+        let mut state =
+            crate::_internal::analysis::state::AnalysisState::with_baseline(large_baseline(), true);
+        for statement in [
+            "CREATE SCHEMA perf_schema;",
+            "CREATE TABLE perf_schema.only_table (id integer);",
+            "BEGIN;",
+        ] {
+            let findings = engine
+                .analyze(statement, &mut state)
+                .unwrap_or_else(|errors| panic!("setup failed on {statement}: {errors:?}"));
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != "chain-conflict"),
+                "unexpected state conflict on {statement}: {findings:?}"
+            );
+        }
+
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        let findings = engine
+            .analyze(
+                "ALTER SCHEMA perf_schema RENAME TO perf_schema_moved;",
+                &mut state,
+            )
+            .expect("schema rename should analyze");
+        let rollback = engine
+            .analyze("ROLLBACK;", &mut state)
+            .expect("schema rename rollback should analyze");
+        let allocations = allocation_delta(before);
+        let elapsed = started.elapsed();
+
+        assert!(
+            findings
+                .iter()
+                .chain(&rollback)
+                .all(|finding| finding.rule_id != "chain-conflict"),
+            "unexpected state conflict: {findings:?} {rollback:?}"
+        );
+        assert!(state.relation_is_present(&object_id("perf_schema", "only_table")));
+        assert!(!state.relation_is_present(&object_id("perf_schema_moved", "only_table")));
+        eprintln!(
+            "scenario=large_baseline_schema_rename statements=2 relations={LARGE_BASELINE_RELATIONS} allocations={} allocated_bytes={} elapsed_ms={}",
+            allocations.0,
+            allocations.1,
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_graph_index_and_definition_update_allocations() {
+        use safe_migrate::_internal::analysis::graph::{
+            DependencyEdge, DependencyGraph, DependencyKind,
+        };
+        use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
+
+        const INDEXES: usize = 10_000;
+        const UPDATES: usize = 1_000;
+        const RENAME_CHAIN: usize = 100;
+
+        let mut graph = DependencyGraph::new();
+        for rename in 0..RENAME_CHAIN {
+            graph.add_edge(DependencyEdge::new(
+                object_id("public", &format!("perf_shared_table_{rename}")),
+                object_id("public", &format!("perf_shared_table_{}", rename + 1)),
+                DependencyKind::RenameTo,
+            ));
+        }
+        let written_table = object_id("public", "perf_shared_table_0");
+        for index in 0..INDEXES {
+            graph.add_edge(DependencyEdge::new(
+                object_id("public", &format!("perf_index_{index}")),
+                written_table.clone(),
+                DependencyKind::IndexOnRelation {
+                    definition: IndexDefinition {
+                        method: Some("btree".into()),
+                        keys: index_keys(vec!["id".into()]),
+                        included: index_keys(Vec::new()),
+                        expression_keys: 0,
+                        unique: false,
+                        nulls_not_distinct: Some(false),
+                        predicate: IndexPredicate::None,
+                        unestablished: false,
+                        valid: true,
+                        ready: true,
+                        live: true,
+                    },
+                    dependency_columns: Vec::new(),
+                    dependency_columns_known: true,
+                    is_concurrent: false,
+                    is_immediate: true,
+                    eligibility_known: true,
+                },
+            ));
+        }
+
+        let renamed_table = object_id("public", &format!("perf_shared_table_{RENAME_CHAIN}"));
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        assert_eq!(graph.cascade_edges(&renamed_table).len(), INDEXES);
+        let build_allocations = allocation_delta(before);
+        let build_elapsed = started.elapsed();
+
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        for index in 0..UPDATES {
+            graph.update_index_definition(
+                &object_id("public", &format!("perf_index_{index}")),
+                |definition| definition.valid = false,
+            );
+        }
+        let update_allocations = allocation_delta(before);
+        let update_elapsed = started.elapsed();
+        assert!(graph.indexes_are_valid());
+
+        eprintln!(
+            "scenario=large_graph_index_build edges={} renames={RENAME_CHAIN} allocations={} allocated_bytes={} elapsed_ms={}",
+            INDEXES + RENAME_CHAIN,
+            build_allocations.0,
+            build_allocations.1,
+            build_elapsed.as_millis()
+        );
+        eprintln!(
+            "scenario=large_graph_definition_updates updates={UPDATES} edges={} allocations={} allocated_bytes={} elapsed_ms={}",
+            INDEXES + RENAME_CHAIN,
+            update_allocations.0,
+            update_allocations.1,
+            update_elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
     fn large_baseline_type_resolution_after_temp_rollback() {
         const RESOLUTIONS: usize = 10_000;
 

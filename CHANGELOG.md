@@ -77,10 +77,17 @@ notes are available on the
   baseline with 50 `ALTER TABLE` statements drops from 462,883 allocations and
   640 ms to 13,208 allocations and about 60 ms in the debug benchmark; a
   1,000-statement chain drops from about 9 s to 1.2 s.
-- Relation and sequence renames now undo through a compact key move and the
-  affected metadata instead of copying the whole namespace. A 1,000-relation
-  baseline with 50 renames drops from 497,767 allocations and 746 ms to 97,467
-  allocations and 216 ms in the debug benchmark.
+- Relation, sequence, and type renames now undo through the affected overlays
+  instead of copying the whole namespace. Type renames snapshot only the
+  renamed type plus dependent relations, functions, and extension members. A
+  1,000-relation baseline with 50 relation renames drops from 497,767
+  allocations and 746 ms to 97,467 allocations and 216 ms in the debug
+  benchmark.
+- Dependency-graph index construction now memoizes rename-chain resolution per
+  endpoint, and a single index-definition update maintains the edge set
+  incrementally instead of rebuilding hash membership and invalidating the
+  derived index for the whole graph. On a 10,100-edge graph, 1,000 definition
+  updates take 24,000 allocations and 32 ms in the debug benchmark.
 
 ## v0.12.0 — 2026-10-31
 
