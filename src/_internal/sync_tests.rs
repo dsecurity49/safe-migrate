@@ -188,6 +188,35 @@ mod tests {
     }
 
     #[test]
+    fn test_search_path_setting_parser_discards_whitespace_outside_quotes() {
+        assert_eq!(
+            parse_search_path_setting("\"billing schema\" , public"),
+            ["billing schema", "public"]
+        );
+        assert_eq!(
+            parse_search_path_setting("  public  ,  \"tenant schema\"  "),
+            ["public", "tenant schema"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" both \"   , normal"),
+            [" both ", "normal"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" leading\"  ,  \"trailing \"  ,  public"),
+            [" leading", "trailing ", "public"]
+        );
+        // Canonical PostgreSQL 18 output for the same settings.
+        assert_eq!(
+            parse_search_path_setting("\"billing schema\", public"),
+            ["billing schema", "public"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" leading\", \"trailing \", \" both \""),
+            [" leading", "trailing ", " both "]
+        );
+    }
+
+    #[test]
     fn test_synced_relation_owner_uses_role_identity() {
         assert_eq!(
             relation_owner_id("app_owner"),

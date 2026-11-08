@@ -1,4 +1,5 @@
 use super::*;
+use crate::_internal::analysis::graph::GraphRenamePlan;
 use crate::_internal::analysis::transaction::BaselineSet;
 
 impl AnalysisState {
@@ -231,13 +232,25 @@ impl AnalysisState {
             .collect();
         publication_scope_updates.sort_by(|left, right| left.0.cmp(&right.0));
 
-        // A rename is a localized key move, not a namespace-wide rewrite.
-        // Existing edges are remapped in place, so the graph still needs a
-        // full snapshot; the overlay maps are restored per object below.
-        self.snapshot_graph_full();
+        let pending_validation_moves = self
+            .local
+            .pending_validation
+            .iter()
+            .any(|(table, _)| table == &rename.old_id);
+        let baseline_foreign_keys_move = self
+            .baseline_foreign_keys
+            .iter()
+            .any(|(table, _)| table == &rename.old_id);
+
+        // A rename is a localized key move, not a namespace-wide rewrite. The
+        // length marker covers appended rename edges; the plan records only
+        // the edges it actually rewrites.
+        self.snapshot_graph();
         if renames_relation {
             self.snapshot_relation_rename(&rename.old_id, &rename.new_id);
-            self.snapshot_pending_validation();
+            if pending_validation_moves {
+                self.snapshot_pending_validation();
+            }
         }
         if let Some(RelationOverlay::Present(mut state)) =
             self.local.relations.remove(&rename.old_id)
@@ -247,6 +260,7 @@ impl AnalysisState {
                 .relations
                 .insert(rename.new_id.clone(), RelationOverlay::Present(state));
         }
+        let mut rename_plan = GraphRenamePlan::default();
         let mut owned_sequence_ids: Vec<ObjectId> = self
             .local
             .sequences
@@ -288,9 +302,9 @@ impl AnalysisState {
             self.local
                 .sequences
                 .insert(new_sequence_id.clone(), SequenceOverlay::Present(sequence));
-            self.local
-                .graph
-                .propagate_sequence_rename(old_sequence_id, new_sequence_id);
+            rename_plan
+                .sequences
+                .insert(old_sequence_id.clone(), new_sequence_id.clone());
             self.local.graph.add_edge(DependencyEdge::new(
                 old_sequence_id.clone(),
                 new_sequence_id.clone(),
@@ -298,9 +312,9 @@ impl AnalysisState {
             ));
         }
         for (old_index_id, new_index_id) in &associated_index_moves {
-            self.local
-                .graph
-                .propagate_index_rename(old_index_id, new_index_id);
+            rename_plan
+                .indexes
+                .insert(old_index_id.clone(), new_index_id.clone());
             self.rename_index_catalog_references(old_index_id, new_index_id);
             self.local.graph.add_edge(DependencyEdge::new(
                 old_index_id.clone(),
@@ -330,9 +344,9 @@ impl AnalysisState {
             self.local
                 .triggers
                 .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
-            self.local
-                .graph
-                .propagate_trigger_rename(&old_trigger_id, &new_trigger_id);
+            rename_plan
+                .triggers
+                .insert(old_trigger_id.clone(), new_trigger_id.clone());
             self.local.graph.add_edge(DependencyEdge::new(
                 old_trigger_id,
                 new_trigger_id,
@@ -390,31 +404,36 @@ impl AnalysisState {
                 }
             }
         }
-        self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
-            .into_iter()
-            .map(|(table, name)| {
-                if table == rename.old_id {
-                    (rename.new_id.clone(), name)
-                } else {
-                    (table, name)
-                }
-            })
-            .collect();
+        if pending_validation_moves {
+            self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
+                .into_iter()
+                .map(|(table, name)| {
+                    if table == rename.old_id {
+                        (rename.new_id.clone(), name)
+                    } else {
+                        (table, name)
+                    }
+                })
+                .collect();
+        }
         self.local.graph.add_edge(DependencyEdge::new(
             rename.old_id.clone(),
             rename.new_id.clone(),
             DependencyKind::RenameTo,
         ));
         if renames_relation {
-            self.local
-                .graph
-                .propagate_relation_rename(&rename.old_id, &rename.new_id);
+            rename_plan
+                .relations
+                .insert(rename.old_id.clone(), rename.new_id.clone());
         }
         if renames_index {
-            self.local
-                .graph
-                .propagate_index_rename(&rename.old_id, &rename.new_id);
+            rename_plan
+                .indexes
+                .insert(rename.old_id.clone(), rename.new_id.clone());
             self.rename_index_catalog_references(&rename.old_id, &rename.new_id);
+        }
+        if let Some(delta) = self.local.graph.apply_rename_plan_recorded(&rename_plan) {
+            self.record_graph_delta(delta);
         }
 
         if renames_relation {
@@ -434,17 +453,19 @@ impl AnalysisState {
             if self.baseline_fk_dependencies.remove(&rename.old_id) {
                 self.baseline_fk_dependencies.insert(rename.new_id.clone());
             }
-            self.snapshot_baseline_foreign_keys();
-            self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
-                .into_iter()
-                .map(|(table, name)| {
-                    if table == rename.old_id {
-                        (rename.new_id.clone(), name)
-                    } else {
-                        (table, name)
-                    }
-                })
-                .collect();
+            if baseline_foreign_keys_move {
+                self.snapshot_baseline_foreign_keys();
+                self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
+                    .into_iter()
+                    .map(|(table, name)| {
+                        if table == rename.old_id {
+                            (rename.new_id.clone(), name)
+                        } else {
+                            (table, name)
+                        }
+                    })
+                    .collect();
+            }
         }
         if renames_index {
             self.snapshot_baseline_set_rename(BaselineSet::Indexes, &rename.old_id, &rename.new_id);
@@ -503,12 +524,14 @@ impl AnalysisState {
                 .constraints
                 .remove(&(constraint.table_id.clone(), old_name.clone()));
             constraint.backing_index = Some(new.clone());
-            if old_name != constraint.name {
-                self.local.graph.rename_constraint(
+            if old_name != constraint.name
+                && let Some(delta) = self.local.graph.rename_constraint_recorded(
                     &constraint.table_id,
                     &old_name,
                     &constraint.name,
-                );
+                )
+            {
+                self.record_graph_delta(delta);
             }
             self.local.constraints.insert(
                 (constraint.table_id.clone(), constraint.name.clone()),

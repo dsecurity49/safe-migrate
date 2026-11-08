@@ -224,7 +224,9 @@ RENAME`/`SET SCHEMA` now record only the affected overlays instead of a
 relations, functions, and extension members; their dependent sets are scanned
 before the undo record is pushed. Schema renames still use the full namespace
 snapshot, and dependency-edge lists are still copied for rename and cascade
-operations pending the graph work.
+operations pending the graph work. Relation renames also still copy the
+pending-validation set and the baseline foreign-key set; those whole-structure
+copies remain in the rename path but are not yet delta-encoded.
 
 A schema rename is retained as a deliberate broad fallback: it rewrites every
 object family and the dependency graph, so a targeted delta would mirror the
@@ -236,8 +238,11 @@ A differential test runs every statement twice, once with the full state
 checkpoint and once with the journal, and requires identical findings plus
 identical complete `AnalysisState` after each statement. The chain includes a
 compound statement that applies one action and conflicts on the next, failed and
-successful savepoint operations, transaction-control conflicts, and autocommit
-DDL.
+successful savepoint operations, transaction-control conflicts, autocommit DDL,
+nested savepoints spanning relation, sequence, and type renames, repeated rename
+chains with rename-back and tombstone reuse, range and extension-member type
+renames, publication conflicts, and `ON COMMIT DROP`/`DELETE ROWS` temporary
+objects.
 
 ```sh
 cargo test --locked --lib large_baseline_short_chain_allocations -- --ignored --nocapture --test-threads=1
@@ -248,19 +253,30 @@ cargo test --locked --lib long_transaction_rollback -- --ignored --nocapture --t
 cargo test --locked --lib statement_undo_journal_matches_full_checkpoint_after_every_statement
 ```
 
-## Graph index resolution and definition updates (2026-11-07)
+## Graph index resolution and definition updates (2026-11-08)
 
-Captured on the same host and debug test profile. `build_indexes()` now
-memoizes rename-chain resolution per unique endpoint and compresses acyclic
-paths, instead of allocating a visited set for every edge endpoint. A single
-`IndexDefinition` update now maintains the edge set incrementally, keeps the
-warm derived index, and uses the cached `by_dependent` positions when they are
-available.
+Captured on the same host and debug test profile. The graph now keeps separate
+lazy cells for rename resolution, dependent-edge lookup, and resolved
+referenced/dependent adjacency. Cascade and cycle consumers build only the cell
+they need, and rename-chain resolution is memoized per unique endpoint instead
+of allocating a visited set for every edge endpoint. A single
+`IndexDefinition` update maintains the edge set incrementally, keeps the warm
+derived indexes, and uses the cached `by_dependent` positions. The fixture mixes
+index, foreign-key, trigger, and inheritance edges so both resolved adjacency
+cells are populated.
 
 | Scenario | Allocations | Allocated bytes | Elapsed |
 | --- | ---: | ---: | ---: |
-| build indexes: 10,000 index edges + 100-hop shared rename chain | 121,800 | 11.4 MB | 226 ms |
-| 1,000 definition updates against the same warm graph | 24,000 | 0.7 MB | 32 ms |
+| cold index construction: 10,000 index edges, 1,000 FK edges, 1,000 trigger edges, 1,000 inheritance edges + 100-hop shared rename chain | 69,376 | 5.1 MB | 119 ms |
+| warm cascade lookup plus result materialization | 13 | 0.26 MB | 2 ms |
+| cold cascade lookup (index construction plus result materialization) | 30,076 | 2.0 MB | 62 ms |
+| 1,000 definition updates against the same warm graph | 21,000 | 0.66 MB | 30 ms |
+
+The definition-update loop prebuilds its 1,000 `ObjectId` keys before the
+allocator and timer start, so the reported cost covers
+`update_index_definition()` rather than caller-side key construction. The
+index-construction scenario forces every lazy cell directly, while the cascade
+scenarios include the returned-edge materialization they are labelled with.
 
 Before this change each definition update cloned every edge into a new
 `HashSet` and invalidated the derived index, so the update cost scaled with the

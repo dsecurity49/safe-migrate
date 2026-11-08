@@ -420,9 +420,9 @@ impl AnalysisState {
         if !self.local.records_undo() {
             return;
         }
-        let previous = self.not_evaluated.clone();
+        let len = self.not_evaluated.len();
         self.local
-            .push_undo(StateChange::NotEvaluatedSnapshot { previous });
+            .push_undo(StateChange::NotEvaluatedLength { len });
     }
 
     pub(super) fn snapshot_co_dropped_objects(&mut self) {

@@ -394,7 +394,7 @@ impl DbCache {
 
         if self
             .pg_version_num
-            .is_some_and(|version| !(140_000..=189_999).contains(&version))
+            .is_some_and(|version| !crate::_internal::sync::is_supported_postgres_version(version))
         {
             return Err("This cache was synchronized from an unsupported PostgreSQL version; PostgreSQL 14 through 18 is required".to_string());
         }

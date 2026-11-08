@@ -321,11 +321,11 @@ fn unsafe_conservative_defaults_are_rejected_at_the_api_boundary() {
     );
     assert!(
         api::Config::default()
-            .with_assumed_postgres_version(180_999)
+            .with_assumed_postgres_version(189_999)
             .validate()
             .is_ok()
     );
-    for unsupported in [0, 130_999, 181_000, u32::MAX] {
+    for unsupported in [0, 130_999, 190_000, u32::MAX] {
         assert_eq!(
             api::Config::default()
                 .with_assumed_postgres_version(unsupported)

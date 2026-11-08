@@ -417,75 +417,146 @@ mod performance_scenarios {
         const INDEXES: usize = 10_000;
         const UPDATES: usize = 1_000;
         const RENAME_CHAIN: usize = 100;
+        const FOREIGN_KEYS: usize = 1_000;
+        const TRIGGERS: usize = 1_000;
+        const INHERITANCE_EDGES: usize = 1_000;
 
-        let mut graph = DependencyGraph::new();
-        for rename in 0..RENAME_CHAIN {
-            graph.add_edge(DependencyEdge::new(
-                object_id("public", &format!("perf_shared_table_{rename}")),
-                object_id("public", &format!("perf_shared_table_{}", rename + 1)),
-                DependencyKind::RenameTo,
-            ));
-        }
-        let written_table = object_id("public", "perf_shared_table_0");
-        for index in 0..INDEXES {
-            graph.add_edge(DependencyEdge::new(
-                object_id("public", &format!("perf_index_{index}")),
-                written_table.clone(),
-                DependencyKind::IndexOnRelation {
-                    definition: IndexDefinition {
-                        method: Some("btree".into()),
-                        keys: index_keys(vec!["id".into()]),
-                        included: index_keys(Vec::new()),
-                        expression_keys: 0,
-                        unique: false,
-                        nulls_not_distinct: Some(false),
-                        predicate: IndexPredicate::None,
-                        unestablished: false,
-                        valid: true,
-                        ready: true,
-                        live: true,
+        let build_graph = || {
+            let mut graph = DependencyGraph::new();
+            for rename in 0..RENAME_CHAIN {
+                graph.add_edge(DependencyEdge::new(
+                    object_id("public", &format!("perf_shared_table_{rename}")),
+                    object_id("public", &format!("perf_shared_table_{}", rename + 1)),
+                    DependencyKind::RenameTo,
+                ));
+            }
+            for foreign_key in 0..FOREIGN_KEYS {
+                graph.add_edge(DependencyEdge::new(
+                    object_id("public", &format!("perf_fk_table_{foreign_key}")),
+                    object_id(
+                        "public",
+                        &format!("perf_fk_table_{}", (foreign_key + 1) % FOREIGN_KEYS),
+                    ),
+                    DependencyKind::ForeignKey {
+                        constraint_name: Some(format!("perf_fk_{foreign_key}")),
+                        from_columns: vec!["id".into()],
+                        to_columns: vec!["id".into()],
+                        operator_evidence: None,
+                        from_generation: 0,
                     },
-                    dependency_columns: Vec::new(),
-                    dependency_columns_known: true,
-                    is_concurrent: false,
-                    is_immediate: true,
-                    eligibility_known: true,
-                },
-            ));
-        }
+                ));
+            }
+            for trigger in 0..TRIGGERS {
+                let trigger_id = object_id("public", &format!("perf_trigger_{trigger}"));
+                graph.add_edge(DependencyEdge::new(
+                    trigger_id.clone(),
+                    object_id("public", &format!("perf_trigger_table_{trigger}")),
+                    DependencyKind::TriggerOnTable {
+                        trigger_id,
+                        function_id: object_id("public", &format!("perf_trigger_fn_{trigger}")),
+                        trigger_generation: 0,
+                    },
+                ));
+            }
+            for inheritance in 0..INHERITANCE_EDGES {
+                graph.add_edge(DependencyEdge::new(
+                    object_id("public", &format!("perf_child_table_{inheritance}")),
+                    object_id("public", &format!("perf_parent_table_{inheritance}")),
+                    DependencyKind::InheritanceOf,
+                ));
+            }
+            let written_table = object_id("public", "perf_shared_table_0");
+            for index in 0..INDEXES {
+                graph.add_edge(DependencyEdge::new(
+                    object_id("public", &format!("perf_index_{index}")),
+                    written_table.clone(),
+                    DependencyKind::IndexOnRelation {
+                        definition: IndexDefinition {
+                            method: Some("btree".into()),
+                            keys: index_keys(vec!["id".into()]),
+                            included: index_keys(Vec::new()),
+                            expression_keys: 0,
+                            unique: false,
+                            nulls_not_distinct: Some(false),
+                            predicate: IndexPredicate::None,
+                            unestablished: false,
+                            valid: true,
+                            ready: true,
+                            live: true,
+                        },
+                        dependency_columns: Vec::new(),
+                        dependency_columns_known: true,
+                        is_concurrent: false,
+                        is_immediate: true,
+                        eligibility_known: true,
+                    },
+                ));
+            }
+            graph
+        };
 
         let renamed_table = object_id("public", &format!("perf_shared_table_{RENAME_CHAIN}"));
+
+        let mut graph = build_graph();
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        graph.build_indexes_for_tests();
+        let index_allocations = allocation_delta(before);
+        let index_elapsed = started.elapsed();
+
         let before = allocation_snapshot();
         let started = Instant::now();
         assert_eq!(graph.cascade_edges(&renamed_table).len(), INDEXES);
-        let build_allocations = allocation_delta(before);
-        let build_elapsed = started.elapsed();
+        let warm_lookup_allocations = allocation_delta(before);
+        let warm_lookup_elapsed = started.elapsed();
 
+        let update_ids = (0..UPDATES)
+            .map(|index| object_id("public", &format!("perf_index_{index}")))
+            .collect::<Vec<_>>();
         let before = allocation_snapshot();
         let started = Instant::now();
-        for index in 0..UPDATES {
-            graph.update_index_definition(
-                &object_id("public", &format!("perf_index_{index}")),
-                |definition| definition.valid = false,
-            );
+        for index in &update_ids {
+            graph.update_index_definition(index, |definition| definition.valid = false);
         }
         let update_allocations = allocation_delta(before);
         let update_elapsed = started.elapsed();
         assert!(graph.indexes_are_valid());
+        assert!(graph.edge_set_is_valid());
+
+        let cold_graph = build_graph();
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        assert_eq!(cold_graph.cascade_edges(&renamed_table).len(), INDEXES);
+        let cold_lookup_allocations = allocation_delta(before);
+        let cold_lookup_elapsed = started.elapsed();
 
         eprintln!(
-            "scenario=large_graph_index_build edges={} renames={RENAME_CHAIN} allocations={} allocated_bytes={} elapsed_ms={}",
-            INDEXES + RENAME_CHAIN,
-            build_allocations.0,
-            build_allocations.1,
-            build_elapsed.as_millis()
+            "scenario=large_graph_index_construction edges={} renames={RENAME_CHAIN} allocations={} allocated_bytes={} elapsed_ms={}",
+            INDEXES + RENAME_CHAIN + FOREIGN_KEYS + TRIGGERS + INHERITANCE_EDGES,
+            index_allocations.0,
+            index_allocations.1,
+            index_elapsed.as_millis()
+        );
+        eprintln!(
+            "scenario=large_graph_warm_cascade_lookup lookups=1 edges={} renames={RENAME_CHAIN} allocations={} allocated_bytes={} elapsed_ms={}",
+            INDEXES + RENAME_CHAIN + FOREIGN_KEYS + TRIGGERS + INHERITANCE_EDGES,
+            warm_lookup_allocations.0,
+            warm_lookup_allocations.1,
+            warm_lookup_elapsed.as_millis()
         );
         eprintln!(
             "scenario=large_graph_definition_updates updates={UPDATES} edges={} allocations={} allocated_bytes={} elapsed_ms={}",
-            INDEXES + RENAME_CHAIN,
+            INDEXES + RENAME_CHAIN + FOREIGN_KEYS + TRIGGERS + INHERITANCE_EDGES,
             update_allocations.0,
             update_allocations.1,
             update_elapsed.as_millis()
+        );
+        eprintln!(
+            "scenario=large_graph_cold_cascade_lookup lookups=1 edges={} renames={RENAME_CHAIN} allocations={} allocated_bytes={} elapsed_ms={}",
+            INDEXES + RENAME_CHAIN + FOREIGN_KEYS + TRIGGERS + INHERITANCE_EDGES,
+            cold_lookup_allocations.0,
+            cold_lookup_allocations.1,
+            cold_lookup_elapsed.as_millis()
         );
     }
 

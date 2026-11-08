@@ -9,91 +9,38 @@ notes are available on the
 
 - `ALTER TYPE ... DROP ATTRIBUTE` on composite types used by table columns now
   reports an `irreversible-migration` data-loss warning.
-- Range types restored from cache re-hydrate their operator class, canonical
-  routine, and subtype-diff routine identities so routine renames and drops
-  track dependencies with full fidelity.
-- `EXECUTE '...'` normalization now understands statement boundaries, string
-  literals, comments, and dollar-quoted bodies, so `EXECUTE` on the same line as
-  another statement is analyzed and text inside literals or comments is left
-  unchanged.
+- `EXECUTE '...'` normalization now handles statement boundaries, literals,
+  comments, and dollar-quoted bodies, including same-line `EXECUTE`.
 - `ALTER TABLE ... VALIDATE CONSTRAINT` is now checked by `blocking-constraint`:
-  validating a large table reports the full scan, and re-validating an already
-  valid constraint stays silent.
-- Attaching a partition now clones the parent's foreign keys onto it, and adding
-  a foreign key to a partitioned table clones it onto existing partitions. A
-  detached partition keeps that reference, so a later `DROP TABLE ... RESTRICT`
-  of the referenced table is no longer reported as safe.
-- `ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ... AS IDENTITY` now creates
-  the backing identity sequence (with PostgreSQL's collision suffixing),
-  validates the NOT NULL/default/type preconditions, and propagates the
-  identity to existing and newly attached partitions.
-- Synchronizing a partitioned table with identity columns no longer fails cache
-  validation: partitions inherit the parent's identity sequence ownership
-  instead of being required to own a sequence themselves.
+  large-table validation reports the full scan, while re-validation stays silent.
+- Partition foreign keys now follow PostgreSQL: attaching a partition clones the
+  parent's FKs, adding an FK to a partitioned table clones it onto existing
+  partitions, and a detached partition keeps the reference, so a later
+  `DROP TABLE ... RESTRICT` is no longer reported safe.
+- `ADD GENERATED ... AS IDENTITY` now creates the backing sequence, validates
+  its preconditions, and propagates identity to existing and new partitions;
+  partitioned identity sync no longer fails cache validation.
 - Function and procedure definitions with a string-literal `AS $$...$$` body no
-  longer mark the analysis chain as unsupported. PostgreSQL records no catalog
-  dependencies for those bodies, so later dependency checks are not weakened.
-- A compound statement that fails and rolls back no longer leaves its skipped
-  checks in the report, so an aborted statement cannot pollute later statements
-  or the final summary.
-- `lint` and `lint-chain` accept `--report-dir` to write the JSON and Markdown
-  reports from a single analysis pass; the GitHub Action now uses it instead of
-  analyzing every migration twice.
-- `init github-actions` now uploads the JSON, Markdown, and diagnostic reports
-  as workflow artifacts, so a failing check leaves inspectable evidence.
-- Unevaluated check lists in the terminal and Markdown reports now compact into
-  a summary count with tier breakdown when more than 3 rules are skipped.
-- Reminders for unevaluated checks now name the missing schema and provide a
-  union-aware sync command so re-syncing does not overwrite existing scope.
-- Catalog synchronization now parses `pg_get_expr` index predicates and
-  expression keys back into the same expression IR used for migrations. Exact
-  matches are comparable, while statement/catalog differences stay unknown
-  instead of becoming false differences; the cache format is now 12.
+  longer mark the analysis chain as unsupported.
+- A failed compound statement no longer leaves its skipped checks in the report.
 - Composite-type dependency analysis now reports every table that reaches the
-  type through a shared container. Previously a second table could be omitted
-  from the finding, lowering the reported severity when it had the larger row
-  estimate.
-- `init github-actions` now fails with recovery guidance when `origin/HEAD`
-  cannot identify the default branch instead of silently assuming `main`; pass
-  `--branch` to override detection.
-- `init github-actions --configure-secrets` now verifies GitHub CLI
-  authentication before writing either workflow, stages each file before
-  replacement, and reports when the database URL was configured but the cache
-  key was not.
-- Name resolution no longer scans every relation and type to decide whether a
-  rolled-back temporary namespace exists, removing a per-resolution scan of
-  the whole schema model from chains that create and roll back temporary
-  tables.
-- The GitHub Action now separates Cargo dependency caching (keyed by lockfile)
-  from commit-exact target caching for SHA-pinned source installs, allowing
-  dependency reuse across Action updates.
-- Each transition now captures only the pre-state catalog families and
-  identities its rules can read, with whole-family fallback where a rule
-  searches an entire family. A recorded 1,000-mutation `ALTER TABLE` chain
-  against 10,000 baseline relations drops from about 83 s to 0.13 s in the
-  debug benchmark.
-- Autocommit statements now roll back through a typed statement undo journal
-  instead of cloning the entire analysis state, and `COMMIT`/`ROLLBACK` no
-  longer clone the accumulated transaction undo history. A 1,000-relation
-  baseline with 50 `ALTER TABLE` statements drops from 462,883 allocations and
-  640 ms to 13,208 allocations and about 60 ms in the debug benchmark; a
-  1,000-statement chain drops from about 9 s to 1.2 s.
-- Relation, sequence, and type renames now undo through the affected overlays
-  instead of copying the whole namespace. Type renames snapshot only the
-  renamed type plus dependent relations, functions, and extension members. A
-  1,000-relation baseline with 50 relation renames drops from 497,767
-  allocations and 746 ms to 97,467 allocations and 216 ms in the debug
-  benchmark.
-- Dependency-graph index construction now memoizes rename-chain resolution per
-  endpoint, and a single index-definition update maintains the edge set
-  incrementally instead of rebuilding hash membership and invalidating the
-  derived index for the whole graph. On a 10,100-edge graph, 1,000 definition
-  updates take 24,000 allocations and 32 ms in the debug benchmark.
-- Transition records and unresolved missing-schema context are now reused across
-  rules in the evaluation loop, and fallback syntax ranges are cached per
-  statement instead of recomputed per finding.
-- Added a scheduled and manual benchmark workflow to track allocation and
-  throughput metrics across large baseline scenarios.
+  type through a shared container.
+- Cache format 12: catalog sync now parses `pg_get_expr` index predicates and
+  expression keys into the migration expression IR, range types re-hydrate
+  routine and operator-class identities, and search-path sync preserves
+  whitespace inside quoted identifiers. Re-run `safe-migrate sync`.
+- `lint` and `lint-chain --report-dir` write both reports in one pass; the GitHub
+  Action uses it, uploads artifacts, and reuses Cargo dependency caches.
+- Unevaluated checks now compact into a tiered summary; missing-schema reminders
+  name the schema and give a union-aware sync command.
+- `init github-actions` now guides recovery for unknown `origin/HEAD`
+  (`--branch` overrides), verifies GitHub CLI auth before writing secrets, and
+  reports partial secret configuration.
+- Analysis and rollback now use typed statement journals and targeted snapshots
+  instead of cloning full state, making large chains and renames faster and
+  leaner; see `docs/BENCHMARKS.md`.
+- PostgreSQL 14-18 version bounds now use one shared check across the public
+  API, cache validation, and sync.
 
 ## v0.12.0 — 2026-10-31
 

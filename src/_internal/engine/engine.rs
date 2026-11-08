@@ -18,6 +18,33 @@ use squawk_syntax::{
 };
 use std::collections::HashSet;
 
+/// Byte-offset to line/column lookup built once per source file.
+struct LineIndex<'a> {
+    sql: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    fn new(sql: &'a str) -> Self {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            sql.bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        Self { sql, line_starts }
+    }
+
+    fn location(&self, start: usize) -> Option<(usize, usize)> {
+        if start > self.sql.len() || !self.sql.is_char_boundary(start) {
+            return None;
+        }
+        let line = self.line_starts.partition_point(|offset| *offset <= start);
+        let line_start = self.line_starts[line.saturating_sub(1)];
+        Some((line, self.sql[line_start..start].chars().count() + 1))
+    }
+}
+
 enum StatementCheckpoint {
     Full(Option<Box<AnalysisState>>),
     TransactionUndo {
@@ -60,7 +87,12 @@ fn is_pure_transaction_control(mutations: &[Mutation]) -> bool {
 }
 
 impl StatementCheckpoint {
-    fn capture(state: &mut AnalysisState, mutations: &[Mutation], force_full: bool) -> Self {
+    fn capture(
+        state: &mut AnalysisState,
+        mutations: &[Mutation],
+        force_full: bool,
+        transaction_control: bool,
+    ) -> Self {
         debug_assert!(
             state.local.statement_undo_log.is_none(),
             "the previous statement's undo journal must be closed before the next checkpoint"
@@ -71,8 +103,7 @@ impl StatementCheckpoint {
                 state.begin_statement_undo();
                 return Self::TransactionControl { shape };
             }
-            let changes_transaction_structure = mutations.iter().any(is_transaction_control);
-            if !changes_transaction_structure {
+            if !transaction_control {
                 if let Some((transaction_depth, undo_len)) = state.transaction_undo_checkpoint() {
                     return Self::TransactionUndo {
                         transaction_depth,
@@ -247,6 +278,7 @@ impl SafeMigrateEngine {
                 .collect();
             let violations =
                 self.analyze_parsed_file(filename, &normalized_sql, sql, &parsed, state)?;
+            let line_index = LineIndex::new(&normalized_sql);
             findings.extend(
                 violations
                     .into_iter()
@@ -271,7 +303,7 @@ impl SafeMigrateEngine {
                         ReportFinding {
                             location: Self::source_location(
                                 filename,
-                                &normalized_sql,
+                                &line_index,
                                 violation.source_range,
                             ),
                             statement_index,
@@ -462,22 +494,10 @@ impl SafeMigrateEngine {
                 mutations.push(Mutation::CheckTimeouts { subject });
             }
             let started_in_transaction = state.in_transaction();
-            let transaction_control = mutations.iter().any(|mutation| {
-                matches!(
-                    mutation,
-                    Mutation::BeginTransaction
-                        | Mutation::CommitTransaction
-                        | Mutation::CommitAndChain
-                        | Mutation::RollbackTransaction
-                        | Mutation::RollbackAndChain
-                        | Mutation::RollbackToSavepoint(_)
-                        | Mutation::Savepoint(_)
-                        | Mutation::ReleaseSavepoint(_)
-                )
-            });
+            let transaction_control = mutations.iter().any(is_transaction_control);
             let force_full = self.force_full_statement_checkpoint();
             let mut statement_checkpoint =
-                StatementCheckpoint::capture(state, &mutations, force_full);
+                StatementCheckpoint::capture(state, &mutations, force_full, transaction_control);
             let mut statement_failed = false;
 
             for mutation in mutations {
@@ -693,22 +713,10 @@ impl SafeMigrateEngine {
 
     fn source_location(
         filename: &str,
-        sql: &str,
+        line_index: &LineIndex<'_>,
         source_range: Option<rowan::TextRange>,
     ) -> Option<SourceLocation> {
-        let start = usize::from(source_range?.start());
-        if start > sql.len() || !sql.is_char_boundary(start) {
-            return None;
-        }
-
-        let before = &sql[..start];
-        let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let column = before
-            .rsplit_once('\n')
-            .map_or(before, |(_, final_line)| final_line)
-            .chars()
-            .count()
-            + 1;
+        let (line, column) = line_index.location(usize::from(source_range?.start()))?;
         Some(SourceLocation {
             file: filename.to_string(),
             line,
@@ -809,7 +817,7 @@ impl SafeMigrateEngine {
         }
     }
 
-    fn strip_sql_leading_comments(s: &str) -> String {
+    fn strip_sql_leading_comments(s: &str) -> &str {
         let mut pos = 0;
         let bytes = s.as_bytes();
         while pos < bytes.len() {
@@ -834,7 +842,7 @@ impl SafeMigrateEngine {
             }
             break;
         }
-        s[pos..].to_string()
+        &s[pos..]
     }
 }
 

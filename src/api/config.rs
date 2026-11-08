@@ -72,7 +72,7 @@ pub struct Config {
     /// checks a `REINDEX DATABASE`/`REINDEX SYSTEM` name against the database
     /// the session is connected to, and never against a baseline's source.
     pub(crate) target_database: Option<String>,
-    pub(crate) disabled_rules: Vec<String>,
+    pub(crate) disabled_rules: BTreeSet<String>,
     pub(crate) schemas: Option<Vec<String>>,
 }
 
@@ -89,7 +89,7 @@ impl Default for Config {
             allow_inline_suppressions: false,
             assume_pg_version: None,
             target_database: None,
-            disabled_rules: Vec::new(),
+            disabled_rules: BTreeSet::new(),
             rules: BTreeMap::new(),
             schemas: None,
         }
@@ -263,7 +263,7 @@ impl Config {
     /// Disable one primary rule by ID.
     pub fn disable_rule(mut self, rule_id: impl Into<String>) -> Self {
         let rule_id = rule_id.into();
-        self.disabled_rules.retain(|disabled| disabled != &rule_id);
+        self.disabled_rules.remove(&rule_id);
         self.rules.entry(rule_id).or_default().disabled = Some(true);
         self
     }
@@ -271,7 +271,7 @@ impl Config {
     /// Enable one primary rule by ID while preserving its threshold overrides.
     pub fn enable_rule(mut self, rule_id: impl Into<String>) -> Self {
         let rule_id = rule_id.into();
-        self.disabled_rules.retain(|disabled| disabled != &rule_id);
+        self.disabled_rules.remove(&rule_id);
         self.rules.entry(rule_id).or_default().disabled = Some(false);
         self
     }
@@ -327,11 +327,7 @@ impl Config {
     pub fn is_rule_disabled(&self, rule_id: &str) -> bool {
         // Either form disables the rule; an explicit `enabled` cannot re-enable
         // something the legacy list still names.
-        if self
-            .disabled_rules
-            .iter()
-            .any(|disabled| disabled == rule_id)
-        {
+        if self.disabled_rules.contains(rule_id) {
             return true;
         }
 
@@ -430,6 +426,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_disabled_rules_load_and_disable() {
+        let config: Config =
+            toml::from_str(r#"disabled_rules = ["missing-idempotency", "blocking-constraint"]"#)
+                .expect("legacy disabled_rules list must load");
+        assert!(config.is_rule_disabled("missing-idempotency"));
+        assert!(config.is_rule_disabled("blocking-constraint"));
+        assert!(!config.is_rule_disabled("other-rule"));
+    }
+
+    #[test]
     fn command_schema_filter_takes_precedence() {
         let config = Config {
             schemas: Some(vec!["public".to_owned()]),
@@ -474,7 +480,9 @@ mod tests {
         config
             .rules
             .insert("typo-rule".to_owned(), RuleConfig::default());
-        config.disabled_rules = vec!["known-rule".to_owned(), "other-typo".to_owned()];
+        config.disabled_rules = ["known-rule".to_owned(), "other-typo".to_owned()]
+            .into_iter()
+            .collect();
 
         let error = config
             .validate_rule_ids(["known-rule"])
@@ -490,7 +498,7 @@ mod tests {
         config
             .rules
             .insert("known-rule".to_owned(), RuleConfig::default());
-        config.disabled_rules = vec!["known-rule".to_owned()];
+        config.disabled_rules = ["known-rule".to_owned()].into_iter().collect();
         config.validate_rule_ids(["known-rule"]).unwrap();
     }
 

@@ -35,8 +35,26 @@ jobs:
 
       - name: Run allocation and throughput benchmarks
         run: |
+          set -euo pipefail
           mkdir -p artifacts
           cargo test --locked --lib performance_scenarios -- --ignored --nocapture --test-threads=1 2>&1 | tee artifacts/benchmarks.log
+
+      - name: Summarize benchmark scenarios
+        if: always()
+        run: |
+          if [ -f artifacts/benchmarks.log ]; then
+            {
+              echo '### Performance scenarios'
+              echo
+              echo "- commit: \`$GITHUB_SHA\`"
+              echo "- host: \`$(uname -sm)\`"
+              echo "- rust: \`$(rustc --version)\`"
+              echo
+              echo '```'
+              grep '^scenario=' artifacts/benchmarks.log || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

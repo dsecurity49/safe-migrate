@@ -23,6 +23,29 @@ fn relation_id(name: &str) -> ObjectId {
     ObjectId::new("public", name)
 }
 
+fn cache_with_untyped_column(schema: &str, table: &str, column: &str) -> DbCache {
+    let mut cache = crate::common::synced_cache();
+    cache.metadata.schemas = Some(vec![schema.to_string()]);
+    let id = ObjectId::new(schema, table);
+    let mut relation = RelationState::new(
+        id.clone(),
+        ObjectId::new(schema, "postgres"),
+        0,
+        None,
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    relation.columns.push(Column::migration_created(
+        column.to_string(),
+        None,
+        false,
+        None,
+    ));
+    cache.insert_baseline(id, relation);
+    cache
+}
+
 fn insert_relation(state: &mut AnalysisState, name: &str, rows: u64) {
     let id = relation_id(name);
     state.local.relations.insert(
@@ -332,6 +355,49 @@ fn selective_capture_matches_full_capture_for_every_pre_state_reader() {
 }
 
 #[test]
+fn failed_statement_rolls_back_not_evaluated_entries() {
+    // A scoped baseline can omit a column's declared type, so the identity
+    // action is unresolved while the later missing-column action conflicts.
+    let cache = cache_with_untyped_column("app", "known", "id");
+    let mut journal_state = AnalysisState::new(cache.clone());
+    let mut full_state = AnalysisState::new(cache.clone());
+    let journal = SafeMigrateEngine::new(Config::default());
+    let full = SafeMigrateEngine::new(Config::default()).with_full_statement_checkpoint_for_tests();
+
+    // Establish that the first action really records a declined evaluation.
+    let mut probe = AnalysisState::new(cache);
+    journal
+        .analyze(
+            "ALTER TABLE app.known ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;",
+            &mut probe,
+        )
+        .unwrap();
+    assert!(
+        !probe.not_evaluated().is_empty(),
+        "the probe action must record a declined evaluation"
+    );
+
+    let statement = "ALTER TABLE app.known ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY, \
+         DROP COLUMN missing;";
+    let journal_violations = journal.analyze(statement, &mut journal_state).unwrap();
+    let full_violations = full.analyze(statement, &mut full_state).unwrap();
+
+    assert_eq!(
+        comparable(&journal_violations),
+        comparable(&full_violations),
+        "journal findings diverged after the failed compound statement"
+    );
+    assert_eq!(
+        journal_state, full_state,
+        "journal state diverged after the failed compound statement"
+    );
+    assert!(
+        journal_state.not_evaluated().is_empty(),
+        "a rolled-back statement must not retain declined evaluations"
+    );
+}
+
+#[test]
 fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
     let mut journal_state = AnalysisState::new(differential_cache());
     let mut full_state = AnalysisState::new(differential_cache());
@@ -409,6 +475,82 @@ fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
         "DROP FUNCTION rename_type_fn(rename_type);",
         "DROP DOMAIN rename_domain;",
         "DROP TYPE rename_type;",
+        "CREATE TYPE nested_range AS RANGE (subtype = integer);",
+        "BEGIN;",
+        "ALTER TYPE nested_range RENAME TO nested_range_sp;",
+        "ROLLBACK;",
+        "DROP TYPE nested_range;",
+        "CREATE EXTENSION audit_ext;",
+        "CREATE TYPE ext_member_type AS (id integer);",
+        "ALTER EXTENSION audit_ext ADD TYPE ext_member_type;",
+        "BEGIN;",
+        "ALTER TYPE ext_member_type RENAME TO ext_member_type_moved;",
+        "ROLLBACK;",
+        "ALTER EXTENSION audit_ext DROP TYPE ext_member_type;",
+        "DROP TYPE ext_member_type;",
+        "DROP EXTENSION audit_ext;",
+        "CREATE TABLE nested_rename_table (id integer);",
+        "CREATE SEQUENCE nested_rename_seq;",
+        "CREATE TYPE nested_rename_type AS (id integer);",
+        "BEGIN;",
+        "SAVEPOINT outer_sp;",
+        "ALTER TABLE nested_rename_table RENAME TO nested_rename_table_sp;",
+        "ALTER SEQUENCE nested_rename_seq RENAME TO nested_rename_seq_sp;",
+        "ALTER TYPE nested_rename_type RENAME TO nested_rename_type_sp;",
+        "SAVEPOINT inner_sp;",
+        "ALTER TABLE nested_rename_table_sp ADD COLUMN inner_column integer;",
+        "ROLLBACK TO SAVEPOINT inner_sp;",
+        "ALTER TABLE nested_rename_table_sp ADD COLUMN after_inner integer;",
+        "RELEASE SAVEPOINT outer_sp;",
+        "COMMIT;",
+        "ALTER TABLE nested_rename_table_sp RENAME TO nested_rename_table_final;",
+        "ALTER SEQUENCE nested_rename_seq_sp RENAME TO nested_rename_seq_final;",
+        "ALTER TYPE nested_rename_type_sp RENAME TO nested_rename_type_final;",
+        "BEGIN;",
+        "ALTER TABLE nested_rename_table_final RENAME TO nested_rename_table_rolled;",
+        "ALTER SEQUENCE nested_rename_seq_final RENAME TO nested_rename_seq_rolled;",
+        "ALTER TYPE nested_rename_type_final RENAME TO nested_rename_type_rolled;",
+        "ROLLBACK;",
+        "DROP TABLE nested_rename_table_final;",
+        "DROP SEQUENCE nested_rename_seq_final;",
+        "DROP TYPE nested_rename_type_final;",
+        "CREATE TABLE rename_chain_table (id integer);",
+        "ALTER TABLE rename_chain_table RENAME TO rename_chain_b;",
+        "ALTER TABLE rename_chain_b RENAME TO rename_chain_c;",
+        "BEGIN;",
+        "ALTER TABLE rename_chain_c RENAME TO rename_chain_back;",
+        "ROLLBACK;",
+        "ALTER TABLE rename_chain_c RENAME TO rename_chain_final;",
+        "DROP TABLE rename_chain_final;",
+        "CREATE TABLE rename_chain_reuse (id integer);",
+        "ALTER TABLE rename_chain_reuse RENAME TO rename_chain_final;",
+        "DROP TABLE rename_chain_final;",
+        "CREATE TABLE rename_chain_rollback (id integer);",
+        "BEGIN;",
+        "ALTER TABLE rename_chain_rollback RENAME TO rename_chain_rollback_b;",
+        "ALTER TABLE rename_chain_rollback_b RENAME TO rename_chain_rollback_c;",
+        "ROLLBACK;",
+        "DROP TABLE rename_chain_rollback;",
+        "CREATE TABLE compound_parent (id integer PRIMARY KEY);",
+        "CREATE TABLE compound_child (id integer REFERENCES compound_parent(id));",
+        "ALTER TABLE compound_parent ADD COLUMN first integer, ADD COLUMN second integer, DROP COLUMN missing_column;",
+        "CREATE FUNCTION compound_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+        "CREATE TRIGGER compound_trigger BEFORE INSERT ON compound_parent FOR EACH ROW EXECUTE FUNCTION compound_trigger_fn();",
+        "CREATE PUBLICATION compound_pub FOR TABLE compound_parent;",
+        "ALTER PUBLICATION compound_pub SET TABLE compound_parent, compound_child;",
+        "ALTER PUBLICATION compound_pub SET TABLE missing_table;",
+        "DROP PUBLICATION compound_pub;",
+        "DROP TRIGGER compound_trigger ON compound_parent;",
+        "DROP FUNCTION compound_trigger_fn();",
+        "DROP TABLE compound_child;",
+        "DROP TABLE compound_parent;",
+        "BEGIN;",
+        "CREATE TEMP TABLE temp_on_commit_drop (id integer) ON COMMIT DROP;",
+        "COMMIT;",
+        "BEGIN;",
+        "CREATE TEMP TABLE temp_on_commit_delete (id integer) ON COMMIT DELETE ROWS;",
+        "COMMIT;",
+        "DROP TABLE temp_on_commit_delete;",
     ];
     let mut saw_conflict = false;
 
@@ -437,6 +579,13 @@ fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
         saw_conflict,
         "chain did not exercise a rolled-back statement"
     );
+    assert!(
+        !journal_state.relation_is_present(&ObjectId::new("public", "nested_rename_table_final"))
+    );
+    assert!(!journal_state.relation_is_present(&ObjectId::new("public", "rename_chain_final")));
+    assert!(!journal_state.relation_is_present(&ObjectId::new("public", "compound_parent")));
+    assert!(!journal_state.relation_is_present(&ObjectId::new("pg_temp", "temp_on_commit_drop")));
+    assert!(!journal_state.relation_is_present(&ObjectId::new("pg_temp", "temp_on_commit_delete")));
 }
 
 fn column_type_ids(state: &AnalysisState) -> Vec<Option<ObjectId>> {

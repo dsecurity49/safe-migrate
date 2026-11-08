@@ -18,6 +18,16 @@ impl AnalysisState {
             .push_undo(StateChange::GraphSnapshot { previous });
     }
 
+    pub(super) fn record_graph_delta(
+        &mut self,
+        delta: crate::_internal::analysis::graph::GraphEdgeDelta,
+    ) {
+        if !self.local.records_undo() {
+            return;
+        }
+        self.local.push_undo(StateChange::GraphEdgeDelta { delta });
+    }
+
     pub(super) fn rollback_frame(&mut self, mut frame: TransactionFrame) {
         self.rollback_undo_log(std::mem::take(&mut frame.undo_log));
     }
@@ -208,6 +218,9 @@ impl AnalysisState {
                 StateChange::GraphSnapshot { previous } => {
                     self.local.graph.replace_edges(previous);
                 }
+                StateChange::GraphEdgeDelta { delta } => {
+                    self.local.graph.restore_edge_delta(delta);
+                }
                 StateChange::RoleContextSnapshot {
                     current_role,
                     current_role_known,
@@ -262,8 +275,8 @@ impl AnalysisState {
                 StateChange::EvidenceLengthMarker { len } => {
                     self.local.evidence.truncate(len);
                 }
-                StateChange::NotEvaluatedSnapshot { previous } => {
-                    self.not_evaluated = previous;
+                StateChange::NotEvaluatedLength { len } => {
+                    self.not_evaluated.truncate(len);
                 }
                 StateChange::CoDroppedObjectsSnapshot { previous } => {
                     self.co_dropped_objects = previous;

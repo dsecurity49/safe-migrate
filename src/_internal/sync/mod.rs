@@ -28,8 +28,12 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 use std::fs;
 
-const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
-const MAX_POSTGRES_VERSION_NUM: u32 = 189_999;
+pub(crate) const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
+pub(crate) const MAX_POSTGRES_VERSION_NUM: u32 = 189_999;
+
+pub(crate) fn is_supported_postgres_version(version: u32) -> bool {
+    (MIN_POSTGRES_VERSION_NUM..=MAX_POSTGRES_VERSION_NUM).contains(&version)
+}
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn sync_cache(
@@ -129,7 +133,7 @@ pub(crate) fn database_config_is_local(config: &PostgresConfig) -> bool {
 }
 
 pub(crate) fn ensure_supported_postgres_version(version: u32) -> Result<()> {
-    if !(MIN_POSTGRES_VERSION_NUM..=MAX_POSTGRES_VERSION_NUM).contains(&version) {
+    if !is_supported_postgres_version(version) {
         anyhow::bail!(
             "PostgreSQL {} is unsupported; safe-migrate sync requires PostgreSQL 14 through 18",
             version / 10_000
@@ -172,23 +176,19 @@ pub(crate) fn cache_search_path(
 /// Parse PostgreSQL's canonical `SHOW search_path` representation while
 /// preserving the special `$user` placeholder, quoted identifier casing, and
 /// intentional leading/trailing whitespace inside quoted identifiers.
+/// Whitespace outside a quoted identifier is list separator noise and is
+/// discarded, matching PostgreSQL's GUC-list grammar.
 pub(crate) fn parse_search_path_setting(setting: &str) -> Vec<String> {
     let mut entries = Vec::new();
     let mut current = String::new();
+    let mut pending_space = String::new();
     let mut chars = setting.chars().peekable();
     let mut quoted = false;
-    let mut was_quoted = false;
 
-    let flush = |entries: &mut Vec<String>, current: &mut String, was_quoted: bool| {
-        let entry = if was_quoted {
-            current.as_str()
-        } else {
-            current.trim()
-        };
-        if !entry.is_empty() {
-            entries.push(entry.to_string());
+    let flush = |entries: &mut Vec<String>, current: &mut String| {
+        if !current.is_empty() {
+            entries.push(std::mem::take(current));
         }
-        current.clear();
     };
 
     while let Some(ch) = chars.next() {
@@ -199,18 +199,30 @@ pub(crate) fn parse_search_path_setting(setting: &str) -> Vec<String> {
             }
             '"' => {
                 quoted = !quoted;
-                was_quoted = true;
+                pending_space.clear();
             }
             ',' if !quoted => {
-                flush(&mut entries, &mut current, was_quoted);
-                was_quoted = false;
+                flush(&mut entries, &mut current);
+                pending_space.clear();
             }
-            ch if !quoted && current.is_empty() && ch.is_whitespace() => {}
-            _ => current.push(ch),
+            ch if !quoted && ch.is_whitespace() => {
+                // Defer outside-quote whitespace so it is dropped at a list
+                // boundary instead of leaking into a quoted identifier.
+                if !current.is_empty() {
+                    pending_space.push(ch);
+                }
+            }
+            _ => {
+                if !quoted {
+                    current.push_str(&pending_space);
+                    pending_space.clear();
+                }
+                current.push(ch);
+            }
         }
     }
 
-    flush(&mut entries, &mut current, was_quoted);
+    flush(&mut entries, &mut current);
     entries
 }
 

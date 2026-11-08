@@ -1,4 +1,4 @@
-use crate::_internal::analysis::graph::DependencyEdge;
+use crate::_internal::analysis::graph::{DependencyEdge, GraphEdgeDelta};
 use crate::_internal::analysis::namespace::SearchPathEntry;
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationOverlay;
@@ -103,6 +103,9 @@ pub(crate) enum StateChange {
     GraphSnapshot {
         previous: Vec<DependencyEdge>,
     },
+    GraphEdgeDelta {
+        delta: GraphEdgeDelta,
+    },
     FunctionSnapshot {
         id: ObjectId,
         previous: Option<crate::_internal::model::function::FunctionOverlay>,
@@ -158,8 +161,8 @@ pub(crate) enum StateChange {
     EvidenceLengthMarker {
         len: usize,
     },
-    NotEvaluatedSnapshot {
-        previous: Vec<crate::_internal::report::violations::NotEvaluated>,
+    NotEvaluatedLength {
+        len: usize,
     },
     CoDroppedObjectsSnapshot {
         previous: HashSet<ObjectId>,

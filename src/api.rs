@@ -1580,7 +1580,7 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
         ));
     }
     if let Some(assumed_version) = config.assumed_postgres_version()
-        && !(140_000..=180_999).contains(&assumed_version)
+        && !crate::_internal::sync::is_supported_postgres_version(assumed_version)
     {
         return Err(Error::configuration(
             "assume_pg_version must be a PostgreSQL 14–18 version number",
@@ -1599,6 +1599,30 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
     registry::validate_rule_configuration(config).map_err(Error::configuration)
 }
 
+fn materialize_rule(config: &Config, descriptor: &registry::RuleDescriptor) -> Rule {
+    Rule {
+        id: descriptor.id.to_owned(),
+        title: descriptor.title.to_owned(),
+        summary: descriptor.summary.to_owned(),
+        impact: descriptor.impact.to_owned(),
+        default_tier: descriptor.default_tier().into(),
+        recipe: descriptor.recipe().to_owned(),
+        supported_configuration_fields: descriptor
+            .supported_configuration_fields
+            .iter()
+            .copied()
+            .map(RuleConfigurationField::from)
+            .collect(),
+        enabled: !config.is_rule_disabled(descriptor.id),
+        tier1_threshold_rows: descriptor
+            .supports(InternalRuleConfigurationField::Tier1ThresholdRows)
+            .then(|| config.rule_tier1_threshold(descriptor.id)),
+        tier2_threshold_rows: descriptor
+            .supports(InternalRuleConfigurationField::Tier2ThresholdRows)
+            .then(|| config.rule_tier2_threshold(descriptor.id)),
+    }
+}
+
 /// Return every primary rule with its effective configuration.
 ///
 /// # Errors
@@ -1608,27 +1632,7 @@ pub fn rules(config: &Config) -> Result<Vec<Rule>, Error> {
     validate_config(config)?;
     Ok(registry::PRIMARY_RULES
         .iter()
-        .map(|descriptor| Rule {
-            id: descriptor.id.to_owned(),
-            title: descriptor.title.to_owned(),
-            summary: descriptor.summary.to_owned(),
-            impact: descriptor.impact.to_owned(),
-            default_tier: descriptor.default_tier().into(),
-            recipe: descriptor.recipe().to_owned(),
-            supported_configuration_fields: descriptor
-                .supported_configuration_fields
-                .iter()
-                .copied()
-                .map(RuleConfigurationField::from)
-                .collect(),
-            enabled: !config.is_rule_disabled(descriptor.id),
-            tier1_threshold_rows: descriptor
-                .supports(InternalRuleConfigurationField::Tier1ThresholdRows)
-                .then(|| config.rule_tier1_threshold(descriptor.id)),
-            tier2_threshold_rows: descriptor
-                .supports(InternalRuleConfigurationField::Tier2ThresholdRows)
-                .then(|| config.rule_tier2_threshold(descriptor.id)),
-        })
+        .map(|descriptor| materialize_rule(config, descriptor))
         .collect())
 }
 
@@ -1639,10 +1643,10 @@ pub fn rules(config: &Config) -> Result<Vec<Rule>, Error> {
 /// Returns [`ErrorKind::Configuration`] when `config` is invalid, or
 /// [`ErrorKind::UnknownRule`] when `rule_id` is not registered.
 pub fn rule(config: &Config, rule_id: &str) -> Result<Rule, Error> {
-    rules(config)?
-        .into_iter()
-        .find(|rule| rule.id == rule_id)
-        .ok_or_else(|| Error::new(ErrorKind::UnknownRule, rule_id))
+    validate_config(config)?;
+    let descriptor = registry::find_primary_rule(rule_id)
+        .ok_or_else(|| Error::new(ErrorKind::UnknownRule, rule_id))?;
+    Ok(materialize_rule(config, descriptor))
 }
 
 /// Synchronize PostgreSQL metadata into a cache that can later be loaded as a

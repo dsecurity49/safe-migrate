@@ -4,7 +4,9 @@ use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
     AlterDomainActionFact, DomainCheckFact, DomainConstraintFact, DomainDefaultFact,
 };
-use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
+use crate::_internal::analysis::graph::{
+    DependencyEdge, DependencyGraph, DependencyKind, GraphRenamePlan,
+};
 use crate::_internal::analysis::mutations::{
     AlterDomainMutation, AlterTypeActionMutation, AlterTypeMutation, CreateDomainMutation,
     CreateTypeMutation, DropDomainMutation, DropTypeMutation, Rename,
@@ -20,6 +22,89 @@ use crate::_internal::model::types::{
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 type TypeLookup = ObjectLookup;
+
+#[derive(Default)]
+struct TypeKindRemap {
+    domain_base: Option<ObjectId>,
+    composite_fields: Vec<(usize, ObjectId)>,
+    range_subtype: Option<ObjectId>,
+    range_multirange: bool,
+    multirange_range: bool,
+    base_element: bool,
+}
+
+impl TypeKindRemap {
+    fn is_empty(&self) -> bool {
+        self.domain_base.is_none()
+            && self.composite_fields.is_empty()
+            && self.range_subtype.is_none()
+            && !self.range_multirange
+            && !self.multirange_range
+            && !self.base_element
+    }
+
+    fn apply(self, kind: &mut TypeKind, rename: &Rename) {
+        let schema_changed = rename.old_id.schema != rename.new_id.schema;
+        match kind {
+            TypeKind::Domain {
+                base_type,
+                base_type_id,
+                ..
+            } => {
+                if let Some(new_id) = self.domain_base {
+                    *base_type = AnalysisState::remapped_type_display(
+                        base_type,
+                        &rename.new_id,
+                        schema_changed,
+                    );
+                    *base_type_id = Some(new_id);
+                }
+            }
+            TypeKind::Composite { fields } => {
+                for (index, new_id) in self.composite_fields {
+                    let field = &mut fields[index];
+                    field.data_type = AnalysisState::remapped_type_display(
+                        &field.data_type,
+                        &rename.new_id,
+                        schema_changed,
+                    );
+                    field.data_type_id = Some(new_id);
+                }
+            }
+            TypeKind::Range {
+                subtype,
+                subtype_id,
+                multirange,
+                ..
+            } => {
+                if let Some(new_id) = self.range_subtype {
+                    if let Some(subtype) = subtype {
+                        *subtype = AnalysisState::remapped_type_display(
+                            subtype,
+                            &rename.new_id,
+                            schema_changed,
+                        );
+                    }
+                    *subtype_id = Some(new_id);
+                }
+                if self.range_multirange {
+                    *multirange = Some(rename.new_id.clone());
+                }
+            }
+            TypeKind::Multirange { range } => {
+                if self.multirange_range {
+                    *range = Some(rename.new_id.clone());
+                }
+            }
+            TypeKind::Base { options, .. } => {
+                if self.base_element {
+                    options.element = Some(rename.new_id.name.clone());
+                }
+            }
+            TypeKind::Enum { .. } => {}
+        }
+    }
+}
 
 impl AnalysisState {
     /// Reject a type the server would refuse to create: a duplicate enum
@@ -69,36 +154,52 @@ impl AnalysisState {
             .then(|| Self::array_type_id(&rename.new_id))
     }
 
-    fn type_kind_references_rename(kind: &TypeKind, rename: &Rename) -> bool {
+    fn type_kind_remap(kind: &TypeKind, rename: &Rename) -> TypeKindRemap {
+        let mut remap = TypeKindRemap::default();
         match kind {
-            TypeKind::Domain { base_type_id, .. } => base_type_id
-                .as_ref()
-                .and_then(|id| Self::renamed_type_id(id, rename))
-                .is_some(),
-            TypeKind::Composite { fields } => fields.iter().any(|field| {
-                field
-                    .data_type_id
+            TypeKind::Domain { base_type_id, .. } => {
+                remap.domain_base = base_type_id
                     .as_ref()
-                    .and_then(|id| Self::renamed_type_id(id, rename))
-                    .is_some()
-            }),
+                    .and_then(|id| Self::renamed_type_id(id, rename));
+            }
+            TypeKind::Composite { fields } => {
+                remap.composite_fields = fields
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, field)| {
+                        field
+                            .data_type_id
+                            .as_ref()
+                            .and_then(|id| Self::renamed_type_id(id, rename))
+                            .map(|new_id| (index, new_id))
+                    })
+                    .collect();
+            }
             TypeKind::Range {
                 subtype_id,
                 multirange,
                 ..
             } => {
-                subtype_id
+                remap.range_subtype = subtype_id
                     .as_ref()
-                    .and_then(|id| Self::renamed_type_id(id, rename))
-                    .is_some()
-                    || multirange.as_ref() == Some(&rename.old_id)
+                    .and_then(|id| Self::renamed_type_id(id, rename));
+                remap.range_multirange = multirange.as_ref() == Some(&rename.old_id);
             }
-            TypeKind::Multirange { range } => range.as_ref() == Some(&rename.old_id),
-            TypeKind::Base { options, .. } => options.element.as_ref().is_some_and(|element| {
-                element == &rename.old_id.name || element == &rename.old_id.to_string()
-            }),
-            TypeKind::Enum { .. } => false,
+            TypeKind::Multirange { range } => {
+                remap.multirange_range = range.as_ref() == Some(&rename.old_id);
+            }
+            TypeKind::Base { options, .. } => {
+                remap.base_element = options.element.as_ref().is_some_and(|element| {
+                    element == &rename.old_id.name || element == &rename.old_id.to_string()
+                });
+            }
+            TypeKind::Enum { .. } => {}
         }
+        remap
+    }
+
+    fn type_kind_references_rename(kind: &TypeKind, rename: &Rename) -> bool {
+        !Self::type_kind_remap(kind, rename).is_empty()
     }
 
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
@@ -407,44 +508,59 @@ impl AnalysisState {
         }
 
         let mut remapped_functions = Vec::new();
+        let mut affected_functions: BTreeSet<ObjectId> = BTreeSet::new();
         for (function_id, overlay) in &self.local.functions {
             let FunctionOverlay::Present(function) = overlay else {
                 continue;
             };
-            let new_arg_types = function
-                .arg_types
-                .iter()
-                .enumerate()
-                .map(|(index, raw)| {
-                    if function
-                        .arg_type_ids
-                        .get(index)
-                        .and_then(|id| id.as_ref())
-                        .and_then(|id| Self::renamed_type_id(id, rename))
-                        .is_some()
-                    {
-                        Self::remapped_type_display(
-                            raw,
-                            &rename.new_id,
-                            rename.old_id.schema != rename.new_id.schema,
-                        )
-                    } else {
-                        raw.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let new_return_type = match function
+            let schema_changed = rename.old_id.schema != rename.new_id.schema;
+            let args_changed = function.arg_type_ids.iter().any(|id| {
+                id.as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .is_some()
+            });
+            let return_changed = function
                 .return_type_id
                 .as_ref()
                 .and_then(|id| Self::renamed_type_id(id, rename))
+                .is_some();
+            if function
+                .internal_type_owner
+                .as_ref()
+                .and_then(|owner| Self::renamed_type_id(owner, rename))
+                .is_some()
             {
-                Some(_) => Self::remapped_type_display(
-                    &function.return_type,
-                    &rename.new_id,
-                    rename.old_id.schema != rename.new_id.schema,
-                ),
-                None => function.return_type.clone(),
-            };
+                affected_functions.insert(function_id.clone());
+            }
+            if !args_changed && !return_changed {
+                continue;
+            }
+            // Build only the pieces that actually change; an unrelated
+            // routine must not clone its whole signature during a type rename.
+            let new_arg_types = args_changed.then(|| {
+                function
+                    .arg_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, raw)| {
+                        if function
+                            .arg_type_ids
+                            .get(index)
+                            .and_then(|id| id.as_ref())
+                            .and_then(|id| Self::renamed_type_id(id, rename))
+                            .is_some()
+                        {
+                            Self::remapped_type_display(raw, &rename.new_id, schema_changed)
+                        } else {
+                            raw.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let new_return_type = return_changed.then(|| {
+                Self::remapped_type_display(&function.return_type, &rename.new_id, schema_changed)
+            });
+            let effective_args = new_arg_types.as_deref().unwrap_or(&function.arg_types);
             let base_name = function_id
                 .name
                 .split_once('(')
@@ -452,20 +568,27 @@ impl AnalysisState {
                 .unwrap_or(&function_id.name);
             let mut new_function_id = ObjectId::new(
                 &function_id.schema,
-                format!("{}({})", base_name, new_arg_types.join(",")),
+                format!("{}({})", base_name, effective_args.join(",")),
             );
             new_function_id.inferred_schema = function_id.inferred_schema;
-            if new_function_id != *function_id
-                || new_arg_types != function.arg_types
-                || new_return_type != function.return_type
-            {
-                remapped_functions.push((
-                    function_id.clone(),
-                    new_function_id,
-                    new_arg_types,
-                    new_return_type,
-                ));
+            let id_changed = new_function_id != *function_id;
+            let args_differ = new_arg_types
+                .as_ref()
+                .is_some_and(|types| types != &function.arg_types);
+            let return_differs = new_return_type
+                .as_ref()
+                .is_some_and(|return_type| return_type != &function.return_type);
+            if !id_changed && !args_differ && !return_differs {
+                continue;
             }
+            affected_functions.insert(function_id.clone());
+            affected_functions.insert(new_function_id.clone());
+            remapped_functions.push((
+                function_id.clone(),
+                new_function_id,
+                new_arg_types,
+                new_return_type,
+            ));
         }
         let moved_function_ids = remapped_functions
             .iter()
@@ -523,24 +646,6 @@ impl AnalysisState {
             })
             .collect();
         affected_types.sort();
-        let mut affected_functions: BTreeSet<ObjectId> = BTreeSet::new();
-        for (old_id, new_id, _, _) in &remapped_functions {
-            affected_functions.insert(old_id.clone());
-            affected_functions.insert(new_id.clone());
-        }
-        for (id, overlay) in &self.local.functions {
-            let FunctionOverlay::Present(function) = overlay else {
-                continue;
-            };
-            if function
-                .internal_type_owner
-                .as_ref()
-                .and_then(|owner| Self::renamed_type_id(owner, rename))
-                .is_some()
-            {
-                affected_functions.insert(id.clone());
-            }
-        }
         let mut affected_extensions: Vec<String> = self
             .local
             .extensions
@@ -561,8 +666,9 @@ impl AnalysisState {
         affected_extensions.sort();
 
         // A type rename touches the type, its dependents, and the graph; the
-        // rest of the namespace is untouched, so snapshot only that write set.
-        self.snapshot_graph_full();
+        // length marker covers appended rename edges and the plan records the
+        // edges it actually rewrites.
+        self.snapshot_graph();
         self.snapshot_type(&rename.old_id);
         self.snapshot_type(&rename.new_id);
         for id in &affected_types {
@@ -577,111 +683,52 @@ impl AnalysisState {
         for name in &affected_extensions {
             self.snapshot_extension(name);
         }
-        self.local
-            .graph
-            .propagate_type_rename(&rename.old_id, &rename.new_id);
+        let mut graph_plan = GraphRenamePlan::default();
+        graph_plan
+            .types
+            .insert(rename.old_id.clone(), rename.new_id.clone());
+        for (old_id, new_id, _, _) in &remapped_functions {
+            if old_id != new_id {
+                graph_plan.routines.insert(old_id.clone(), new_id.clone());
+            }
+        }
+        if let Some(delta) = self.local.graph.apply_rename_plan_recorded(&graph_plan) {
+            self.record_graph_delta(delta);
+        }
         if let Some(TypeOverlay::Present(mut state)) = self.local.types.remove(&rename.old_id) {
             state.id = rename.new_id.clone();
             self.local
                 .types
                 .insert(rename.new_id.clone(), TypeOverlay::Present(state));
         }
-        for overlay in self.local.relations.values_mut() {
-            if let RelationOverlay::Present(relation) = overlay {
-                for column in &mut relation.columns {
-                    let remapped = column
-                        .type_id
-                        .as_ref()
-                        .and_then(|id| Self::renamed_type_id(id, rename));
-                    if let Some(new_type_id) = remapped {
-                        column.data_type = Some(Self::remapped_type_display(
-                            column.data_type.as_deref().unwrap_or_default(),
-                            &rename.new_id,
-                            rename.old_id.schema != rename.new_id.schema,
-                        ));
-                        column.type_id = Some(new_type_id);
-                    }
-                }
-            }
-        }
-        for overlay in self.local.types.values_mut() {
-            let TypeOverlay::Present(TypeState { kind, .. }) = overlay else {
+        for id in &affected_relations {
+            let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) else {
                 continue;
             };
-            match kind {
-                TypeKind::Domain {
-                    base_type,
-                    base_type_id,
-                    ..
-                } => {
-                    if let Some(new_id) = base_type_id
-                        .as_ref()
-                        .and_then(|id| Self::renamed_type_id(id, rename))
-                    {
-                        *base_type = Self::remapped_type_display(
-                            base_type,
-                            &rename.new_id,
-                            rename.old_id.schema != rename.new_id.schema,
-                        );
-                        *base_type_id = Some(new_id);
-                    }
+            for column in &mut relation.columns {
+                let remapped = column
+                    .type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename));
+                if let Some(new_type_id) = remapped {
+                    column.data_type = Some(Self::remapped_type_display(
+                        column.data_type.as_deref().unwrap_or_default(),
+                        &rename.new_id,
+                        rename.old_id.schema != rename.new_id.schema,
+                    ));
+                    column.type_id = Some(new_type_id);
                 }
-                TypeKind::Composite { fields } => {
-                    for field in fields {
-                        if let Some(new_id) = field
-                            .data_type_id
-                            .as_ref()
-                            .and_then(|id| Self::renamed_type_id(id, rename))
-                        {
-                            field.data_type = Self::remapped_type_display(
-                                &field.data_type,
-                                &rename.new_id,
-                                rename.old_id.schema != rename.new_id.schema,
-                            );
-                            field.data_type_id = Some(new_id);
-                        }
-                    }
-                }
-                TypeKind::Range {
-                    subtype,
-                    subtype_id,
-                    multirange,
-                    ..
-                } => {
-                    if let Some(new_id) = subtype_id
-                        .as_ref()
-                        .and_then(|id| Self::renamed_type_id(id, rename))
-                    {
-                        if let Some(subtype) = subtype {
-                            *subtype = Self::remapped_type_display(
-                                subtype,
-                                &rename.new_id,
-                                rename.old_id.schema != rename.new_id.schema,
-                            );
-                        }
-                        *subtype_id = Some(new_id);
-                    }
-                    if multirange.as_ref() == Some(&rename.old_id) {
-                        *multirange = Some(rename.new_id.clone());
-                    }
-                }
-                TypeKind::Multirange { range } => {
-                    if range.as_ref() == Some(&rename.old_id) {
-                        *range = Some(rename.new_id.clone());
-                    }
-                }
-                TypeKind::Base { options, .. } => {
-                    if let Some(ref elem) = options.element
-                        && (elem == &rename.old_id.name || elem == &rename.old_id.to_string())
-                    {
-                        options.element = Some(rename.new_id.name.clone());
-                    }
-                }
-                TypeKind::Enum { .. } => {}
             }
         }
-        for overlay in self.local.functions.values_mut() {
-            if let FunctionOverlay::Present(function) = overlay
+        for id in &affected_types {
+            let Some(TypeOverlay::Present(state)) = self.local.types.get_mut(id) else {
+                continue;
+            };
+            let remap = Self::type_kind_remap(&state.kind, rename);
+            remap.apply(&mut state.kind, rename);
+        }
+        for id in &affected_functions {
+            if let Some(FunctionOverlay::Present(function)) = self.local.functions.get_mut(id)
                 && let Some(owner) = function.internal_type_owner.as_mut()
                 && let Some(remapped) = Self::renamed_type_id(owner, rename)
             {
@@ -693,7 +740,9 @@ impl AnalysisState {
                 self.local.functions.remove(&old_id)
             {
                 function.id = new_id.clone();
-                function.arg_types = arg_types;
+                if let Some(arg_types) = arg_types {
+                    function.arg_types = arg_types;
+                }
                 for type_id in &mut function.arg_type_ids {
                     if let Some(remapped) = type_id
                         .as_ref()
@@ -702,7 +751,9 @@ impl AnalysisState {
                         *type_id = Some(remapped);
                     }
                 }
-                function.return_type = return_type;
+                if let Some(return_type) = return_type {
+                    function.return_type = return_type;
+                }
                 if let Some(remapped) = function
                     .return_type_id
                     .as_ref()
@@ -714,7 +765,6 @@ impl AnalysisState {
                     .functions
                     .insert(new_id.clone(), FunctionOverlay::Present(function));
                 if old_id != new_id {
-                    self.local.graph.propagate_function_rename(&old_id, &new_id);
                     self.local.graph.add_edge(DependencyEdge::new(
                         old_id,
                         new_id,
@@ -725,25 +775,22 @@ impl AnalysisState {
         }
 
         // Remap extension membership when a type is renamed or moved across schemas.
-        for overlay in self.local.extensions.values_mut() {
-            let crate::_internal::model::extension::ExtensionOverlay::Present(ext) = overlay else {
+        for name in &affected_extensions {
+            let Some(crate::_internal::model::extension::ExtensionOverlay::Present(ext)) =
+                self.local.extensions.get_mut(name)
+            else {
                 continue;
             };
-            if ext.members.iter().any(|m| {
-                m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
+            let mut updated_members = std::collections::BTreeSet::new();
+            for mut m in ext.members.iter().cloned() {
+                if m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
                     && m.id == rename.old_id
-            }) {
-                let mut updated_members = std::collections::BTreeSet::new();
-                for mut m in ext.members.iter().cloned() {
-                    if m.kind == crate::_internal::model::extension::ExtensionMemberKind::Type
-                        && m.id == rename.old_id
-                    {
-                        m.id = rename.new_id.clone();
-                    }
-                    updated_members.insert(m);
+                {
+                    m.id = rename.new_id.clone();
                 }
-                ext.members = updated_members;
+                updated_members.insert(m);
             }
+            ext.members = updated_members;
         }
 
         MutationResult::Applied
