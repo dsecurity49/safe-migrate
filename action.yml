@@ -223,7 +223,7 @@ runs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-        key: safe-migrate-cargo-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path)) }}
+        key: safe-migrate-cargo-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           safe-migrate-cargo-deps-${{ runner.os }}-${{ runner.arch }}-
 
