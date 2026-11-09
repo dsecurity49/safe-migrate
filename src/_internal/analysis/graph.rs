@@ -401,6 +401,7 @@ impl DependencyGraph {
         matches!(
             kind,
             DependencyKind::ViewDependency { .. }
+                | DependencyKind::ViewUsesType
                 | DependencyKind::IndexOnRelation { .. }
                 | DependencyKind::ForeignKey { .. }
                 | DependencyKind::InheritanceOf
@@ -1659,16 +1660,6 @@ impl DependencyGraph {
         });
     }
 
-    /// Backwards-compatible relation rename entry point.
-    ///
-    /// New callers should use the typed helpers above.  Keeping this method
-    /// relation-scoped prevents the old all-endpoints behavior from silently
-    /// rewriting sequence, trigger, function, or publication identity data.
-    #[cfg(test)]
-    pub(crate) fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        self.propagate_relation_rename(old_id, new_id);
-    }
-
     /// Views that depend on a routine.
     ///
     /// A reference that resolved to an exact signature matches only that
@@ -1698,10 +1689,18 @@ impl DependencyGraph {
 
     /// Views whose body casts to a type.
     pub(crate) fn views_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        let target = self.resolve_rename(ty);
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(ty)
+                .filter(|edge| matches!(edge.kind, DependencyKind::ViewUsesType))
+                .collect();
+        }
         self.edges
             .iter()
             .filter(|edge| {
-                matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *ty
+                matches!(edge.kind, DependencyKind::ViewUsesType)
+                    && (self.resolve_rename(&edge.referenced) == target || &edge.referenced == ty)
             })
             .collect()
     }
@@ -2160,7 +2159,7 @@ mod tests {
         ));
         assert_indexed_views_match_scan(&graph, &targets);
 
-        graph.propagate_rename(&b, &c);
+        graph.propagate_relation_rename(&b, &c);
         graph.add_edge(DependencyEdge::new(
             b.clone(),
             c.clone(),

@@ -146,10 +146,16 @@ impl ObjectId {
 
 impl std::fmt::Display for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // If this is an internal composite trigger key (formatted as "<table_name>\0<trigger_name>"),
+        // format as "<schema>.<table_name>.<trigger_name>" for safe, clean display without raw NUL bytes.
+        let name_display = match self.name.split_once('\0') {
+            Some((table, trigger)) => format!("{table}.{trigger}"),
+            None => self.name.clone(),
+        };
         if self.inferred_schema {
-            write!(f, "{}.{} (inferred)", self.schema, self.name)
+            write!(f, "{}.{} (inferred)", self.schema, name_display)
         } else {
-            write!(f, "{}.{}", self.schema, self.name)
+            write!(f, "{}.{}", self.schema, name_display)
         }
     }
 }
