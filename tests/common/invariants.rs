@@ -100,6 +100,10 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
         local.graph.indexes_are_valid(),
         "dependency-graph indexes disagree with canonical edges"
     );
+    assert!(
+        local.graph.edge_set_is_valid(),
+        "dependency-graph edge set disagrees with canonical edges"
+    );
 
     for (name, schema) in &local.schemas {
         if let SchemaOverlay::Present(schema) = schema {

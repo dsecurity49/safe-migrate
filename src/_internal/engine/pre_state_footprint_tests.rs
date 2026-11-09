@@ -588,6 +588,91 @@ fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
     assert!(!journal_state.relation_is_present(&ObjectId::new("pg_temp", "temp_on_commit_delete")));
 }
 
+#[test]
+fn transaction_and_savepoint_rollback_matches_full_snapshot_reference() {
+    // Permanent reference oracle: verifies that transaction undo logs and nested
+    // savepoint rollbacks produce states and findings identical to full-copy snapshots.
+    let cache = differential_cache();
+    let mut journal_state = AnalysisState::new(cache.clone());
+    let mut snapshot_oracle_state = AnalysisState::new(cache);
+    let engine = SafeMigrateEngine::new(Config::default());
+
+    let mut oracle_snapshots: Vec<AnalysisState> = Vec::new();
+
+    let script = [
+        "CREATE TABLE accounts (id int PRIMARY KEY, balance numeric);",
+        "BEGIN;",
+        "ALTER TABLE accounts ADD COLUMN status text;",
+        "SAVEPOINT sp1;",
+        "ALTER TABLE accounts RENAME COLUMN status TO account_status;",
+        "CREATE TABLE audit_log (entry_id int);",
+        "SAVEPOINT sp2;",
+        "ALTER TABLE accounts ADD COLUMN internal_notes text;",
+        "ROLLBACK TO SAVEPOINT sp2;",
+        "RELEASE SAVEPOINT sp1;",
+        "COMMIT;",
+        "BEGIN;",
+        "ALTER TABLE accounts RENAME TO accounts_temp;",
+        "SAVEPOINT rename_sp;",
+        "ALTER TABLE accounts_temp ADD COLUMN extra_col int;",
+        "ROLLBACK TO SAVEPOINT rename_sp;",
+        "ROLLBACK;",
+    ];
+
+    for stmt in script {
+        let journal_violations = engine
+            .analyze(stmt, &mut journal_state)
+            .unwrap_or_else(|e| panic!("journal failed on {stmt}: {e:?}"));
+
+        let oracle_violations = engine
+            .analyze(stmt, &mut snapshot_oracle_state)
+            .unwrap_or_else(|e| panic!("oracle failed on {stmt}: {e:?}"));
+
+        if stmt == "BEGIN;" || stmt.starts_with("SAVEPOINT") {
+            oracle_snapshots.push(snapshot_oracle_state.clone());
+        } else if stmt.starts_with("ROLLBACK TO SAVEPOINT") {
+            let snap = oracle_snapshots.pop().expect("matching savepoint snapshot");
+            snapshot_oracle_state = snap;
+        } else if stmt == "ROLLBACK;" {
+            let mut snap = oracle_snapshots.remove(0);
+            oracle_snapshots.clear();
+            snap.local.transactions.clear();
+            snapshot_oracle_state = snap;
+        } else if stmt == "COMMIT;" {
+            oracle_snapshots.clear();
+        } else if stmt.starts_with("RELEASE SAVEPOINT") {
+            oracle_snapshots.pop();
+        }
+
+        assert_eq!(
+            comparable(&journal_violations),
+            comparable(&oracle_violations),
+            "findings diverged on: {stmt}"
+        );
+        // Compare external observable catalogue state across tables, columns, constraints, and graph
+        assert_eq!(
+            journal_state.local.relations, snapshot_oracle_state.local.relations,
+            "relations diverged from full-copy snapshot oracle on: {stmt}"
+        );
+        assert_eq!(
+            journal_state.local.constraints, snapshot_oracle_state.local.constraints,
+            "constraints diverged from full-copy snapshot oracle on: {stmt}"
+        );
+        assert_eq!(
+            journal_state.local.graph.edges(),
+            snapshot_oracle_state.local.graph.edges(),
+            "graph edges diverged from full-copy snapshot oracle on: {stmt}"
+        );
+        assert_eq!(
+            journal_state.in_transaction(),
+            snapshot_oracle_state.in_transaction(),
+            "transaction status diverged on: {stmt}"
+        );
+        assert!(journal_state.local.graph.indexes_are_valid());
+        assert!(journal_state.local.graph.edge_set_is_valid());
+    }
+}
+
 fn column_type_ids(state: &AnalysisState) -> Vec<Option<ObjectId>> {
     let RelationOverlay::Present(relation) = state
         .local
@@ -743,12 +828,18 @@ fn differential_chain() -> &'static [&'static str] {
         "ALTER DOMAIN positive_int SET NOT NULL;",
         "TRUNCATE users;",
         "ALTER TYPE address DROP ATTRIBUTE zip;",
+        "CREATE TABLE partition_p (id int, val text) PARTITION BY RANGE (id);",
+        "CREATE TABLE partition_c PARTITION OF partition_p FOR VALUES FROM (0) TO (100);",
+        "CREATE INDEX p_val_idx ON partition_p (val);",
+        "ALTER TABLE partition_p RENAME COLUMN val TO val_renamed;",
+        "ALTER INDEX p_val_idx RENAME TO p_val_idx_renamed;",
         "ALTER TABLE users RENAME TO users_renamed;",
         "DROP TABLE users_renamed CASCADE;",
         "DROP SEQUENCE users_seq;",
         "DROP FUNCTION f();",
         "DROP TYPE address;",
         "DROP DOMAIN positive_int;",
+        "DROP TABLE partition_p;",
         "DROP TABLE baseline_orders;",
     ]
 }

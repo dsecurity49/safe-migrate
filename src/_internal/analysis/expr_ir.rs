@@ -96,26 +96,30 @@ impl ExprIr {
         }
     }
 
-    pub(crate) fn rename_column(&mut self, from: &str, to: &str) {
+    pub(crate) fn rename_column(&mut self, from: &str, to: &str) -> bool {
         match self {
             Self::ColumnRef(name) => {
                 if name == from {
                     *name = to.to_string();
+                    true
+                } else {
+                    false
                 }
             }
             Self::FunctionCall { args, .. } => {
+                let mut changed = false;
                 for arg in args {
-                    arg.rename_column(from, to);
+                    changed |= arg.rename_column(from, to);
                 }
+                changed
             }
             Self::BinaryOp { left, right, .. } => {
-                left.rename_column(from, to);
-                right.rename_column(from, to);
+                let l = left.rename_column(from, to);
+                let r = right.rename_column(from, to);
+                l || r
             }
-            Self::Cast { expr, .. } | Self::UnaryOp { expr, .. } => {
-                expr.rename_column(from, to);
-            }
-            Self::Literal(_) | Self::Sentinel(_) | Self::Omitted => {}
+            Self::Cast { expr, .. } | Self::UnaryOp { expr, .. } => expr.rename_column(from, to),
+            Self::Literal(_) | Self::Sentinel(_) | Self::Omitted => false,
         }
     }
 

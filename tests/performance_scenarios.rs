@@ -930,4 +930,205 @@ mod performance_scenarios {
             elapsed,
         );
     }
+
+    #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_graph_rename_plan_allocations_and_fast_path() {
+        use safe_migrate::_internal::analysis::graph::{
+            DependencyEdge, DependencyGraph, DependencyKind, GraphRenamePlan,
+        };
+        use safe_migrate::_internal::ast::identifiers::ObjectId;
+        use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
+
+        const EDGES: usize = 10_000;
+        let mut graph = DependencyGraph::new();
+
+        for i in 0..EDGES {
+            let index_id = ObjectId::new("public", format!("idx_{i}"));
+            let table_id = ObjectId::new("public", format!("tbl_{i}"));
+            graph.add_edge(DependencyEdge::new(
+                index_id,
+                table_id,
+                DependencyKind::IndexOnRelation {
+                    definition: IndexDefinition {
+                        method: Some("btree".into()),
+                        keys: index_keys(vec!["id".into()]),
+                        included: index_keys(Vec::new()),
+                        expression_keys: 0,
+                        unique: false,
+                        nulls_not_distinct: Some(false),
+                        predicate: IndexPredicate::None,
+                        unestablished: false,
+                        valid: true,
+                        ready: true,
+                        live: true,
+                    },
+                    dependency_columns: Vec::new(),
+                    dependency_columns_known: true,
+                    is_concurrent: false,
+                    is_immediate: true,
+                    eligibility_known: true,
+                },
+            ));
+        }
+
+        let mut plan = GraphRenamePlan::default();
+        plan.relations.insert(
+            ObjectId::new("public", "tbl_0"),
+            ObjectId::new("public", "tbl_0_renamed"),
+        );
+
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        let delta = graph
+            .apply_rename_plan_recorded(&plan)
+            .expect("rename plan must apply");
+        let allocations = allocation_delta(before);
+        let elapsed = started.elapsed();
+
+        assert_eq!(graph.edge_count(), EDGES);
+        assert!(graph.indexes_are_valid());
+
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        graph.restore_edge_delta(delta);
+        let rollback_allocs = allocation_delta(before);
+        let rollback_elapsed = started.elapsed();
+
+        assert_eq!(graph.edge_count(), EDGES);
+        assert!(graph.indexes_are_valid());
+
+        eprintln!(
+            "scenario=large_graph_rename_plan_single_change edges={EDGES} allocations={} allocated_bytes={} elapsed_ms={}",
+            allocations.0,
+            allocations.1,
+            elapsed.as_millis()
+        );
+        eprintln!(
+            "scenario=large_graph_rename_plan_rollback edges={EDGES} allocations={} allocated_bytes={} elapsed_ms={}",
+            rollback_allocs.0,
+            rollback_allocs.1,
+            rollback_elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_graph_batched_column_rename_sparse_vs_unrelated() {
+        use safe_migrate::_internal::analysis::expr_ir::ExprIr;
+        use safe_migrate::_internal::analysis::graph::{
+            DependencyEdge, DependencyGraph, DependencyKind,
+        };
+        use safe_migrate::_internal::ast::identifiers::ObjectId;
+        use safe_migrate::_internal::model::index::{
+            IndexDefinition, IndexKey, IndexKeyKind, IndexPredicate, index_keys,
+        };
+        use std::collections::HashSet;
+
+        const EDGES: usize = 10_000;
+        let mut graph = DependencyGraph::new();
+
+        let target_table = ObjectId::new("public", "target_tbl");
+        let other_table = ObjectId::new("public", "other_tbl");
+
+        // 1 target edge that actually matches
+        graph.add_edge(DependencyEdge::new(
+            ObjectId::new("public", "target_idx"),
+            target_table.clone(),
+            DependencyKind::IndexOnRelation {
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["target_col".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
+                dependency_columns: Vec::new(),
+                dependency_columns_known: true,
+                is_concurrent: false,
+                is_immediate: true,
+                eligibility_known: true,
+            },
+        ));
+
+        // 9,999 unrelated expression and column indexes
+        for i in 1..EDGES {
+            let index_id = ObjectId::new("public", format!("idx_{i}"));
+            graph.add_edge(DependencyEdge::new(
+                index_id,
+                other_table.clone(),
+                DependencyKind::IndexOnRelation {
+                    definition: IndexDefinition {
+                        method: Some("btree".into()),
+                        keys: vec![IndexKey {
+                            kind: IndexKeyKind::CatalogExpression(ExprIr::ColumnRef(
+                                "unrelated_col".into(),
+                            )),
+                            opclass: safe_migrate::_internal::model::index::KeyOpclass::Default(
+                                None,
+                            ),
+                            collation: safe_migrate::_internal::model::index::KeyCollation::Derived,
+                            order: safe_migrate::_internal::model::index::IndexOrder::Default,
+                        }],
+                        included: index_keys(Vec::new()),
+                        expression_keys: 1,
+                        unique: false,
+                        nulls_not_distinct: Some(false),
+                        predicate: IndexPredicate::None,
+                        unestablished: false,
+                        valid: true,
+                        ready: true,
+                        live: true,
+                    },
+                    dependency_columns: vec!["unrelated_col".into()],
+                    dependency_columns_known: true,
+                    is_concurrent: false,
+                    is_immediate: true,
+                    eligibility_known: true,
+                },
+            ));
+        }
+
+        let mut affected = HashSet::new();
+        affected.insert(target_table);
+
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        let delta = graph
+            .rename_columns_for_relations_recorded(&affected, "target_col", "renamed_col")
+            .expect("must mutate the target edge");
+        let allocations = allocation_delta(before);
+        let elapsed = started.elapsed();
+
+        assert_eq!(graph.edge_count(), EDGES);
+        assert!(graph.indexes_are_valid());
+
+        let before = allocation_snapshot();
+        let started = Instant::now();
+        graph.restore_edge_delta(delta);
+        let rollback_allocs = allocation_delta(before);
+        let rollback_elapsed = started.elapsed();
+
+        assert_eq!(graph.edge_count(), EDGES);
+        assert!(graph.indexes_are_valid());
+
+        eprintln!(
+            "scenario=large_graph_batched_column_rename edges={EDGES} allocations={} allocated_bytes={} elapsed_ms={}",
+            allocations.0,
+            allocations.1,
+            elapsed.as_millis()
+        );
+        eprintln!(
+            "scenario=large_graph_batched_column_rename_rollback edges={EDGES} allocations={} allocated_bytes={} elapsed_ms={}",
+            rollback_allocs.0,
+            rollback_allocs.1,
+            rollback_elapsed.as_millis()
+        );
+    }
 }

@@ -322,28 +322,32 @@ impl AnalysisState {
                 DependencyKind::RenameTo,
             ));
         }
-        let mut triggers_to_move: Vec<(ObjectId, crate::_internal::model::trigger::TriggerState)> =
-            self.local
-                .triggers
-                .iter()
-                .filter_map(|(id, overlay)| match overlay {
-                    TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
-                        Some((id.clone(), trigger.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
+        let mut triggers_to_move: Vec<(ObjectId, String)> = self
+            .local
+            .triggers
+            .iter()
+            .filter_map(|(id, overlay)| match overlay {
+                TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
+                    Some((id.clone(), trigger.name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         triggers_to_move.sort_by(|left, right| left.0.cmp(&right.0));
-        for (old_trigger_id, mut trigger) in triggers_to_move {
-            let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
+        for (old_trigger_id, trigger_name) in triggers_to_move {
+            let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger_name);
             self.snapshot_trigger(&old_trigger_id);
             self.snapshot_trigger(&new_trigger_id);
-            self.local.triggers.remove(&old_trigger_id);
-            trigger.id = new_trigger_id.clone();
-            trigger.table_id = rename.new_id.clone();
-            self.local
-                .triggers
-                .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
+            if let Some(TriggerOverlay::Present(mut trigger)) =
+                self.local.triggers.get(&old_trigger_id).cloned()
+            {
+                self.local.triggers.remove(&old_trigger_id);
+                trigger.id = new_trigger_id.clone();
+                trigger.table_id = rename.new_id.clone();
+                self.local
+                    .triggers
+                    .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
+            }
             rename_plan
                 .triggers
                 .insert(old_trigger_id.clone(), new_trigger_id.clone());
@@ -353,24 +357,31 @@ impl AnalysisState {
                 DependencyKind::RenameTo,
             ));
         }
-        let mut constraints_to_move: Vec<(String, ConstraintState)> = self
+        let mut constraints_to_move: Vec<String> = self
             .local
             .constraints
-            .iter()
-            .filter(|((table_id, _), _)| table_id == &rename.old_id)
-            .map(|((_, name), constraint)| (name.clone(), constraint.clone()))
+            .keys()
+            .filter(|(table_id, _)| table_id == &rename.old_id)
+            .map(|(_, name)| name.clone())
             .collect();
-        constraints_to_move.sort_by(|left, right| left.0.cmp(&right.0));
-        for (name, mut constraint) in constraints_to_move {
+        constraints_to_move.sort();
+        for name in constraints_to_move {
             self.snapshot_constraint(&rename.old_id, &name);
             self.snapshot_constraint(&rename.new_id, &name);
-            self.local
+            if let Some(mut constraint) = self
+                .local
                 .constraints
-                .remove(&(rename.old_id.clone(), name.clone()));
-            constraint.table_id = rename.new_id.clone();
-            self.local
-                .constraints
-                .insert((rename.new_id.clone(), name), constraint);
+                .get(&(rename.old_id.clone(), name.clone()))
+                .cloned()
+            {
+                self.local
+                    .constraints
+                    .remove(&(rename.old_id.clone(), name.clone()));
+                constraint.table_id = rename.new_id.clone();
+                self.local
+                    .constraints
+                    .insert((rename.new_id.clone(), name), constraint);
+            }
         }
 
         for (publication_name, object_indexes) in publication_scope_updates {
@@ -495,48 +506,60 @@ impl AnalysisState {
 
     // The caller snapshots the graph before changing these coupled identities.
     pub(super) fn rename_index_catalog_references(&mut self, old: &ObjectId, new: &ObjectId) {
-        let mut constraints = self
+        let mut constraint_keys = self
             .local
             .constraints
-            .values()
-            .filter(|constraint| constraint.backing_index.as_ref() == Some(old))
-            .cloned()
+            .iter()
+            .filter(|(_, constraint)| constraint.backing_index.as_ref() == Some(old))
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        constraints.sort_by(|left, right| {
-            left.table_id
-                .cmp(&right.table_id)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        for mut constraint in constraints {
-            let old_name = constraint.name.clone();
-            let owns_index = matches!(
-                constraint.kind,
-                ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
-            );
+        constraint_keys.sort();
+
+        for (table_id, old_name) in constraint_keys {
+            let mut new_name = old_name.clone();
+            let owns_index = self
+                .local
+                .constraints
+                .get(&(table_id.clone(), old_name.clone()))
+                .is_some_and(|constraint| {
+                    matches!(
+                        constraint.kind,
+                        ConstraintKind::PrimaryKey
+                            | ConstraintKind::Unique
+                            | ConstraintKind::Exclusion
+                    )
+                });
             if owns_index && old.name != new.name {
-                constraint.name = new.name.clone();
+                new_name = new.name.clone();
             }
-            self.snapshot_constraint(&constraint.table_id, &old_name);
-            if constraint.name != old_name {
-                self.snapshot_constraint(&constraint.table_id, &constraint.name);
+            self.snapshot_constraint(&table_id, &old_name);
+            if new_name != old_name {
+                self.snapshot_constraint(&table_id, &new_name);
             }
+            let Some(mut constraint) = self
+                .local
+                .constraints
+                .get(&(table_id.clone(), old_name.clone()))
+                .cloned()
+            else {
+                continue;
+            };
             self.local
                 .constraints
-                .remove(&(constraint.table_id.clone(), old_name.clone()));
+                .remove(&(table_id.clone(), old_name.clone()));
+            constraint.name = new_name.clone();
             constraint.backing_index = Some(new.clone());
-            if old_name != constraint.name
-                && let Some(delta) = self.local.graph.rename_constraint_recorded(
-                    &constraint.table_id,
-                    &old_name,
-                    &constraint.name,
-                )
+            if old_name != new_name
+                && let Some(delta) = self
+                    .local
+                    .graph
+                    .rename_constraint_recorded(&table_id, &old_name, &new_name)
             {
                 self.record_graph_delta(delta);
             }
-            self.local.constraints.insert(
-                (constraint.table_id.clone(), constraint.name.clone()),
-                constraint,
-            );
+            self.local
+                .constraints
+                .insert((table_id, new_name), constraint);
         }
         if old.name == new.name {
             return;

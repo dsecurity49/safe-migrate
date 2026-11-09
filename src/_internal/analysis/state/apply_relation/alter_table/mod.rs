@@ -34,6 +34,11 @@ impl AnalysisState {
             Vec::new()
         };
         if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
+            let resolved_alter_id = self.local.graph.resolve_rename(&alter.id);
+            let closure_set: HashSet<&ObjectId> = recursive_rename_descendants
+                .iter()
+                .map(|id| self.local.graph.resolve_rename(id))
+                .collect();
             for descendant in &recursive_rename_descendants {
                 let Some(RelationOverlay::Present(relation)) = self.local.relations.get(descendant)
                 else {
@@ -64,17 +69,9 @@ impl AnalysisState {
                 let expected_parents = self
                     .local
                     .graph
-                    .edges()
-                    .iter()
-                    .filter(|edge| {
-                        edge.dependent == *descendant
-                            && matches!(
-                                edge.kind,
-                                DependencyKind::InheritanceOf | DependencyKind::PartitionOf
-                            )
-                            && (edge.referenced == alter.id
-                                || recursive_rename_descendants.contains(&edge.referenced))
-                    })
+                    .inheritance_parents_of(descendant)
+                    .into_iter()
+                    .filter(|&parent| parent == resolved_alter_id || closure_set.contains(parent))
                     .count() as u32;
                 if provenance.parent_count > expected_parents {
                     return MutationResult::conflict(format!(

@@ -371,13 +371,13 @@ impl Config {
         &self,
         primary_rule_ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), Error> {
-        let valid: BTreeSet<String> = primary_rule_ids.into_iter().map(str::to_owned).collect();
+        let valid: BTreeSet<&'a str> = primary_rule_ids.into_iter().collect();
         let unknown: BTreeSet<&str> = self
             .rules
             .keys()
             .map(String::as_str)
             .chain(self.disabled_rules.iter().map(String::as_str))
-            .filter(|rule_id| !valid.contains(*rule_id))
+            .filter(|rule_id| !valid.contains(rule_id))
             .collect();
 
         if unknown.is_empty() {

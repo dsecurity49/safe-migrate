@@ -1174,10 +1174,10 @@ impl AnalysisState {
             _ => {}
         }
         if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
-            self.rename_relation_column_metadata(&alter.id, from, to);
-            for descendant in recursive_rename_descendants {
-                self.rename_relation_column_metadata(&descendant, from, to);
-            }
+            let mut all_affected = Vec::with_capacity(recursive_rename_descendants.len() + 1);
+            all_affected.push(alter.id.clone());
+            all_affected.extend(recursive_rename_descendants);
+            self.rename_relations_column_metadata_batch(&all_affected, from, to);
 
             // Publication column lists are catalog identities, not merely
             // display text. PostgreSQL follows a renamed column in an

@@ -135,6 +135,7 @@ pub(crate) struct DependencyGraph {
     // lookups must not force the expensive resolved-adjacency build.
     rename_index: OnceCell<HashMap<ObjectId, usize>>,
     dependent_index: OnceCell<HashMap<ObjectId, Vec<usize>>>,
+    index_partition_index: OnceCell<HashMap<ObjectId, Vec<usize>>>,
     resolved_indexes: OnceCell<ResolvedIndexes>,
 }
 
@@ -179,6 +180,7 @@ impl Clone for DependencyGraph {
             // checkpoints; the clone builds them only if a lookup needs them.
             rename_index: OnceCell::new(),
             dependent_index: OnceCell::new(),
+            index_partition_index: OnceCell::new(),
             resolved_indexes: OnceCell::new(),
         }
     }
@@ -267,6 +269,8 @@ impl DependencyGraph {
         let rename = Self::build_rename_index(&self.edges);
         self.rename_index() == &rename
             && self.dependent_index() == &Self::build_dependent_index(&self.edges)
+            && self.index_partition_index()
+                == &Self::build_index_partition_index(&self.edges, &rename)
             && self.resolved_indexes() == &Self::build_resolved_indexes(&self.edges, &rename)
     }
 
@@ -282,12 +286,14 @@ impl DependencyGraph {
     pub(crate) fn build_indexes_for_tests(&self) {
         let _ = self.rename_index();
         let _ = self.dependent_index();
+        let _ = self.index_partition_index();
         let _ = self.resolved_indexes();
     }
 
     fn invalidate_indexes(&mut self) {
         self.rename_index.take();
         self.dependent_index.take();
+        self.index_partition_index.take();
         self.resolved_indexes.take();
     }
 
@@ -299,6 +305,31 @@ impl DependencyGraph {
     fn dependent_index(&self) -> &HashMap<ObjectId, Vec<usize>> {
         self.dependent_index
             .get_or_init(|| Self::build_dependent_index(&self.edges))
+    }
+
+    fn index_partition_index(&self) -> &HashMap<ObjectId, Vec<usize>> {
+        self.index_partition_index
+            .get_or_init(|| Self::build_index_partition_index(&self.edges, self.rename_index()))
+    }
+
+    fn build_index_partition_index(
+        edges: &[DependencyEdge],
+        rename_by_source: &HashMap<ObjectId, usize>,
+    ) -> HashMap<ObjectId, Vec<usize>> {
+        let mut by_referenced: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+        let mut resolved: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            if matches!(edge.kind, DependencyKind::IndexPartitionOf) {
+                let referenced = Self::resolve_rename_memo(
+                    edges,
+                    rename_by_source,
+                    &mut resolved,
+                    &edge.referenced,
+                );
+                by_referenced.entry(referenced).or_default().push(index);
+            }
+        }
+        by_referenced
     }
 
     fn resolved_indexes(&self) -> &ResolvedIndexes {
@@ -650,6 +681,18 @@ impl DependencyGraph {
         Some(&self.edges[position].referenced)
     }
 
+    /// The child indexes attached to `parent`, if any.
+    pub(crate) fn index_partitions_of(&self, parent: &ObjectId) -> Vec<ObjectId> {
+        let target = self.resolve_rename(parent);
+        if let Some(positions) = self.index_partition_index().get(target) {
+            return positions
+                .iter()
+                .map(|&idx| self.edges[idx].dependent.clone())
+                .collect();
+        }
+        Vec::new()
+    }
+
     /// Rewrite a recorded index definition in place.
     ///
     /// Only one edge payload changes, so the edge set and derived indexes are
@@ -763,6 +806,58 @@ impl DependencyGraph {
                 ) && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
             })
             .map(|e| self.resolve_rename(&e.dependent))
+            .collect()
+    }
+
+    pub(crate) fn inheritance_children_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(id)
+                .filter(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                    )
+                })
+                .map(|edge| self.resolve_rename(&edge.dependent))
+                .collect();
+        }
+        let target = self.resolve_rename(id);
+        self.edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                ) && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
+            })
+            .map(|e| self.resolve_rename(&e.dependent))
+            .collect()
+    }
+
+    pub(crate) fn inheritance_parents_of(&self, child: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_dependent_edges(child)
+                .filter(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                    )
+                })
+                .map(|edge| self.resolve_rename(&edge.referenced))
+                .collect();
+        }
+        let target = self.resolve_rename(child);
+        self.edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                ) && (self.resolve_rename(&e.dependent) == target || &e.dependent == child)
+            })
+            .map(|e| self.resolve_rename(&e.referenced))
             .collect()
     }
 
@@ -983,8 +1078,12 @@ impl DependencyGraph {
         let mut changed = false;
         match &mut edge.kind {
             DependencyKind::RenameTo => {}
-            // Index-to-index: a relation rename never moves an index.
-            DependencyKind::IndexPartitionOf => {}
+            // Index-to-index: a relation rename never moves an index, but an
+            // index rename or schema move changes both endpoints.
+            DependencyKind::IndexPartitionOf => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.indexes);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.indexes);
+            }
             DependencyKind::ForeignKey { .. }
             | DependencyKind::ViewDependency { .. }
             | DependencyKind::InheritanceOf
@@ -1044,6 +1143,25 @@ impl DependencyGraph {
         &mut self,
         changed: &[(usize, DependencyEdge)],
     ) -> Vec<(usize, DependencyEdge)> {
+        // Fast path: if reinserting only the changed edges produces no duplicates,
+        // we can avoid re-hashing and re-allocating the entire graph set.
+        let mut had_collision = false;
+        for (_, original) in changed {
+            self.edge_set.remove(original);
+        }
+        for (index, _) in changed {
+            if !self.edge_set.insert(self.edges[*index].clone()) {
+                had_collision = true;
+                break;
+            }
+        }
+
+        if !had_collision {
+            return Vec::new();
+        }
+
+        // Collision path: rebuild keeping the canonical first occurrences.
+        let changed_map: HashMap<usize, DependencyEdge> = changed.iter().cloned().collect();
         let mut seen = HashSet::with_capacity(self.edges.len());
         let mut removed = Vec::new();
         let mut kept = Vec::with_capacity(self.edges.len());
@@ -1051,10 +1169,9 @@ impl DependencyGraph {
             if seen.insert(edge.clone()) {
                 kept.push(edge);
             } else {
-                let original = changed
-                    .iter()
-                    .find(|(position, _)| *position == index)
-                    .map(|(_, original)| original.clone())
+                let original = changed_map
+                    .get(&index)
+                    .cloned()
                     .unwrap_or_else(|| edge.clone());
                 removed.push((index, original));
             }
@@ -1226,9 +1343,179 @@ impl DependencyGraph {
         })
     }
 
+    /// Rename table columns across multiple relations in a single recorded pass.
+    pub(crate) fn rename_columns_for_relations_recorded(
+        &mut self,
+        table_ids: &HashSet<ObjectId>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Option<GraphEdgeDelta> {
+        let original_len = self.edges.len();
+        let mut changed = Vec::new();
+
+        for index in 0..self.edges.len() {
+            let edge = &self.edges[index];
+            let needs_mutation = match &edge.kind {
+                DependencyKind::ForeignKey {
+                    from_columns,
+                    to_columns,
+                    ..
+                } => {
+                    (table_ids.contains(&edge.dependent)
+                        && from_columns.iter().any(|c| c == old_name))
+                        || (table_ids.contains(&edge.referenced)
+                            && to_columns.iter().any(|c| c == old_name))
+                }
+                DependencyKind::ConstraintOnRelation { columns, .. }
+                | DependencyKind::ConstraintDependency { columns, .. } => {
+                    table_ids.contains(&edge.dependent) && columns.iter().any(|c| c == old_name)
+                }
+                DependencyKind::ColumnGeneratedFrom {
+                    column,
+                    depends_on_column,
+                } => {
+                    (table_ids.contains(&edge.dependent) && column == old_name)
+                        || (table_ids.contains(&edge.referenced) && depends_on_column == old_name)
+                }
+                DependencyKind::ColumnDefaultOnSequence { column } => {
+                    table_ids.contains(&edge.dependent) && column == old_name
+                }
+                DependencyKind::IndexOnRelation {
+                    definition,
+                    dependency_columns,
+                    ..
+                } => {
+                    if !table_ids.contains(&edge.referenced) {
+                        false
+                    } else {
+                        let in_keys = definition
+                            .keys
+                            .iter()
+                            .chain(definition.included.iter())
+                            .any(|key| match &key.kind {
+                                crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                                    name == old_name
+                                }
+                                crate::_internal::model::index::IndexKeyKind::CatalogExpression(
+                                    expr,
+                                ) => expr
+                                    .referenced_columns()
+                                    .is_some_and(|cols| cols.contains(old_name)),
+                                crate::_internal::model::index::IndexKeyKind::Expression(_) => {
+                                    false
+                                }
+                            });
+                        in_keys || dependency_columns.iter().any(|c| c == old_name)
+                    }
+                }
+                DependencyKind::SequenceOwnedBy { column } => {
+                    table_ids.contains(&edge.referenced) && column == old_name
+                }
+                _ => false,
+            };
+
+            if !needs_mutation {
+                continue;
+            }
+
+            let original = self.edges[index].clone();
+            let edge = &mut self.edges[index];
+
+            match &mut edge.kind {
+                DependencyKind::ForeignKey {
+                    from_columns,
+                    to_columns,
+                    ..
+                } => {
+                    if table_ids.contains(&edge.dependent) {
+                        for column in from_columns {
+                            if column == old_name {
+                                *column = new_name.to_string();
+                            }
+                        }
+                    }
+                    if table_ids.contains(&edge.referenced) {
+                        for column in to_columns {
+                            if column == old_name {
+                                *column = new_name.to_string();
+                            }
+                        }
+                    }
+                }
+                DependencyKind::ConstraintOnRelation { columns, .. }
+                | DependencyKind::ConstraintDependency { columns, .. } => {
+                    for column in columns {
+                        if column == old_name {
+                            *column = new_name.to_string();
+                        }
+                    }
+                }
+                DependencyKind::ColumnGeneratedFrom {
+                    column,
+                    depends_on_column,
+                } => {
+                    if table_ids.contains(&edge.dependent) && column == old_name {
+                        *column = new_name.to_string();
+                    }
+                    if table_ids.contains(&edge.referenced) && depends_on_column == old_name {
+                        *depends_on_column = new_name.to_string();
+                    }
+                }
+                DependencyKind::ColumnDefaultOnSequence { column } => {
+                    *column = new_name.to_string();
+                }
+                DependencyKind::IndexOnRelation {
+                    definition,
+                    dependency_columns,
+                    ..
+                } => {
+                    for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                        match &mut key.kind {
+                            crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                                if name == old_name {
+                                    *name = new_name.to_string();
+                                }
+                            }
+                            crate::_internal::model::index::IndexKeyKind::CatalogExpression(
+                                expr,
+                            ) => {
+                                expr.rename_column(old_name, new_name);
+                            }
+                            crate::_internal::model::index::IndexKeyKind::Expression(_) => {}
+                        }
+                    }
+                    for column in dependency_columns.iter_mut() {
+                        if column == old_name {
+                            *column = new_name.to_string();
+                        }
+                    }
+                }
+                DependencyKind::SequenceOwnedBy { column } => {
+                    *column = new_name.to_string();
+                }
+                _ => {}
+            }
+
+            changed.push((index, original));
+        }
+
+        if changed.is_empty() {
+            return None;
+        }
+
+        let removed = self.deduplicate_edges_recording(&changed);
+        self.invalidate_indexes();
+        Some(GraphEdgeDelta {
+            original_len,
+            changed,
+            removed,
+        })
+    }
+
     /// Rename a table column in all typed dependency payloads that can carry
     /// column identity. The endpoint direction determines whether the column
     /// is source-side or referenced-side for foreign keys.
+    #[cfg(test)]
     pub(crate) fn rename_column_dependencies(
         &mut self,
         table_id: &ObjectId,
@@ -1640,6 +1927,75 @@ mod tests {
         graph.truncate(before_len);
         assert_eq!(graph.edges(), before.as_slice());
         assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn rename_plan_remaps_index_partition_of_endpoints() {
+        let mut graph = DependencyGraph::new();
+        let parent_idx = id("parent_idx");
+        let child_idx = id("child_idx");
+        let table = id("table");
+        let child_table = id("child_table");
+
+        let index_kind = || DependencyKind::IndexOnRelation {
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
+            dependency_columns: Vec::new(),
+            dependency_columns_known: true,
+            is_concurrent: false,
+            is_immediate: true,
+            eligibility_known: true,
+        };
+
+        graph.add_edge(DependencyEdge::new(parent_idx.clone(), table, index_kind()));
+        graph.add_edge(DependencyEdge::new(
+            child_idx.clone(),
+            child_table,
+            index_kind(),
+        ));
+        graph.add_edge(DependencyEdge::new(
+            child_idx.clone(),
+            parent_idx.clone(),
+            DependencyKind::IndexPartitionOf,
+        ));
+
+        let renamed_parent = id("renamed_parent_idx");
+        let renamed_child = id("renamed_child_idx");
+        let mut plan = GraphRenamePlan::default();
+        plan.indexes
+            .insert(parent_idx.clone(), renamed_parent.clone());
+        plan.indexes
+            .insert(child_idx.clone(), renamed_child.clone());
+
+        let delta = graph
+            .apply_rename_plan_recorded(&plan)
+            .expect("rename plan must record edge changes");
+
+        assert_eq!(graph.index_parent_of(&renamed_child), Some(&renamed_parent));
+        assert_eq!(graph.index_parent_of(&child_idx), None);
+
+        let partition_edge = graph
+            .edges()
+            .iter()
+            .find(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf))
+            .expect("partition edge must remain");
+        assert_eq!(partition_edge.dependent, renamed_child);
+        assert_eq!(partition_edge.referenced, renamed_parent);
+
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.index_parent_of(&child_idx), Some(&parent_idx));
+        assert_eq!(graph.index_parent_of(&renamed_child), None);
     }
 
     #[test]

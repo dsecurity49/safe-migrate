@@ -189,7 +189,7 @@ impl AnalysisState {
         {
             rel.triggers.insert(create_trigger.name.clone());
         }
-        self.snapshot_graph_full();
+        self.snapshot_graph();
         self.local.graph.add_edge(DependencyEdge::new(
             trigger_id.clone(),
             create_trigger.table.clone(),

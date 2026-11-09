@@ -733,29 +733,30 @@ impl SafeMigrateEngine {
     /// The scan is lexical rather than line-based so string literals, quoted
     /// identifiers, dollar-quoted bodies, and comments cannot be mistaken for
     /// statement starts.
-    fn normalize_execute(sql: &str) -> String {
-        let mut bytes = sql.as_bytes().to_vec();
+    fn normalize_execute<'a>(sql: &'a str) -> std::borrow::Cow<'a, str> {
+        let bytes = sql.as_bytes();
         let mut index = 0;
         let mut at_statement_start = true;
+        let mut rewrite_offsets = Vec::new();
 
         while index < bytes.len() {
             match bytes[index] {
                 b'\'' => {
-                    index = skip_quoted_string(&bytes, index);
+                    index = skip_quoted_string(bytes, index);
                     at_statement_start = false;
                 }
                 b'"' => {
-                    index = skip_quoted_identifier(&bytes, index);
+                    index = skip_quoted_identifier(bytes, index);
                     at_statement_start = false;
                 }
                 b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                    index = skip_line_comment(&bytes, index);
+                    index = skip_line_comment(bytes, index);
                 }
                 b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                    index = skip_block_comment(&bytes, index);
+                    index = skip_block_comment(bytes, index);
                 }
-                b'$' if !preceded_by_identifier(&bytes, index) => {
-                    if let Some(end) = dollar_quote_end(&bytes, index) {
+                b'$' if !preceded_by_identifier(bytes, index) => {
+                    if let Some(end) = dollar_quote_end(bytes, index) {
                         index = end;
                         at_statement_start = false;
                     } else {
@@ -770,10 +771,10 @@ impl SafeMigrateEngine {
                 byte if byte.is_ascii_whitespace() => index += 1,
                 _ => {
                     if at_statement_start
-                        && starts_with_keyword(&bytes, index, b"EXECUTE")
-                        && next_token_is_string(&bytes, index + b"EXECUTE".len())
+                        && starts_with_keyword(bytes, index, b"EXECUTE")
+                        && next_token_is_string(bytes, index + b"EXECUTE".len())
                     {
-                        bytes[index..index + b"EXECUTE".len()].copy_from_slice(b"DO     ");
+                        rewrite_offsets.push(index);
                     }
                     index += 1;
                     at_statement_start = false;
@@ -781,7 +782,18 @@ impl SafeMigrateEngine {
             }
         }
 
-        String::from_utf8(bytes).expect("normalization replaces ASCII bytes with ASCII bytes")
+        if rewrite_offsets.is_empty() {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+
+        let mut mutated = bytes.to_vec();
+        for offset in rewrite_offsets {
+            mutated[offset..offset + b"EXECUTE".len()].copy_from_slice(b"DO     ");
+        }
+        std::borrow::Cow::Owned(
+            String::from_utf8(mutated)
+                .expect("normalization replaces ASCII bytes with ASCII bytes"),
+        )
     }
 
     fn parse_directives(
@@ -1043,5 +1055,19 @@ mod tests {
         let normalized = SafeMigrateEngine::normalize_execute(sql);
         assert_eq!(normalized.len(), sql.len());
         assert_eq!(normalized, "SELECT 'é'; DO      'DROP TABLE x';");
+    }
+
+    #[test]
+    fn normalize_execute_borrows_when_no_rewrite_needed() {
+        let sql = "SELECT 1; INSERT INTO t VALUES ('EXECUTE');";
+        let res = SafeMigrateEngine::normalize_execute(sql);
+        assert!(matches!(res, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn normalize_execute_owns_when_rewrite_performed() {
+        let sql = "EXECUTE 'DROP TABLE x';";
+        let res = SafeMigrateEngine::normalize_execute(sql);
+        assert!(matches!(res, std::borrow::Cow::Owned(_)));
     }
 }

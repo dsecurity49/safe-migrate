@@ -320,15 +320,16 @@ impl AnalysisState {
         // index attached to this parent, whichever index that is.
         if let Some(child_table) = self.index_table_of(child) {
             let child_table = self.local.graph.resolve_rename(child_table);
-            let duplicate = self.local.graph.edges().iter().any(|edge| {
-                matches!(edge.kind, DependencyKind::IndexPartitionOf)
-                    && self.local.graph.resolve_rename(&edge.referenced) == resolved_parent
-                    && self.local.graph.resolve_rename(&edge.dependent)
-                        != self.local.graph.resolve_rename(child)
-                    && self
-                        .index_table_of(&edge.dependent)
-                        .is_some_and(|owner| self.local.graph.resolve_rename(owner) == child_table)
-            });
+            let resolved_child = self.local.graph.resolve_rename(child);
+            let duplicate = self
+                .index_partitions_of(parent)
+                .into_iter()
+                .any(|existing| {
+                    self.local.graph.resolve_rename(&existing) != resolved_child
+                        && self.index_table_of(&existing).is_some_and(|owner| {
+                            self.local.graph.resolve_rename(owner) == child_table
+                        })
+                });
             if duplicate {
                 return Some(AttachRefusal::DuplicateAttachment);
             }
@@ -451,16 +452,17 @@ impl AnalysisState {
             return true;
         }
         let attached = self.index_partitions_of(index);
-        partitions.iter().all(|partition| {
-            attached.iter().any(|child| {
-                self.index_table_of(child).is_some_and(|owner| {
-                    self.local.graph.resolve_rename(owner)
-                        == self.local.graph.resolve_rename(partition)
-                }) && self
-                    .index_definition_of(child)
-                    .is_some_and(|definition| definition.valid)
-            })
-        })
+        let mut covered_partitions: HashSet<&ObjectId> = HashSet::with_capacity(attached.len());
+        for child in &attached {
+            if let Some(owner) = self.index_table_of(child)
+                && self.index_definition_of(child).is_some_and(|def| def.valid)
+            {
+                covered_partitions.insert(self.local.graph.resolve_rename(owner));
+            }
+        }
+        partitions
+            .iter()
+            .all(|p| covered_partitions.contains(self.local.graph.resolve_rename(p)))
     }
 
     /// Record `child` as a partition of `parent`.
@@ -514,6 +516,30 @@ impl AnalysisState {
         template: &DependencyKind,
         rule: ChildReuseRule,
     ) -> (ObjectId, bool) {
+        let backing: HashMap<ObjectId, ConstraintKind> = self
+            .local
+            .constraints
+            .values()
+            .filter_map(|constraint| {
+                let index = constraint.backing_index.as_ref()?;
+                matches!(
+                    constraint.kind,
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
+                )
+                .then_some((index.clone(), constraint.kind))
+            })
+            .collect();
+        self.ensure_partition_index_child_with_context(parent, table, template, rule, &backing)
+    }
+
+    fn ensure_partition_index_child_with_context(
+        &mut self,
+        parent: &ObjectId,
+        table: &ObjectId,
+        template: &DependencyKind,
+        rule: ChildReuseRule,
+        backing: &HashMap<ObjectId, ConstraintKind>,
+    ) -> (ObjectId, bool) {
         let DependencyKind::IndexOnRelation {
             definition: template_definition,
             ..
@@ -522,24 +548,7 @@ impl AnalysisState {
             unreachable!("partition index templates are index edges")
         };
         let resolved_table = self.local.graph.resolve_rename(table).clone();
-        // Every candidate asks the same catalog question, so resolve the
-        // backing constraints once instead of rescanning per index edge.
         let reused = {
-            let backing: HashMap<&ObjectId, ConstraintKind> = self
-                .local
-                .constraints
-                .values()
-                .filter_map(|constraint| {
-                    let index = constraint.backing_index.as_ref()?;
-                    matches!(
-                        constraint.kind,
-                        ConstraintKind::PrimaryKey
-                            | ConstraintKind::Unique
-                            | ConstraintKind::Exclusion
-                    )
-                    .then_some((index, constraint.kind))
-                })
-                .collect();
             let parent_backing = backing.get(parent).copied();
             self.local
                 .graph
@@ -611,8 +620,9 @@ impl AnalysisState {
             .cloned()
             .collect();
         for partition in partitions {
-            let (_, child_valid) =
-                self.ensure_partition_index_child(&id, &partition, template, rule);
+            let (_, child_valid) = self.ensure_partition_index_child_with_context(
+                &id, &partition, template, rule, backing,
+            );
             valid &= child_valid;
         }
         if !valid {
@@ -680,16 +690,6 @@ impl AnalysisState {
 
     /// The child indexes that would fall if `parent` were dropped.
     pub(super) fn index_partitions_of(&self, parent: &ObjectId) -> Vec<ObjectId> {
-        self.local
-            .graph
-            .edges()
-            .iter()
-            .filter(|edge| {
-                matches!(edge.kind, DependencyKind::IndexPartitionOf)
-                    && self.local.graph.resolve_rename(&edge.referenced)
-                        == self.local.graph.resolve_rename(parent)
-            })
-            .map(|edge| edge.dependent.clone())
-            .collect()
+        self.local.graph.index_partitions_of(parent)
     }
 }
