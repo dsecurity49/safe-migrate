@@ -617,17 +617,18 @@ impl AnalysisState {
                 let RelationOverlay::Present(relation) = overlay else {
                     return None;
                 };
-                relation
-                    .columns
-                    .iter()
-                    .any(|column| {
-                        column
-                            .type_id
-                            .as_ref()
-                            .and_then(|type_id| Self::renamed_type_id(type_id, rename))
-                            .is_some()
-                    })
-                    .then_some(id.clone())
+                let relation_matches = relation.columns.iter().any(|column| {
+                    column
+                        .type_id
+                        .as_ref()
+                        .and_then(|type_id| Self::renamed_type_id(type_id, rename))
+                        .is_some()
+                }) || relation
+                    .of_type
+                    .as_ref()
+                    .and_then(|type_id| Self::renamed_type_id(type_id, rename))
+                    .is_some();
+                relation_matches.then_some(id.clone())
             })
             .collect();
         affected_relations.sort();
@@ -642,7 +643,20 @@ impl AnalysisState {
                 let TypeOverlay::Present(state) = overlay else {
                     return None;
                 };
-                Self::type_kind_references_rename(&state.kind, rename).then_some(id.clone())
+                let references_rename = Self::type_kind_references_rename(&state.kind, rename)
+                    || match &state.kind {
+                        TypeKind::Range {
+                            canonical_id,
+                            subtype_diff_id,
+                            ..
+                        } => remapped_functions.iter().any(|(old_func, new_func, _, _)| {
+                            old_func != new_func
+                                && (canonical_id.as_ref() == Some(old_func)
+                                    || subtype_diff_id.as_ref() == Some(old_func))
+                        }),
+                        _ => false,
+                    };
+                references_rename.then_some(id.clone())
             })
             .collect();
         affected_types.sort();
@@ -687,6 +701,10 @@ impl AnalysisState {
         graph_plan
             .types
             .insert(rename.old_id.clone(), rename.new_id.clone());
+        graph_plan.types.insert(
+            Self::array_type_id(&rename.old_id),
+            Self::array_type_id(&rename.new_id),
+        );
         for (old_id, new_id, _, _) in &remapped_functions {
             if old_id != new_id {
                 graph_plan.routines.insert(old_id.clone(), new_id.clone());
@@ -705,6 +723,13 @@ impl AnalysisState {
             let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) else {
                 continue;
             };
+            if let Some(remapped) = relation
+                .of_type
+                .as_ref()
+                .and_then(|type_id| Self::renamed_type_id(type_id, rename))
+            {
+                relation.of_type = Some(remapped);
+            }
             for column in &mut relation.columns {
                 let remapped = column
                     .type_id
@@ -766,10 +791,11 @@ impl AnalysisState {
                     .insert(new_id.clone(), FunctionOverlay::Present(function));
                 if old_id != new_id {
                     self.local.graph.add_edge(DependencyEdge::new(
-                        old_id,
-                        new_id,
+                        old_id.clone(),
+                        new_id.clone(),
                         DependencyKind::RenameTo,
                     ));
+                    self.remap_range_routine_reference(&old_id, &new_id);
                 }
             }
         }

@@ -252,8 +252,9 @@ impl AnalysisState {
                 self.snapshot_pending_validation();
             }
         }
-        if let Some(RelationOverlay::Present(mut state)) =
-            self.local.relations.remove(&rename.old_id)
+        if renames_relation
+            && let Some(RelationOverlay::Present(mut state)) =
+                self.local.relations.remove(&rename.old_id)
         {
             state.id = rename.new_id.clone();
             self.local

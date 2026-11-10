@@ -696,6 +696,16 @@ fn a_view_depends_on_the_types_its_body_casts_to() {
     assert_eq!(
         conflicts(
             "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT ARRAY[1]::ct[] AS r;
+                 ALTER TYPE ct RENAME TO ct2;
+                 DROP TYPE ct2;"
+        ),
+        1,
+        "a cast to an array of a user type must track type renames and block dropping it"
+    );
+    assert_eq!(
+        conflicts(
+            "CREATE TYPE ct AS (z int);
                  CREATE VIEW v AS SELECT 1 AS r;
                  DROP TYPE ct;"
         ),

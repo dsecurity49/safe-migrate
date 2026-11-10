@@ -978,6 +978,9 @@ mod performance_scenarios {
             ObjectId::new("public", "tbl_0_renamed"),
         );
 
+        let initial_edges = graph.edges().to_vec();
+        let target_index = ObjectId::new("public", "idx_0");
+
         let before = allocation_snapshot();
         let started = Instant::now();
         let delta = graph
@@ -987,6 +990,10 @@ mod performance_scenarios {
         let elapsed = started.elapsed();
 
         assert_eq!(graph.edge_count(), EDGES);
+        assert_eq!(
+            graph.index_table_of(&target_index),
+            Some(&ObjectId::new("public", "tbl_0_renamed"))
+        );
         assert!(graph.indexes_are_valid());
 
         let before = allocation_snapshot();
@@ -996,6 +1003,11 @@ mod performance_scenarios {
         let rollback_elapsed = started.elapsed();
 
         assert_eq!(graph.edge_count(), EDGES);
+        assert_eq!(
+            graph.index_table_of(&target_index),
+            Some(&ObjectId::new("public", "tbl_0"))
+        );
+        assert_eq!(graph.edges(), initial_edges.as_slice());
         assert!(graph.indexes_are_valid());
 
         eprintln!(

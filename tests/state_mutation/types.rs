@@ -2334,18 +2334,42 @@ fn range_subtype_diff_is_a_routine_dependency_that_tracks_renames() {
 
     engine
         .analyze(
-            "DROP FUNCTION public.diff2(integer, integer) CASCADE;",
+            "CREATE TYPE public.my_int AS (val integer);
+             CREATE FUNCTION public.diff_custom(public.my_int, public.my_int) RETURNS double precision
+                 LANGUAGE sql IMMUTABLE AS 'SELECT 1.0';
+             CREATE TYPE public.custom_range AS RANGE (subtype = public.my_int, subtype_diff = public.diff_custom);
+             ALTER TYPE public.my_int RENAME TO my_int_renamed;",
             &mut state,
         )
         .unwrap();
-    assert!(!matches!(
-        state.local.types.get(&range),
-        Some(TypeOverlay::Present(_))
-    ));
-    assert!(!matches!(
-        state.local.types.get(&object_id("public", "r_multirange")),
-        Some(TypeOverlay::Present(_))
-    ));
+
+    let renamed_func = object_id(
+        "public",
+        "diff_custom(public.my_int_renamed,public.my_int_renamed)",
+    );
+    let custom_range = object_id("public", "custom_range");
+    match state.local.types.get(&custom_range) {
+        Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Range {
+                subtype_diff_id, ..
+            },
+            ..
+        })) => assert_eq!(subtype_diff_id.as_ref(), Some(&renamed_func)),
+        other => panic!("expected custom_range type, got {other:?}"),
+    }
+
+    let violations = engine
+        .analyze(
+            "DROP FUNCTION public.diff_custom(public.my_int_renamed, public.my_int_renamed);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "{violations:#?}"
+    );
 }
 
 #[test]
@@ -2468,9 +2492,10 @@ fn composite_attribute_alterations_synchronize_typed_tables() {
         .analyze(
             "CREATE TYPE item_t AS (a integer, b text);
              CREATE TABLE typed_items OF item_t;
-             ALTER TYPE item_t ADD ATTRIBUTE c boolean CASCADE;
-             ALTER TYPE item_t RENAME ATTRIBUTE b TO b_renamed CASCADE;
-             ALTER TYPE item_t DROP ATTRIBUTE a CASCADE;",
+             ALTER TYPE item_t RENAME TO item_t_renamed;
+             ALTER TYPE item_t_renamed ADD ATTRIBUTE c boolean CASCADE;
+             ALTER TYPE item_t_renamed RENAME ATTRIBUTE b TO b_renamed CASCADE;
+             ALTER TYPE item_t_renamed DROP ATTRIBUTE a CASCADE;",
             &mut state,
         )
         .unwrap();
@@ -2480,6 +2505,10 @@ fn composite_attribute_alterations_synchronize_typed_tables() {
         panic!("typed_items should be present");
     };
 
+    assert_eq!(
+        tbl.of_type.as_ref(),
+        Some(&object_id("public", "item_t_renamed"))
+    );
     assert!(!tbl.has_column("a"));
     assert!(tbl.has_column("b_renamed"));
     assert!(tbl.has_column("c"));
