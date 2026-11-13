@@ -225,6 +225,7 @@ fn role_inherit_option_is_preserved_across_mutations() {
             via_legacy_group_syntax: false,
         },
         inherits: Some(true),
+        rename_to: None,
     });
     assert_eq!(state.apply(&alter, None), MutationResult::Applied);
     let Some(crate::_internal::model::role::RoleOverlay::Present(role)) =
@@ -490,6 +491,7 @@ fn baseline_drop_column_applies_and_taints_without_dependency_coverage() {
         &Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
             id: table_id.clone(),
             only: false,
+            if_exists: false,
             action: crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
                 name: "id".to_string(),
                 if_exists: false,

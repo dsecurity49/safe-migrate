@@ -1,4 +1,4 @@
-use crate::_internal::analysis::evidence::EvidenceLocation;
+use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceLocation, EvidenceScope};
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::outcome::AnalysisOutcome;
 use crate::_internal::analysis::resolver::Resolver;
@@ -97,6 +97,7 @@ impl StatementCheckpoint {
             state.local.statement_undo_log.is_none(),
             "the previous statement's undo journal must be closed before the next checkpoint"
         );
+        state.local.statement_snapshot_ids.clear();
         if !force_full {
             if is_pure_transaction_control(mutations) {
                 let shape = state.transaction_shape();
@@ -540,6 +541,26 @@ impl SafeMigrateEngine {
                 }
 
                 if result == crate::_internal::analysis::state::MutationResult::NotExecuted {
+                    if state.transaction_is_aborted() {
+                        state.taint(EvidenceCode::TransactionAborted, EvidenceScope::Chain);
+                        for rule in &self.rules {
+                            state.record_not_evaluated(
+                                crate::_internal::report::violations::NotEvaluated {
+                                    rule_id: rule.id(),
+                                    tier: rule.default_tier(),
+                                    cause: EvidenceCode::TransactionAborted,
+                                    sql: Some(stmt_text.trim().to_string()),
+                                    recipe:
+                                        crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                            EvidenceCode::TransactionAborted,
+                                            &[],
+                                            None,
+                                        ),
+                                    missing_schemas: Vec::new(),
+                                },
+                            );
+                        }
+                    }
                     continue;
                 }
 

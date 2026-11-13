@@ -1758,6 +1758,7 @@ fn foreign_table_accepts_the_statements_postgres_accepts() {
     let alter = Mutation::AlterTable(AlterTable {
         id: id.clone(),
         only: false,
+        if_exists: false,
         action: AlterTableActionMutation::AddColumn {
             name: "extra".to_string(),
             ty: Some("integer".to_string()),

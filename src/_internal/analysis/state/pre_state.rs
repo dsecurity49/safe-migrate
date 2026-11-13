@@ -60,6 +60,7 @@ pub(crate) struct PreStateReadSet {
     pub extensions: ReadScope<String>,
     pub types: ReadScope<ObjectId>,
     pub indexes: ReadScope<ObjectId>,
+    pub constraints: ReadScope<(ObjectId, String)>,
     pub baseline_foreign_keys: ReadScope<(ObjectId, String)>,
 }
 
@@ -80,8 +81,82 @@ impl PreStateReadSet {
             extensions: ReadScope::All,
             types: ReadScope::All,
             indexes: ReadScope::All,
+            constraints: ReadScope::All,
             baseline_foreign_keys: ReadScope::All,
         }
+    }
+}
+
+#[derive(Default)]
+struct RelationColumnProvenance {
+    present: Option<Vec<String>>,
+    created: HashMap<String, bool>,
+    dropped: HashMap<String, bool>,
+}
+
+impl RelationColumnProvenance {
+    /// Reconcile the simulated state with the relation state before one
+    /// mutation, inferring additions, drops, and same-position renames.
+    fn observe_snapshot(&mut self, previous: &Option<RelationOverlay>) {
+        let next_columns: Vec<String> = match previous {
+            Some(RelationOverlay::Present(relation)) => relation
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            // The relation was absent or tombstoned, so this mutation
+            // recreated it; every column in the following state is new.
+            None | Some(RelationOverlay::Dropped) => {
+                self.present = Some(Vec::new());
+                self.created.clear();
+                self.dropped.clear();
+                return;
+            }
+        };
+
+        match self.present.take() {
+            None => {
+                for name in &next_columns {
+                    self.created.insert(name.clone(), false);
+                }
+            }
+            Some(previous_columns) => {
+                let removed: Vec<(usize, &String)> = previous_columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| !next_columns.contains(name))
+                    .collect();
+                let added: Vec<(usize, &String)> = next_columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| !previous_columns.contains(name))
+                    .collect();
+
+                let renamed = removed.len() == 1 && added.len() == 1 && removed[0].0 == added[0].0;
+                if renamed {
+                    let was_created = self.created.remove(removed[0].1).unwrap_or(false);
+                    self.created.insert(added[0].1.clone(), was_created);
+                } else {
+                    for (_, name) in removed {
+                        self.dropped
+                            .insert(name.clone(), self.created.remove(name).unwrap_or(false));
+                    }
+                    for (_, name) in added {
+                        self.created.insert(name.clone(), true);
+                    }
+                }
+            }
+        }
+
+        self.present = Some(next_columns);
+    }
+
+    fn was_created(&self, column: &str) -> bool {
+        self.created
+            .get(column)
+            .copied()
+            .or_else(|| self.dropped.get(column).copied())
+            .unwrap_or(false)
     }
 }
 
@@ -95,25 +170,32 @@ impl AnalysisState {
             return false;
         }
 
-        // Search from the oldest transaction frame to the newest
+        // Replay pre-mutation snapshots chronologically, moving each relation's
+        // provenance with its rename. The id is not stable: `ALTER TABLE ...
+        // RENAME TO` (or a schema move) changes it mid-transaction, and a later
+        // table may reuse the old name.
+        let mut relations: HashMap<ObjectId, RelationColumnProvenance> = HashMap::new();
         for frame in &self.local.transactions {
             for change in &frame.undo_log {
-                if let StateChange::RelationSnapshot { id, previous } = change
-                    && id == table_id
-                {
-                    match previous.as_ref() {
-                        None | Some(RelationOverlay::Dropped) => {
-                            return true;
-                        }
-                        Some(RelationOverlay::Present(r)) => {
-                            let col_existed = r.columns.iter().any(|c| c.name == column);
-                            return !col_existed;
-                        }
+                match change {
+                    StateChange::RelationSnapshot { id, previous } => {
+                        relations
+                            .entry(id.clone())
+                            .or_default()
+                            .observe_snapshot(previous.as_ref());
                     }
+                    StateChange::RelationRename { old_id, new_id, .. } => {
+                        let moved = relations.remove(old_id).unwrap_or_default();
+                        relations.insert(new_id.clone(), moved);
+                    }
+                    _ => {}
                 }
             }
         }
-        false
+
+        relations
+            .get(table_id)
+            .is_some_and(|relation| relation.was_created(column))
     }
 
     #[cfg(test)]
@@ -134,6 +216,7 @@ impl AnalysisState {
             extensions,
             types,
             indexes,
+            constraints,
             baseline_foreign_keys,
         } = pre_state;
 
@@ -247,6 +330,13 @@ impl AnalysisState {
                 indexes.truncate(index);
             }
         }
+
+        sync_selected_map(
+            constraints,
+            &self.local.constraints,
+            &reads.constraints,
+            |constraint| Some(constraint),
+        );
 
         match &reads.baseline_foreign_keys {
             ReadScope::None => baseline_foreign_keys.clear(),

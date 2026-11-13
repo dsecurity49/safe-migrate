@@ -1094,6 +1094,7 @@ impl AnalysisState {
             extension_try!(self.apply_alter_table(&AlterTable {
                 id: table,
                 only: false,
+                if_exists: false,
                 action: AlterTableActionMutation::DropConstraint {
                     name: constraint_name.to_string(),
                     if_exists: false,

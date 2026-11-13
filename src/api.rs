@@ -352,116 +352,6 @@ pub enum Tier {
     Tier3,
 }
 
-/// Stable category of the SQL operation that produced a finding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub enum OperationKind {
-    /// Drops a table column.
-    DropColumn,
-    /// Drops a table.
-    DropTable,
-    /// Drops an index.
-    DropIndex,
-    /// Drops a view.
-    DropView,
-    /// Drops a materialized view.
-    DropMaterializedView,
-    /// Drops a function.
-    DropFunction,
-    /// Drops a procedure.
-    DropProcedure,
-    /// Drops a schema.
-    DropSchema,
-    /// Drops a database.
-    DropDatabase,
-    /// Drops a sequence.
-    DropSequence,
-    /// Drops a domain.
-    DropDomain,
-    /// Drops a type.
-    DropType,
-    /// Drops a publication.
-    DropPublication,
-    /// Drops a trigger.
-    DropTrigger,
-    /// Drops a row-level security policy.
-    DropPolicy,
-    /// Adds a table column.
-    AddColumn,
-    /// Changes a column's data type.
-    AlterColumnType,
-    /// Adds a table constraint.
-    AddConstraint,
-    /// Creates an index.
-    CreateIndex,
-    /// Creates a table.
-    CreateTable,
-    /// Creates a view.
-    CreateView,
-    /// Creates a function.
-    CreateFunction,
-    /// Creates a procedure.
-    CreateProcedure,
-    /// Changes a function.
-    AlterFunction,
-    /// Changes a procedure.
-    AlterProcedure,
-    /// Refreshes a materialized view.
-    RefreshMaterializedView,
-    /// Reindexes a table, index, database, schema, or system.
-    Reindex,
-    /// Attaches a partition.
-    AttachPartition,
-    /// Detaches a partition.
-    DetachPartition,
-    /// Runs `VACUUM FULL`.
-    VacuumFull,
-    /// Acquires an explicit table lock.
-    LockTable,
-    /// Removes all rows from one or more tables.
-    TruncateTable,
-    /// Grants privileges.
-    Grant,
-    /// Revokes privileges.
-    RevokeGrant,
-    /// Changes a type definition.
-    AlterType,
-    /// Creates a trigger.
-    CreateTrigger,
-    /// Creates a row-level security policy.
-    CreatePolicy,
-    /// Disables a trigger.
-    DisableTrigger,
-    /// Enables a trigger.
-    EnableTrigger,
-    /// Renames a table.
-    RenameTable,
-    /// Renames a table column.
-    RenameColumn,
-    /// Renames an object with no more specific category.
-    Rename,
-    /// SQL whose effects cannot be modeled precisely.
-    OpaqueSql,
-    /// Creates a schema.
-    CreateSchema,
-    /// Sets or drops a column default.
-    SetDefault,
-    /// Creates a sequence.
-    CreateSequence,
-    /// Creates a domain.
-    CreateDomain,
-    /// Changes a schema.
-    AlterSchema,
-    /// Represents a conflict detected before execution.
-    Conflict,
-    /// Represents an irreversible operation.
-    Irreversible,
-    /// Represents a reference that could not be resolved safely.
-    UnresolvedReference,
-    /// A named operation outside the stable categories above.
-    Other(String),
-}
-
 /// Stable category of the database object associated with a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[non_exhaustive]
@@ -571,6 +461,8 @@ pub enum EvidenceCode {
     UnknownObjectState,
     /// Transaction state became uncertain.
     TransactionStateUnknown,
+    /// The transaction was aborted before the statement could run.
+    TransactionAborted,
     /// A state transition was deliberately treated as opaque.
     UnmodeledState,
 }
@@ -1904,6 +1796,7 @@ impl From<internal_evidence::EvidenceCode> for EvidenceCode {
             internal_evidence::EvidenceCode::TransactionStateUnknown => {
                 Self::TransactionStateUnknown
             }
+            internal_evidence::EvidenceCode::TransactionAborted => Self::TransactionAborted,
             internal_evidence::EvidenceCode::UnmodeledState => Self::UnmodeledState,
         }
     }
@@ -1920,6 +1813,7 @@ impl From<EvidenceCode> for internal_evidence::EvidenceCode {
             EvidenceCode::UnresolvedReference => Self::UnresolvedReference,
             EvidenceCode::UnknownObjectState => Self::UnknownObjectState,
             EvidenceCode::TransactionStateUnknown => Self::TransactionStateUnknown,
+            EvidenceCode::TransactionAborted => Self::TransactionAborted,
             EvidenceCode::UnmodeledState => Self::UnmodeledState,
         }
     }

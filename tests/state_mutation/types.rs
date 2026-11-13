@@ -1543,6 +1543,123 @@ fn type_change_rewrite_matches_postgres_rewrite_behaviour() {
     }
 }
 
+fn insert_composite_item(cache: &mut safe_migrate::_internal::db::cache::DbCache) -> ObjectId {
+    let type_id = object_id("public", "item");
+    cache.types.insert(
+        type_id.clone(),
+        TypeState {
+            id: type_id.clone(),
+            generation: 0,
+            owner: object_id("public", "owner"),
+            kind: TypeKind::Composite {
+                fields: vec![safe_migrate::_internal::model::types::CompositeFieldState {
+                    name: "a".to_string(),
+                    data_type: "integer".to_string(),
+                    data_type_id: None,
+                    collation: None,
+                    collation_id: None,
+                }],
+            },
+        },
+    );
+    type_id
+}
+
+fn typed_table_rewrite_state(estimated_rows: Option<u64>) -> AnalysisState {
+    let mut cache = synced_cache();
+    let type_id = insert_composite_item(&mut cache);
+    let table_id = object_id("public", "typed");
+    let mut table = RelationState::new(
+        table_id.clone(),
+        object_id("public", "owner"),
+        0,
+        estimated_rows,
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    table.of_type = Some(type_id.clone());
+    let mut column =
+        Column::migration_created("a".to_string(), Some("integer".to_string()), false, None);
+    column.type_id = Some(type_id);
+    table.columns.push(column);
+    cache.insert_baseline(table_id, table);
+    AnalysisState::new(cache)
+}
+
+#[test]
+fn composite_attribute_rewrite_requires_typed_table_row_statistics() {
+    let engine = setup_engine();
+
+    let mut missing_stats = typed_table_rewrite_state(None);
+    let findings = engine
+        .analyze(
+            "ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut missing_stats,
+        )
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "type-change-rewrite"),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        missing_stats.local.confidence,
+        Confidence::Tainted,
+        "missing typed-table statistics must mark the rewrite uncertain: {:?}",
+        missing_stats.evidence()
+    );
+    assert!(
+        missing_stats
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::CatalogCoverageIncomplete)
+    );
+
+    let mut known_stats = typed_table_rewrite_state(Some(1_000));
+    let findings = engine
+        .analyze(
+            "ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut known_stats,
+        )
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "type-change-rewrite"),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        known_stats.local.confidence,
+        Confidence::Exact,
+        "known typed-table statistics keep the rewrite exact: {:?}",
+        known_stats.evidence()
+    );
+
+    let mut cache = synced_cache();
+    insert_composite_item(&mut cache);
+    let mut no_typed_table = AnalysisState::new(cache);
+    let findings = engine
+        .analyze(
+            "ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut no_typed_table,
+        )
+        .unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "type-change-rewrite"),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        no_typed_table.local.confidence,
+        Confidence::Exact,
+        "a composite without typed tables needs no relation statistics: {:?}",
+        no_typed_table.evidence()
+    );
+}
+
 #[test]
 fn type_change_rewrite_handles_typed_tables_when_composite_fields_change() {
     let engine = setup_engine();

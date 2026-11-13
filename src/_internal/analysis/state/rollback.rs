@@ -230,6 +230,8 @@ impl AnalysisState {
                     session_role_known,
                     persistent_session_role,
                     persistent_session_role_known,
+                    authenticated_role,
+                    authenticated_role_known,
                 } => {
                     self.local.current_role = current_role;
                     self.local.current_role_known = current_role_known;
@@ -239,6 +241,8 @@ impl AnalysisState {
                     self.local.session_role_known = session_role_known;
                     self.local.persistent_session_role = persistent_session_role;
                     self.local.persistent_session_role_known = persistent_session_role_known;
+                    self.local.authenticated_role = authenticated_role;
+                    self.local.authenticated_role_known = authenticated_role_known;
                 }
                 StateChange::SearchPathSnapshot {
                     previous,
@@ -276,12 +280,28 @@ impl AnalysisState {
                     self.local.evidence.truncate(len);
                 }
                 StateChange::NotEvaluatedLength { len } => {
+                    let preserved: Vec<_> = self
+                        .not_evaluated
+                        .iter()
+                        .skip(len)
+                        .filter(|entry| {
+                            entry.cause
+                                == crate::_internal::analysis::evidence::EvidenceCode::TransactionAborted
+                        })
+                        .cloned()
+                        .collect();
                     self.not_evaluated.truncate(len);
+                    self.not_evaluated.extend(preserved);
                 }
                 StateChange::CoDroppedObjectsSnapshot { previous } => {
                     self.co_dropped_objects = previous;
                 }
             }
+        }
+        if self.not_evaluated.iter().any(|entry| {
+            entry.cause == crate::_internal::analysis::evidence::EvidenceCode::TransactionAborted
+        }) {
+            self.local.confidence = Confidence::Tainted;
         }
         debug_assert!(self.local.graph.indexes_are_valid());
     }
@@ -289,10 +309,12 @@ impl AnalysisState {
     pub(crate) fn begin_statement_undo(&mut self) {
         debug_assert!(self.local.statement_undo_log.is_none());
         self.local.statement_undo_log = Some(Vec::new());
+        self.local.statement_snapshot_ids.clear();
     }
 
     pub(crate) fn commit_statement_undo(&mut self) {
         self.local.statement_undo_log = None;
+        self.local.statement_snapshot_ids.clear();
     }
 
     pub(crate) fn transaction_shape(&self) -> Vec<(TransactionFrameKind, usize)> {
@@ -308,6 +330,7 @@ impl AnalysisState {
             return Err("statement undo journal was already closed");
         };
         self.rollback_undo_log(undo_log);
+        self.local.statement_snapshot_ids.clear();
         Ok(())
     }
 
@@ -334,6 +357,7 @@ impl AnalysisState {
         }
         let statement_undo = frame.undo_log.split_off(undo_len);
         self.rollback_undo_log(statement_undo);
+        self.local.statement_snapshot_ids.clear();
         debug_assert!(self.local.graph.indexes_are_valid());
         Ok(())
     }

@@ -605,9 +605,12 @@ impl Resolver {
             StatementFact::AlterTable {
                 name,
                 only,
+                if_exists,
                 actions,
             } => {
-                mutations.extend(Self::resolve_alter_table(name, *only, actions, state));
+                mutations.extend(Self::resolve_alter_table(
+                    name, *only, *if_exists, actions, state,
+                ));
             }
             StatementFact::DropTable {
                 names,

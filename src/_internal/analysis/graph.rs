@@ -1412,6 +1412,10 @@ impl DependencyGraph {
                 DependencyKind::SequenceOwnedBy { column } => {
                     table_ids.contains(&edge.referenced) && column == old_name
                 }
+                DependencyKind::ViewDependency {
+                    referenced_column: Some(column),
+                    ..
+                } => table_ids.contains(&edge.referenced) && column == old_name,
                 _ => false,
             };
 
@@ -1492,6 +1496,12 @@ impl DependencyGraph {
                     }
                 }
                 DependencyKind::SequenceOwnedBy { column } => {
+                    *column = new_name.to_string();
+                }
+                DependencyKind::ViewDependency {
+                    referenced_column: Some(column),
+                    ..
+                } => {
                     *column = new_name.to_string();
                 }
                 _ => {}
@@ -2073,6 +2083,50 @@ mod tests {
             panic!("expected constraint dependency edge");
         };
         assert_eq!(columns, &["new_id"]);
+    }
+
+    #[test]
+    fn column_rename_updates_cached_view_columns_for_all_affected_relations() {
+        let mut graph = DependencyGraph::new();
+        for (view, table, column) in [
+            ("parent_view", "parent", Some("old_id")),
+            ("child_view", "child", Some("old_id")),
+            ("relation_level_view", "child", None),
+        ] {
+            graph.add_edge(DependencyEdge::new(
+                id(view),
+                id(table),
+                DependencyKind::ViewDependency {
+                    view_generation: 1,
+                    referenced_column: column.map(str::to_string),
+                },
+            ));
+        }
+        let before = graph.edges().to_vec();
+        let affected: HashSet<ObjectId> = [id("parent"), id("child")].into_iter().collect();
+
+        let delta = graph
+            .rename_columns_for_relations_recorded(&affected, "old_id", "new_id")
+            .expect("a precise view-column dependency should follow the rename");
+
+        let columns: Vec<_> = graph
+            .edges()
+            .iter()
+            .map(|edge| match &edge.kind {
+                DependencyKind::ViewDependency {
+                    referenced_column, ..
+                } => referenced_column.clone(),
+                _ => unreachable!("only view dependencies were inserted"),
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            vec![Some("new_id".to_string()), Some("new_id".to_string()), None,]
+        );
+
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.edges(), before.as_slice());
+        assert!(graph.indexes_are_valid());
     }
 
     fn relation_edge(dependent: &str, referenced: &str, kind: DependencyKind) -> DependencyEdge {

@@ -721,6 +721,7 @@ impl AnalysisState {
                 current_evidence_location: None,
                 transactions: Vec::new(),
                 statement_undo_log: None,
+                statement_snapshot_ids: HashSet::new(),
                 transaction_aborted: false,
                 pending_validation: HashSet::new(),
                 generation_counter: 0,

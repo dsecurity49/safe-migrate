@@ -603,7 +603,13 @@ mod architectural_gap_tests {
             .unwrap();
         assert!(
             v2.iter()
-                .any(|v| v.rule_id == "table-rewrite-storage" && v.tier == ViolationTier::Tier1)
+                .any(|v| v.rule_id == "table-rewrite-storage" && v.tier == ViolationTier::Tier3),
+            "SET STORAGE changes metadata only and must not be a Tier 1 rewrite: {v2:?}"
+        );
+        assert!(
+            !v2.iter()
+                .any(|v| v.reason.contains("causes a table rewrite")),
+            "SET STORAGE must not claim a table rewrite: {v2:?}"
         );
     }
     // Generation counter rollback.

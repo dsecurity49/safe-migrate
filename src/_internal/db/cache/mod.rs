@@ -543,6 +543,7 @@ impl DbCache {
                 return Err(format!("relation '{}' has a malformed table option", id));
             }
             let mut column_names = HashSet::new();
+            let mut columns_by_name = HashMap::new();
             for column in &relation.columns {
                 if column.name.is_empty() {
                     return Err(format!(
@@ -550,6 +551,7 @@ impl DbCache {
                         id
                     ));
                 }
+                columns_by_name.insert(column.name.as_str(), column);
                 if !column_names.insert(column.name.as_str()) {
                     return Err(format!(
                         "relation '{}' contains duplicate column '{}', which makes lookup ambiguous",
@@ -611,7 +613,7 @@ impl DbCache {
                 }
             }
             for column in relation.identity_columns.keys() {
-                let Some(column_state) = relation.get_column(column) else {
+                let Some(column_state) = columns_by_name.get(column.as_str()).copied() else {
                     return Err(format!(
                         "relation '{}' identifies missing column '{}' as an identity column",
                         id, column
@@ -625,7 +627,7 @@ impl DbCache {
                 }
             }
             for (column, generated) in &relation.generated_columns {
-                let Some(column_state) = relation.get_column(column) else {
+                let Some(column_state) = columns_by_name.get(column.as_str()).copied() else {
                     return Err(format!(
                         "relation '{}' identifies missing column '{}' as generated",
                         id, column

@@ -1497,6 +1497,7 @@ fn a_foreign_table_can_hold_a_partition() {
     let attach = Mutation::AlterTable(AlterTable {
         id: parent,
         only: false,
+        if_exists: false,
         action: AlterTableActionMutation::AttachPartition {
             child,
             strategy: None,

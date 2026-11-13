@@ -88,7 +88,7 @@ impl Rule for DriftDetectionRule {
                 }
             }
             Mutation::AlterTable(a) => {
-                if !pre_state.relations.contains_key(&a.id) {
+                if !a.if_exists && !pre_state.relations.contains_key(&a.id) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
 

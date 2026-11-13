@@ -23,6 +23,9 @@ impl AnalysisState {
         if !self.local.records_undo() {
             return;
         }
+        if !self.local.statement_snapshot_ids.insert(id.clone()) {
+            return;
+        }
         let previous = self.local.relations.get(id).cloned();
         self.local.push_undo(StateChange::RelationSnapshot {
             id: id.clone(),
@@ -302,6 +305,8 @@ impl AnalysisState {
             session_role_known: self.local.session_role_known,
             persistent_session_role: self.local.persistent_session_role.clone(),
             persistent_session_role_known: self.local.persistent_session_role_known,
+            authenticated_role: self.local.authenticated_role.clone(),
+            authenticated_role_known: self.local.authenticated_role_known,
         });
     }
 

@@ -16,6 +16,7 @@ pub(crate) enum EvidenceCode {
     UnresolvedReference,
     UnknownObjectState,
     TransactionStateUnknown,
+    TransactionAborted,
     UnmodeledState,
 }
 
@@ -30,6 +31,7 @@ impl EvidenceCode {
             Self::UnresolvedReference => "unresolved_reference",
             Self::UnknownObjectState => "unknown_object_state",
             Self::TransactionStateUnknown => "transaction_state_unknown",
+            Self::TransactionAborted => "transaction_aborted",
             Self::UnmodeledState => "unmodeled_state",
         }
     }
@@ -46,6 +48,9 @@ impl EvidenceCode {
             Self::UnresolvedReference => "an object reference could not be resolved exactly",
             Self::UnknownObjectState => "the required object state is unknown",
             Self::TransactionStateUnknown => "transaction state cannot be modeled exactly",
+            Self::TransactionAborted => {
+                "the transaction was aborted before this statement could run"
+            }
             Self::UnmodeledState => {
                 "required PostgreSQL state is deliberately outside the semantic model"
             }

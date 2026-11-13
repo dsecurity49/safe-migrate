@@ -591,6 +591,7 @@ impl AstVisitor {
         Some(StatementFact::AlterTable {
             name: table_name,
             only: node.table_relation_name()?.only_token().is_some(),
+            if_exists: node.if_exists().is_some(),
             actions,
         })
     }

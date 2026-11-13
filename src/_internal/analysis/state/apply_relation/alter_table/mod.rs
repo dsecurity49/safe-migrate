@@ -119,6 +119,9 @@ impl AnalysisState {
                 return MutationResult::conflict(format!("object '{}' is not a table", alter.id));
             }
             ObjectLookup::AuthoritativelyAbsent | ObjectLookup::Tombstone => {
+                if alter.if_exists {
+                    return MutationResult::Applied;
+                }
                 return MutationResult::conflict(format!("relation '{}' does not exist", alter.id));
             }
             ObjectLookup::Unknown => {

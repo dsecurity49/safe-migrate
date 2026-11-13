@@ -114,6 +114,10 @@ impl MutationResult {
         matches!(self, Self::NoOp)
     }
 
+    pub(crate) fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(_))
+    }
+
     pub(crate) fn conflict(reason: impl Into<String>) -> Self {
         Self::Conflict(ConflictKind::Rejected {
             reason: reason.into(),
@@ -253,6 +257,9 @@ pub(crate) struct LocalState {
     /// Undo log for the autocommit statement currently being applied. `None`
     /// outside a statement; explicit transactions use the innermost frame.
     pub statement_undo_log: Option<Vec<StateChange>>,
+    /// Relations already snapshotted in the current statement. A wide ALTER
+    /// needs only the state before its first mutation for statement rollback.
+    pub statement_snapshot_ids: HashSet<ObjectId>,
     pub transaction_aborted: bool,
     pub pending_validation: HashSet<(ObjectId, String)>,
     pub generation_counter: u64,
@@ -269,6 +276,7 @@ pub(crate) struct PreState {
     pub extensions: HashMap<String, crate::_internal::model::extension::ExtensionState>,
     pub types: HashMap<ObjectId, crate::_internal::model::types::TypeState>,
     pub indexes: Vec<crate::_internal::analysis::graph::DependencyEdge>,
+    pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
 }
 

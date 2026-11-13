@@ -335,6 +335,7 @@ pub(crate) enum StatementFact {
     AlterTable {
         name: QualifiedName,
         only: bool,
+        if_exists: bool,
         actions: Vec<AlterTableActionFact>,
     },
     AlterIndex {
@@ -752,6 +753,7 @@ pub(crate) struct CreateRoleFact {
 pub(crate) struct AlterRoleFact {
     pub name: RoleFact,
     pub inherits: Option<bool>,
+    pub rename_to: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

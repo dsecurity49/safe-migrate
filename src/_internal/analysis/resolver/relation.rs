@@ -229,12 +229,15 @@ impl Resolver {
     pub(super) fn resolve_alter_table(
         name: &QualifiedName,
         only: bool,
+        if_exists: bool,
         actions: &[AlterTableActionFact],
         state: &AnalysisState,
     ) -> Vec<Mutation> {
         let id = Self::resolve_relation_lookup_name(name, state);
         let mut mutations = Vec::with_capacity(actions.len());
-        mutations.extend(Self::unresolved_reference(ObjectKind::Table, &id, state));
+        if !if_exists {
+            mutations.extend(Self::unresolved_reference(ObjectKind::Table, &id, state));
+        }
         for action_fact in actions {
             let action = match action_fact {
                 AlterTableActionFact::AddColumn {
@@ -602,6 +605,7 @@ impl Resolver {
             mutations.push(Mutation::AlterTable(AlterTable {
                 id: id.clone(),
                 only,
+                if_exists,
                 action,
             }));
         }

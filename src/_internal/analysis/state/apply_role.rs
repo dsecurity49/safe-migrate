@@ -60,7 +60,6 @@ impl AnalysisState {
         ) else {
             return self.unresolved(EvidenceCode::UnresolvedReference);
         };
-        self.snapshot_role(&role_id);
         match self.role_lookup(&role_id) {
             RoleLookup::Present => {}
             RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
@@ -71,11 +70,81 @@ impl AnalysisState {
             }
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
+        if let Some(new_name) = &role.rename_to {
+            return self.apply_rename_role(&role_id, new_name);
+        }
+        self.snapshot_role(&role_id);
         if let Some(inherits) = role.inherits
             && let Some(RoleOverlay::Present(current)) = self.local.roles.get_mut(&role_id)
         {
             current.inherits = inherits;
         }
+        self.snapshot_generation_counter();
+        self.local.generation_counter += 1;
+        MutationResult::Applied
+    }
+
+    fn apply_rename_role(&mut self, old_id: &ObjectId, new_name: &str) -> MutationResult {
+        let new_id = ObjectId::new("", new_name);
+        match self.role_lookup(&new_id) {
+            RoleLookup::Present => {
+                return MutationResult::conflict(format!("role '{new_name}' already exists"));
+            }
+            RoleLookup::Unknown => {
+                return self.unresolved(EvidenceCode::UnknownObjectState);
+            }
+            RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {}
+            RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
+        }
+
+        self.snapshot_role(old_id);
+        self.snapshot_role(&new_id);
+        self.snapshot_role_context();
+        self.snapshot_role_membership_grantors();
+
+        let referencing_roles: Vec<ObjectId> = self
+            .local
+            .roles
+            .iter()
+            .filter_map(|(id, overlay)| match overlay {
+                RoleOverlay::Present(role) if role_references(role, old_id) => Some(id.clone()),
+                _ => None,
+            })
+            .filter(|id| id != old_id && id != &new_id)
+            .collect();
+        for id in &referencing_roles {
+            self.snapshot_role(id);
+        }
+
+        let Some(RoleOverlay::Present(mut renamed)) = self.local.roles.remove(old_id) else {
+            unreachable!("role presence checked before rename");
+        };
+        renamed.id = new_id.clone();
+        self.local
+            .roles
+            .insert(new_id.clone(), RoleOverlay::Present(renamed));
+        self.local
+            .roles
+            .insert(old_id.clone(), RoleOverlay::Dropped);
+
+        let role_ids: Vec<ObjectId> = self.local.roles.keys().cloned().collect();
+        for id in role_ids {
+            let Some(RoleOverlay::Present(member)) = self.local.roles.get_mut(&id) else {
+                continue;
+            };
+            replace_role_reference(&mut member.member_of, old_id, &new_id);
+            replace_role_reference(&mut member.can_administer_membership, old_id, &new_id);
+            replace_role_reference(&mut member.can_inherit_from, old_id, &new_id);
+            replace_role_reference(&mut member.can_set_role_to, old_id, &new_id);
+        }
+        for grantor in &mut self.local.role_membership_grantors {
+            replace_role_id(&mut grantor.member, old_id, &new_id);
+            replace_role_id(&mut grantor.role, old_id, &new_id);
+            replace_role_id(&mut grantor.grantor, old_id, &new_id);
+        }
+
+        rename_role_context(self, old_id, &new_id);
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
         MutationResult::Applied
@@ -1175,4 +1244,53 @@ impl AnalysisState {
         }
         Ok(ids)
     }
+}
+
+fn role_references(role: &RoleState, id: &ObjectId) -> bool {
+    role.member_of.contains(id)
+        || role.can_administer_membership.contains(id)
+        || role.can_inherit_from.contains(id)
+        || role.can_set_role_to.contains(id)
+}
+
+fn replace_role_reference(ids: &mut [ObjectId], old: &ObjectId, new: &ObjectId) {
+    for id in ids {
+        replace_role_id(id, old, new);
+    }
+}
+
+fn replace_role_id(id: &mut ObjectId, old: &ObjectId, new: &ObjectId) {
+    if id == old {
+        *id = new.clone();
+    }
+}
+
+fn rename_role_context(state: &mut AnalysisState, old_id: &ObjectId, new_id: &ObjectId) {
+    let old_name = old_id.name.as_str();
+    let new_name = new_id.name.as_str();
+    let rename = |value: &mut String, known: bool| {
+        if known && value == old_name {
+            *value = new_name.to_string();
+        }
+    };
+    rename(
+        &mut state.local.current_role,
+        state.local.current_role_known,
+    );
+    rename(
+        &mut state.local.persistent_current_role,
+        state.local.persistent_current_role_known,
+    );
+    rename(
+        &mut state.local.session_role,
+        state.local.session_role_known,
+    );
+    rename(
+        &mut state.local.persistent_session_role,
+        state.local.persistent_session_role_known,
+    );
+    rename(
+        &mut state.local.authenticated_role,
+        state.local.authenticated_role_known,
+    );
 }

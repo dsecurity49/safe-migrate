@@ -1315,3 +1315,17 @@ fn create_index_retains_eligibility_proof_facts() {
     assert_eq!(key_collations, [None]);
     assert!(!nulls_not_distinct);
 }
+
+#[test]
+fn alter_table_preserves_if_exists_scope() {
+    for (sql, expected) in [
+        ("ALTER TABLE IF EXISTS items ADD COLUMN c integer;", true),
+        ("ALTER TABLE items ADD COLUMN c integer;", false),
+    ] {
+        let facts = parse_and_extract(sql);
+        assert!(
+            matches!(&facts[0], StatementFact::AlterTable { if_exists, .. } if *if_exists == expected),
+            "unexpected if_exists for {sql}"
+        );
+    }
+}

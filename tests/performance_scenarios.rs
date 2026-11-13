@@ -243,6 +243,7 @@ mod performance_scenarios {
             let mutation = Mutation::AlterTable(AlterTable {
                 id: ObjectId::new("public", "perf_baseline_0"),
                 only: false,
+                if_exists: false,
                 action: AlterTableActionMutation::DropColumn {
                     name: "unused".to_string(),
                     if_exists: true,
@@ -294,6 +295,7 @@ mod performance_scenarios {
                     Mutation::AlterTable(AlterTable {
                         id: ObjectId::new("public", format!("perf_baseline_{}", index % relations)),
                         only: false,
+                        if_exists: false,
                         action: AlterTableActionMutation::DropColumn {
                             name: "unused".to_string(),
                             if_exists: true,

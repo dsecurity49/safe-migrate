@@ -480,24 +480,33 @@ mod destructive_rule_tests {
         let engine = setup_engine();
 
         let mut cache = crate::common::synced_cache();
-        cache.insert_baseline(
+        let mut relation = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
-            safe_migrate::_internal::model::relation::RelationState::new(
-                object_id("public", "t"),
-                ObjectId::new("public", "postgres"),
-                0,
-                Some(500),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
         );
+        relation.columns.push(Column {
+            name: "data".into(),
+            data_type: Some("integer".into()),
+            type_id: None,
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: Some(-1),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
+        });
+        cache.insert_baseline(object_id("public", "t"), relation);
 
         let mut state = AnalysisState::new(cache);
-
-        engine
-            .analyze("CREATE TABLE t(data int);", &mut state)
-            .unwrap();
 
         let v = engine
             .analyze("ALTER TABLE t ALTER COLUMN data TYPE text;", &mut state)

@@ -110,6 +110,7 @@ fn alter_table_reads_only_its_target_and_foreign_key_parent() {
     let mutation = Mutation::AlterTable(AlterTable {
         id: target.clone(),
         only: false,
+        if_exists: false,
         action: AlterTableActionMutation::AddForeignKey {
             constraint_name: Some("orders_customer_fk".to_string()),
             to_table: parent.clone(),

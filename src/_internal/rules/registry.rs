@@ -336,7 +336,7 @@ const SECONDARY_RULES: &[SecondaryRule] = &[
     },
     SecondaryRule {
         id: "table-rewrite-storage",
-        title: "Table rewrite for storage",
+        title: "Storage parameter lock",
     },
     SecondaryRule {
         id: "table-rewrite-access-method",

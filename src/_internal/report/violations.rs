@@ -187,6 +187,10 @@ impl NotEvaluated {
                 "Re-run `safe-migrate sync` with a wider schema scope so the object state is known, then re-run the analysis."
                     .to_string()
             }
+            EvidenceCode::TransactionAborted => {
+                "Fix the statement that aborted the transaction, then re-run the analysis."
+                    .to_string()
+            }
         }
     }
 }

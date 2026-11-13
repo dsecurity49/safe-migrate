@@ -143,6 +143,23 @@ impl RuleCapability {
                         .map(|relation| &relation.id),
                 );
             }
+            crate::_internal::analysis::mutations::Mutation::AlterType(alter) => {
+                if let crate::_internal::analysis::mutations::AlterTypeActionMutation::AlterAttributeType {
+                    name, ..
+                } = &alter.action
+                {
+                    targets.extend(
+                        pre_state
+                            .relations
+                            .values()
+                            .filter(|relation| {
+                                relation.of_type.as_ref() == Some(&alter.id)
+                                    && relation.has_column(name)
+                            })
+                            .map(|relation| &relation.id),
+                    );
+                }
+            }
             crate::_internal::analysis::mutations::Mutation::DropIndex(drop) => {
                 for index_id in &drop.ids {
                     targets.extend(pre_state.indexes.iter().filter_map(|edge| {

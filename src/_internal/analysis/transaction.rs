@@ -154,6 +154,8 @@ pub(crate) enum StateChange {
         session_role_known: bool,
         persistent_session_role: String,
         persistent_session_role_known: bool,
+        authenticated_role: String,
+        authenticated_role_known: bool,
     },
     ConfidenceSnapshot {
         previous: crate::_internal::analysis::state::Confidence,

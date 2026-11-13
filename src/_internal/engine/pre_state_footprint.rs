@@ -32,6 +32,13 @@ pub(crate) fn for_mutation(
                 | AlterTableActionMutation::DetachPartition { child, .. } => {
                     reads.relations.insert(child.clone());
                 }
+                AlterTableActionMutation::SetNotNull { .. } => {
+                    for (table_id, name) in state.local.constraints.keys() {
+                        if table_id == &alter.id {
+                            reads.constraints.insert((table_id.clone(), name.clone()));
+                        }
+                    }
+                }
                 _ => {}
             }
         }

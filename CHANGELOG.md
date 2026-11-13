@@ -7,6 +7,44 @@ notes are available on the
 
 ## Unreleased (v0.13.0)
 
+- `ALTER TABLE IF EXISTS` on an absent relation is now a no-op instead of a
+  Tier 1 schema-drift or chain conflict; the unguarded form still reports drift.
+- `ALTER ROLE ... RENAME TO` now moves role state, membership references, and
+  role context to the new name. Role ownership and ACL references are not
+  modeled, so the chain is tainted instead of claiming exact confidence.
+- Statements skipped after a transaction abort are reported as not evaluated
+  with a `transaction_aborted` cause, and the report cannot remain at exact
+  confidence.
+- `SET NOT NULL` after a validated `CHECK (column IS NOT NULL)` now uses the
+  metadata-only fast path, matching PostgreSQL instead of warning about a full
+  table scan.
+- `SET STORAGE` is now a Tier 3 lock advisory; it no longer claims to rewrite
+  the table.
+- `type-change-rewrite` no longer reports on a column change that already
+  conflicted, removing a secondary finding that obscured the real conflict.
+- Catalog sync now filters scoped dependency lookups by in-scope OIDs before
+  joining `pg_depend`, avoiding a full catalog scan on every scoped sync.
+- Sequence runtime values are read in one batched query instead of one round
+  trip per sequence.
+- A multi-action `ALTER TABLE` now snapshots each relation once per statement,
+  avoiding quadratic snapshot cost for wide tables.
+- Trigger parentage now comes only from `pg_trigger.tgparentid`; a same-named
+  trigger on an inheritance child is no longer cached as a cloned parent edge.
+- View dependencies now include foreign tables, so dropping or altering a
+  foreign table that backs a view is visible to dependency checks.
+- Removed the unused `OperationKind` enum from the public API.
+- Cache validation indexes columns by name, avoiding quadratic validation for
+  very wide relations.
+- Cached column-level view dependencies now follow `ALTER TABLE ... RENAME
+  COLUMN`: a later drop of the renamed column is blocked or cascades the view,
+  and rollback restores the original dependency.
+- Dropping a column that was renamed earlier in the same transaction remains a
+  Tier 1 data-loss warning instead of being downgraded to Tier 3. Provenance
+  also follows table renames and schema moves, including name reuse, and
+  survives savepoint rollback and release.
+- `ALTER TYPE ... ALTER ATTRIBUTE ... TYPE` on a composite used by typed tables
+  now marks the rewrite uncertain when a dependent table has no row estimate,
+  instead of reporting it as exact.
 - `ALTER TYPE ... DROP ATTRIBUTE` on composite types used by table columns now
   reports an `irreversible-migration` data-loss warning.
 - `EXECUTE '...'` normalization now handles statement boundaries, literals,

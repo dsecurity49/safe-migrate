@@ -802,6 +802,9 @@ impl Rule for TypeChangeRewriteRule {
         let pre_state = context.pre_state();
         let state = context.state();
         let config = context.config();
+        if result.is_conflict() {
+            return vec![];
+        }
         // A skipped type change against a present relation can mean that the
         // baseline did not expose enough column/type evidence to mutate state.
         // Keep the rewrite warning conservative in that case; silently
