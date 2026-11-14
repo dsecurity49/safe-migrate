@@ -56,8 +56,10 @@ The simulator models tables, indexes, constraints, partitions, views,
 materialized views, sequences, routines, domains, extensions, and PostgreSQL
 type lifecycles. The built-in rules cover:
 
-- blocking locks, table rewrites, constraints, indexes, partitions, and
-  materialized-view refreshes;
+- size-independent lock-mode advisories (`lock-risk`) kept separate from
+  row-count-based scan and rewrite warnings;
+- table rewrites, constraints, indexes, partitions, and materialized-view
+  refreshes;
 - destructive changes, cascades, schema drift, dependency breakage, and
   migration ordering conflicts;
 - grants, policies, disabled triggers, roles, and privilege-sensitive changes;
@@ -188,6 +190,32 @@ visible in pull request diffs and subject to review. Use per-rule
 as the standard suppression path.
 
 Keep suppressions narrow and explain the reason in the migration review.
+
+## DDL lock modes
+
+| Operation | Lock mode |
+| --- | --- |
+| Add a valid `CHECK` constraint | `ACCESS EXCLUSIVE` |
+| Add a valid `FOREIGN KEY` constraint | `SHARE ROW EXCLUSIVE` on both the referencing and referenced tables |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` |
+| `SET STORAGE`, `SET NOT NULL`, `SET DATA TYPE`, `SET ACCESS METHOD` | `ACCESS EXCLUSIVE` |
+| Add `UNIQUE`, `PRIMARY KEY`, or `EXCLUDE` without `USING INDEX` | `ACCESS EXCLUSIVE` plus `SHARE` while the index is built |
+| `ATTACH PARTITION` | `ACCESS EXCLUSIVE` on the partition, `SHARE UPDATE EXCLUSIVE` on the parent |
+| `DETACH PARTITION` | `ACCESS EXCLUSIVE` on parent and partition; `CONCURRENTLY` uses `SHARE UPDATE EXCLUSIVE` on the parent |
+| `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` | `SHARE` / `ACCESS EXCLUSIVE` |
+| `REINDEX` without `CONCURRENTLY` | `SHARE` on a table, `ACCESS EXCLUSIVE` on an index |
+| `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` | `ACCESS EXCLUSIVE` |
+| `TRUNCATE` | `ACCESS EXCLUSIVE` |
+| Add a domain constraint | `SHARE` on each table using the domain |
+
+These are reported by `lock-risk` (and `set-storage-lock` for storage
+parameters) regardless of table size. Scan and rewrite cost remains a separate,
+row-count-based finding. Dedicated Tier 1/2 rules such as
+`require-concurrent-index`, `require-concurrent-reindex`,
+`blocking-mat-view-refresh`, and `vacuum-full` still provide the actionable
+warning; `lock-risk` adds the exact mode without replacing them. Brief
+metadata-only operations such as `ADD`/`DROP`/`RENAME COLUMN`, `SET DEFAULT`,
+and `ALTER TYPE` are not separately flagged.
 
 ## Migration timeouts
 

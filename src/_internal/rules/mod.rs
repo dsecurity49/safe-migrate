@@ -6,6 +6,7 @@ pub(crate) mod expressions;
 pub(crate) mod functions;
 pub(crate) mod idempotency;
 pub(crate) mod indexes;
+pub(crate) mod locks;
 pub(crate) mod opaque;
 pub(crate) mod partitions;
 pub(crate) mod policies;

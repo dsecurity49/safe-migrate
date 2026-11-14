@@ -1,0 +1,1 @@
+ALTER TABLE parent ADD CONSTRAINT c CHECK (id > 0);

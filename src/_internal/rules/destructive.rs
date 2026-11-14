@@ -789,7 +789,7 @@ impl Rule for TypeChangeRewriteRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Changing this column type requires an ACCESS EXCLUSIVE table rewrite. Add a new column, backfill, and swap."
+        "Changing this column type requires a table rewrite. Add a new column, backfill, and swap."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {

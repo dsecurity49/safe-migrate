@@ -603,13 +603,78 @@ mod architectural_gap_tests {
             .unwrap();
         assert!(
             v2.iter()
-                .any(|v| v.rule_id == "table-rewrite-storage" && v.tier == ViolationTier::Tier3),
+                .any(|v| v.rule_id == "set-storage-lock" && v.tier == ViolationTier::Tier3),
             "SET STORAGE changes metadata only and must not be a Tier 1 rewrite: {v2:?}"
         );
         assert!(
             !v2.iter()
                 .any(|v| v.reason.contains("causes a table rewrite")),
             "SET STORAGE must not claim a table rewrite: {v2:?}"
+        );
+    }
+
+    #[test]
+    fn set_storage_lock_advisory_is_size_independent() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.search_path = vec!["public".to_string()];
+        cache.schemas.insert(
+            "public".to_string(),
+            safe_migrate::_internal::model::schema::SchemaState {
+                name: "public".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
+
+        let table_id = object_id("public", "small_table");
+        let mut table = safe_migrate::_internal::model::relation::RelationState::new(
+            table_id.clone(),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        table
+            .columns
+            .push(safe_migrate::_internal::model::column::Column {
+                name: "id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: Some(-1),
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
+            });
+        table.last_analyze = Some("2026-09-01 00:00:00+00".to_string());
+        cache.insert_baseline(table_id, table);
+
+        let mut state =
+            safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(cache, true);
+        let violations = engine
+            .analyze(
+                "ALTER TABLE public.small_table ALTER COLUMN id SET STORAGE MAIN;",
+                &mut state,
+            )
+            .unwrap();
+        let advisory = violations
+            .iter()
+            .find(|violation| violation.rule_id == "set-storage-lock")
+            .expect("SET STORAGE must report the lock regardless of table size");
+        assert_eq!(advisory.tier, ViolationTier::Tier3);
+        assert!(advisory.reason.contains("ACCESS EXCLUSIVE"), "{advisory:?}");
+        assert!(
+            !advisory.reason.contains("causes a table rewrite"),
+            "{advisory:?}"
         );
     }
     // Generation counter rollback.

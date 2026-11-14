@@ -299,7 +299,7 @@ fn rules_command_lists_registry_descriptors_in_json() {
     // version 3 is what tells consumers `remediation` became `recipe`.
     assert_eq!(report["schema_version"], 3);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 30);
+    assert_eq!(rules.len(), 31);
     assert_eq!(rules[0]["id"], "irreversible-migration");
     assert_eq!(rules[0]["title"], "Irreversible migration");
     assert!(rules[0].get("recipe").is_some());
@@ -339,7 +339,7 @@ fn rules_command_separates_human_descriptors() {
             .lines()
             .filter(|line| line.len() >= 40 && line.bytes().all(|byte| byte == b'-'))
             .count(),
-        29
+        30
     );
 }
 

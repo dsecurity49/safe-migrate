@@ -1209,10 +1209,6 @@
    ],
    "excluded_fixtures": [
     {
-     "fixture": "006_set_storage.sql",
-     "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
-    },
-    {
      "fixture": "007_set_access_method.sql",
      "reason": "Table access method identity is not synchronized or normalized by the differential harness."
     },
@@ -2773,7 +2769,66 @@
   "required_relations": [
    "public.test_table"
   ],
-  "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, extension dependencies, and index attachment."
+   "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, extension dependencies, and index attachment."
+  },
+  {
+   "rule_dir": "rule_33_set-storage-lock",
+   "enabled": false,
+   "fixtures": [],
+   "excluded_fixtures": [
+    {
+     "fixture": "001_set_storage.sql",
+     "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
+    }
+   ],
+   "schemas": [
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
+   ],
+   "scope": [
+    "relations",
+    "columns"
+   ]
+  },
+  {
+   "rule_dir": "rule_34_lock-risk",
+   "enabled": true,
+   "fixtures": [
+    "001_check_constraint.sql",
+    "safe_001_concurrent_index.sql"
+   ],
+   "fixture_transactional": {
+    "safe_001_concurrent_index.sql": false
+   },
+   "fixture_autocommit": [
+    "safe_001_concurrent_index.sql"
+   ],
+   "schemas": [
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
+   ],
+   "scope": [
+    "relations",
+    "constraints",
+    "indexes"
+   ],
+   "required_relations": [
+    "public.parent",
+    "public.test_table"
+   ],
+   "notes": "Validates that lock-risk fixtures execute and that CONCURRENTLY index creation remains a no-finding path."
   }
  ]
 }

@@ -100,6 +100,129 @@ fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
 }
 
 #[test]
+fn test_rule_blocking_constraint_reports_lock_modes() {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(crate::common::synced_cache());
+
+    engine
+        .analyze(
+            "CREATE TABLE parent (id integer PRIMARY KEY);
+             CREATE TABLE child (id integer, parent_id integer);",
+            &mut state,
+        )
+        .unwrap();
+    for overlay in state.local.relations.values_mut() {
+        if let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) =
+            overlay
+        {
+            relation.estimated_rows = Some(500_000);
+            relation.last_analyze = Some("2026-01-01 00:00:00".to_string());
+        }
+    }
+
+    let check_findings = engine
+        .analyze(
+            "ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0);",
+            &mut state,
+        )
+        .unwrap();
+    let check = check_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "blocking-constraint" && violation.reason.contains("child_check")
+        })
+        .expect("valid CHECK constraint should be reported");
+    assert!(!check.reason.contains("ACCESS EXCLUSIVE"), "{check:#?}");
+    assert!(
+        !check.recipe.contains("ACCESS EXCLUSIVE") && !check.recipe.contains("FOREIGN KEY"),
+        "CHECK scan recipe must not repeat lock-mode text: {check:#?}"
+    );
+    let check_lock = check_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk" && violation.reason.contains("CHECK constraint")
+        })
+        .expect("valid CHECK constraint must have a separate lock-risk finding");
+    assert!(
+        check_lock.reason.contains("ACCESS EXCLUSIVE"),
+        "{check_lock:#?}"
+    );
+
+    let foreign_key_findings = engine
+        .analyze(
+            "ALTER TABLE child ADD CONSTRAINT child_fk FOREIGN KEY (parent_id) REFERENCES parent(id);",
+            &mut state,
+        )
+        .unwrap();
+    let foreign_key = foreign_key_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "blocking-constraint" && violation.reason.contains("child_fk")
+        })
+        .expect("valid FOREIGN KEY constraint should be reported");
+    assert!(
+        !foreign_key.reason.contains("SHARE ROW EXCLUSIVE"),
+        "{foreign_key:#?}"
+    );
+    assert!(
+        foreign_key.reason.contains("child") && foreign_key.reason.contains("parent"),
+        "{foreign_key:#?}"
+    );
+    assert!(
+        !foreign_key.recipe.contains("SHARE ROW EXCLUSIVE")
+            && foreign_key.recipe.contains("FOREIGN KEY")
+            && !foreign_key.recipe.contains("CHECK"),
+        "FOREIGN KEY scan recipe must not repeat lock-mode text: {foreign_key:#?}"
+    );
+    let foreign_key_lock = foreign_key_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk" && violation.reason.contains("FOREIGN KEY")
+        })
+        .expect("valid FOREIGN KEY must have a separate lock-risk finding");
+    assert!(
+        foreign_key_lock.reason.contains("SHARE ROW EXCLUSIVE")
+            && foreign_key_lock.reason.contains("child")
+            && foreign_key_lock.reason.contains("parent"),
+        "{foreign_key_lock:#?}"
+    );
+
+    engine
+        .analyze(
+            "ALTER TABLE child ADD CONSTRAINT child_fk_pending FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    let validate_findings = engine
+        .analyze(
+            "ALTER TABLE child VALIDATE CONSTRAINT child_fk_pending;",
+            &mut state,
+        )
+        .unwrap();
+    let validate = validate_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "blocking-constraint"
+                && violation.reason.contains("child_fk_pending")
+        })
+        .expect("validating a pending constraint should be reported");
+    assert!(
+        !validate.reason.contains("SHARE UPDATE EXCLUSIVE"),
+        "{validate:#?}"
+    );
+    let validate_lock = validate_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk" && violation.reason.contains("Validating a constraint")
+        })
+        .expect("VALIDATE must have a separate lock-risk finding");
+    assert!(
+        validate_lock.reason.contains("SHARE UPDATE EXCLUSIVE"),
+        "{validate_lock:#?}"
+    );
+}
+
+#[test]
 fn test_rule_blocking_constraint_validate_scans_large_table() {
     let engine = setup_engine();
     let mut cache = crate::common::synced_cache();

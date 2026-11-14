@@ -11,6 +11,7 @@ use crate::_internal::rules::expressions::VolatileDefaultRule;
 use crate::_internal::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
 use crate::_internal::rules::idempotency::IdempotencyRule;
 use crate::_internal::rules::indexes::{ConcurrentIndexRule, RequireConcurrentReindexRule};
+use crate::_internal::rules::locks::LockRiskRule;
 use crate::_internal::rules::opaque::OpaqueDynamicSqlRule;
 use crate::_internal::rules::partitions::{PartitionLockRule, PartitionStrategyMismatchRule};
 use crate::_internal::rules::policies::RestrictivePolicyRule;
@@ -211,6 +212,13 @@ pub(crate) static PRIMARY_RULES: &[RuleDescriptor] = &[
         WITH_ROW_THRESHOLDS
     ),
     descriptor!(
+        "lock-risk",
+        "Lock risk",
+        "Flags the lock mode and targets of DDL independent of table size.",
+        "locking",
+        LockRiskRule
+    ),
+    descriptor!(
         "partition-strategy-mismatch",
         "Partition strategy mismatch",
         "Flags incompatible partition attachment.",
@@ -335,7 +343,7 @@ const SECONDARY_RULES: &[SecondaryRule] = &[
         title: "Blocking index constraint",
     },
     SecondaryRule {
-        id: "table-rewrite-storage",
+        id: "set-storage-lock",
         title: "Storage parameter lock",
     },
     SecondaryRule {

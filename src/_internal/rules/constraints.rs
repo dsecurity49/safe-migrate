@@ -10,6 +10,10 @@ use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability,
 
 pub(crate) struct BlockingConstraintRule;
 
+const CHECK_CONSTRAINT_RECIPE: &str = "Add the CHECK constraint as NOT VALID first, then VALIDATE it in a separate transaction to avoid scanning the table under a strong lock.";
+const FOREIGN_KEY_CONSTRAINT_RECIPE: &str = "Add the FOREIGN KEY constraint as NOT VALID first, then VALIDATE it in a separate transaction to avoid scanning the referencing table under a strong lock.";
+const VALIDATE_CONSTRAINT_RECIPE: &str = "VALIDATE CONSTRAINT scans every row. Run it during a low-traffic window with a bounded `lock_timeout`; an interrupted validation can be resumed.";
+
 impl Rule for BlockingConstraintRule {
     fn id(&self) -> &'static str {
         "blocking-constraint"
@@ -18,7 +22,7 @@ impl Rule for BlockingConstraintRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Adding a valid CHECK or FOREIGN KEY constraint takes an ACCESS EXCLUSIVE lock and scans the table. Add it as NOT VALID first, then VALIDATE it in a separate transaction."
+        "Add constraints as NOT VALID first, then VALIDATE them in a separate transaction to avoid a long scan under a strong lock."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -71,7 +75,6 @@ impl Rule for BlockingConstraintRule {
                         ..
                     }
                     | AlterTableActionMutation::AddExcludeConstraint { .. }
-                    | AlterTableActionMutation::SetStorage { .. }
                     | AlterTableActionMutation::SetAccessMethod { .. }
                     | AlterTableActionMutation::ValidateConstraint { .. }
             );
@@ -148,17 +151,20 @@ impl Rule for BlockingConstraintRule {
             // Emit staleness warning if required (and if it's not going to be completely silent)
             if is_stale && tier != ViolationTier::Tier3 {
                 let key = format!("{}_stale_{}", self.id(), alter.id);
-                violations.push(Violation { source_range: None,
+                violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
 
                     object_kind: ObjectKind::Table,
                     object_name: alter.id.to_string(),
                     tier: ViolationTier::Tier2,
-                    reason: "Table statistics are offline/stale. Lock evaluations may be inaccurate.".to_string(),
-                    recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
+                    reason:
+                        "Table statistics are offline/stale. Lock evaluations may be inaccurate."
+                            .to_string(),
+                    recipe:
+                        "Run ANALYZE to ensure accurate row estimates before structural changes.",
                     dedup_key: Some(key),
-                            sql: None,
-
+                    sql: None,
                 });
             }
 
@@ -175,7 +181,7 @@ impl Rule for BlockingConstraintRule {
                 } => {
                     let name_str = constraint_name.as_deref().unwrap_or("unnamed");
                     let mut reason = format!(
-                        "Synchronous CHECK constraint '{}' addition on {}",
+                        "Synchronous CHECK constraint '{}' addition on {} scans the table",
                         name_str, alter.id
                     );
                     if is_stale {
@@ -190,7 +196,7 @@ impl Rule for BlockingConstraintRule {
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: self.recipe(),
+                        recipe: CHECK_CONSTRAINT_RECIPE,
                         dedup_key: None,
                         sql: None,
                     });
@@ -204,7 +210,7 @@ impl Rule for BlockingConstraintRule {
                     let name_str = constraint_name.as_deref().unwrap_or("unnamed");
 
                     let mut reason = format!(
-                        "Synchronous FOREIGN KEY constraint '{}' addition locks {} and {}",
+                        "Synchronous FOREIGN KEY constraint '{}' addition on {} scans the referencing table (the referenced table {} is verified via index)",
                         name_str, alter.id, to_table
                     );
                     if is_partitioned {
@@ -222,7 +228,7 @@ impl Rule for BlockingConstraintRule {
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: self.recipe(),
+                        recipe: FOREIGN_KEY_CONSTRAINT_RECIPE,
                         dedup_key: None,
                         sql: None,
                     });
@@ -313,23 +319,6 @@ impl Rule for BlockingConstraintRule {
 
                     });
                 }
-                AlterTableActionMutation::SetStorage { column, .. } => {
-                    violations.push(Violation { source_range: None,
-                        rule_id: "table-rewrite-storage",
-
-                        object_kind: ObjectKind::Table,
-                        object_name: alter.id.column_name(column),
-                        tier: ViolationTier::Tier3,
-                        reason: format!(
-                            "Changing storage parameter for {}.{} takes an ACCESS EXCLUSIVE lock but does not rewrite the table",
-                            alter.id, column
-                        ),
-                        recipe: "SET STORAGE changes metadata only, but it still takes an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
-                        dedup_key: None,
-                                    sql: None,
-
-                    });
-                }
                 AlterTableActionMutation::ValidateConstraint { constraint_name } => {
                     let mut reason = format!(
                         "Validating constraint '{}' on {} scans the table",
@@ -339,17 +328,17 @@ impl Rule for BlockingConstraintRule {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
-                    violations.push(Violation { source_range: None,
+                    violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
 
                         object_kind: ObjectKind::Table,
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: "VALIDATE CONSTRAINT scans every row while holding SHARE UPDATE EXCLUSIVE. Run it during a low-traffic window with a bounded `lock_timeout`; an interrupted validation can be resumed.",
+                        recipe: VALIDATE_CONSTRAINT_RECIPE,
                         dedup_key: None,
-                                    sql: None,
-
+                        sql: None,
                     });
                 }
                 AlterTableActionMutation::SetAccessMethod { .. } => {
@@ -368,7 +357,7 @@ impl Rule for BlockingConstraintRule {
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: "Changing table access method requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
+                        recipe: "Changing table access method rewrites the table. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
 

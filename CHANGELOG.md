@@ -18,8 +18,13 @@ notes are available on the
 - `SET NOT NULL` after a validated `CHECK (column IS NOT NULL)` now uses the
   metadata-only fast path, matching PostgreSQL instead of warning about a full
   table scan.
-- `SET STORAGE` is now a Tier 3 lock advisory; it no longer claims to rewrite
-  the table.
+- Added `lock-risk`, a size-independent Tier 3 advisory that names the lock
+  mode and targets of DDL. Row-count-based scan and rewrite findings no longer
+  repeat lock-mode text. Dedicated Tier 1/2 rules still provide their
+  actionable warnings.
+- `SET STORAGE` is now a size-independent Tier 3 `set-storage-lock` advisory;
+  it no longer claims to rewrite the table, and small tables no longer lose
+  the lock warning.
 - `type-change-rewrite` no longer reports on a column change that already
   conflicted, removing a secondary finding that obscured the real conflict.
 - Catalog sync now filters scoped dependency lookups by in-scope OIDs before
@@ -32,6 +37,13 @@ notes are available on the
   trigger on an inheritance child is no longer cached as a cloned parent edge.
 - View dependencies now include foreign tables, so dropping or altering a
   foreign table that backs a view is visible to dependency checks.
+- Constraint lock predictions now live in `lock-risk`: `ACCESS EXCLUSIVE` for a
+  valid `CHECK`, `SHARE ROW EXCLUSIVE` on both tables for a valid `FOREIGN KEY`,
+  and `SHARE UPDATE EXCLUSIVE` for `VALIDATE CONSTRAINT`.
+- Partition lock predictions now match PostgreSQL: `ATTACH PARTITION` takes
+  `SHARE UPDATE EXCLUSIVE` on the parent and `ACCESS EXCLUSIVE` on the
+  partition; `DETACH PARTITION CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE` on
+  the parent.
 - Removed the unused `OperationKind` enum from the public API.
 - Cache validation indexes columns by name, avoiding quadratic validation for
   very wide relations.

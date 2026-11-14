@@ -527,6 +527,34 @@ pub(crate) enum LockModeFact {
     AccessExclusive,
 }
 
+impl LockModeFact {
+    pub(crate) const fn sql_name(self) -> &'static str {
+        match self {
+            Self::AccessShare => "ACCESS SHARE",
+            Self::RowShare => "ROW SHARE",
+            Self::RowExclusive => "ROW EXCLUSIVE",
+            Self::ShareUpdateExclusive => "SHARE UPDATE EXCLUSIVE",
+            Self::Share => "SHARE",
+            Self::ShareRowExclusive => "SHARE ROW EXCLUSIVE",
+            Self::Exclusive => "EXCLUSIVE",
+            Self::AccessExclusive => "ACCESS EXCLUSIVE",
+        }
+    }
+
+    /// Plain `SELECT` needs ACCESS SHARE; only ACCESS EXCLUSIVE conflicts.
+    pub(crate) const fn blocks_reads(self) -> bool {
+        matches!(self, Self::AccessExclusive)
+    }
+
+    /// Ordinary DML needs ROW EXCLUSIVE; SHARE and stronger conflict with it.
+    pub(crate) const fn blocks_writes(self) -> bool {
+        matches!(
+            self,
+            Self::Share | Self::ShareRowExclusive | Self::Exclusive | Self::AccessExclusive
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuleEnableModeFact {
     Origin,

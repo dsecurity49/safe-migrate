@@ -187,12 +187,7 @@ impl Rule for LockTableRule {
             LockModeFact::Exclusive | LockModeFact::ShareRowExclusive => self.default_tier(),
             _ => return Vec::new(),
         };
-        let mode = match lock.mode {
-            LockModeFact::ShareRowExclusive => "SHARE ROW EXCLUSIVE",
-            LockModeFact::Exclusive => "EXCLUSIVE",
-            LockModeFact::AccessExclusive => "ACCESS EXCLUSIVE",
-            _ => unreachable!("only strong lock modes reach this rule"),
-        };
+        let mode = lock.mode.sql_name();
         lock.targets
             .iter()
             .map(|target| Violation {
@@ -224,7 +219,7 @@ impl Rule for VacuumFullRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "VACUUM FULL rewrites the entire table and requires an ACCESS EXCLUSIVE lock. Run this manually outside of migration pipelines."
+        "VACUUM FULL rewrites the entire table. Run this manually outside of migration pipelines."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -248,7 +243,7 @@ impl Rule for VacuumFullRule {
                 object_kind: ObjectKind::Table,
                 object_name,
                 tier: self.default_tier(),
-                reason: "VACUUM FULL requires an ACCESS EXCLUSIVE lock".to_string(),
+                reason: "VACUUM FULL rewrites the entire table".to_string(),
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
