@@ -177,6 +177,86 @@ fn reindex_table_predicts_share() {
 }
 
 #[test]
+fn reindex_table_predicts_access_exclusive_on_each_index() {
+    assert_reason_contains(
+        "CREATE TABLE re_t (id integer);
+         CREATE INDEX re_t_idx ON re_t (id);",
+        "REINDEX TABLE re_t;",
+        &[
+            "SHARE on table public.re_t",
+            "ACCESS EXCLUSIVE on index public.re_t_idx",
+        ],
+    );
+}
+
+#[test]
+fn reindex_partitioned_table_predicts_partition_index_lock() {
+    let reasons = lock_reasons(
+        "CREATE TABLE rp (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE rp_a (id integer);
+         ALTER TABLE rp ATTACH PARTITION rp_a FOR VALUES FROM (0) TO (10);
+         CREATE INDEX rp_id_idx ON rp (id);",
+        "REINDEX TABLE rp;",
+    );
+    assert!(
+        reasons.iter().any(|reason| {
+            reason.contains("ACCESS EXCLUSIVE on index public.rp_id_idx")
+                && reason.contains("SHARE on table public.rp")
+        }),
+        "parent index lock missing: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|reason| {
+            reason.contains("ACCESS EXCLUSIVE on index public.rp_a")
+                && reason.contains("SHARE on table public.rp_a")
+        }),
+        "partition index lock missing: {reasons:?}"
+    );
+}
+
+#[test]
+fn primary_key_using_index_with_incomplete_metadata_is_cautious() {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(synced_cache());
+    engine
+        .analyze(
+            "CREATE TABLE pk_t (id integer);
+             CREATE UNIQUE INDEX pk_t_id_key ON pk_t (id);",
+            &mut state,
+        )
+        .unwrap();
+    for overlay in state.local.relations.values_mut() {
+        if let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) =
+            overlay
+            && relation.id.name == "pk_t"
+        {
+            relation.columns_complete = false;
+        }
+    }
+
+    let findings = engine
+        .analyze(
+            "ALTER TABLE pk_t ADD CONSTRAINT pk_t_pkey PRIMARY KEY USING INDEX pk_t_id_key;",
+            &mut state,
+        )
+        .unwrap();
+    let reason = findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk"
+                && violation
+                    .reason
+                    .contains("PRIMARY KEY constraint using an existing index")
+        })
+        .map(|violation| violation.reason.clone())
+        .expect("PRIMARY KEY USING INDEX lock finding");
+    assert!(
+        reason.contains("if the indexed columns are not already NOT NULL"),
+        "unknown nullability must stay cautious: {reason}"
+    );
+}
+
+#[test]
 fn refresh_materialized_view_predicts_access_exclusive() {
     assert_reason_contains(
         TABLES,

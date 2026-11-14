@@ -571,6 +571,12 @@ fn index_and_refresh_lock_modes_match_postgresql() {
         "ShareLock",
         "REINDEX TABLE",
     );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.t_note_idx"),
+        "AccessExclusiveLock",
+        "REINDEX TABLE index",
+    );
     transaction.rollback().expect("rollback REINDEX probe");
 
     let mut transaction = client

@@ -810,6 +810,24 @@ impl DependencyGraph {
             .collect()
     }
 
+    /// Transitive partitions below `id`, including nested sub-partitions.
+    pub(crate) fn partition_descendants(&self, id: &ObjectId) -> Vec<ObjectId> {
+        let mut descendants = Vec::new();
+        let mut queue = self
+            .partitions_of(id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        while let Some(child) = queue.pop() {
+            if descendants.contains(&child) {
+                continue;
+            }
+            queue.extend(self.partitions_of(&child).into_iter().cloned());
+            descendants.push(child);
+        }
+        descendants
+    }
+
     pub(crate) fn inheritance_children_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self

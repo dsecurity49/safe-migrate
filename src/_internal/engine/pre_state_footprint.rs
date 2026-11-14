@@ -96,6 +96,18 @@ pub(crate) fn for_mutation(
         } => match target {
             ReindexTargetMutation::Table(table) => {
                 reads.relations.insert(table.clone());
+                let mut tables = HashSet::from([table.clone()]);
+                tables.extend(state.local.graph.partition_descendants(table));
+                for edge in state.local.graph.edges() {
+                    if matches!(
+                        edge.kind,
+                        crate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    ) && tables.contains(&edge.referenced)
+                    {
+                        reads.indexes.insert(edge.dependent.clone());
+                        reads.relations.insert(edge.referenced.clone());
+                    }
+                }
             }
             ReindexTargetMutation::Index(index) => {
                 let indexes = HashSet::from([index.clone()]);

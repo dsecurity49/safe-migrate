@@ -57,6 +57,7 @@ impl LockTargetRole {
 pub(crate) enum LockWork {
     MetadataOnly,
     TableScan,
+    ConditionalTableScan,
     TableRewrite,
     IndexBuild,
 }
@@ -66,6 +67,9 @@ impl LockWork {
         match self {
             Self::MetadataOnly => "",
             Self::TableScan => ", scanning the table",
+            Self::ConditionalTableScan => {
+                ", scanning the table if the indexed columns are not already NOT NULL"
+            }
             Self::TableRewrite => ", rewriting the table",
             Self::IndexBuild => ", building the index",
         }
@@ -251,7 +255,7 @@ fn predict_locks(
         Mutation::Reindex {
             target: Some(target),
             concurrently: false,
-        } => predict_reindex(target, pre_state),
+        } => predict_reindex(target, pre_state, state),
         Mutation::RefreshMaterializedView(refresh) if !refresh.concurrently => {
             vec![LockPrediction {
                 object_kind: ObjectKind::MaterializedView,
@@ -404,10 +408,10 @@ fn predict_alter_table(
             let nullable = key_columns
                 .as_deref()
                 .and_then(|columns| columns_are_nullable(pre_state, subject, columns));
-            let work = if nullable == Some(true) {
-                LockWork::TableScan
-            } else {
-                LockWork::MetadataOnly
+            let work = match nullable {
+                Some(true) => LockWork::TableScan,
+                Some(false) => LockWork::MetadataOnly,
+                None => LockWork::ConditionalTableScan,
             };
             vec![LockPrediction {
                 object_kind: ObjectKind::Table,
@@ -481,12 +485,12 @@ fn predict_alter_table(
                 },
             ];
             let mut seen = HashSet::from([child.clone()]);
-            for descendant in partition_descendants(state, child) {
+            for descendant in state.local.graph.partition_descendants(child) {
                 push_partition_target(&mut targets, &mut seen, descendant, LockTargetRole::Child);
             }
             for default in default_partitions(state, subject) {
-                for descendant in
-                    std::iter::once(default.clone()).chain(partition_descendants(state, &default))
+                for descendant in std::iter::once(default.clone())
+                    .chain(state.local.graph.partition_descendants(&default))
                 {
                     push_partition_target(
                         &mut targets,
@@ -545,19 +549,39 @@ fn predict_alter_table(
     }
 }
 
-fn predict_reindex(target: &ReindexTargetMutation, pre_state: &PreState) -> Vec<LockPrediction> {
+fn predict_reindex(
+    target: &ReindexTargetMutation,
+    pre_state: &PreState,
+    state: &AnalysisState,
+) -> Vec<LockPrediction> {
     match target {
-        ReindexTargetMutation::Table(table) => vec![LockPrediction {
-            object_kind: ObjectKind::Table,
-            object_name: table.to_string(),
-            operation: "Reindexing a table without CONCURRENTLY",
-            work: LockWork::IndexBuild,
-            targets: vec![LockTarget {
-                relation: table.clone(),
-                mode: LockModeFact::Share,
-                role: LockTargetRole::Subject,
-            }],
-        }],
+        ReindexTargetMutation::Table(table) => {
+            // PostgreSQL rebuilds every index of the table, including indexes
+            // on its partitions, and takes ACCESS EXCLUSIVE on each one.
+            let mut tables = HashSet::from([table.clone()]);
+            tables.extend(state.local.graph.partition_descendants(table));
+            let predictions = pre_state
+                .indexes
+                .iter()
+                .filter(|edge| tables.contains(&edge.referenced))
+                .map(|edge| predict_reindexed_index(pre_state, &edge.dependent))
+                .collect::<Vec<_>>();
+            if predictions.is_empty() {
+                vec![LockPrediction {
+                    object_kind: ObjectKind::Table,
+                    object_name: table.to_string(),
+                    operation: "Reindexing a table without CONCURRENTLY",
+                    work: LockWork::IndexBuild,
+                    targets: vec![LockTarget {
+                        relation: table.clone(),
+                        mode: LockModeFact::Share,
+                        role: LockTargetRole::Subject,
+                    }],
+                }]
+            } else {
+                predictions
+            }
+        }
         ReindexTargetMutation::Index(index) => {
             vec![predict_reindexed_index(pre_state, index)]
         }
@@ -614,25 +638,6 @@ fn push_partition_target(
             role,
         });
     }
-}
-
-fn partition_descendants(state: &AnalysisState, root: &ObjectId) -> Vec<ObjectId> {
-    let mut descendants = Vec::new();
-    let mut queue = state
-        .local
-        .graph
-        .partitions_of(root)
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    while let Some(child) = queue.pop() {
-        if descendants.contains(&child) {
-            continue;
-        }
-        queue.extend(state.local.graph.partitions_of(&child).into_iter().cloned());
-        descendants.push(child);
-    }
-    descendants
 }
 
 fn default_partitions(state: &AnalysisState, parent: &ObjectId) -> Vec<ObjectId> {
