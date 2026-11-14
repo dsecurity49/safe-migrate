@@ -2801,6 +2801,11 @@
    "enabled": true,
    "fixtures": [
     "001_check_constraint.sql",
+    "002_not_valid_check.sql",
+    "003_not_valid_fk.sql",
+    "004_validate_fk.sql",
+    "005_attach_default_partition.sql",
+    "006_pk_using_index.sql",
     "safe_001_concurrent_index.sql"
    ],
    "fixture_transactional": {

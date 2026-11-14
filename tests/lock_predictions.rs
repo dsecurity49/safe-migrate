@@ -343,3 +343,159 @@ fn domain_constraint_predicts_share_on_using_tables() {
         &["SHARE on table public.domtab"],
     );
 }
+
+#[test]
+fn not_valid_check_still_predicts_access_exclusive() {
+    assert_reason_contains(
+        TABLES,
+        "ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0) NOT VALID;",
+        &[
+            "Adding a CHECK constraint as NOT VALID",
+            "ACCESS EXCLUSIVE on table public.child",
+        ],
+    );
+}
+
+#[test]
+fn not_valid_foreign_key_predicts_share_row_exclusive_on_both_tables() {
+    assert_reason_contains(
+        TABLES,
+        "ALTER TABLE child ADD CONSTRAINT child_fk
+           FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID;",
+        &[
+            "Adding a FOREIGN KEY constraint as NOT VALID",
+            "SHARE ROW EXCLUSIVE",
+            "referenced table public.parent",
+        ],
+    );
+}
+
+#[test]
+fn validate_foreign_key_predicts_row_share_on_referenced_table() {
+    assert_reason_contains(
+        TABLES,
+        "ALTER TABLE child ADD CONSTRAINT child_fk
+           FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID;
+         ALTER TABLE child VALIDATE CONSTRAINT child_fk;",
+        &[
+            "SHARE UPDATE EXCLUSIVE on table public.child",
+            "ROW SHARE on referenced table public.parent",
+        ],
+    );
+}
+
+#[test]
+fn attach_partition_predicts_default_partition_lock() {
+    assert_reason_contains(
+        "CREATE TABLE part_parent (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE part_default PARTITION OF part_parent DEFAULT;
+         CREATE TABLE part_child (id integer);",
+        "ALTER TABLE part_parent ATTACH PARTITION part_child FOR VALUES FROM (0) TO (10);",
+        &["default partition public.part_default"],
+    );
+}
+
+#[test]
+fn attach_partition_predicts_subpartition_locks() {
+    assert_reason_contains(
+        "CREATE TABLE part_parent (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE part_child (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE part_child_a (id integer);
+         ALTER TABLE part_child ATTACH PARTITION part_child_a
+           FOR VALUES FROM (0) TO (10);",
+        "ALTER TABLE part_parent ATTACH PARTITION part_child FOR VALUES FROM (0) TO (100);",
+        &["partition public.part_child_a"],
+    );
+}
+
+#[test]
+fn primary_key_using_index_on_nullable_column_predicts_scan() {
+    assert_reason_contains(
+        "CREATE TABLE pk_t (id integer);
+         CREATE UNIQUE INDEX pk_t_id_key ON pk_t (id);",
+        "ALTER TABLE pk_t ADD CONSTRAINT pk_t_pkey PRIMARY KEY USING INDEX pk_t_id_key;",
+        &[
+            "Adding a PRIMARY KEY constraint using an existing index",
+            "ACCESS EXCLUSIVE on table public.pk_t",
+            "scanning the table",
+        ],
+    );
+}
+
+#[test]
+fn primary_key_using_index_on_not_null_column_does_not_claim_scan() {
+    let reasons = lock_reasons(
+        "CREATE TABLE pk_t (id integer NOT NULL);
+         CREATE UNIQUE INDEX pk_t_id_key ON pk_t (id);",
+        "ALTER TABLE pk_t ADD CONSTRAINT pk_t_pkey PRIMARY KEY USING INDEX pk_t_id_key;",
+    );
+    let reason = reasons
+        .iter()
+        .find(|reason| reason.contains("PRIMARY KEY constraint using an existing index"))
+        .expect("PRIMARY KEY USING INDEX lock finding");
+    assert!(
+        !reason.contains("scanning the table"),
+        "a NOT NULL index must not claim a scan: {reason}"
+    );
+}
+
+#[test]
+fn unique_using_index_predicts_access_exclusive() {
+    assert_reason_contains(
+        "CREATE TABLE uq_t (id integer);
+         CREATE UNIQUE INDEX uq_t_id_key ON uq_t (id);",
+        "ALTER TABLE uq_t ADD CONSTRAINT uq_t_key UNIQUE USING INDEX uq_t_id_key;",
+        &[
+            "Adding a UNIQUE constraint using an existing index",
+            "ACCESS EXCLUSIVE on table public.uq_t",
+        ],
+    );
+}
+
+#[test]
+fn reindex_index_predicts_share_on_table_and_access_exclusive_on_index() {
+    assert_reason_contains(
+        "CREATE TABLE re_t (id integer);
+         CREATE INDEX re_t_idx ON re_t (id);",
+        "REINDEX INDEX re_t_idx;",
+        &[
+            "SHARE on table public.re_t",
+            "ACCESS EXCLUSIVE on index public.re_t_idx",
+        ],
+    );
+}
+
+#[test]
+fn reindex_schema_predicts_each_index_lock() {
+    assert_reason_contains(
+        "CREATE SCHEMA re_schema;
+         CREATE TABLE re_schema.re_t (id integer);
+         CREATE INDEX re_schema.re_t_idx ON re_schema.re_t (id);",
+        "REINDEX SCHEMA re_schema;",
+        &[
+            "SHARE on table re_schema.re_t",
+            "ACCESS EXCLUSIVE on index re_schema.re_t_idx",
+        ],
+    );
+}
+
+#[test]
+fn detach_partition_predicts_share_on_referencing_table() {
+    assert_reason_contains(
+        "CREATE TABLE det_parent (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE det_child (id integer NOT NULL);
+         ALTER TABLE det_parent ATTACH PARTITION det_child FOR VALUES FROM (0) TO (10);
+         CREATE TABLE det_ref (parent_id integer REFERENCES det_parent(id));",
+        "ALTER TABLE det_parent DETACH PARTITION det_child;",
+        &["SHARE on referencing table public.det_ref"],
+    );
+}
+
+#[test]
+fn lock_reason_mentions_transaction_lifetime() {
+    assert_reason_contains(
+        TABLES,
+        "ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0);",
+        &["held until the transaction ends"],
+    );
+}

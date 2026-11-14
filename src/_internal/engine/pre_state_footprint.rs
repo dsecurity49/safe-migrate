@@ -1,5 +1,5 @@
 use crate::_internal::analysis::mutations::{
-    AlterTableActionMutation, AlterTypeActionMutation, Mutation,
+    AlterTableActionMutation, AlterTypeActionMutation, Mutation, ReindexTargetMutation,
 };
 use crate::_internal::analysis::state::{AnalysisState, CascadeResult, PreStateReadSet, ReadScope};
 use std::collections::HashSet;
@@ -90,6 +90,50 @@ pub(crate) fn for_mutation(
             reads.sequences.insert(rename.old_id.clone());
             reads.indexes.insert(rename.old_id.clone());
         }
+        Mutation::Reindex {
+            target: Some(target),
+            concurrently: false,
+        } => match target {
+            ReindexTargetMutation::Table(table) => {
+                reads.relations.insert(table.clone());
+            }
+            ReindexTargetMutation::Index(index) => {
+                let indexes = HashSet::from([index.clone()]);
+                reads.indexes.insert(index.clone());
+                for edge in state.local.graph.edges_for_dependents(&indexes) {
+                    if matches!(
+                        edge.kind,
+                        crate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    ) {
+                        reads.relations.insert(edge.referenced.clone());
+                    }
+                }
+            }
+            ReindexTargetMutation::Schema(schema) => {
+                for edge in state.local.graph.edges() {
+                    if matches!(
+                        edge.kind,
+                        crate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    ) && edge.dependent.schema.as_str() == schema.as_str()
+                    {
+                        reads.indexes.insert(edge.dependent.clone());
+                        reads.relations.insert(edge.referenced.clone());
+                    }
+                }
+            }
+            ReindexTargetMutation::Database(_) => {
+                for edge in state.local.graph.edges() {
+                    if matches!(
+                        edge.kind,
+                        crate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    ) {
+                        reads.indexes.insert(edge.dependent.clone());
+                        reads.relations.insert(edge.referenced.clone());
+                    }
+                }
+            }
+            ReindexTargetMutation::System(_) => {}
+        },
         Mutation::AlterType(alter) => match &alter.action {
             AlterTypeActionMutation::DropAttribute { .. }
             | AlterTypeActionMutation::AlterAttributeType { .. } => {

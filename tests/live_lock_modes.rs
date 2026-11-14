@@ -97,6 +97,24 @@ fn constraint_lock_modes_match_postgresql() {
     );
     transaction.rollback().expect("rollback CHECK lock probe");
 
+    let mut transaction = client
+        .transaction()
+        .expect("begin NOT VALID CHECK lock probe");
+    transaction
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.child ADD CONSTRAINT child_check_pending CHECK (id > 0) NOT VALID;"
+        ))
+        .expect("add NOT VALID CHECK constraint");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.child"),
+        "AccessExclusiveLock",
+        "NOT VALID CHECK",
+    );
+    transaction
+        .rollback()
+        .expect("rollback NOT VALID CHECK lock probe");
+
     let mut transaction = client.transaction().expect("begin FOREIGN KEY lock probe");
     transaction
         .batch_execute(&format!(
@@ -119,6 +137,31 @@ fn constraint_lock_modes_match_postgresql() {
     transaction
         .rollback()
         .expect("rollback FOREIGN KEY lock probe");
+
+    let mut transaction = client
+        .transaction()
+        .expect("begin NOT VALID FOREIGN KEY lock probe");
+    transaction
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.child ADD CONSTRAINT child_fk_pending_direct
+             FOREIGN KEY (parent_id) REFERENCES {schema}.parent(id) NOT VALID;"
+        ))
+        .expect("add NOT VALID FOREIGN KEY constraint");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.child"),
+        "ShareRowExclusiveLock",
+        "NOT VALID FOREIGN KEY referencing table",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.parent"),
+        "ShareRowExclusiveLock",
+        "NOT VALID FOREIGN KEY referenced table",
+    );
+    transaction
+        .rollback()
+        .expect("rollback NOT VALID FOREIGN KEY lock probe");
 
     client
         .batch_execute(&format!(
@@ -144,6 +187,12 @@ fn constraint_lock_modes_match_postgresql() {
         "AccessExclusiveLock",
         "VALIDATE CONSTRAINT",
     );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.parent"),
+        "RowShareLock",
+        "VALIDATE FOREIGN KEY referenced table",
+    );
     transaction
         .rollback()
         .expect("rollback VALIDATE lock probe");
@@ -167,7 +216,24 @@ fn table_ddl_lock_modes_match_postgresql() {
              CREATE TABLE {schema}.part_child_attached (id integer);
              CREATE TABLE {schema}.part_child_new (id integer);
              ALTER TABLE {schema}.part_parent
-               ATTACH PARTITION {schema}.part_child_attached FOR VALUES FROM (0) TO (10);
+                ATTACH PARTITION {schema}.part_child_attached FOR VALUES FROM (0) TO (10);
+             CREATE TABLE {schema}.default_parent (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE {schema}.default_child
+                PARTITION OF {schema}.default_parent DEFAULT;
+             CREATE TABLE {schema}.default_attach (id integer);
+             CREATE TABLE {schema}.sub_parent (id integer NOT NULL) PARTITION BY RANGE (id);
+             CREATE TABLE {schema}.sub_child (id integer NOT NULL) PARTITION BY RANGE (id);
+             CREATE TABLE {schema}.sub_leaf (id integer NOT NULL);
+             ALTER TABLE {schema}.sub_child
+                ATTACH PARTITION {schema}.sub_leaf FOR VALUES FROM (0) TO (10);
+             CREATE TABLE {schema}.pk_t (id integer);
+             CREATE UNIQUE INDEX pk_t_id_key ON {schema}.pk_t (id);
+             CREATE TABLE {schema}.det_parent (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+             CREATE TABLE {schema}.det_child (id integer NOT NULL);
+             ALTER TABLE {schema}.det_parent
+                ATTACH PARTITION {schema}.det_child FOR VALUES FROM (0) TO (10);
+             CREATE TABLE {schema}.det_ref
+                (parent_id integer REFERENCES {schema}.det_parent(id));
              CREATE DOMAIN {schema}.posint AS integer;
              CREATE TABLE {schema}.domtab (value {schema}.posint);"
         ))
@@ -296,6 +362,117 @@ fn table_ddl_lock_modes_match_postgresql() {
     );
     transaction.rollback().expect("rollback ATTACH probe");
 
+    let mut transaction = client
+        .transaction()
+        .expect("begin ATTACH default partition lock probe");
+    transaction
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.default_parent
+               ATTACH PARTITION {schema}.default_attach FOR VALUES FROM (10) TO (20);"
+        ))
+        .expect("attach partition with default present");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.default_parent"),
+        "ShareUpdateExclusiveLock",
+        "ATTACH PARTITION with default parent",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.default_attach"),
+        "AccessExclusiveLock",
+        "ATTACH PARTITION with default child",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.default_child"),
+        "AccessExclusiveLock",
+        "ATTACH PARTITION default partition",
+    );
+    transaction
+        .rollback()
+        .expect("rollback ATTACH default partition probe");
+
+    let mut transaction = client
+        .transaction()
+        .expect("begin ATTACH subpartition lock probe");
+    transaction
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.sub_parent
+               ATTACH PARTITION {schema}.sub_child FOR VALUES FROM (0) TO (100);"
+        ))
+        .expect("attach partitioned partition");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.sub_parent"),
+        "ShareUpdateExclusiveLock",
+        "ATTACH PARTITION subpartition parent",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.sub_child"),
+        "AccessExclusiveLock",
+        "ATTACH PARTITION partitioned child",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.sub_leaf"),
+        "AccessExclusiveLock",
+        "ATTACH PARTITION subpartition",
+    );
+    transaction
+        .rollback()
+        .expect("rollback ATTACH subpartition probe");
+
+    let mut transaction = client
+        .transaction()
+        .expect("begin PRIMARY KEY USING INDEX lock probe");
+    transaction
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.pk_t
+               ADD CONSTRAINT pk_t_pkey PRIMARY KEY USING INDEX pk_t_id_key;"
+        ))
+        .expect("add primary key using index");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.pk_t"),
+        "AccessExclusiveLock",
+        "PRIMARY KEY USING INDEX",
+    );
+    transaction
+        .rollback()
+        .expect("rollback PRIMARY KEY USING INDEX probe");
+
+    let mut transaction = client
+        .transaction()
+        .expect("begin DETACH referencing table lock probe");
+    transaction
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.det_parent DETACH PARTITION {schema}.det_child;"
+        ))
+        .expect("detach referenced partition");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.det_parent"),
+        "AccessExclusiveLock",
+        "DETACH referenced partition parent",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.det_child"),
+        "AccessExclusiveLock",
+        "DETACH referenced partition child",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.det_ref"),
+        "ShareLock",
+        "DETACH referencing table",
+    );
+    transaction
+        .rollback()
+        .expect("rollback DETACH referencing table probe");
+
     let mut transaction = client.transaction().expect("begin TRUNCATE lock probe");
     transaction
         .batch_execute(&format!("TRUNCATE {schema}.t;"))
@@ -395,6 +572,28 @@ fn index_and_refresh_lock_modes_match_postgresql() {
         "REINDEX TABLE",
     );
     transaction.rollback().expect("rollback REINDEX probe");
+
+    let mut transaction = client
+        .transaction()
+        .expect("begin REINDEX INDEX lock probe");
+    transaction
+        .batch_execute(&format!("REINDEX INDEX {schema}.t_note_idx;"))
+        .expect("reindex index");
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.t"),
+        "ShareLock",
+        "REINDEX INDEX table",
+    );
+    assert_lock_mode(
+        &mut transaction,
+        &format!("{schema}.t_note_idx"),
+        "AccessExclusiveLock",
+        "REINDEX INDEX index",
+    );
+    transaction
+        .rollback()
+        .expect("rollback REINDEX INDEX probe");
 
     let mut transaction = client
         .transaction()

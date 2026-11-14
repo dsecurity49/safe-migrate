@@ -195,21 +195,24 @@ Keep suppressions narrow and explain the reason in the migration review.
 
 | Operation | Lock mode |
 | --- | --- |
-| Add a valid `CHECK` constraint | `ACCESS EXCLUSIVE` |
-| Add a valid `FOREIGN KEY` constraint | `SHARE ROW EXCLUSIVE` on both the referencing and referenced tables |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` |
+| Add a `CHECK` constraint, valid or `NOT VALID` | `ACCESS EXCLUSIVE`; only the valid form scans |
+| Add a `FOREIGN KEY`, valid or `NOT VALID` | `SHARE ROW EXCLUSIVE` on both the referencing and referenced tables |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE`; a foreign key also takes `ROW SHARE` on the referenced table |
 | `SET STORAGE`, `SET NOT NULL`, `SET DATA TYPE`, `SET ACCESS METHOD` | `ACCESS EXCLUSIVE` |
 | Add `UNIQUE`, `PRIMARY KEY`, or `EXCLUDE` without `USING INDEX` | `ACCESS EXCLUSIVE` plus `SHARE` while the index is built |
-| `ATTACH PARTITION` | `ACCESS EXCLUSIVE` on the partition, `SHARE UPDATE EXCLUSIVE` on the parent |
-| `DETACH PARTITION` | `ACCESS EXCLUSIVE` on parent and partition; `CONCURRENTLY` uses `SHARE UPDATE EXCLUSIVE` on the parent |
+| Add `UNIQUE` or `PRIMARY KEY` with `USING INDEX` | `ACCESS EXCLUSIVE`; a primary key also scans when an indexed column is still nullable |
+| `ATTACH PARTITION` | `ACCESS EXCLUSIVE` on the partition, `SHARE UPDATE EXCLUSIVE` on the parent, plus `ACCESS EXCLUSIVE` on default partitions and subpartitions |
+| `DETACH PARTITION` | `ACCESS EXCLUSIVE` on parent and partition, `SHARE` on tables referencing the parent; `CONCURRENTLY` uses `SHARE UPDATE EXCLUSIVE` on the parent |
 | `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` | `SHARE` / `ACCESS EXCLUSIVE` |
-| `REINDEX` without `CONCURRENTLY` | `SHARE` on a table, `ACCESS EXCLUSIVE` on an index |
+| `REINDEX` without `CONCURRENTLY` | `SHARE` on a table, `ACCESS EXCLUSIVE` on an index; schema and database forms are reported per index |
 | `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` | `ACCESS EXCLUSIVE` |
 | `TRUNCATE` | `ACCESS EXCLUSIVE` |
 | Add a domain constraint | `SHARE` on each table using the domain |
 
 These are reported by `lock-risk` (and `set-storage-lock` for storage
-parameters) regardless of table size. Scan and rewrite cost remains a separate,
+parameters) regardless of table size. PostgreSQL holds the relation locks until
+the transaction ends, so the advisory names the mode and targets rather than
+claiming a statement-scoped release. Scan and rewrite cost remains a separate,
 row-count-based finding. Dedicated Tier 1/2 rules such as
 `require-concurrent-index`, `require-concurrent-reindex`,
 `blocking-mat-view-refresh`, and `vacuum-full` still provide the actionable

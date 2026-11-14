@@ -38,12 +38,20 @@ notes are available on the
 - View dependencies now include foreign tables, so dropping or altering a
   foreign table that backs a view is visible to dependency checks.
 - Constraint lock predictions now live in `lock-risk`: `ACCESS EXCLUSIVE` for a
-  valid `CHECK`, `SHARE ROW EXCLUSIVE` on both tables for a valid `FOREIGN KEY`,
-  and `SHARE UPDATE EXCLUSIVE` for `VALIDATE CONSTRAINT`.
+  valid or `NOT VALID` `CHECK`, `SHARE ROW EXCLUSIVE` on both tables for a
+  valid or `NOT VALID` `FOREIGN KEY`, and `SHARE UPDATE EXCLUSIVE` for
+  `VALIDATE CONSTRAINT`, plus `ROW SHARE` on the referenced table when
+  validating a foreign key.
 - Partition lock predictions now match PostgreSQL: `ATTACH PARTITION` takes
-  `SHARE UPDATE EXCLUSIVE` on the parent and `ACCESS EXCLUSIVE` on the
-  partition; `DETACH PARTITION CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE` on
-  the parent.
+  `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE` on the partition,
+  and `ACCESS EXCLUSIVE` on default partitions and subpartitions;
+  `DETACH PARTITION` also takes `SHARE` on tables referencing the parent, and
+  `DETACH PARTITION CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE` on the parent.
+- `lock-risk` now covers `UNIQUE`/`PRIMARY KEY ... USING INDEX` (including the
+  implicit `NOT NULL` scan for nullable primary-key columns) and reports
+  `REINDEX SCHEMA`/`DATABASE` per index instead of omitting them.
+- Lock reasons state that PostgreSQL holds the lock until the transaction ends
+  instead of implying a statement-scoped release.
 - Removed the unused `OperationKind` enum from the public API.
 - Cache validation indexes columns by name, avoiding quadratic validation for
   very wide relations.
