@@ -120,6 +120,7 @@ pub(super) fn load_sequences(
         .try_get(0)
         .context("recovery state")?;
     let mut sequences = std::collections::HashMap::new();
+    let mut readable_runtime = Vec::new();
     for row in rows {
         let id = ObjectId::new(
             row.try_get::<_, String>("sequence_schema")
@@ -164,12 +165,10 @@ pub(super) fn load_sequences(
         let can_read_runtime: bool = row
             .try_get("can_read_runtime")
             .context("sequence runtime read privilege")?;
-        let runtime = if can_read_runtime && sequence_runtime_is_readable(in_recovery, persistence)
-        {
-            load_sequence_runtime(client, &id, pg_version_num)?
-        } else {
-            crate::_internal::model::sequence::SequenceRuntime::unknown()
-        };
+        if can_read_runtime && sequence_runtime_is_readable(in_recovery, persistence) {
+            readable_runtime.push(id.clone());
+        }
+        let runtime = crate::_internal::model::sequence::SequenceRuntime::unknown();
         sequences.insert(
             id.clone(),
             crate::_internal::model::sequence::SequenceState {
@@ -197,33 +196,67 @@ pub(super) fn load_sequences(
             },
         );
     }
+    for (id, runtime) in load_sequence_runtimes(client, &readable_runtime, pg_version_num)? {
+        if let Some(sequence) = sequences.get_mut(&id) {
+            sequence.runtime = runtime;
+        }
+    }
     Ok(sequences)
 }
 
-fn load_sequence_runtime(
+fn load_sequence_runtimes(
     client: &mut impl GenericClient,
-    id: &ObjectId,
+    ids: &[ObjectId],
     pg_version_num: u32,
-) -> Result<crate::_internal::model::sequence::SequenceRuntime> {
-    let relation = format!("{}.{}", quote_ident(&id.schema), quote_ident(&id.name));
-    let row = if pg_version_num >= 180_000 {
+) -> Result<std::collections::HashMap<ObjectId, crate::_internal::model::sequence::SequenceRuntime>>
+{
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = if pg_version_num >= 180_000 {
+        let relations: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{}.{}", quote_ident(&id.schema), quote_ident(&id.name)))
+            .collect();
         client
-            .query_one(
-                "SELECT last_value, is_called FROM pg_catalog.pg_get_sequence_data($1::text::regclass)",
-                &[&relation],
+            .query(
+                "SELECT r.ord, d.last_value, d.is_called
+                 FROM unnest($1::text[]) WITH ORDINALITY AS r(relation, ord)
+                 CROSS JOIN LATERAL pg_catalog.pg_get_sequence_data(r.relation::regclass) AS d(last_value, is_called)",
+                &[&relations],
             )
             .context("Failed to read sequence runtime data")?
     } else {
+        let selects = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let relation = format!("{}.{}", quote_ident(&id.schema), quote_ident(&id.name));
+                format!(
+                    "SELECT {}::bigint AS ord, last_value, is_called FROM {relation}",
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
         client
-            .query_one(
-                &format!("SELECT last_value, is_called FROM {relation}"),
-                &[],
-            )
+            .query(&selects, &[])
             .context("Failed to read sequence runtime data")?
     };
-    let last_value: Option<i64> = row.try_get("last_value").context("sequence last value")?;
-    let is_called: Option<bool> = row.try_get("is_called").context("sequence is_called")?;
-    Ok(sequence_runtime(last_value, is_called))
+    let mut runtimes = std::collections::HashMap::new();
+    for row in rows {
+        let index: i64 = row.try_get("ord").context("sequence runtime index")?;
+        let index = index
+            .checked_sub(1)
+            .context("sequence runtime index out of range")? as usize;
+        let id = ids
+            .get(index)
+            .context("sequence runtime index out of range")?;
+        let last_value: Option<i64> = row.try_get("last_value").context("sequence last value")?;
+        let is_called: Option<bool> = row.try_get("is_called").context("sequence is_called")?;
+        runtimes.insert(id.clone(), sequence_runtime(last_value, is_called));
+    }
+    Ok(runtimes)
 }
 
 fn sequence_runtime_is_readable(

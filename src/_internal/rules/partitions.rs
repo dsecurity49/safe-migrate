@@ -14,7 +14,7 @@ impl Rule for PartitionLockRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Attaching or detaching partitions takes an ACCESS EXCLUSIVE lock on the parent table. Run ATTACH PARTITION concurrently (or manage locks explicitly during low traffic)."
+        "Attaching a partition scans the partition and detaching can lock the parent. Use DETACH PARTITION CONCURRENTLY where supported and manage locks during low traffic."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {

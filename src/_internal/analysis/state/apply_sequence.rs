@@ -6,6 +6,7 @@ use crate::_internal::analysis::mutations::{
     AlterSequenceActionMutation, AlterSequenceMutation, CreateSequenceMutation,
     DropSequenceMutation, SequenceOptionMutation,
 };
+use crate::_internal::analysis::transaction::BaselineSet;
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequencePersistence, SequenceState,
@@ -587,6 +588,8 @@ impl AnalysisState {
         }
         let runtime =
             crate::_internal::model::sequence::SequenceRuntime::fresh(parameters.start_value);
+        let is_temp_sequence = parameters.persistence
+            == crate::_internal::model::sequence::SequencePersistence::Temporary;
         self.local.sequences.insert(
             create.id.clone(),
             SequenceOverlay::Present(SequenceState {
@@ -613,6 +616,9 @@ impl AnalysisState {
                     column: column.clone(),
                 },
             ));
+        }
+        if is_temp_sequence {
+            self.note_temp_object_created();
         }
         MutationResult::Applied
     }
@@ -772,7 +778,9 @@ impl AnalysisState {
                         "sequence must be in the same schema as its owning table".to_string(),
                     );
                 }
-                self.snapshot_namespace();
+                self.snapshot_graph_full();
+                self.snapshot_sequence_rename(&alter.id, new_id);
+                self.snapshot_baseline_set_rename(BaselineSet::Sequences, &alter.id, new_id);
                 let mut moved = match self.local.sequences.get(&alter.id) {
                     Some(SequenceOverlay::Present(sequence)) => sequence.clone(),
                     _ => unreachable!("sequence presence checked above"),

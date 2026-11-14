@@ -585,6 +585,177 @@ fn test_topology_rename_index() {
 }
 
 #[test]
+fn partitioned_index_hierarchy_remaps_endpoints_on_index_rename_and_schema_move() {
+    use crate::common::invariants::assert_state_invariants;
+
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    engine
+        .analyze(
+            "CREATE SCHEMA other;
+             CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text) PARTITION BY RANGE (a);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE TABLE d (a integer, b text);
+             ALTER TABLE c ATTACH PARTITION d FOR VALUES FROM (0) TO (5);
+             CREATE INDEX p_b ON p (b);",
+            &mut state,
+        )
+        .unwrap();
+
+    let parent_idx = object_id("public", "p_b");
+    let child_idx = object_id("public", "c_b_idx");
+    let grandchild_idx = object_id("public", "d_b_idx");
+
+    let partition_edges: Vec<_> = state
+        .local
+        .graph
+        .edges()
+        .iter()
+        .filter(|e| matches!(e.kind, DependencyKind::IndexPartitionOf))
+        .cloned()
+        .collect();
+    assert_eq!(partition_edges.len(), 2);
+    assert!(
+        partition_edges
+            .iter()
+            .any(|e| e.dependent == child_idx && e.referenced == parent_idx)
+    );
+    assert!(
+        partition_edges
+            .iter()
+            .any(|e| e.dependent == grandchild_idx && e.referenced == child_idx)
+    );
+    assert_state_invariants(&state);
+
+    // 1. Rename parent index
+    engine
+        .analyze("ALTER INDEX p_b RENAME TO p_b_renamed;", &mut state)
+        .unwrap();
+
+    let renamed_parent = object_id("public", "p_b_renamed");
+    let partition_edges_after_rename: Vec<_> = state
+        .local
+        .graph
+        .edges()
+        .iter()
+        .filter(|e| matches!(e.kind, DependencyKind::IndexPartitionOf))
+        .cloned()
+        .collect();
+    assert_eq!(partition_edges_after_rename.len(), 2);
+    assert!(
+        partition_edges_after_rename
+            .iter()
+            .any(|e| e.dependent == child_idx && e.referenced == renamed_parent),
+        "IndexPartitionOf edge must point to renamed parent index: {partition_edges_after_rename:?}"
+    );
+    assert!(
+        !partition_edges_after_rename
+            .iter()
+            .any(|e| e.referenced == parent_idx),
+        "old parent index identity must not remain on partition edge"
+    );
+    assert_state_invariants(&state);
+
+    // 2. Schema move on partition table c moves its associated index c_b_idx
+    engine
+        .analyze("ALTER TABLE c SET SCHEMA other;", &mut state)
+        .unwrap();
+
+    let moved_child = object_id("other", "c_b_idx");
+    let partition_edges_after_move: Vec<_> = state
+        .local
+        .graph
+        .edges()
+        .iter()
+        .filter(|e| matches!(e.kind, DependencyKind::IndexPartitionOf))
+        .cloned()
+        .collect();
+    assert!(
+        partition_edges_after_move
+            .iter()
+            .any(|e| e.dependent == moved_child && e.referenced == renamed_parent),
+        "moved child index must update its dependent endpoint: {partition_edges_after_move:?}"
+    );
+    assert!(
+        partition_edges_after_move
+            .iter()
+            .any(|e| e.dependent == grandchild_idx && e.referenced == moved_child),
+        "grandchild edge must update its referenced parent endpoint to moved child: {partition_edges_after_move:?}"
+    );
+    assert_state_invariants(&state);
+
+    // 3. Rollback inside transaction preserves original endpoints
+    let mut txn_state = state.clone();
+    engine
+        .analyze(
+            "BEGIN;
+             ALTER INDEX p_b_renamed RENAME TO p_b_rolled;
+             ROLLBACK;",
+            &mut txn_state,
+        )
+        .unwrap();
+
+    assert_eq!(
+        txn_state.local.graph.edges(),
+        state.local.graph.edges(),
+        "graph edges must match after rolled back index rename"
+    );
+    assert_state_invariants(&txn_state);
+
+    // 4. Direct child-index rename updates both child IndexOnRelation and incoming IndexPartitionOf
+    engine
+        .analyze(
+            "ALTER INDEX other.c_b_idx RENAME TO c_b_idx_renamed;",
+            &mut state,
+        )
+        .unwrap();
+
+    let renamed_child = object_id("other", "c_b_idx_renamed");
+    let partition_edges_after_child_rename: Vec<_> = state
+        .local
+        .graph
+        .edges()
+        .iter()
+        .filter(|e| matches!(e.kind, DependencyKind::IndexPartitionOf))
+        .cloned()
+        .collect();
+    assert!(
+        partition_edges_after_child_rename
+            .iter()
+            .any(|e| e.dependent == renamed_child && e.referenced == renamed_parent),
+        "renamed child index must update its dependent endpoint: {partition_edges_after_child_rename:?}"
+    );
+    assert!(
+        partition_edges_after_child_rename
+            .iter()
+            .any(|e| e.dependent == grandchild_idx && e.referenced == renamed_child),
+        "grandchild edge must update its referenced parent endpoint to renamed child: {partition_edges_after_child_rename:?}"
+    );
+    assert_state_invariants(&state);
+
+    // 5. Schema move rollback preserves endpoints
+    let mut schema_move_rollback_state = state.clone();
+    engine
+        .analyze(
+            "CREATE SCHEMA rollback_schema;
+             BEGIN;
+             ALTER TABLE c SET SCHEMA rollback_schema;
+             ROLLBACK;",
+            &mut schema_move_rollback_state,
+        )
+        .unwrap();
+
+    assert_eq!(
+        schema_move_rollback_state.local.graph.edges(),
+        state.local.graph.edges(),
+        "graph edges must match after rolled back partition table schema move"
+    );
+    assert_state_invariants(&schema_move_rollback_state);
+}
+
+#[test]
 fn create_index_validates_key_and_include_columns() {
     let engine = setup_engine();
     let reason = |sql: &str| {

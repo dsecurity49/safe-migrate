@@ -6,6 +6,7 @@ pub(crate) mod expressions;
 pub(crate) mod functions;
 pub(crate) mod idempotency;
 pub(crate) mod indexes;
+pub(crate) mod locks;
 pub(crate) mod opaque;
 pub(crate) mod partitions;
 pub(crate) mod policies;
@@ -26,6 +27,7 @@ use crate::api::config::Config;
 /// Keeping this bundle immutable prevents the engine from accidentally
 /// evaluating a rule against state from a different statement and provides a
 /// single extension point for evidence/capability metadata.
+#[derive(Clone, Copy)]
 pub(crate) struct TransitionRecord<'a> {
     mutation: &'a Mutation,
     result: &'a MutationResult,
@@ -142,6 +144,23 @@ impl RuleCapability {
                         .map(|relation| &relation.id),
                 );
             }
+            crate::_internal::analysis::mutations::Mutation::AlterType(alter) => {
+                if let crate::_internal::analysis::mutations::AlterTypeActionMutation::AlterAttributeType {
+                    name, ..
+                } = &alter.action
+                {
+                    targets.extend(
+                        pre_state
+                            .relations
+                            .values()
+                            .filter(|relation| {
+                                relation.of_type.as_ref() == Some(&alter.id)
+                                    && relation.has_column(name)
+                            })
+                            .map(|relation| &relation.id),
+                    );
+                }
+            }
             crate::_internal::analysis::mutations::Mutation::DropIndex(drop) => {
                 for index_id in &drop.ids {
                     targets.extend(pre_state.indexes.iter().filter_map(|edge| {
@@ -208,6 +227,7 @@ pub(crate) const BASELINE_STATS_DEPENDENCY_CAPABILITIES: &[RuleCapability] = &[
 pub(crate) const TRANSACTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::TransactionState];
 
 impl<'a> RuleContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         mutation: &'a Mutation,
         result: &'a MutationResult,
@@ -216,8 +236,20 @@ impl<'a> RuleContext<'a> {
         config: &'a Config,
         cascade_closure: Option<&'a CascadeResult>,
     ) -> Self {
+        Self::from_transition(
+            TransitionRecord::new(mutation, result, pre_state, cascade_closure),
+            state,
+            config,
+        )
+    }
+
+    pub(crate) fn from_transition(
+        transition: TransitionRecord<'a>,
+        state: &'a AnalysisState,
+        config: &'a Config,
+    ) -> Self {
         Self {
-            transition: TransitionRecord::new(mutation, result, pre_state, cascade_closure),
+            transition,
             state,
             config,
         }

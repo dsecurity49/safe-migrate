@@ -25,7 +25,7 @@ fn terminal_inline(value: &str) -> String {
     output
 }
 
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     terminal_inline(&path.display().to_string())
 }
 
@@ -86,6 +86,10 @@ enum Commands {
         /// Launch an interactive terminal UI to browse violations
         #[arg(short, long, conflicts_with_all = ["json", "markdown"])]
         interactive: bool,
+
+        /// Write JSON and Markdown reports to this directory in one analysis pass
+        #[arg(long, conflicts_with_all = ["interactive", "json", "markdown"])]
+        report_dir: Option<PathBuf>,
     },
     /// Lint a chain of SQL migration files in order (state persists across files)
     LintChain {
@@ -118,6 +122,10 @@ enum Commands {
         /// Launch an interactive terminal UI to browse violations
         #[arg(short, long, conflicts_with_all = ["json", "markdown"])]
         interactive: bool,
+
+        /// Write JSON and Markdown reports to this directory in one analysis pass
+        #[arg(long, conflicts_with_all = ["interactive", "json", "markdown"])]
+        report_dir: Option<PathBuf>,
     },
     /// Sync PostgreSQL schema metadata and statistics into a local cache
     Sync {
@@ -164,12 +172,13 @@ enum CacheCommands {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum OutputMode {
     Human,
     Json,
     Markdown,
     Interactive,
+    Reports(PathBuf),
 }
 
 struct PreparedCache {
@@ -178,8 +187,15 @@ struct PreparedCache {
 }
 
 impl OutputMode {
-    fn from_flags(json: bool, markdown: bool, interactive: bool) -> Self {
-        if json {
+    fn from_flags(
+        json: bool,
+        markdown: bool,
+        interactive: bool,
+        report_dir: Option<PathBuf>,
+    ) -> Self {
+        if let Some(dir) = report_dir {
+            Self::Reports(dir)
+        } else if json {
             Self::Json
         } else if markdown {
             Self::Markdown
@@ -212,13 +228,14 @@ fn run() -> Result<()> {
             json,
             markdown,
             interactive,
+            report_dir,
         } => run_lint(
             &file,
             config.as_deref(),
             &cache,
             no_cache,
             no_auto_sync,
-            OutputMode::from_flags(json, markdown, interactive),
+            OutputMode::from_flags(json, markdown, interactive, report_dir),
             cli.no_color,
         ),
         Commands::LintChain {
@@ -230,13 +247,14 @@ fn run() -> Result<()> {
             json,
             markdown,
             interactive,
+            report_dir,
         } => run_lint_chain(
             &dir,
             config.as_deref(),
             &cache,
             no_cache,
             no_auto_sync,
-            OutputMode::from_flags(json, markdown, interactive),
+            OutputMode::from_flags(json, markdown, interactive, report_dir),
             cli.no_color,
         ),
         Commands::Sync {
@@ -698,6 +716,39 @@ fn finish_analysis(
         }
         OutputMode::Interactive => {
             outcome.run_interactive().map_err(anyhow::Error::new)?;
+        }
+        OutputMode::Reports(dir) => {
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("Failed to create report directory: {}", dir.display()))?;
+            let json_path = dir.join("safe-migrate-report.json");
+            let markdown_path = dir.join("safe-migrate-report.md");
+            if json_path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(anyhow::anyhow!(
+                    "Refusing to write JSON report to symlink destination: {}",
+                    json_path.display()
+                ));
+            }
+            if markdown_path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(anyhow::anyhow!(
+                    "Refusing to write Markdown report to symlink destination: {}",
+                    markdown_path.display()
+                ));
+            }
+            fs::write(&json_path, serde_json::to_string_pretty(&outcome.json())?)
+                .with_context(|| format!("Failed to write JSON report: {}", json_path.display()))?;
+            fs::write(&markdown_path, outcome.markdown()).with_context(|| {
+                format!(
+                    "Failed to write Markdown report: {}",
+                    markdown_path.display()
+                )
+            })?;
+            eprintln!("[ INFO ] Wrote reports to {}", display_path(&dir));
         }
     }
 

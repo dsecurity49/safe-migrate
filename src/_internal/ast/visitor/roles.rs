@@ -158,8 +158,19 @@ impl AstVisitor {
             }
             _ => None,
         });
+        let rename_to = match node.action() {
+            Some(ast::AlterRoleAction::RoleRenameTo(rename)) => rename
+                .role()
+                .and_then(|role| role.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            _ => None,
+        };
         Some(StatementFact::AlterRole(
-            crate::_internal::analysis::facts::AlterRoleFact { name, inherits },
+            crate::_internal::analysis::facts::AlterRoleFact {
+                name,
+                inherits,
+                rename_to,
+            },
         ))
     }
 

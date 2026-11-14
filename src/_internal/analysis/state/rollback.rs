@@ -2,19 +2,30 @@ use super::*;
 
 impl AnalysisState {
     pub(super) fn snapshot_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::GraphLengthMarker {
-                len: self.local.graph.edge_count(),
-            });
+        if !self.local.records_undo() {
+            return;
         }
+        let len = self.local.graph.edge_count();
+        self.local.push_undo(StateChange::GraphLengthMarker { len });
     }
 
     pub(super) fn snapshot_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::GraphSnapshot {
-                previous: self.local.graph.edges().to_vec(),
-            });
+        if !self.local.records_undo() {
+            return;
         }
+        let previous = self.local.graph.edges().to_vec();
+        self.local
+            .push_undo(StateChange::GraphSnapshot { previous });
+    }
+
+    pub(super) fn record_graph_delta(
+        &mut self,
+        delta: crate::_internal::analysis::graph::GraphEdgeDelta,
+    ) {
+        if !self.local.records_undo() {
+            return;
+        }
+        self.local.push_undo(StateChange::GraphEdgeDelta { delta });
     }
 
     pub(super) fn rollback_frame(&mut self, mut frame: TransactionFrame) {
@@ -63,6 +74,26 @@ impl AnalysisState {
                         self.local.relations.remove(&id);
                     }
                 }
+                StateChange::RelationRename {
+                    old_id,
+                    new_id,
+                    previous_new,
+                } => {
+                    if let Some(mut overlay) = self.local.relations.remove(&new_id) {
+                        if let RelationOverlay::Present(state) = &mut overlay {
+                            state.id = old_id.clone();
+                        }
+                        self.local.relations.insert(old_id, overlay);
+                    }
+                    match *previous_new {
+                        Some(overlay) => {
+                            self.local.relations.insert(new_id, overlay);
+                        }
+                        None => {
+                            self.local.relations.remove(&new_id);
+                        }
+                    }
+                }
                 StateChange::TypeSnapshot { id, previous } => {
                     if let Some(prev) = previous {
                         self.local.types.insert(id, prev);
@@ -75,6 +106,26 @@ impl AnalysisState {
                         self.local.sequences.insert(id, prev);
                     } else {
                         self.local.sequences.remove(&id);
+                    }
+                }
+                StateChange::SequenceRename {
+                    old_id,
+                    new_id,
+                    previous_new,
+                } => {
+                    if let Some(mut overlay) = self.local.sequences.remove(&new_id) {
+                        if let SequenceOverlay::Present(state) = &mut overlay {
+                            state.id = old_id.clone();
+                        }
+                        self.local.sequences.insert(old_id, overlay);
+                    }
+                    match *previous_new {
+                        Some(overlay) => {
+                            self.local.sequences.insert(new_id, overlay);
+                        }
+                        None => {
+                            self.local.sequences.remove(&new_id);
+                        }
                     }
                 }
                 StateChange::ExtensionSnapshot { name, previous } => {
@@ -141,11 +192,34 @@ impl AnalysisState {
                 StateChange::BaselineForeignKeysSnapshot { previous } => {
                     self.baseline_foreign_keys = previous;
                 }
+                StateChange::BaselineSetRenameSnapshot {
+                    set,
+                    old,
+                    new,
+                    old_present,
+                    new_present,
+                } => {
+                    let target = match set {
+                        BaselineSet::Relations => &mut self.baseline_relations,
+                        BaselineSet::Indexes => &mut self.baseline_indexes,
+                        BaselineSet::FkDependencies => &mut self.baseline_fk_dependencies,
+                        BaselineSet::Sequences => &mut self.baseline_sequences,
+                    };
+                    if !new_present {
+                        target.remove(&new);
+                    }
+                    if old_present {
+                        target.insert(old);
+                    }
+                }
                 StateChange::GraphLengthMarker { len } => {
                     self.local.graph.truncate(len);
                 }
                 StateChange::GraphSnapshot { previous } => {
                     self.local.graph.replace_edges(previous);
+                }
+                StateChange::GraphEdgeDelta { delta } => {
+                    self.local.graph.restore_edge_delta(delta);
                 }
                 StateChange::RoleContextSnapshot {
                     current_role,
@@ -156,6 +230,8 @@ impl AnalysisState {
                     session_role_known,
                     persistent_session_role,
                     persistent_session_role_known,
+                    authenticated_role,
+                    authenticated_role_known,
                 } => {
                     self.local.current_role = current_role;
                     self.local.current_role_known = current_role_known;
@@ -165,6 +241,8 @@ impl AnalysisState {
                     self.local.session_role_known = session_role_known;
                     self.local.persistent_session_role = persistent_session_role;
                     self.local.persistent_session_role_known = persistent_session_role_known;
+                    self.local.authenticated_role = authenticated_role;
+                    self.local.authenticated_role_known = authenticated_role_known;
                 }
                 StateChange::SearchPathSnapshot {
                     previous,
@@ -174,6 +252,13 @@ impl AnalysisState {
                     self.local.search_path = previous;
                     self.local.search_path_template = previous_template;
                     self.local.session_search_path_template = previous_session_template;
+                }
+                StateChange::TempNamespaceSnapshot {
+                    previous,
+                    previous_search_path,
+                } => {
+                    self.local.temp_namespace_created = previous;
+                    self.local.search_path = previous_search_path;
                 }
                 StateChange::TimeoutSettingsSnapshot {
                     lock_timeout,
@@ -191,12 +276,62 @@ impl AnalysisState {
                 StateChange::ConfidenceSnapshot { previous } => {
                     self.local.confidence = previous;
                 }
-                StateChange::EvidenceSnapshot { previous } => {
-                    self.local.evidence = previous;
+                StateChange::EvidenceLengthMarker { len } => {
+                    self.local.evidence.truncate(len);
+                }
+                StateChange::NotEvaluatedLength { len } => {
+                    let preserved: Vec<_> = self
+                        .not_evaluated
+                        .iter()
+                        .skip(len)
+                        .filter(|entry| {
+                            entry.cause
+                                == crate::_internal::analysis::evidence::EvidenceCode::TransactionAborted
+                        })
+                        .cloned()
+                        .collect();
+                    self.not_evaluated.truncate(len);
+                    self.not_evaluated.extend(preserved);
+                }
+                StateChange::CoDroppedObjectsSnapshot { previous } => {
+                    self.co_dropped_objects = previous;
                 }
             }
         }
+        if self.not_evaluated.iter().any(|entry| {
+            entry.cause == crate::_internal::analysis::evidence::EvidenceCode::TransactionAborted
+        }) {
+            self.local.confidence = Confidence::Tainted;
+        }
         debug_assert!(self.local.graph.indexes_are_valid());
+    }
+
+    pub(crate) fn begin_statement_undo(&mut self) {
+        debug_assert!(self.local.statement_undo_log.is_none());
+        self.local.statement_undo_log = Some(Vec::new());
+        self.local.statement_snapshot_ids.clear();
+    }
+
+    pub(crate) fn commit_statement_undo(&mut self) {
+        self.local.statement_undo_log = None;
+        self.local.statement_snapshot_ids.clear();
+    }
+
+    pub(crate) fn transaction_shape(&self) -> Vec<(TransactionFrameKind, usize)> {
+        self.local
+            .transactions
+            .iter()
+            .map(|frame| (frame.kind.clone(), frame.undo_log.len()))
+            .collect()
+    }
+
+    pub(crate) fn rollback_statement_undo(&mut self) -> Result<(), &'static str> {
+        let Some(undo_log) = self.local.statement_undo_log.take() else {
+            return Err("statement undo journal was already closed");
+        };
+        self.rollback_undo_log(undo_log);
+        self.local.statement_snapshot_ids.clear();
+        Ok(())
     }
 
     pub(crate) fn transaction_undo_checkpoint(&self) -> Option<(usize, usize)> {
@@ -222,6 +357,7 @@ impl AnalysisState {
         }
         let statement_undo = frame.undo_log.split_off(undo_len);
         self.rollback_undo_log(statement_undo);
+        self.local.statement_snapshot_ids.clear();
         debug_assert!(self.local.graph.indexes_are_valid());
         Ok(())
     }

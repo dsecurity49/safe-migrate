@@ -5,8 +5,8 @@ use crate::_internal::analysis::facts::{
 };
 use crate::_internal::analysis::mutations::{
     AlterTable, AlterTableActionMutation, ColumnMutation, CreateTable, DropIndex,
-    DropMaterializedViewMutation, DropTable, DropViewMutation, FkMutation, LikeSourceMutation,
-    Mutation, PersistenceMutation, Rename,
+    DropMaterializedViewMutation, DropTable, DropViewMutation, FkMutation,
+    IdentitySequenceOptionsMutation, LikeSourceMutation, Mutation, PersistenceMutation, Rename,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
@@ -229,12 +229,15 @@ impl Resolver {
     pub(super) fn resolve_alter_table(
         name: &QualifiedName,
         only: bool,
+        if_exists: bool,
         actions: &[AlterTableActionFact],
         state: &AnalysisState,
     ) -> Vec<Mutation> {
         let id = Self::resolve_relation_lookup_name(name, state);
         let mut mutations = Vec::with_capacity(actions.len());
-        mutations.extend(Self::unresolved_reference(ObjectKind::Table, &id, state));
+        if !if_exists {
+            mutations.extend(Self::unresolved_reference(ObjectKind::Table, &id, state));
+        }
         for action_fact in actions {
             let action = match action_fact {
                 AlterTableActionFact::AddColumn {
@@ -255,21 +258,9 @@ impl Resolver {
                     default: default.clone(),
                     depends_on: None,
                     generation: *generation,
-                    identity_sequence: identity_sequence.as_ref().map(|options| {
-                        crate::_internal::analysis::mutations::IdentitySequenceOptionsMutation {
-                            data_type: options.data_type.clone(),
-                            start_value: options.start_value,
-                            increment: options.increment,
-                            min_value: options.min_value,
-                            max_value: options.max_value,
-                            cache_size: options.cache_size,
-                            cycle: options.cycle,
-                            persistence: options.persistence,
-                            sequence_name: options.sequence_name.as_ref().map(|name| {
-                                Self::resolve_creation_name(name, state)
-                            }),
-                        }
-                    }),
+                    identity_sequence: identity_sequence
+                        .as_ref()
+                        .map(|options| Self::resolve_identity_sequence_options(options, state)),
                     generated_expr: generated_expr.clone(),
                     generated_expr_sql: generated_expr_sql.clone(),
                 },
@@ -410,6 +401,18 @@ impl Resolver {
                         default: default.clone(),
                     }
                 }
+                AlterTableActionFact::AddIdentity {
+                    column,
+                    generation,
+                    identity_sequence,
+                } => AlterTableActionMutation::AddIdentity {
+                    column: column.clone(),
+                    generation: *generation,
+                    identity_sequence: Self::resolve_identity_sequence_options(
+                        identity_sequence,
+                        state,
+                    ),
+                },
                 AlterTableActionFact::ValidateConstraint { constraint_name } => {
                     AlterTableActionMutation::ValidateConstraint {
                         constraint_name: constraint_name.clone(),
@@ -602,6 +605,7 @@ impl Resolver {
             mutations.push(Mutation::AlterTable(AlterTable {
                 id: id.clone(),
                 only,
+                if_exists,
                 action,
             }));
         }
@@ -672,5 +676,25 @@ impl Resolver {
             concurrently,
             cascade,
         })
+    }
+
+    fn resolve_identity_sequence_options(
+        options: &crate::_internal::analysis::facts::IdentitySequenceOptionsFact,
+        state: &AnalysisState,
+    ) -> IdentitySequenceOptionsMutation {
+        IdentitySequenceOptionsMutation {
+            data_type: options.data_type.clone(),
+            start_value: options.start_value,
+            increment: options.increment,
+            min_value: options.min_value,
+            max_value: options.max_value,
+            cache_size: options.cache_size,
+            cycle: options.cycle,
+            persistence: options.persistence,
+            sequence_name: options
+                .sequence_name
+                .as_ref()
+                .map(|name| Self::resolve_creation_name(name, state)),
+        }
     }
 }

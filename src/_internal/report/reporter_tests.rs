@@ -529,6 +529,43 @@ mod tests {
     }
 
     #[test]
+    fn human_and_markdown_not_evaluated_compacts_large_rule_lists() {
+        let outcome = AnalysisOutcome::new(Vec::new(), Confidence::Exact, Vec::new());
+        let skipped = vec![
+            make_skipped(
+                "rule-1",
+                ViolationTier::Tier1,
+                EvidenceCode::UnknownObjectState,
+                "Sync schema.",
+            ),
+            make_skipped(
+                "rule-2",
+                ViolationTier::Tier1,
+                EvidenceCode::UnknownObjectState,
+                "Sync schema.",
+            ),
+            make_skipped(
+                "rule-3",
+                ViolationTier::Tier2,
+                EvidenceCode::UnknownObjectState,
+                "Sync schema.",
+            ),
+            make_skipped(
+                "rule-4",
+                ViolationTier::Tier3,
+                EvidenceCode::UnknownObjectState,
+                "Sync schema.",
+            ),
+        ];
+
+        let human = human_not_evaluated(&skipped);
+        assert!(human.contains("rules  : 4 rules skipped (2 Tier 1, 1 Tier 2, 1 Tier 3)"));
+
+        let markdown = Reporter::markdown_outcome(&outcome, &skipped);
+        assert!(markdown.contains("4 rules (2 Tier 1, 1 Tier 2, 1 Tier 3)"));
+    }
+
+    #[test]
     fn test_verdict_halt_tier1() {
         let violations = vec![make_violation("test-rule", ViolationTier::Tier1, "halt")];
         assert_eq!(compute_verdict(&violations), Verdict::Halt);

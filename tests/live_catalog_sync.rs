@@ -2,6 +2,7 @@ use crate::common::database_hosts_are_local;
 use std::fs;
 use std::io::Read;
 
+use safe_migrate::_internal::analysis::expr_ir::ExprIr;
 use safe_migrate::_internal::analysis::facts::{
     ConnectionTarget, PublicationObjectFact, PublicationRowFilter, PublicationScope,
 };
@@ -14,6 +15,7 @@ use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{
     FunctionOverlay, RoutineKind, SecurityMode, Volatility,
 };
+use safe_migrate::_internal::model::index::{IndexKeyKind, IndexPredicate};
 use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
 use safe_migrate::_internal::model::types::TypeKind;
 use safe_migrate::_internal::sync::sync_cache;
@@ -90,7 +92,7 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V11(cache) = versioned else {
+    let DbCacheVersioned::V12(cache) = versioned else {
         panic!("catalog sync must encode the V8 cache variant");
     };
     (*cache, payload)
@@ -484,10 +486,13 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         .iter()
         .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_partial_key"))
         .expect("synchronized partial index");
-    // The catalog states a predicate exists but carries no parsed identity.
     assert_eq!(
         partial.definition.predicate,
-        safe_migrate::_internal::model::index::IndexPredicate::Opaque
+        IndexPredicate::Catalog(ExprIr::BinaryOp {
+            left: Box::new(ExprIr::ColumnRef("note".into())),
+            op: "IS NOT".into(),
+            right: Box::new(ExprIr::Literal("NULL".into())),
+        })
     );
     assert_eq!(partial.definition.key_column_names(), ["id"]);
     assert_eq!(partial.dependency_columns, ["id", "note"]);
@@ -504,6 +509,13 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert!(
         expression.definition.keys.len() > expression.definition.key_column_names().len(),
         "expression keys must still occupy key positions"
+    );
+    assert_eq!(
+        expression.definition.keys[0].kind,
+        IndexKeyKind::CatalogExpression(ExprIr::FunctionCall {
+            name: "lower".into(),
+            args: vec![ExprIr::ColumnRef("note".into())],
+        })
     );
     assert_eq!(expression.dependency_columns, ["note"]);
     assert!(expression.dependency_columns_known);
@@ -1369,4 +1381,131 @@ fn scoped_table_without_external_dependents_stays_evaluated() {
     client
         .batch_execute(&format!("DROP SCHEMA {scope} CASCADE;"))
         .expect("remove scoped table fixture");
+}
+
+#[test]
+#[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+fn trigger_parent_edges_require_tgparentid() {
+    let guard = crate::internal_tests::live_database_test_lock();
+    let (database_config, _, _) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for trigger parent sync"),
+    );
+    let _cleanup = CatalogCleanup(database_config.clone());
+    let mut client = database_config
+        .connect(postgres::NoTls)
+        .expect("connect for trigger parent sync");
+
+    let scope = "sm_v7_trigger_scope";
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {scope} CASCADE;
+             CREATE SCHEMA {scope};
+             CREATE FUNCTION {scope}.trg() RETURNS trigger
+               LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+             CREATE TABLE {scope}.parent (id integer);
+             CREATE TABLE {scope}.child () INHERITS ({scope}.parent);
+             CREATE TRIGGER same_name BEFORE INSERT ON {scope}.parent
+               FOR EACH ROW EXECUTE FUNCTION {scope}.trg();
+             CREATE TRIGGER same_name BEFORE INSERT ON {scope}.child
+               FOR EACH ROW EXECUTE FUNCTION {scope}.trg();
+             CREATE TABLE {scope}.part_parent (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE {scope}.part_child PARTITION OF {scope}.part_parent
+               FOR VALUES FROM (0) TO (10);
+             CREATE TRIGGER part_trg BEFORE INSERT ON {scope}.part_parent
+               FOR EACH ROW EXECUTE FUNCTION {scope}.trg();"
+        ))
+        .expect("seed trigger parent fixtures");
+
+    let temp_dir = tempfile::tempdir().expect("create trigger parent directory");
+    let cache_path = temp_dir.path().join("triggers.cache");
+    sync_cache(&cache_path, Some(&[scope.to_string()]), false).expect("sync trigger parents");
+    let (cache, _) = decode_cache(&cache_path);
+
+    let child_trigger = cache
+        .triggers
+        .iter()
+        .find(|trigger| {
+            trigger.table_id == ObjectId::new(scope, "child")
+                && trigger.trigger_id == ObjectId::new(scope, "same_name")
+        })
+        .expect("synchronized child trigger");
+    assert_eq!(
+        child_trigger.parent_trigger_id, None,
+        "an independently-created child trigger must not inherit a same-named parent trigger"
+    );
+
+    let partition_trigger = cache
+        .triggers
+        .iter()
+        .find(|trigger| {
+            trigger.table_id == ObjectId::new(scope, "part_child")
+                && trigger.trigger_id == ObjectId::new(scope, "part_trg")
+        })
+        .expect("synchronized partition trigger");
+    assert_eq!(
+        partition_trigger.parent_trigger_id,
+        Some(ObjectId::new(scope, "part_parent\0part_trg")),
+        "a cloned partition trigger must retain its catalog parent"
+    );
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {scope} CASCADE;"))
+        .expect("remove trigger parent fixtures");
+}
+
+#[test]
+#[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+fn foreign_table_view_dependencies_are_synchronized() {
+    let guard = crate::internal_tests::live_database_test_lock();
+    let (database_config, _, _) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for foreign table dependency sync"),
+    );
+    let _cleanup = CatalogCleanup(database_config.clone());
+    let mut client = database_config
+        .connect(postgres::NoTls)
+        .expect("connect for foreign table dependency sync");
+
+    let scope = "sm_v7_foreign_scope";
+    let wrapper = "sm_v7_foreign_wrapper";
+    let server = "sm_v7_foreign_server";
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {scope} CASCADE;
+             DROP SERVER IF EXISTS {server} CASCADE;
+             DROP FOREIGN DATA WRAPPER IF EXISTS {wrapper} CASCADE;
+             CREATE SCHEMA {scope};
+             CREATE FOREIGN DATA WRAPPER {wrapper} NO HANDLER NO VALIDATOR;
+             CREATE SERVER {server} FOREIGN DATA WRAPPER {wrapper};
+             CREATE FOREIGN TABLE {scope}.ft_orders (id integer) SERVER {server};
+             CREATE VIEW {scope}.ft_view AS SELECT id FROM {scope}.ft_orders;"
+        ))
+        .expect("seed foreign table dependency fixtures");
+
+    let temp_dir = tempfile::tempdir().expect("create foreign table dependency directory");
+    let cache_path = temp_dir.path().join("foreign-dependencies.cache");
+    sync_cache(&cache_path, Some(&[scope.to_string()]), false)
+        .expect("sync foreign table dependencies");
+    let (cache, _) = decode_cache(&cache_path);
+
+    assert!(
+        cache.dependencies.iter().any(|dependency| {
+            dependency.dependent == ObjectId::new(scope, "ft_view")
+                && dependency.referenced == ObjectId::new(scope, "ft_orders")
+                && dependency.referenced_column.as_deref() == Some("id")
+        }),
+        "foreign table column dependency is missing: {:?}",
+        cache.dependencies
+    );
+
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA {scope} CASCADE;
+             DROP SERVER {server} CASCADE;
+             DROP FOREIGN DATA WRAPPER {wrapper} CASCADE;"
+        ))
+        .expect("remove foreign table dependency fixtures");
 }

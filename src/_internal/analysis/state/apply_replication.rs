@@ -78,7 +78,7 @@ impl AnalysisState {
         );
 
         if let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &scope {
-            self.snapshot_graph_full();
+            self.snapshot_graph();
             for obj in objects {
                 if let crate::_internal::analysis::facts::PublicationObjectFact::Table {
                     name,

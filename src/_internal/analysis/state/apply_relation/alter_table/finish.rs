@@ -252,6 +252,34 @@ impl AnalysisState {
                         default: default.clone(),
                     });
                 }
+                AlterTableActionMutation::AddIdentity {
+                    column, generation, ..
+                } => {
+                    rel.identity_columns.insert(
+                        column.clone(),
+                        match generation {
+                            crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways => {
+                                crate::_internal::model::relation::IdentityGeneration::Always
+                            }
+                            crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault => {
+                                crate::_internal::model::relation::IdentityGeneration::ByDefault
+                            }
+                            _ => unreachable!("ADD IDENTITY carries an identity generation"),
+                        },
+                    );
+                    if let Some((sequence_id, column_name, _, _)) = &implicit_add
+                        && column_name == column
+                        && let Some(column_state) =
+                            rel.columns.iter_mut().find(|state| state.name == *column)
+                    {
+                        column_state.default = Some(Self::sequence_nextval_default(sequence_id));
+                        column_state.default_expr_text = Some(format!(
+                            "nextval('{}.{}'::regclass)",
+                            sequence_id.schema, sequence_id.name
+                        ));
+                        column_state.is_nullable = false;
+                    }
+                }
                 AlterTableActionMutation::SetStorage { column, mode } => {
                     rel.apply_column_action(&ColumnAction::SetStorage {
                         name: column.clone(),
@@ -334,8 +362,7 @@ impl AnalysisState {
                             .pending_validation
                             .insert((alter.id.clone(), constraint_name.clone()));
                     }
-                    self.snapshot_graph();
-                    self.local.graph.add_edge(DependencyEdge::new(
+                    let edge = DependencyEdge::new(
                         alter.id.clone(),
                         to_table.clone(),
                         DependencyKind::ForeignKey {
@@ -347,7 +374,10 @@ impl AnalysisState {
                             operator_evidence: None,
                             from_generation: generation,
                         },
-                    ));
+                    );
+                    self.snapshot_graph();
+                    self.local.graph.add_edge(edge.clone());
+                    self.clone_foreign_key_to_partition_descendants(&alter.id, &edge);
                 }
                 AlterTableActionMutation::DropConstraint { name, .. } => {
                     self.snapshot_constraint(&alter.id, name);
@@ -1020,6 +1050,8 @@ impl AnalysisState {
                 }
                 self.refresh_default_partition_constraints(&alter.id);
                 self.ensure_partition_indexes_and_constraints(&alter.id, child);
+                self.clone_partition_foreign_keys(&alter.id, child);
+                self.propagate_attached_partition_identity(&alter.id, child);
                 let result = self.clone_row_triggers_to_partition(&alter.id, child);
                 debug_assert!(matches!(result, MutationResult::Applied));
                 if !matches!(result, MutationResult::Applied) {
@@ -1047,6 +1079,19 @@ impl AnalysisState {
                     }
                 }
                 self.remove_partition_trigger_clones(&alter.id, child);
+                self.remove_inherited_partition_identity(&alter.id, child);
+            }
+            AlterTableActionMutation::AddIdentity {
+                column, generation, ..
+            } => {
+                if let Some((sequence_id, _, _, _)) = &implicit_add {
+                    self.propagate_identity_to_partition_descendants(
+                        &alter.id,
+                        column,
+                        *generation,
+                        sequence_id,
+                    );
+                }
             }
             _ => {}
         }
@@ -1129,10 +1174,10 @@ impl AnalysisState {
             _ => {}
         }
         if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
-            self.rename_relation_column_metadata(&alter.id, from, to);
-            for descendant in recursive_rename_descendants {
-                self.rename_relation_column_metadata(&descendant, from, to);
-            }
+            let mut all_affected = Vec::with_capacity(recursive_rename_descendants.len() + 1);
+            all_affected.push(alter.id.clone());
+            all_affected.extend(recursive_rename_descendants);
+            self.rename_relations_column_metadata_batch(&all_affected, from, to);
 
             // Publication column lists are catalog identities, not merely
             // display text. PostgreSQL follows a renamed column in an

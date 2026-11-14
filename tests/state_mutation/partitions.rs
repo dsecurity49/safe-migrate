@@ -1497,6 +1497,7 @@ fn a_foreign_table_can_hold_a_partition() {
     let attach = Mutation::AlterTable(AlterTable {
         id: parent,
         only: false,
+        if_exists: false,
         action: AlterTableActionMutation::AttachPartition {
             child,
             strategy: None,
@@ -1507,4 +1508,181 @@ fn a_foreign_table_can_hold_a_partition() {
         !matches!(state.apply(&attach, None), MutationResult::Conflict { .. }),
         "ATTACH PARTITION accepts a foreign table"
     );
+}
+
+#[test]
+fn attach_partition_clones_parent_foreign_keys() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TABLE customers (id integer PRIMARY KEY);
+             CREATE TABLE orders (
+                id integer,
+                customer_id integer,
+                CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers(id)
+             ) PARTITION BY RANGE (id);
+             CREATE TABLE orders_2026 (id integer, customer_id integer);
+             ALTER TABLE orders ATTACH PARTITION orders_2026 FOR VALUES FROM (1) TO (1000);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    let child = object_id("public", "orders_2026");
+    let constraint = state
+        .local
+        .constraints
+        .get(&(child.clone(), "orders_customer_fk".to_string()))
+        .expect("attach must clone the parent foreign key");
+    assert_eq!(constraint.kind, ConstraintKind::ForeignKey);
+    assert!(state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == child
+            && edge.referenced == object_id("public", "customers")
+            && matches!(
+                &edge.kind,
+                DependencyKind::ForeignKey {
+                    constraint_name: Some(name),
+                    ..
+                } if name == "orders_customer_fk"
+            )
+    }));
+}
+
+#[test]
+fn detached_partition_keeps_its_cloned_foreign_key_dependency() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE cust (id integer PRIMARY KEY);
+             CREATE TABLE parent_part (
+                id integer,
+                cust_id integer,
+                CONSTRAINT fk_cust FOREIGN KEY (cust_id) REFERENCES cust(id)
+             ) PARTITION BY RANGE (id);
+             CREATE TABLE child_part (id integer, cust_id integer);
+             ALTER TABLE parent_part ATTACH PARTITION child_part FOR VALUES FROM (1) TO (100);
+             ALTER TABLE parent_part DETACH PARTITION child_part;
+             DROP TABLE parent_part CASCADE;",
+            &mut state,
+        )
+        .unwrap();
+
+    let child = object_id("public", "child_part");
+    let constraint = state
+        .local
+        .constraints
+        .get(&(child.clone(), "fk_cust".to_string()))
+        .expect("detach keeps the foreign key on the former partition");
+    assert_eq!(constraint.kind, ConstraintKind::ForeignKey);
+    assert!(state.relation_is_present(&child));
+
+    let findings = engine
+        .analyze("DROP TABLE cust RESTRICT;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "the detached partition must still reference cust: {findings:?}"
+    );
+    assert!(state.relation_is_present(&object_id("public", "cust")));
+}
+
+#[test]
+fn adding_parent_foreign_key_clones_onto_attached_partitions() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE customers (id integer PRIMARY KEY);
+             CREATE TABLE orders (id integer, customer_id integer) PARTITION BY RANGE (id);
+             CREATE TABLE orders_2026 (id integer, customer_id integer);
+             ALTER TABLE orders ATTACH PARTITION orders_2026 FOR VALUES FROM (1) TO (1000);
+             ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                FOREIGN KEY (customer_id) REFERENCES customers(id);",
+            &mut state,
+        )
+        .unwrap();
+
+    let child = object_id("public", "orders_2026");
+    let constraint = state
+        .local
+        .constraints
+        .get(&(child.clone(), "orders_customer_fk".to_string()))
+        .expect("adding the parent foreign key must clone it onto partitions");
+    assert_eq!(constraint.kind, ConstraintKind::ForeignKey);
+    let findings = engine
+        .analyze("DROP TABLE customers RESTRICT;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn attach_partition_adopts_an_equivalent_foreign_key_and_suffixes_collisions() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE customers (id integer PRIMARY KEY);
+             CREATE TABLE orders (
+                id integer,
+                customer_id integer,
+                CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers(id)
+             ) PARTITION BY RANGE (id);
+             CREATE TABLE adopted (id integer, customer_id integer,
+                CONSTRAINT local_fk FOREIGN KEY (customer_id) REFERENCES customers(id));
+             CREATE TABLE collision (id integer, customer_id integer,
+                CONSTRAINT orders_customer_fk CHECK (id > 0));
+             ALTER TABLE orders ATTACH PARTITION adopted FOR VALUES FROM (0) TO (100);
+             ALTER TABLE orders ATTACH PARTITION collision FOR VALUES FROM (100) TO (200);",
+            &mut state,
+        )
+        .unwrap();
+
+    let adopted = object_id("public", "adopted");
+    assert!(
+        state
+            .local
+            .constraints
+            .contains_key(&(adopted.clone(), "local_fk".to_string())),
+        "an equivalent child foreign key is adopted"
+    );
+    assert!(
+        !state
+            .local
+            .constraints
+            .contains_key(&(adopted.clone(), "orders_customer_fk".to_string())),
+        "adoption must not duplicate the foreign key"
+    );
+    assert_eq!(
+        state
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                edge.dependent == adopted && matches!(edge.kind, DependencyKind::ForeignKey { .. })
+            })
+            .count(),
+        1
+    );
+
+    let collision = object_id("public", "collision");
+    let cloned = state
+        .local
+        .constraints
+        .get(&(collision.clone(), "orders_customer_fk_1".to_string()))
+        .expect("a same-named constraint forces PostgreSQL's numeric suffix");
+    assert_eq!(cloned.kind, ConstraintKind::ForeignKey);
 }

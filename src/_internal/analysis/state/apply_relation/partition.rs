@@ -995,4 +995,383 @@ impl AnalysisState {
             }
         }
     }
+
+    /// `CloneForeignKeyConstraintsIfNeeded`: attaching a partition clones the
+    /// parent's foreign keys onto the child, adopting an equivalent child
+    /// constraint instead of creating a duplicate.
+    pub(super) fn clone_partition_foreign_keys(&mut self, parent: &ObjectId, child: &ObjectId) {
+        let parent_foreign_keys: Vec<DependencyEdge> = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                edge.dependent == *parent
+                    && matches!(edge.kind, DependencyKind::ForeignKey { .. })
+                    && self.dependency_edge_is_current(edge)
+            })
+            .cloned()
+            .collect();
+        let mut targets = vec![child.clone()];
+        targets.extend(self.partition_descendants(child));
+        for target in targets {
+            let existing = self.partition_foreign_keys(&target);
+            for edge in &parent_foreign_keys {
+                self.clone_partition_foreign_key(edge, &target, &existing);
+            }
+        }
+    }
+
+    /// Acquiring a foreign key on a partitioned table clones it onto every
+    /// partition that is already attached.
+    pub(super) fn clone_foreign_key_to_partition_descendants(
+        &mut self,
+        parent: &ObjectId,
+        parent_edge: &DependencyEdge,
+    ) {
+        for child in self.partition_descendants(parent) {
+            let existing = self.partition_foreign_keys(&child);
+            self.clone_partition_foreign_key(parent_edge, &child, &existing);
+        }
+    }
+
+    pub(super) fn partition_descendants(&self, root: &ObjectId) -> Vec<ObjectId> {
+        let mut pending = vec![root.clone()];
+        let mut visited = HashSet::from([root.clone()]);
+        let mut descendants = Vec::new();
+        while let Some(parent) = pending.pop() {
+            for edge in self.local.graph.edges() {
+                if edge.referenced != parent
+                    || !matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                    || !visited.insert(edge.dependent.clone())
+                {
+                    continue;
+                }
+                pending.push(edge.dependent.clone());
+                descendants.push(edge.dependent.clone());
+            }
+        }
+        descendants
+    }
+
+    /// PostgreSQL applies an identity column added to a partitioned table to
+    /// every existing partition. The partitions share the parent's sequence.
+    pub(super) fn propagate_identity_to_partition_descendants(
+        &mut self,
+        parent: &ObjectId,
+        column: &str,
+        generation: crate::_internal::analysis::facts::ColumnGeneration,
+        sequence_id: &ObjectId,
+    ) {
+        let generation = match generation {
+            crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways => {
+                crate::_internal::model::relation::IdentityGeneration::Always
+            }
+            crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault => {
+                crate::_internal::model::relation::IdentityGeneration::ByDefault
+            }
+            _ => unreachable!("ADD IDENTITY carries an identity generation"),
+        };
+        let default = Self::sequence_nextval_default(sequence_id);
+        let default_text = format!(
+            "nextval('{}.{}'::regclass)",
+            sequence_id.schema, sequence_id.name
+        );
+        let mut incomplete = false;
+        for descendant in self.partition_descendants(parent) {
+            self.snapshot_relation(&descendant);
+            let Some(RelationOverlay::Present(relation)) =
+                self.local.relations.get_mut(&descendant)
+            else {
+                incomplete = true;
+                continue;
+            };
+            let Some(column_state) = relation
+                .columns
+                .iter_mut()
+                .find(|state| state.name == column)
+            else {
+                incomplete = true;
+                continue;
+            };
+            column_state.default = Some(default.clone());
+            column_state.default_expr_text = Some(default_text.clone());
+            column_state.is_nullable = false;
+            relation
+                .identity_columns
+                .insert(column.to_string(), generation);
+        }
+        if incomplete {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+        }
+    }
+
+    /// Attaching a table to a table with identity columns copies the identity
+    /// property (but not the parent's sequence ownership) to the new subtree.
+    pub(super) fn propagate_attached_partition_identity(
+        &mut self,
+        parent: &ObjectId,
+        child: &ObjectId,
+    ) {
+        let parent_identity: Vec<(
+            String,
+            crate::_internal::model::relation::IdentityGeneration,
+        )> = match self.local.relations.get(parent) {
+            Some(RelationOverlay::Present(relation)) => relation
+                .identity_columns
+                .iter()
+                .map(|(column, generation)| (column.clone(), *generation))
+                .collect(),
+            _ => return,
+        };
+        for (column, generation) in parent_identity {
+            let Some(sequence_id) = self.owned_identity_sequence(parent, &column) else {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+                continue;
+            };
+            let default = Self::sequence_nextval_default(&sequence_id);
+            let default_text = format!(
+                "nextval('{}.{}'::regclass)",
+                sequence_id.schema, sequence_id.name
+            );
+            let mut targets = vec![child.clone()];
+            targets.extend(self.partition_descendants(child));
+            let mut incomplete = false;
+            for target in targets {
+                self.snapshot_relation(&target);
+                let mut applied = false;
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(&target)
+                {
+                    if let Some(column_state) = relation
+                        .columns
+                        .iter_mut()
+                        .find(|state| state.name == column)
+                    {
+                        // A partition may carry a local default; PostgreSQL
+                        // keeps it even though identity takes precedence.
+                        if column_state.default.is_none() {
+                            column_state.default = Some(default.clone());
+                            column_state.default_expr_text = Some(default_text.clone());
+                        }
+                        column_state.is_nullable = false;
+                        applied = true;
+                    }
+                    if applied {
+                        relation.identity_columns.insert(column.clone(), generation);
+                    }
+                }
+                if !applied {
+                    incomplete = true;
+                }
+            }
+            if incomplete {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+            }
+        }
+    }
+
+    /// Detaching a partition drops the identity property PostgreSQL inherits
+    /// from the parent, including from nested partitions in the detached
+    /// subtree.
+    pub(super) fn remove_inherited_partition_identity(
+        &mut self,
+        parent: &ObjectId,
+        child: &ObjectId,
+    ) {
+        let parent_identity_columns: Vec<String> = match self.local.relations.get(parent) {
+            Some(RelationOverlay::Present(relation)) => {
+                relation.identity_columns.keys().cloned().collect()
+            }
+            _ => return,
+        };
+        for column in parent_identity_columns {
+            let sequence_text = self
+                .owned_identity_sequence(parent, &column)
+                .map(|sequence_id| {
+                    format!(
+                        "nextval('{}.{}'::regclass)",
+                        sequence_id.schema, sequence_id.name
+                    )
+                });
+            let mut targets = vec![child.clone()];
+            targets.extend(self.partition_descendants(child));
+            for target in targets {
+                self.snapshot_relation(&target);
+                let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(&target)
+                else {
+                    continue;
+                };
+                relation.identity_columns.remove(&column);
+                if let Some(column_state) = relation
+                    .columns
+                    .iter_mut()
+                    .find(|state| state.name == column)
+                    && column_state.default_expr_text.is_some()
+                    && column_state.default_expr_text == sequence_text
+                {
+                    column_state.default = None;
+                    column_state.default_expr_text = None;
+                }
+            }
+        }
+    }
+
+    fn owned_identity_sequence(&self, table: &ObjectId, column: &str) -> Option<ObjectId> {
+        let mut pending = vec![table.clone()];
+        let mut visited = HashSet::from([table.clone()]);
+        while let Some(current) = pending.pop() {
+            let sequence = self
+                .local
+                .sequences
+                .iter()
+                .find_map(|(id, overlay)| match overlay {
+                    SequenceOverlay::Present(sequence)
+                        if sequence.kind == SequenceKind::Identity
+                            && sequence.owned_by.as_ref()
+                                == Some(&(current.clone(), column.to_string())) =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                });
+            if sequence.is_some() {
+                return sequence;
+            }
+            for edge in self.local.graph.edges() {
+                if edge.dependent == current
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                    && visited.insert(edge.referenced.clone())
+                {
+                    pending.push(edge.referenced.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn partition_foreign_keys(&self, table: &ObjectId) -> Vec<DependencyEdge> {
+        self.local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                edge.dependent == *table
+                    && matches!(edge.kind, DependencyKind::ForeignKey { .. })
+                    && self.dependency_edge_is_current(edge)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn clone_partition_foreign_key(
+        &mut self,
+        parent_edge: &DependencyEdge,
+        child: &ObjectId,
+        existing: &[DependencyEdge],
+    ) {
+        let DependencyKind::ForeignKey {
+            constraint_name: Some(parent_name),
+            from_columns,
+            to_columns,
+            operator_evidence,
+            ..
+        } = &parent_edge.kind
+        else {
+            return;
+        };
+        let already_present = existing.iter().any(|edge| match &edge.kind {
+            DependencyKind::ForeignKey {
+                from_columns: child_from_columns,
+                to_columns: child_to_columns,
+                ..
+            } => {
+                edge.referenced == parent_edge.referenced
+                    && child_from_columns == from_columns
+                    && child_to_columns == to_columns
+            }
+            _ => false,
+        });
+        if already_present {
+            return;
+        }
+        let Some(RelationOverlay::Present(child_relation)) = self.local.relations.get(child) else {
+            return;
+        };
+        let generation = child_relation.generation;
+        let validated = self
+            .local
+            .constraints
+            .get(&(parent_edge.dependent.clone(), parent_name.clone()))
+            .is_none_or(|constraint| constraint.validated);
+        let constraint_name = self.partition_clone_constraint_name(child, parent_name);
+        self.snapshot_constraint(child, &constraint_name);
+        self.local.constraints.insert(
+            (child.clone(), constraint_name.clone()),
+            ConstraintState {
+                table_id: child.clone(),
+                name: constraint_name.clone(),
+                kind: ConstraintKind::ForeignKey,
+                validated,
+                definition: None,
+                backing_index: None,
+            },
+        );
+        if !validated {
+            self.snapshot_pending_validation();
+            self.local
+                .pending_validation
+                .insert((child.clone(), constraint_name.clone()));
+        }
+        self.snapshot_graph();
+        self.local.graph.add_edge(DependencyEdge::new(
+            child.clone(),
+            parent_edge.referenced.clone(),
+            DependencyKind::ForeignKey {
+                constraint_name: Some(constraint_name),
+                from_columns: from_columns.clone(),
+                to_columns: to_columns.clone(),
+                operator_evidence: operator_evidence.clone(),
+                from_generation: generation,
+            },
+        ));
+    }
+
+    fn partition_clone_constraint_name(&self, child: &ObjectId, base: &str) -> String {
+        let taken = |candidate: &str| {
+            self.local
+                .constraints
+                .contains_key(&(child.clone(), candidate.to_string()))
+        };
+        if !taken(base) {
+            return base.to_string();
+        }
+        (1..)
+            .map(|suffix| {
+                let suffix = format!("_{suffix}");
+                let mut end = 63usize.saturating_sub(suffix.len()).min(base.len());
+                while !base.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}{suffix}", &base[..end])
+            })
+            .find(|candidate| !taken(candidate))
+            .expect("constraint suffix space is unbounded")
+    }
 }

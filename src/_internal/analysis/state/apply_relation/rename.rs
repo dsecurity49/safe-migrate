@@ -1,4 +1,6 @@
 use super::*;
+use crate::_internal::analysis::graph::GraphRenamePlan;
+use crate::_internal::analysis::transaction::BaselineSet;
 
 impl AnalysisState {
     /// Return the key definitions that can be proved for a relation.
@@ -140,7 +142,7 @@ impl AnalysisState {
         }
 
         let schema_move = rename.old_id.schema != rename.new_id.schema;
-        let associated_sequence_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
+        let mut associated_sequence_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
             self.local
                 .sequences
                 .iter()
@@ -163,7 +165,8 @@ impl AnalysisState {
         } else {
             Vec::new()
         };
-        let associated_index_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
+        associated_sequence_moves.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut associated_index_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
             self.local
                 .graph
                 .edges()
@@ -182,6 +185,7 @@ impl AnalysisState {
         } else {
             Vec::new()
         };
+        associated_index_moves.sort_by(|left, right| left.0.cmp(&right.0));
         for (old_id, new_id) in associated_sequence_moves
             .iter()
             .chain(&associated_index_moves)
@@ -194,7 +198,7 @@ impl AnalysisState {
             }
         }
 
-        let publication_scope_updates: Vec<(String, Vec<usize>)> = self
+        let mut publication_scope_updates: Vec<(String, Vec<usize>)> = self
             .local
             .publications
             .iter()
@@ -226,17 +230,39 @@ impl AnalysisState {
                 (!indexes.is_empty()).then(|| (publication_name.clone(), indexes))
             })
             .collect();
+        publication_scope_updates.sort_by(|left, right| left.0.cmp(&right.0));
 
-        self.snapshot_namespace();
-        if let Some(RelationOverlay::Present(mut state)) =
-            self.local.relations.remove(&rename.old_id)
+        let pending_validation_moves = self
+            .local
+            .pending_validation
+            .iter()
+            .any(|(table, _)| table == &rename.old_id);
+        let baseline_foreign_keys_move = self
+            .baseline_foreign_keys
+            .iter()
+            .any(|(table, _)| table == &rename.old_id);
+
+        // A rename is a localized key move, not a namespace-wide rewrite. The
+        // length marker covers appended rename edges; the plan records only
+        // the edges it actually rewrites.
+        self.snapshot_graph();
+        if renames_relation {
+            self.snapshot_relation_rename(&rename.old_id, &rename.new_id);
+            if pending_validation_moves {
+                self.snapshot_pending_validation();
+            }
+        }
+        if renames_relation
+            && let Some(RelationOverlay::Present(mut state)) =
+                self.local.relations.remove(&rename.old_id)
         {
             state.id = rename.new_id.clone();
             self.local
                 .relations
                 .insert(rename.new_id.clone(), RelationOverlay::Present(state));
         }
-        let owned_sequence_ids: Vec<ObjectId> = self
+        let mut rename_plan = GraphRenamePlan::default();
+        let mut owned_sequence_ids: Vec<ObjectId> = self
             .local
             .sequences
             .iter()
@@ -252,6 +278,7 @@ impl AnalysisState {
                 _ => None,
             })
             .collect();
+        owned_sequence_ids.sort();
         for sequence_id in owned_sequence_ids {
             self.snapshot_sequence(&sequence_id);
             if let Some(SequenceOverlay::Present(sequence)) =
@@ -276,9 +303,9 @@ impl AnalysisState {
             self.local
                 .sequences
                 .insert(new_sequence_id.clone(), SequenceOverlay::Present(sequence));
-            self.local
-                .graph
-                .propagate_sequence_rename(old_sequence_id, new_sequence_id);
+            rename_plan
+                .sequences
+                .insert(old_sequence_id.clone(), new_sequence_id.clone());
             self.local.graph.add_edge(DependencyEdge::new(
                 old_sequence_id.clone(),
                 new_sequence_id.clone(),
@@ -286,9 +313,9 @@ impl AnalysisState {
             ));
         }
         for (old_index_id, new_index_id) in &associated_index_moves {
-            self.local
-                .graph
-                .propagate_index_rename(old_index_id, new_index_id);
+            rename_plan
+                .indexes
+                .insert(old_index_id.clone(), new_index_id.clone());
             self.rename_index_catalog_references(old_index_id, new_index_id);
             self.local.graph.add_edge(DependencyEdge::new(
                 old_index_id.clone(),
@@ -296,51 +323,66 @@ impl AnalysisState {
                 DependencyKind::RenameTo,
             ));
         }
-        let triggers_to_move: Vec<(ObjectId, crate::_internal::model::trigger::TriggerState)> =
-            self.local
+        let mut triggers_to_move: Vec<(ObjectId, String)> = self
+            .local
+            .triggers
+            .iter()
+            .filter_map(|(id, overlay)| match overlay {
+                TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
+                    Some((id.clone(), trigger.name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        triggers_to_move.sort_by(|left, right| left.0.cmp(&right.0));
+        for (old_trigger_id, trigger_name) in triggers_to_move {
+            let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger_name);
+            self.snapshot_trigger(&old_trigger_id);
+            self.snapshot_trigger(&new_trigger_id);
+            if let Some(TriggerOverlay::Present(mut trigger)) =
+                self.local.triggers.get(&old_trigger_id).cloned()
+            {
+                self.local.triggers.remove(&old_trigger_id);
+                trigger.id = new_trigger_id.clone();
+                trigger.table_id = rename.new_id.clone();
+                self.local
+                    .triggers
+                    .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
+            }
+            rename_plan
                 .triggers
-                .iter()
-                .filter_map(|(id, overlay)| match overlay {
-                    TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
-                        Some((id.clone(), trigger.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-        for (old_trigger_id, mut trigger) in triggers_to_move {
-            let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
-            self.local.triggers.remove(&old_trigger_id);
-            trigger.id = new_trigger_id.clone();
-            trigger.table_id = rename.new_id.clone();
-            self.local
-                .triggers
-                .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
-            self.local
-                .graph
-                .propagate_trigger_rename(&old_trigger_id, &new_trigger_id);
+                .insert(old_trigger_id.clone(), new_trigger_id.clone());
             self.local.graph.add_edge(DependencyEdge::new(
                 old_trigger_id,
                 new_trigger_id,
                 DependencyKind::RenameTo,
             ));
         }
-        let constraints_to_move: Vec<(String, ConstraintState)> = self
+        let mut constraints_to_move: Vec<String> = self
             .local
             .constraints
-            .iter()
-            .filter(|((table_id, _), _)| table_id == &rename.old_id)
-            .map(|((_, name), constraint)| (name.clone(), constraint.clone()))
+            .keys()
+            .filter(|(table_id, _)| table_id == &rename.old_id)
+            .map(|(_, name)| name.clone())
             .collect();
-        for (name, mut constraint) in constraints_to_move {
+        constraints_to_move.sort();
+        for name in constraints_to_move {
             self.snapshot_constraint(&rename.old_id, &name);
             self.snapshot_constraint(&rename.new_id, &name);
-            self.local
+            if let Some(mut constraint) = self
+                .local
                 .constraints
-                .remove(&(rename.old_id.clone(), name.clone()));
-            constraint.table_id = rename.new_id.clone();
-            self.local
-                .constraints
-                .insert((rename.new_id.clone(), name), constraint);
+                .get(&(rename.old_id.clone(), name.clone()))
+                .cloned()
+            {
+                self.local
+                    .constraints
+                    .remove(&(rename.old_id.clone(), name.clone()));
+                constraint.table_id = rename.new_id.clone();
+                self.local
+                    .constraints
+                    .insert((rename.new_id.clone(), name), constraint);
+            }
         }
 
         for (publication_name, object_indexes) in publication_scope_updates {
@@ -374,41 +416,8 @@ impl AnalysisState {
                 }
             }
         }
-        self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
-            .into_iter()
-            .map(|(table, name)| {
-                if table == rename.old_id {
-                    (rename.new_id.clone(), name)
-                } else {
-                    (table, name)
-                }
-            })
-            .collect();
-        self.local.graph.add_edge(DependencyEdge::new(
-            rename.old_id.clone(),
-            rename.new_id.clone(),
-            DependencyKind::RenameTo,
-        ));
-        if renames_relation {
-            self.local
-                .graph
-                .propagate_relation_rename(&rename.old_id, &rename.new_id);
-        }
-        if renames_index {
-            self.local
-                .graph
-                .propagate_index_rename(&rename.old_id, &rename.new_id);
-            self.rename_index_catalog_references(&rename.old_id, &rename.new_id);
-        }
-
-        if renames_relation {
-            if self.baseline_relations.remove(&rename.old_id) {
-                self.baseline_relations.insert(rename.new_id.clone());
-            }
-            if self.baseline_fk_dependencies.remove(&rename.old_id) {
-                self.baseline_fk_dependencies.insert(rename.new_id.clone());
-            }
-            self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
+        if pending_validation_moves {
+            self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
                 .into_iter()
                 .map(|(table, name)| {
                     if table == rename.old_id {
@@ -419,15 +428,75 @@ impl AnalysisState {
                 })
                 .collect();
         }
-        if renames_index && self.baseline_indexes.remove(&rename.old_id) {
-            self.baseline_indexes.insert(rename.new_id.clone());
+        self.local.graph.add_edge(DependencyEdge::new(
+            rename.old_id.clone(),
+            rename.new_id.clone(),
+            DependencyKind::RenameTo,
+        ));
+        if renames_relation {
+            rename_plan
+                .relations
+                .insert(rename.old_id.clone(), rename.new_id.clone());
+        }
+        if renames_index {
+            rename_plan
+                .indexes
+                .insert(rename.old_id.clone(), rename.new_id.clone());
+            self.rename_index_catalog_references(&rename.old_id, &rename.new_id);
+        }
+        if let Some(delta) = self.local.graph.apply_rename_plan_recorded(&rename_plan) {
+            self.record_graph_delta(delta);
+        }
+
+        if renames_relation {
+            self.snapshot_baseline_set_rename(
+                BaselineSet::Relations,
+                &rename.old_id,
+                &rename.new_id,
+            );
+            if self.baseline_relations.remove(&rename.old_id) {
+                self.baseline_relations.insert(rename.new_id.clone());
+            }
+            self.snapshot_baseline_set_rename(
+                BaselineSet::FkDependencies,
+                &rename.old_id,
+                &rename.new_id,
+            );
+            if self.baseline_fk_dependencies.remove(&rename.old_id) {
+                self.baseline_fk_dependencies.insert(rename.new_id.clone());
+            }
+            if baseline_foreign_keys_move {
+                self.snapshot_baseline_foreign_keys();
+                self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
+                    .into_iter()
+                    .map(|(table, name)| {
+                        if table == rename.old_id {
+                            (rename.new_id.clone(), name)
+                        } else {
+                            (table, name)
+                        }
+                    })
+                    .collect();
+            }
+        }
+        if renames_index {
+            self.snapshot_baseline_set_rename(BaselineSet::Indexes, &rename.old_id, &rename.new_id);
+            if self.baseline_indexes.remove(&rename.old_id) {
+                self.baseline_indexes.insert(rename.new_id.clone());
+            }
         }
         for (old_sequence_id, new_sequence_id) in &associated_sequence_moves {
+            self.snapshot_baseline_set_rename(
+                BaselineSet::Sequences,
+                old_sequence_id,
+                new_sequence_id,
+            );
             if self.baseline_sequences.remove(old_sequence_id) {
                 self.baseline_sequences.insert(new_sequence_id.clone());
             }
         }
         for (old_index_id, new_index_id) in &associated_index_moves {
+            self.snapshot_baseline_set_rename(BaselineSet::Indexes, old_index_id, new_index_id);
             if self.baseline_indexes.remove(old_index_id) {
                 self.baseline_indexes.insert(new_index_id.clone());
             }
@@ -436,51 +505,91 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
-    // The caller takes a namespace snapshot before changing these coupled identities.
+    // The caller snapshots the graph before changing these coupled identities.
     pub(super) fn rename_index_catalog_references(&mut self, old: &ObjectId, new: &ObjectId) {
-        let constraints = self
+        let mut constraint_keys = self
             .local
             .constraints
-            .values()
-            .filter(|constraint| constraint.backing_index.as_ref() == Some(old))
-            .cloned()
+            .iter()
+            .filter(|(_, constraint)| constraint.backing_index.as_ref() == Some(old))
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        for mut constraint in constraints {
-            let old_name = constraint.name.clone();
-            let owns_index = matches!(
-                constraint.kind,
-                ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
-            );
+        constraint_keys.sort();
+
+        for (table_id, old_name) in constraint_keys {
+            let mut new_name = old_name.clone();
+            let owns_index = self
+                .local
+                .constraints
+                .get(&(table_id.clone(), old_name.clone()))
+                .is_some_and(|constraint| {
+                    matches!(
+                        constraint.kind,
+                        ConstraintKind::PrimaryKey
+                            | ConstraintKind::Unique
+                            | ConstraintKind::Exclusion
+                    )
+                });
             if owns_index && old.name != new.name {
-                constraint.name = new.name.clone();
+                new_name = new.name.clone();
+            }
+            self.snapshot_constraint(&table_id, &old_name);
+            if new_name != old_name {
+                self.snapshot_constraint(&table_id, &new_name);
+            }
+            let Some(mut constraint) = self
+                .local
+                .constraints
+                .get(&(table_id.clone(), old_name.clone()))
+                .cloned()
+            else {
+                continue;
+            };
+            self.local
+                .constraints
+                .remove(&(table_id.clone(), old_name.clone()));
+            constraint.name = new_name.clone();
+            constraint.backing_index = Some(new.clone());
+            if old_name != new_name
+                && let Some(delta) = self
+                    .local
+                    .graph
+                    .rename_constraint_recorded(&table_id, &old_name, &new_name)
+            {
+                self.record_graph_delta(delta);
             }
             self.local
                 .constraints
-                .remove(&(constraint.table_id.clone(), old_name.clone()));
-            constraint.backing_index = Some(new.clone());
-            if old_name != constraint.name {
-                self.local.graph.rename_constraint(
-                    &constraint.table_id,
-                    &old_name,
-                    &constraint.name,
-                );
-            }
-            self.local.constraints.insert(
-                (constraint.table_id.clone(), constraint.name.clone()),
-                constraint,
-            );
+                .insert((table_id, new_name), constraint);
         }
         if old.name == new.name {
             return;
         }
         let old_replica = format!("USING INDEX {}", old.name);
-        for (id, overlay) in &mut self.local.relations {
-            let RelationOverlay::Present(relation) = overlay else {
+        let mut affected_relations: Vec<ObjectId> = self
+            .local
+            .relations
+            .iter()
+            .filter_map(|(id, overlay)| {
+                let RelationOverlay::Present(relation) = overlay else {
+                    return None;
+                };
+                if id.schema != old.schema {
+                    return None;
+                }
+                (relation.cluster_index.as_deref() == Some(old.name.as_str())
+                    || relation.replica_identity.as_deref() == Some(old_replica.as_str()))
+                .then_some(id.clone())
+            })
+            .collect();
+        affected_relations.sort();
+        for id in &affected_relations {
+            self.snapshot_relation(id);
+        }
+        for id in affected_relations {
+            let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(&id) else {
                 continue;
             };
-            if id.schema != old.schema {
-                continue;
-            }
             if relation.cluster_index.as_deref() == Some(old.name.as_str()) {
                 relation.cluster_index = Some(new.name.clone());
             }
@@ -541,7 +650,7 @@ impl AnalysisState {
     /// together with the table. Keep this dependent metadata synchronized for
     /// both ALTER TABLE OWNER and the direct relation-owner mutation path.
     pub(super) fn transfer_owned_sequence_owners(&mut self, table: &ObjectId, owner: &ObjectId) {
-        let owned_sequence_ids: Vec<ObjectId> = self
+        let mut owned_sequence_ids: Vec<ObjectId> = self
             .local
             .sequences
             .iter()
@@ -556,6 +665,7 @@ impl AnalysisState {
                     .then_some(sequence_id.clone())
             })
             .collect();
+        owned_sequence_ids.sort();
         for sequence_id in owned_sequence_ids {
             self.snapshot_sequence(&sequence_id);
             if let Some(SequenceOverlay::Present(sequence)) =

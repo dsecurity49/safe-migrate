@@ -19,7 +19,7 @@ use crate::_internal::model::index::{
     statement_index_keys,
 };
 use crate::_internal::model::types::{TypeKind, TypeOverlay};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The outcome of comparing two index shapes.
 #[derive(PartialEq, Eq)]
@@ -265,29 +265,12 @@ impl AnalysisState {
         &self,
         id: &ObjectId,
     ) -> Option<&crate::_internal::model::index::IndexDefinition> {
-        self.local
-            .graph
-            .edges()
-            .iter()
-            .find(|edge| {
-                edge.dependent == *id && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-            })
-            .and_then(|edge| match &edge.kind {
-                DependencyKind::IndexOnRelation { definition, .. } => Some(definition),
-                _ => None,
-            })
+        self.local.graph.index_definition_of(id)
     }
 
     /// The parent index `child` is currently attached to, if any.
     pub(super) fn index_parent_of(&self, child: &ObjectId) -> Option<&ObjectId> {
-        self.local
-            .graph
-            .edges()
-            .iter()
-            .find(|edge| {
-                edge.dependent == *child && matches!(edge.kind, DependencyKind::IndexPartitionOf)
-            })
-            .map(|edge| &edge.referenced)
+        self.local.graph.index_parent_of(child)
     }
 
     /// The table an index is defined on.
@@ -325,8 +308,8 @@ impl AnalysisState {
         child: &ObjectId,
     ) -> Option<AttachRefusal> {
         let resolved_parent = self.local.graph.resolve_rename(parent);
-        let attached_here = self
-            .index_parent_of(child)
+        let current_parent = self.index_parent_of(child);
+        let attached_here = current_parent
             .is_some_and(|current| self.local.graph.resolve_rename(current) == resolved_parent);
         // Re-attaching to the same parent is not an error; it re-triggers the
         // parent's validation.
@@ -337,20 +320,21 @@ impl AnalysisState {
         // index attached to this parent, whichever index that is.
         if let Some(child_table) = self.index_table_of(child) {
             let child_table = self.local.graph.resolve_rename(child_table);
-            let duplicate = self.local.graph.edges().iter().any(|edge| {
-                matches!(edge.kind, DependencyKind::IndexPartitionOf)
-                    && self.local.graph.resolve_rename(&edge.referenced) == resolved_parent
-                    && self.local.graph.resolve_rename(&edge.dependent)
-                        != self.local.graph.resolve_rename(child)
-                    && self
-                        .index_table_of(&edge.dependent)
-                        .is_some_and(|owner| self.local.graph.resolve_rename(owner) == child_table)
-            });
+            let resolved_child = self.local.graph.resolve_rename(child);
+            let duplicate = self
+                .index_partitions_of(parent)
+                .into_iter()
+                .any(|existing| {
+                    self.local.graph.resolve_rename(&existing) != resolved_child
+                        && self.index_table_of(&existing).is_some_and(|owner| {
+                            self.local.graph.resolve_rename(owner) == child_table
+                        })
+                });
             if duplicate {
                 return Some(AttachRefusal::DuplicateAttachment);
             }
         }
-        if self.index_parent_of(child).is_some() {
+        if current_parent.is_some() {
             return Some(AttachRefusal::AttachedElsewhere);
         }
         let (Some(parent_table), Some(child_table)) =
@@ -468,16 +452,17 @@ impl AnalysisState {
             return true;
         }
         let attached = self.index_partitions_of(index);
-        partitions.iter().all(|partition| {
-            attached.iter().any(|child| {
-                self.index_table_of(child).is_some_and(|owner| {
-                    self.local.graph.resolve_rename(owner)
-                        == self.local.graph.resolve_rename(partition)
-                }) && self
-                    .index_definition_of(child)
-                    .is_some_and(|definition| definition.valid)
-            })
-        })
+        let mut covered_partitions: HashSet<&ObjectId> = HashSet::with_capacity(attached.len());
+        for child in &attached {
+            if let Some(owner) = self.index_table_of(child)
+                && self.index_definition_of(child).is_some_and(|def| def.valid)
+            {
+                covered_partitions.insert(self.local.graph.resolve_rename(owner));
+            }
+        }
+        partitions
+            .iter()
+            .all(|p| covered_partitions.contains(self.local.graph.resolve_rename(p)))
     }
 
     /// Record `child` as a partition of `parent`.
@@ -531,6 +516,30 @@ impl AnalysisState {
         template: &DependencyKind,
         rule: ChildReuseRule,
     ) -> (ObjectId, bool) {
+        let backing: HashMap<ObjectId, ConstraintKind> = self
+            .local
+            .constraints
+            .values()
+            .filter_map(|constraint| {
+                let index = constraint.backing_index.as_ref()?;
+                matches!(
+                    constraint.kind,
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
+                )
+                .then_some((index.clone(), constraint.kind))
+            })
+            .collect();
+        self.ensure_partition_index_child_with_context(parent, table, template, rule, &backing)
+    }
+
+    fn ensure_partition_index_child_with_context(
+        &mut self,
+        parent: &ObjectId,
+        table: &ObjectId,
+        template: &DependencyKind,
+        rule: ChildReuseRule,
+        backing: &HashMap<ObjectId, ConstraintKind>,
+    ) -> (ObjectId, bool) {
         let DependencyKind::IndexOnRelation {
             definition: template_definition,
             ..
@@ -539,38 +548,40 @@ impl AnalysisState {
             unreachable!("partition index templates are index edges")
         };
         let resolved_table = self.local.graph.resolve_rename(table).clone();
-        let parent_backing = self.constraint_backing(parent);
-        let reused = self
-            .local
-            .graph
-            .edges()
-            .iter()
-            .filter(|edge| {
-                matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                    && self.index_parent_of(&edge.dependent).is_none()
-                    && self.index_table_of(&edge.dependent).is_some_and(|owner| {
-                        self.local.graph.resolve_rename(owner) == &resolved_table
-                    })
-            })
-            .find(|edge| {
-                let DependencyKind::IndexOnRelation { definition, .. } = &edge.kind else {
-                    return false;
-                };
-                // A synthetic constraint marker settles nothing, so it never
-                // reuses or is reused through the shape comparison.
-                if template_definition.attach_equivalence(definition) != IndexEquivalence::Identical
-                {
-                    return false;
-                }
-                match (parent_backing, self.constraint_backing(&edge.dependent)) {
-                    (Some(_), None) => false,
-                    (Some(parent_kind), Some(child_kind)) => {
-                        rule == ChildReuseRule::Creation || parent_kind == child_kind
+        let reused = {
+            let parent_backing = backing.get(parent).copied();
+            self.local
+                .graph
+                .edges()
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                        && self.index_parent_of(&edge.dependent).is_none()
+                        && self.index_table_of(&edge.dependent).is_some_and(|owner| {
+                            self.local.graph.resolve_rename(owner) == &resolved_table
+                        })
+                })
+                .find(|edge| {
+                    let DependencyKind::IndexOnRelation { definition, .. } = &edge.kind else {
+                        return false;
+                    };
+                    // A synthetic constraint marker settles nothing, so it never
+                    // reuses or is reused through the shape comparison.
+                    if template_definition.attach_equivalence(definition)
+                        != IndexEquivalence::Identical
+                    {
+                        return false;
                     }
-                    (None, _) => true,
-                }
-            })
-            .map(|edge| edge.dependent.clone());
+                    match (parent_backing, backing.get(&edge.dependent).copied()) {
+                        (Some(_), None) => false,
+                        (Some(parent_kind), Some(child_kind)) => {
+                            rule == ChildReuseRule::Creation || parent_kind == child_kind
+                        }
+                        (None, _) => true,
+                    }
+                })
+                .map(|edge| edge.dependent.clone())
+        };
         if let Some(existing) = reused {
             self.record_index_partition(parent, &existing);
             return (
@@ -609,8 +620,9 @@ impl AnalysisState {
             .cloned()
             .collect();
         for partition in partitions {
-            let (_, child_valid) =
-                self.ensure_partition_index_child(&id, &partition, template, rule);
+            let (_, child_valid) = self.ensure_partition_index_child_with_context(
+                &id, &partition, template, rule, backing,
+            );
             valid &= child_valid;
         }
         if !valid {
@@ -678,16 +690,6 @@ impl AnalysisState {
 
     /// The child indexes that would fall if `parent` were dropped.
     pub(super) fn index_partitions_of(&self, parent: &ObjectId) -> Vec<ObjectId> {
-        self.local
-            .graph
-            .edges()
-            .iter()
-            .filter(|edge| {
-                matches!(edge.kind, DependencyKind::IndexPartitionOf)
-                    && self.local.graph.resolve_rename(&edge.referenced)
-                        == self.local.graph.resolve_rename(parent)
-            })
-            .map(|edge| edge.dependent.clone())
-            .collect()
+        self.local.graph.index_partitions_of(parent)
     }
 }

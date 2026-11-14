@@ -1,0 +1,863 @@
+use super::pre_state_footprint::for_mutation;
+use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
+use crate::_internal::analysis::mutations::{
+    AlterTable, AlterTableActionMutation, AlterTypeActionMutation, AlterTypeMutation,
+    DropFunctionMutation, DropIndex, DropTable, Mutation, Rename,
+};
+use crate::_internal::analysis::state::{
+    AnalysisState, CascadeResult, PreStateReadSet, ReadScope, RelationOverlay,
+};
+use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::db::cache::DbCache;
+use crate::_internal::engine::engine::SafeMigrateEngine;
+use crate::_internal::model::column::Column;
+use crate::_internal::model::function::{FunctionOverlay, FunctionState};
+use crate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
+use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use crate::_internal::model::types::{TypeKind, TypeOverlay};
+use crate::_internal::report::violations::Violation;
+use crate::api::config::Config;
+use std::collections::HashSet;
+
+fn relation_id(name: &str) -> ObjectId {
+    ObjectId::new("public", name)
+}
+
+fn cache_with_untyped_column(schema: &str, table: &str, column: &str) -> DbCache {
+    let mut cache = crate::common::synced_cache();
+    cache.metadata.schemas = Some(vec![schema.to_string()]);
+    let id = ObjectId::new(schema, table);
+    let mut relation = RelationState::new(
+        id.clone(),
+        ObjectId::new(schema, "postgres"),
+        0,
+        None,
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    relation.columns.push(Column::migration_created(
+        column.to_string(),
+        None,
+        false,
+        None,
+    ));
+    cache.insert_baseline(id, relation);
+    cache
+}
+
+fn insert_relation(state: &mut AnalysisState, name: &str, rows: u64) {
+    let id = relation_id(name);
+    state.local.relations.insert(
+        id.clone(),
+        RelationOverlay::Present(RelationState::new(
+            id,
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(rows),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        )),
+    );
+}
+
+fn selected_ids<K>(scope: &ReadScope<K>) -> &HashSet<K> {
+    match scope {
+        ReadScope::Selected(ids) => ids,
+        _ => panic!("expected selected scope"),
+    }
+}
+
+fn assert_no_reads(reads: &PreStateReadSet) {
+    for (family, is_none) in [
+        ("relations", matches!(reads.relations, ReadScope::None)),
+        ("functions", matches!(reads.functions, ReadScope::None)),
+        ("roles", matches!(reads.roles, ReadScope::None)),
+        (
+            "publications",
+            matches!(reads.publications, ReadScope::None),
+        ),
+        (
+            "subscriptions",
+            matches!(reads.subscriptions, ReadScope::None),
+        ),
+        ("sequences", matches!(reads.sequences, ReadScope::None)),
+        ("extensions", matches!(reads.extensions, ReadScope::None)),
+        ("types", matches!(reads.types, ReadScope::None)),
+        ("indexes", matches!(reads.indexes, ReadScope::None)),
+        (
+            "baseline_foreign_keys",
+            matches!(reads.baseline_foreign_keys, ReadScope::None),
+        ),
+    ] {
+        assert!(is_none, "{family} should not be captured");
+    }
+}
+
+#[test]
+fn mutations_without_pre_state_readers_capture_nothing() {
+    let state = AnalysisState::new(DbCache::new());
+    let reads = for_mutation(&state, &Mutation::BeginTransaction, None);
+    assert_no_reads(&reads);
+}
+
+#[test]
+fn alter_table_reads_only_its_target_and_foreign_key_parent() {
+    let state = AnalysisState::new(DbCache::new());
+    let target = relation_id("orders");
+    let parent = relation_id("customers");
+    let mutation = Mutation::AlterTable(AlterTable {
+        id: target.clone(),
+        only: false,
+        if_exists: false,
+        action: AlterTableActionMutation::AddForeignKey {
+            constraint_name: Some("orders_customer_fk".to_string()),
+            to_table: parent.clone(),
+            from_columns: vec!["customer_id".to_string()],
+            to_columns: vec!["id".to_string()],
+            not_valid: false,
+        },
+    });
+
+    let reads = for_mutation(&state, &mutation, None);
+
+    let relations = selected_ids(&reads.relations);
+    assert_eq!(relations.len(), 2);
+    assert!(relations.contains(&target));
+    assert!(relations.contains(&parent));
+    assert!(matches!(reads.types, ReadScope::None));
+    assert!(matches!(reads.indexes, ReadScope::None));
+}
+
+#[test]
+fn composite_type_changes_require_the_whole_relation_and_type_family() {
+    let state = AnalysisState::new(DbCache::new());
+    for action in [
+        AlterTypeActionMutation::DropAttribute {
+            name: "street".to_string(),
+            if_exists: false,
+            cascade: false,
+        },
+        AlterTypeActionMutation::AlterAttributeType {
+            name: "street".to_string(),
+            data_type: "text".to_string(),
+            collation: None,
+            cascade: false,
+        },
+    ] {
+        let reads = for_mutation(
+            &state,
+            &Mutation::AlterType(AlterTypeMutation {
+                id: ObjectId::new("public", "address"),
+                action,
+            }),
+            None,
+        );
+        assert!(matches!(reads.relations, ReadScope::All));
+        assert!(matches!(reads.types, ReadScope::All));
+    }
+
+    let reads = for_mutation(
+        &state,
+        &Mutation::AlterType(AlterTypeMutation {
+            id: ObjectId::new("public", "mood"),
+            action: AlterTypeActionMutation::AddValue {
+                new_value: "happy".to_string(),
+                neighbor: None,
+                before: false,
+            },
+        }),
+        None,
+    );
+    assert!(matches!(reads.relations, ReadScope::None));
+    assert_eq!(
+        selected_ids(&reads.types),
+        &HashSet::from([ObjectId::new("public", "mood")])
+    );
+}
+
+#[test]
+fn drop_index_reads_the_index_attachment_and_its_relation() {
+    let mut state = AnalysisState::new(DbCache::new());
+    let table = relation_id("users");
+    let index = relation_id("users_idx");
+    insert_relation(&mut state, "users", 100);
+    state.local.graph.add_edge(DependencyEdge::new(
+        index.clone(),
+        table.clone(),
+        DependencyKind::IndexOnRelation {
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
+            dependency_columns: vec!["id".into()],
+            dependency_columns_known: true,
+            is_concurrent: false,
+            is_immediate: true,
+            eligibility_known: true,
+        },
+    ));
+
+    let reads = for_mutation(
+        &state,
+        &Mutation::DropIndex(DropIndex {
+            ids: vec![index.clone()],
+            if_exists: false,
+            concurrently: false,
+            cascade: false,
+        }),
+        None,
+    );
+
+    assert_eq!(selected_ids(&reads.indexes), &HashSet::from([index]));
+    assert_eq!(selected_ids(&reads.relations), &HashSet::from([table]));
+}
+
+#[test]
+fn drop_table_cascade_reads_only_the_constraints_in_the_closure() {
+    let state = AnalysisState::new(DbCache::new());
+    let table = relation_id("orders");
+    let constraint = (relation_id("line_items"), "line_items_order_fk".to_string());
+    let cascade = CascadeResult {
+        dropped_relations: HashSet::from([table.clone()]),
+        dropped_indexes: HashSet::new(),
+        dropped_constraints: HashSet::from([constraint.clone()]),
+    };
+
+    let reads = for_mutation(
+        &state,
+        &Mutation::DropTable(DropTable {
+            ids: vec![table.clone()],
+            if_exists: false,
+            cascade: true,
+        }),
+        Some(&cascade),
+    );
+
+    assert_eq!(selected_ids(&reads.relations), &HashSet::from([table]));
+    assert_eq!(
+        selected_ids(&reads.baseline_foreign_keys),
+        &HashSet::from([constraint])
+    );
+}
+
+#[test]
+fn dropping_routines_keeps_the_whole_function_family() {
+    let state = AnalysisState::new(DbCache::new());
+    let reads = for_mutation(
+        &state,
+        &Mutation::DropFunction(DropFunctionMutation {
+            signatures: Vec::new(),
+            if_exists: false,
+            cascade: false,
+        }),
+        None,
+    );
+    assert!(matches!(reads.functions, ReadScope::All));
+}
+
+#[test]
+fn rename_checks_every_keyed_family_for_the_old_identity() {
+    let state = AnalysisState::new(DbCache::new());
+    let old = relation_id("legacy_orders");
+    let reads = for_mutation(
+        &state,
+        &Mutation::Rename(Rename {
+            old_id: old.clone(),
+            new_id: relation_id("orders"),
+        }),
+        None,
+    );
+
+    assert_eq!(
+        selected_ids(&reads.relations),
+        &HashSet::from([old.clone()])
+    );
+    assert_eq!(selected_ids(&reads.types), &HashSet::from([old.clone()]));
+    assert_eq!(
+        selected_ids(&reads.sequences),
+        &HashSet::from([old.clone()])
+    );
+    assert_eq!(selected_ids(&reads.indexes), &HashSet::from([old.clone()]));
+}
+
+#[test]
+fn alter_domain_reads_the_domain_and_every_relation_using_it() {
+    let mut state = AnalysisState::new(DbCache::new());
+    let domain = ObjectId::new("public", "positive_int");
+    let table = relation_id("scores");
+    insert_relation(&mut state, "scores", 100);
+    let Some(RelationOverlay::Present(relation)) = state.local.relations.get_mut(&table) else {
+        panic!("scores must exist");
+    };
+    let mut column =
+        Column::migration_created("score".into(), Some("positive_int".into()), true, None);
+    column.type_id = Some(domain.clone());
+    relation.columns.push(column);
+
+    let reads = for_mutation(
+        &state,
+        &Mutation::AlterDomain(crate::_internal::analysis::mutations::AlterDomainMutation {
+            id: domain.clone(),
+            action: None,
+        }),
+        None,
+    );
+
+    assert_eq!(selected_ids(&reads.types), &HashSet::from([domain]));
+    assert_eq!(selected_ids(&reads.relations), &HashSet::from([table]));
+}
+
+#[test]
+fn selective_capture_matches_full_capture_for_every_pre_state_reader() {
+    let mut selective_state = AnalysisState::new(differential_cache());
+    let mut full_state = AnalysisState::new(differential_cache());
+    let selective = SafeMigrateEngine::new(Config::default());
+    let full = SafeMigrateEngine::new(Config::default()).with_full_pre_state_for_tests();
+    let mut observed_rules = HashSet::new();
+
+    for statement in differential_chain() {
+        let selective_violations = selective
+            .analyze(statement, &mut selective_state)
+            .unwrap_or_else(|errors| panic!("selective failed on {statement}: {errors:?}"));
+        let full_violations = full
+            .analyze(statement, &mut full_state)
+            .unwrap_or_else(|errors| panic!("full failed on {statement}: {errors:?}"));
+        assert_eq!(
+            comparable(&selective_violations),
+            comparable(&full_violations),
+            "selective pre-state diverged from full pre-state after: {statement}"
+        );
+        observed_rules.extend(
+            full_violations
+                .iter()
+                .map(|violation| violation.rule_id.to_string()),
+        );
+    }
+
+    assert!(
+        observed_rules.contains("type-change-rewrite"),
+        "differential chain did not exercise type-change pre-state reads: {observed_rules:?}"
+    );
+    assert!(
+        observed_rules.contains("require-concurrent-drop-index"),
+        "differential chain did not exercise index pre-state reads: {observed_rules:?}"
+    );
+}
+
+#[test]
+fn failed_statement_rolls_back_not_evaluated_entries() {
+    // A scoped baseline can omit a column's declared type, so the identity
+    // action is unresolved while the later missing-column action conflicts.
+    let cache = cache_with_untyped_column("app", "known", "id");
+    let mut journal_state = AnalysisState::new(cache.clone());
+    let mut full_state = AnalysisState::new(cache.clone());
+    let journal = SafeMigrateEngine::new(Config::default());
+    let full = SafeMigrateEngine::new(Config::default()).with_full_statement_checkpoint_for_tests();
+
+    // Establish that the first action really records a declined evaluation.
+    let mut probe = AnalysisState::new(cache);
+    journal
+        .analyze(
+            "ALTER TABLE app.known ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;",
+            &mut probe,
+        )
+        .unwrap();
+    assert!(
+        !probe.not_evaluated().is_empty(),
+        "the probe action must record a declined evaluation"
+    );
+
+    let statement = "ALTER TABLE app.known ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY, \
+         DROP COLUMN missing;";
+    let journal_violations = journal.analyze(statement, &mut journal_state).unwrap();
+    let full_violations = full.analyze(statement, &mut full_state).unwrap();
+
+    assert_eq!(
+        comparable(&journal_violations),
+        comparable(&full_violations),
+        "journal findings diverged after the failed compound statement"
+    );
+    assert_eq!(
+        journal_state, full_state,
+        "journal state diverged after the failed compound statement"
+    );
+    assert!(
+        journal_state.not_evaluated().is_empty(),
+        "a rolled-back statement must not retain declined evaluations"
+    );
+}
+
+#[test]
+fn statement_undo_journal_matches_full_checkpoint_after_every_statement() {
+    let mut journal_state = AnalysisState::new(differential_cache());
+    let mut full_state = AnalysisState::new(differential_cache());
+    let journal = SafeMigrateEngine::new(Config::default());
+    let full = SafeMigrateEngine::new(Config::default()).with_full_statement_checkpoint_for_tests();
+
+    let statements = [
+        "CREATE TABLE users (id integer PRIMARY KEY, name text);",
+        "ALTER TABLE users ADD COLUMN retained text, ADD COLUMN also_retained integer;",
+        "ALTER TABLE users ADD COLUMN rolled_back text, DROP COLUMN missing_column;",
+        "ALTER TABLE users ADD COLUMN after_conflict integer;",
+        "CREATE INDEX users_after_conflict_idx ON users (after_conflict);",
+        "DROP INDEX users_after_conflict_idx;",
+        "SAVEPOINT outside_transaction;",
+        "COMMIT AND CHAIN;",
+        "BEGIN;",
+        "SAVEPOINT sp;",
+        "ROLLBACK TO missing;",
+        "ROLLBACK;",
+        "BEGIN;",
+        "SAVEPOINT sp;",
+        "CREATE TABLE control_table (id integer);",
+        "ROLLBACK TO sp;",
+        "RELEASE sp;",
+        "COMMIT;",
+        "ALTER TABLE users RENAME TO users_renamed;",
+        "DROP TABLE users_renamed;",
+        "BEGIN;",
+        "ALTER TABLE baseline_users RENAME TO baseline_users_moved;",
+        "ROLLBACK;",
+        "CREATE SCHEMA move_target;",
+        "CREATE TABLE move_owner (id serial PRIMARY KEY);",
+        "CREATE INDEX move_owner_idx ON move_owner (id);",
+        "BEGIN;",
+        "ALTER TABLE move_owner SET SCHEMA move_target;",
+        "ROLLBACK;",
+        "CREATE TABLE trigger_owner (id integer);",
+        "CREATE FUNCTION trigger_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+        "CREATE TRIGGER trigger_owner_trg BEFORE INSERT ON trigger_owner FOR EACH ROW EXECUTE FUNCTION trigger_fn();",
+        "BEGIN;",
+        "ALTER TABLE trigger_owner RENAME TO trigger_owner_moved;",
+        "ROLLBACK;",
+        "CREATE TABLE identity_owner (id integer NOT NULL);",
+        "ALTER TABLE identity_owner ADD CONSTRAINT identity_owner_key UNIQUE (id);",
+        "ALTER TABLE identity_owner CLUSTER ON identity_owner_key;",
+        "ALTER TABLE identity_owner REPLICA IDENTITY USING INDEX identity_owner_key;",
+        "BEGIN;",
+        "ALTER INDEX identity_owner_key RENAME TO identity_owner_key_renamed;",
+        "ROLLBACK;",
+        "CREATE SEQUENCE rollback_seq;",
+        "BEGIN;",
+        "ALTER SEQUENCE rollback_seq RENAME TO rollback_seq_moved;",
+        "ROLLBACK;",
+        "ALTER SEQUENCE rollback_seq INCREMENT BY 2;",
+        "CREATE SCHEMA seq_target;",
+        "CREATE SEQUENCE move_seq;",
+        "BEGIN;",
+        "ALTER SEQUENCE move_seq SET SCHEMA seq_target;",
+        "ROLLBACK;",
+        "ALTER SEQUENCE move_seq INCREMENT BY 2;",
+        "CREATE TYPE rename_type AS (id integer);",
+        "CREATE DOMAIN rename_domain AS rename_type;",
+        "CREATE TABLE rename_type_owner (value rename_type, values rename_type[]);",
+        "CREATE FUNCTION rename_type_fn(value rename_type) RETURNS rename_type LANGUAGE sql AS 'SELECT value';",
+        "BEGIN;",
+        "ALTER TYPE rename_type RENAME TO rename_type_moved;",
+        "ROLLBACK;",
+        "CREATE SCHEMA type_target;",
+        "BEGIN;",
+        "ALTER TYPE rename_type SET SCHEMA type_target;",
+        "ROLLBACK;",
+        "ALTER TYPE rename_type ADD ATTRIBUTE extra text;",
+        "ALTER TABLE rename_type_owner ADD COLUMN still_here text;",
+        "DROP TABLE rename_type_owner;",
+        "DROP FUNCTION rename_type_fn(rename_type);",
+        "DROP DOMAIN rename_domain;",
+        "DROP TYPE rename_type;",
+        "CREATE TYPE nested_range AS RANGE (subtype = integer);",
+        "BEGIN;",
+        "ALTER TYPE nested_range RENAME TO nested_range_sp;",
+        "ROLLBACK;",
+        "DROP TYPE nested_range;",
+        "CREATE EXTENSION audit_ext;",
+        "CREATE TYPE ext_member_type AS (id integer);",
+        "ALTER EXTENSION audit_ext ADD TYPE ext_member_type;",
+        "BEGIN;",
+        "ALTER TYPE ext_member_type RENAME TO ext_member_type_moved;",
+        "ROLLBACK;",
+        "ALTER EXTENSION audit_ext DROP TYPE ext_member_type;",
+        "DROP TYPE ext_member_type;",
+        "DROP EXTENSION audit_ext;",
+        "CREATE TABLE nested_rename_table (id integer);",
+        "CREATE SEQUENCE nested_rename_seq;",
+        "CREATE TYPE nested_rename_type AS (id integer);",
+        "BEGIN;",
+        "SAVEPOINT outer_sp;",
+        "ALTER TABLE nested_rename_table RENAME TO nested_rename_table_sp;",
+        "ALTER SEQUENCE nested_rename_seq RENAME TO nested_rename_seq_sp;",
+        "ALTER TYPE nested_rename_type RENAME TO nested_rename_type_sp;",
+        "SAVEPOINT inner_sp;",
+        "ALTER TABLE nested_rename_table_sp ADD COLUMN inner_column integer;",
+        "ROLLBACK TO SAVEPOINT inner_sp;",
+        "ALTER TABLE nested_rename_table_sp ADD COLUMN after_inner integer;",
+        "RELEASE SAVEPOINT outer_sp;",
+        "COMMIT;",
+        "ALTER TABLE nested_rename_table_sp RENAME TO nested_rename_table_final;",
+        "ALTER SEQUENCE nested_rename_seq_sp RENAME TO nested_rename_seq_final;",
+        "ALTER TYPE nested_rename_type_sp RENAME TO nested_rename_type_final;",
+        "BEGIN;",
+        "ALTER TABLE nested_rename_table_final RENAME TO nested_rename_table_rolled;",
+        "ALTER SEQUENCE nested_rename_seq_final RENAME TO nested_rename_seq_rolled;",
+        "ALTER TYPE nested_rename_type_final RENAME TO nested_rename_type_rolled;",
+        "ROLLBACK;",
+        "DROP TABLE nested_rename_table_final;",
+        "DROP SEQUENCE nested_rename_seq_final;",
+        "DROP TYPE nested_rename_type_final;",
+        "CREATE TABLE rename_chain_table (id integer);",
+        "ALTER TABLE rename_chain_table RENAME TO rename_chain_b;",
+        "ALTER TABLE rename_chain_b RENAME TO rename_chain_c;",
+        "BEGIN;",
+        "ALTER TABLE rename_chain_c RENAME TO rename_chain_back;",
+        "ROLLBACK;",
+        "ALTER TABLE rename_chain_c RENAME TO rename_chain_final;",
+        "DROP TABLE rename_chain_final;",
+        "CREATE TABLE rename_chain_reuse (id integer);",
+        "ALTER TABLE rename_chain_reuse RENAME TO rename_chain_final;",
+        "DROP TABLE rename_chain_final;",
+        "CREATE TABLE rename_chain_rollback (id integer);",
+        "BEGIN;",
+        "ALTER TABLE rename_chain_rollback RENAME TO rename_chain_rollback_b;",
+        "ALTER TABLE rename_chain_rollback_b RENAME TO rename_chain_rollback_c;",
+        "ROLLBACK;",
+        "DROP TABLE rename_chain_rollback;",
+        "CREATE TABLE compound_parent (id integer PRIMARY KEY);",
+        "CREATE TABLE compound_child (id integer REFERENCES compound_parent(id));",
+        "ALTER TABLE compound_parent ADD COLUMN first integer, ADD COLUMN second integer, DROP COLUMN missing_column;",
+        "CREATE FUNCTION compound_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+        "CREATE TRIGGER compound_trigger BEFORE INSERT ON compound_parent FOR EACH ROW EXECUTE FUNCTION compound_trigger_fn();",
+        "CREATE PUBLICATION compound_pub FOR TABLE compound_parent;",
+        "ALTER PUBLICATION compound_pub SET TABLE compound_parent, compound_child;",
+        "ALTER PUBLICATION compound_pub SET TABLE missing_table;",
+        "DROP PUBLICATION compound_pub;",
+        "DROP TRIGGER compound_trigger ON compound_parent;",
+        "DROP FUNCTION compound_trigger_fn();",
+        "DROP TABLE compound_child;",
+        "DROP TABLE compound_parent;",
+        "BEGIN;",
+        "CREATE TEMP TABLE temp_on_commit_drop (id integer) ON COMMIT DROP;",
+        "COMMIT;",
+        "BEGIN;",
+        "CREATE TEMP TABLE temp_on_commit_delete (id integer) ON COMMIT DELETE ROWS;",
+        "COMMIT;",
+        "DROP TABLE temp_on_commit_delete;",
+    ];
+    let mut saw_conflict = false;
+
+    for statement in statements {
+        let journal_violations = journal
+            .analyze(statement, &mut journal_state)
+            .unwrap_or_else(|errors| panic!("journal failed on {statement}: {errors:?}"));
+        let full_violations = full
+            .analyze(statement, &mut full_state)
+            .unwrap_or_else(|errors| panic!("full failed on {statement}: {errors:?}"));
+        assert_eq!(
+            comparable(&journal_violations),
+            comparable(&full_violations),
+            "journal findings diverged from full checkpoint after: {statement}"
+        );
+        assert_eq!(
+            journal_state, full_state,
+            "statement journal state diverged after: {statement}"
+        );
+        saw_conflict |= journal_violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict");
+    }
+
+    assert!(
+        saw_conflict,
+        "chain did not exercise a rolled-back statement"
+    );
+    assert!(
+        !journal_state.relation_is_present(&ObjectId::new("public", "nested_rename_table_final"))
+    );
+    assert!(!journal_state.relation_is_present(&ObjectId::new("public", "rename_chain_final")));
+    assert!(!journal_state.relation_is_present(&ObjectId::new("public", "compound_parent")));
+    assert!(!journal_state.relation_is_present(&ObjectId::new("pg_temp", "temp_on_commit_drop")));
+    assert!(!journal_state.relation_is_present(&ObjectId::new("pg_temp", "temp_on_commit_delete")));
+}
+
+#[test]
+fn transaction_and_savepoint_rollback_matches_full_snapshot_reference() {
+    // Permanent reference oracle: verifies that transaction undo logs and nested
+    // savepoint rollbacks produce states and findings identical to full-copy snapshots.
+    let cache = differential_cache();
+    let mut journal_state = AnalysisState::new(cache.clone());
+    let mut snapshot_oracle_state = AnalysisState::new(cache);
+    let engine = SafeMigrateEngine::new(Config::default());
+
+    let mut oracle_snapshots: Vec<AnalysisState> = Vec::new();
+
+    let script = [
+        "CREATE TABLE accounts (id int PRIMARY KEY, balance numeric);",
+        "BEGIN;",
+        "ALTER TABLE accounts ADD COLUMN status text;",
+        "SAVEPOINT sp1;",
+        "ALTER TABLE accounts RENAME COLUMN status TO account_status;",
+        "CREATE TABLE audit_log (entry_id int);",
+        "SAVEPOINT sp2;",
+        "ALTER TABLE accounts ADD COLUMN internal_notes text;",
+        "ROLLBACK TO SAVEPOINT sp2;",
+        "RELEASE SAVEPOINT sp1;",
+        "COMMIT;",
+        "BEGIN;",
+        "ALTER TABLE accounts RENAME TO accounts_temp;",
+        "SAVEPOINT rename_sp;",
+        "ALTER TABLE accounts_temp ADD COLUMN extra_col int;",
+        "ROLLBACK TO SAVEPOINT rename_sp;",
+        "ROLLBACK;",
+    ];
+
+    for stmt in script {
+        let journal_violations = engine
+            .analyze(stmt, &mut journal_state)
+            .unwrap_or_else(|e| panic!("journal failed on {stmt}: {e:?}"));
+
+        let oracle_violations = engine
+            .analyze(stmt, &mut snapshot_oracle_state)
+            .unwrap_or_else(|e| panic!("oracle failed on {stmt}: {e:?}"));
+
+        if stmt == "BEGIN;" || stmt.starts_with("SAVEPOINT") {
+            oracle_snapshots.push(snapshot_oracle_state.clone());
+        } else if stmt.starts_with("ROLLBACK TO SAVEPOINT") {
+            let snap = oracle_snapshots.pop().expect("matching savepoint snapshot");
+            snapshot_oracle_state = snap;
+        } else if stmt == "ROLLBACK;" {
+            let mut snap = oracle_snapshots.remove(0);
+            oracle_snapshots.clear();
+            snap.local.transactions.clear();
+            snapshot_oracle_state = snap;
+        } else if stmt == "COMMIT;" {
+            oracle_snapshots.clear();
+        } else if stmt.starts_with("RELEASE SAVEPOINT") {
+            oracle_snapshots.pop();
+        }
+
+        assert_eq!(
+            comparable(&journal_violations),
+            comparable(&oracle_violations),
+            "findings diverged on: {stmt}"
+        );
+        // Compare external observable catalogue state across tables, columns, constraints, and graph
+        assert_eq!(
+            journal_state.local.relations, snapshot_oracle_state.local.relations,
+            "relations diverged from full-copy snapshot oracle on: {stmt}"
+        );
+        assert_eq!(
+            journal_state.local.constraints, snapshot_oracle_state.local.constraints,
+            "constraints diverged from full-copy snapshot oracle on: {stmt}"
+        );
+        assert_eq!(
+            journal_state.local.graph.edges(),
+            snapshot_oracle_state.local.graph.edges(),
+            "graph edges diverged from full-copy snapshot oracle on: {stmt}"
+        );
+        assert_eq!(
+            journal_state.in_transaction(),
+            snapshot_oracle_state.in_transaction(),
+            "transaction status diverged on: {stmt}"
+        );
+        assert!(journal_state.local.graph.indexes_are_valid());
+        assert!(journal_state.local.graph.edge_set_is_valid());
+    }
+}
+
+fn column_type_ids(state: &AnalysisState) -> Vec<Option<ObjectId>> {
+    let RelationOverlay::Present(relation) = state
+        .local
+        .relations
+        .get(&relation_id("rename_type_owner"))
+        .expect("relation exists")
+    else {
+        panic!("relation is present");
+    };
+    relation
+        .columns
+        .iter()
+        .map(|column| column.type_id.clone())
+        .collect()
+}
+
+fn renamed_function(state: &AnalysisState) -> (&ObjectId, &FunctionState) {
+    state
+        .local
+        .functions
+        .iter()
+        .find_map(|(id, overlay)| {
+            let FunctionOverlay::Present(function) = overlay else {
+                return None;
+            };
+            id.name
+                .starts_with("rename_type_fn(")
+                .then_some((id, function))
+        })
+        .expect("function exists")
+}
+
+fn domain_base_type(state: &AnalysisState, id: &ObjectId) -> Option<ObjectId> {
+    let TypeOverlay::Present(domain) = state.local.types.get(id).expect("domain exists") else {
+        panic!("domain is present");
+    };
+    let TypeKind::Domain { base_type_id, .. } = &domain.kind else {
+        panic!("domain kind");
+    };
+    base_type_id.clone()
+}
+
+#[test]
+fn type_rename_rollback_restores_dependents() {
+    let mut state = AnalysisState::new(differential_cache());
+    let engine = SafeMigrateEngine::new(Config::default());
+    for statement in [
+        "CREATE TYPE rename_type AS (id integer);",
+        "CREATE DOMAIN rename_domain AS rename_type;",
+        "CREATE TABLE rename_type_owner (value rename_type, values rename_type[]);",
+        "CREATE FUNCTION rename_type_fn(value rename_type) RETURNS rename_type LANGUAGE sql AS 'SELECT value';",
+        "BEGIN;",
+        "ALTER TYPE rename_type RENAME TO rename_type_moved;",
+    ] {
+        let violations = engine
+            .analyze(statement, &mut state)
+            .unwrap_or_else(|errors| panic!("failed on {statement}: {errors:?}"));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "unexpected conflict on {statement}: {violations:?}"
+        );
+    }
+
+    let old = ObjectId::new("public", "rename_type");
+    let moved = ObjectId::new("public", "rename_type_moved");
+    let old_array = AnalysisState::array_type_id(&old);
+    let moved_array = AnalysisState::array_type_id(&moved);
+    let domain_id = ObjectId::new("public", "rename_domain");
+
+    assert!(matches!(
+        state.local.types.get(&moved),
+        Some(TypeOverlay::Present(_))
+    ));
+    assert!(!state.local.types.contains_key(&old));
+    let columns = column_type_ids(&state);
+    assert!(columns.contains(&Some(moved.clone())));
+    assert!(columns.contains(&Some(moved_array.clone())));
+    let (function_id, function) = renamed_function(&state);
+    assert!(function_id.name.contains("_moved"));
+    assert!(
+        function
+            .arg_type_ids
+            .iter()
+            .flatten()
+            .any(|id| id == &moved)
+    );
+    assert_eq!(function.return_type_id.as_ref(), Some(&moved));
+    assert_eq!(domain_base_type(&state, &domain_id), Some(moved.clone()));
+
+    let violations = engine
+        .analyze("ROLLBACK;", &mut state)
+        .unwrap_or_else(|errors| panic!("rollback failed: {errors:?}"));
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "unexpected conflict on ROLLBACK: {violations:?}"
+    );
+
+    assert!(matches!(
+        state.local.types.get(&old),
+        Some(TypeOverlay::Present(_))
+    ));
+    assert!(!state.local.types.contains_key(&moved));
+    let columns = column_type_ids(&state);
+    assert!(columns.contains(&Some(old.clone())));
+    assert!(columns.contains(&Some(old_array.clone())));
+    let (function_id, function) = renamed_function(&state);
+    assert!(!function_id.name.contains("_moved"));
+    assert!(function.arg_type_ids.iter().flatten().any(|id| id == &old));
+    assert_eq!(function.return_type_id.as_ref(), Some(&old));
+    assert_eq!(domain_base_type(&state, &domain_id), Some(old.clone()));
+}
+
+fn differential_cache() -> DbCache {
+    let mut cache = crate::common::synced_cache();
+    for (name, rows) in [("baseline_orders", 5_000_u64), ("baseline_users", 25)] {
+        let id = ObjectId::new("public", name);
+        cache.insert_baseline(
+            id.clone(),
+            RelationState::new(
+                id,
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(rows),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+    }
+    cache
+}
+
+fn differential_chain() -> &'static [&'static str] {
+    &[
+        "ALTER TABLE baseline_orders ADD COLUMN note text DEFAULT 'x';",
+        "ALTER TABLE baseline_orders ALTER COLUMN id TYPE bigint;",
+        "CREATE TYPE address AS (city text, zip text);",
+        "CREATE DOMAIN positive_int AS integer CHECK (VALUE > 0);",
+        "CREATE TABLE users (id integer PRIMARY KEY, addr address, score positive_int);",
+        "CREATE INDEX users_idx ON users (id);",
+        "CREATE SEQUENCE users_seq;",
+        "CREATE FUNCTION f() RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';",
+        "ALTER TABLE users ADD COLUMN name text;",
+        "ALTER TABLE users ALTER COLUMN id TYPE bigint;",
+        "ALTER TABLE users ADD CONSTRAINT users_fk FOREIGN KEY (score) REFERENCES users(id);",
+        "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users;",
+        "REFRESH MATERIALIZED VIEW users_mv;",
+        "DROP INDEX users_idx;",
+        "ALTER DOMAIN positive_int SET NOT NULL;",
+        "TRUNCATE users;",
+        "ALTER TYPE address DROP ATTRIBUTE zip;",
+        "CREATE TABLE partition_p (id int, val text) PARTITION BY RANGE (id);",
+        "CREATE TABLE partition_c PARTITION OF partition_p FOR VALUES FROM (0) TO (100);",
+        "CREATE INDEX p_val_idx ON partition_p (val);",
+        "ALTER TABLE partition_p RENAME COLUMN val TO val_renamed;",
+        "ALTER INDEX p_val_idx RENAME TO p_val_idx_renamed;",
+        "ALTER TABLE users RENAME TO users_renamed;",
+        "DROP TABLE users_renamed CASCADE;",
+        "DROP SEQUENCE users_seq;",
+        "DROP FUNCTION f();",
+        "DROP TYPE address;",
+        "DROP DOMAIN positive_int;",
+        "DROP TABLE partition_p;",
+        "DROP TABLE baseline_orders;",
+    ]
+}
+
+fn comparable(violations: &[Violation]) -> Vec<String> {
+    violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "{}|{}|{:?}|{:?}|{}|{:?}",
+                violation.rule_id,
+                violation.object_name,
+                violation.tier,
+                violation.object_kind,
+                violation.reason,
+                violation.source_range
+            )
+        })
+        .collect()
+}

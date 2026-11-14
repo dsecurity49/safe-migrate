@@ -39,8 +39,12 @@ mod live_cache_encryption;
 mod live_catalog_sync;
 #[path = "../tests/live_differential_harness/mod.rs"]
 mod live_differential_harness;
+#[path = "../tests/live_lock_modes.rs"]
+mod live_lock_modes;
 #[path = "../tests/live_parity_oracle_file.rs"]
 mod live_parity_oracle;
+#[path = "../tests/lock_predictions.rs"]
+mod lock_predictions;
 #[path = "../tests/performance_scenarios.rs"]
 mod performance_scenarios_file;
 #[path = "../tests/resolver_namespaces.rs"]

@@ -546,6 +546,32 @@ fn alter_procedure_options_are_applied_rather_than_dropped() {
 }
 
 #[test]
+fn string_literal_function_bodies_do_not_taint_the_chain() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE FUNCTION get_v() RETURNS text LANGUAGE sql IMMUTABLE
+             AS $$ SELECT '1.0'::text; $$;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert_eq!(state.confidence(), &Confidence::Exact);
+    assert!(
+        !state
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::UnsupportedSemantics)
+    );
+    assert!(matches!(
+        state.local.functions.get(&object_id("public", "get_v()")),
+        Some(FunctionOverlay::Present(function))
+            if function.language == "sql" && function.volatility == Volatility::Immutable
+    ));
+}
+
+#[test]
 fn cascading_a_function_drop_covers_only_the_moved_name() {
     let engine = setup_engine();
     let state_after = |functions: &[&str], sql: &str| {
@@ -795,20 +821,19 @@ fn test_state_drop_function_if_exists() {
 }
 
 #[test]
-fn creating_a_new_function_taints_unmodeled_body_state() {
+fn creating_a_new_function_taints_unmodeled_options() {
     let engine = setup_engine();
     let mut state = setup_state();
 
     engine
         .analyze(
-            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql STRICT AS $$ SELECT 1 $$;",
             &mut state,
         )
         .unwrap();
 
-    // FunctionState tracks identity and selected options, but not the
-    // SQL body/dependency graph represented by `AS`; retaining Exact here
-    // would overstate what later dependency checks can prove.
+    // FunctionState tracks identity and selected options, but not STRICT;
+    // retaining Exact here would overstate what later checks can prove.
     assert_eq!(state.local.confidence, Confidence::Tainted);
     assert!(matches!(
         state.local.functions.get(&object_id("public", "work()")),

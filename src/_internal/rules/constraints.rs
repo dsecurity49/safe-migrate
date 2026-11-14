@@ -3,11 +3,16 @@ use crate::_internal::analysis::mutations::{
     AlterDomainMutation, AlterTableActionMutation, Mutation,
 };
 
+use crate::_internal::model::constraint::ConstraintKind;
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub(crate) struct BlockingConstraintRule;
+
+const CHECK_CONSTRAINT_RECIPE: &str = "Add the CHECK constraint as NOT VALID first, then VALIDATE it in a separate transaction to avoid scanning the table under a strong lock.";
+const FOREIGN_KEY_CONSTRAINT_RECIPE: &str = "Add the FOREIGN KEY constraint as NOT VALID first, then VALIDATE it in a separate transaction to avoid scanning the referencing table under a strong lock.";
+const VALIDATE_CONSTRAINT_RECIPE: &str = "VALIDATE CONSTRAINT scans every row. Run it during a low-traffic window with a bounded `lock_timeout`; an interrupted validation can be resumed.";
 
 impl Rule for BlockingConstraintRule {
     fn id(&self) -> &'static str {
@@ -17,7 +22,7 @@ impl Rule for BlockingConstraintRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Adding a valid CHECK or FOREIGN KEY constraint takes an ACCESS EXCLUSIVE lock and scans the table. Add it as NOT VALID first, then VALIDATE it in a separate transaction."
+        "Add constraints as NOT VALID first, then VALIDATE them in a separate transaction to avoid a long scan under a strong lock."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -70,10 +75,10 @@ impl Rule for BlockingConstraintRule {
                         ..
                     }
                     | AlterTableActionMutation::AddExcludeConstraint { .. }
-                    | AlterTableActionMutation::SetStorage { .. }
                     | AlterTableActionMutation::SetAccessMethod { .. }
+                    | AlterTableActionMutation::ValidateConstraint { .. }
             );
-            if !action_is_relevant {
+            if !action_is_relevant || context.result().is_noop() {
                 return violations;
             }
 
@@ -146,17 +151,20 @@ impl Rule for BlockingConstraintRule {
             // Emit staleness warning if required (and if it's not going to be completely silent)
             if is_stale && tier != ViolationTier::Tier3 {
                 let key = format!("{}_stale_{}", self.id(), alter.id);
-                violations.push(Violation { source_range: None,
+                violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
 
                     object_kind: ObjectKind::Table,
                     object_name: alter.id.to_string(),
                     tier: ViolationTier::Tier2,
-                    reason: "Table statistics are offline/stale. Lock evaluations may be inaccurate.".to_string(),
-                    recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
+                    reason:
+                        "Table statistics are offline/stale. Lock evaluations may be inaccurate."
+                            .to_string(),
+                    recipe:
+                        "Run ANALYZE to ensure accurate row estimates before structural changes.",
                     dedup_key: Some(key),
-                            sql: None,
-
+                    sql: None,
                 });
             }
 
@@ -173,7 +181,7 @@ impl Rule for BlockingConstraintRule {
                 } => {
                     let name_str = constraint_name.as_deref().unwrap_or("unnamed");
                     let mut reason = format!(
-                        "Synchronous CHECK constraint '{}' addition on {}",
+                        "Synchronous CHECK constraint '{}' addition on {} scans the table",
                         name_str, alter.id
                     );
                     if is_stale {
@@ -188,7 +196,7 @@ impl Rule for BlockingConstraintRule {
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: self.recipe(),
+                        recipe: CHECK_CONSTRAINT_RECIPE,
                         dedup_key: None,
                         sql: None,
                     });
@@ -202,7 +210,7 @@ impl Rule for BlockingConstraintRule {
                     let name_str = constraint_name.as_deref().unwrap_or("unnamed");
 
                     let mut reason = format!(
-                        "Synchronous FOREIGN KEY constraint '{}' addition locks {} and {}",
+                        "Synchronous FOREIGN KEY constraint '{}' addition on {} scans the referencing table (the referenced table {} is verified via index)",
                         name_str, alter.id, to_table
                     );
                     if is_partitioned {
@@ -220,7 +228,7 @@ impl Rule for BlockingConstraintRule {
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: self.recipe(),
+                        recipe: FOREIGN_KEY_CONSTRAINT_RECIPE,
                         dedup_key: None,
                         sql: None,
                     });
@@ -235,7 +243,17 @@ impl Rule for BlockingConstraintRule {
                                 .map(|c| !c.is_nullable)
                                 .unwrap_or(false)
                         })
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        || context.pre_state().constraints.iter().any(
+                            |((table_id, _), constraint)| {
+                                table_id == &alter.id
+                                    && constraint.kind == ConstraintKind::Check
+                                    && constraint.validated
+                                    && constraint.definition.as_deref().is_some_and(|definition| {
+                                        check_definition_proves_not_null(definition, column)
+                                    })
+                            },
+                        );
 
                     if !has_fast_path {
                         violations.push(Violation {
@@ -301,26 +319,26 @@ impl Rule for BlockingConstraintRule {
 
                     });
                 }
-                AlterTableActionMutation::SetStorage { column, .. } => {
+                AlterTableActionMutation::ValidateConstraint { constraint_name } => {
                     let mut reason = format!(
-                        "Changing storage parameter for {}.{} causes a table rewrite",
-                        alter.id, column
+                        "Validating constraint '{}' on {} scans the table",
+                        constraint_name, alter.id
                     );
                     if is_stale {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
-                    violations.push(Violation { source_range: None,
-                        rule_id: "table-rewrite-storage",
+                    violations.push(Violation {
+                        source_range: None,
+                        rule_id: self.id(),
 
                         object_kind: ObjectKind::Table,
-                        object_name: alter.id.column_name(column),
+                        object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: "Changing column storage requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
+                        recipe: VALIDATE_CONSTRAINT_RECIPE,
                         dedup_key: None,
-                                    sql: None,
-
+                        sql: None,
                     });
                 }
                 AlterTableActionMutation::SetAccessMethod { .. } => {
@@ -339,7 +357,7 @@ impl Rule for BlockingConstraintRule {
                         object_name: alter.id.to_string(),
                         tier,
                         reason,
-                        recipe: "Changing table access method requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
+                        recipe: "Changing table access method rewrites the table. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
 
@@ -495,4 +513,55 @@ impl BlockingConstraintRule {
         });
         violations
     }
+}
+
+fn check_definition_proves_not_null(definition: &str, column: &str) -> bool {
+    let definition = strip_outer_parentheses(definition.trim());
+    let Some(lhs) = strip_keyword_suffix(definition, "IS NOT NULL") else {
+        return false;
+    };
+    let lhs = strip_outer_parentheses(lhs.trim());
+    let quoted = format!("\"{}\"", column.replace('"', "\"\""));
+    lhs == column || lhs == quoted
+}
+
+fn strip_keyword_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    let start = value.len().checked_sub(suffix.len())?;
+    if !value.is_char_boundary(start) {
+        return None;
+    }
+    value[start..]
+        .eq_ignore_ascii_case(suffix)
+        .then(|| &value[..start])
+}
+
+fn strip_outer_parentheses(mut value: &str) -> &str {
+    loop {
+        let trimmed = value.trim();
+        if trimmed.len() < 2 || !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if !parentheses_are_balanced(inner) {
+            return trimmed;
+        }
+        value = inner;
+    }
+}
+
+fn parentheses_are_balanced(value: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }

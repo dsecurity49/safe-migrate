@@ -335,6 +335,7 @@ pub(crate) enum StatementFact {
     AlterTable {
         name: QualifiedName,
         only: bool,
+        if_exists: bool,
         actions: Vec<AlterTableActionFact>,
     },
     AlterIndex {
@@ -524,6 +525,34 @@ pub(crate) enum LockModeFact {
     ShareRowExclusive,
     Exclusive,
     AccessExclusive,
+}
+
+impl LockModeFact {
+    pub(crate) const fn sql_name(self) -> &'static str {
+        match self {
+            Self::AccessShare => "ACCESS SHARE",
+            Self::RowShare => "ROW SHARE",
+            Self::RowExclusive => "ROW EXCLUSIVE",
+            Self::ShareUpdateExclusive => "SHARE UPDATE EXCLUSIVE",
+            Self::Share => "SHARE",
+            Self::ShareRowExclusive => "SHARE ROW EXCLUSIVE",
+            Self::Exclusive => "EXCLUSIVE",
+            Self::AccessExclusive => "ACCESS EXCLUSIVE",
+        }
+    }
+
+    /// Plain `SELECT` needs ACCESS SHARE; only ACCESS EXCLUSIVE conflicts.
+    pub(crate) const fn blocks_reads(self) -> bool {
+        matches!(self, Self::AccessExclusive)
+    }
+
+    /// Ordinary DML needs ROW EXCLUSIVE; SHARE and stronger conflict with it.
+    pub(crate) const fn blocks_writes(self) -> bool {
+        matches!(
+            self,
+            Self::Share | Self::ShareRowExclusive | Self::Exclusive | Self::AccessExclusive
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -752,6 +781,7 @@ pub(crate) struct CreateRoleFact {
 pub(crate) struct AlterRoleFact {
     pub name: RoleFact,
     pub inherits: Option<bool>,
+    pub rename_to: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1557,6 +1587,11 @@ pub(crate) enum AlterTableActionFact {
     SetDefault {
         column: String,
         default: Option<ExprIr>,
+    },
+    AddIdentity {
+        column: String,
+        generation: ColumnGeneration,
+        identity_sequence: Box<IdentitySequenceOptionsFact>,
     },
     SetExpression {
         column: String,

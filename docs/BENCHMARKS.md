@@ -145,3 +145,147 @@ Run the isolated comparison with:
 ```sh
 cargo test --locked --jobs 1 --lib internal_tests::performance_scenarios::large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
 ```
+
+## Temporary-namespace resolution (2026-11-06)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. A 1,000-relation synchronized baseline resolves `integer`
+10,000 times after a temporary table is created and the creating transaction is
+rolled back. The old implementation scanned every relation and type on each
+resolution to prove the namespace was gone. The measurement was 1,978 ms; the
+same process measured 154 ms with the scan hint forced off, so the scan
+accounted for most of the difference.
+
+The exact namespace flag removes that scan. Five runs after the change measured
+62, 62, 62, 65, and 61 ms after the rollback (median **62 ms**) and 93, 92, 92,
+92, and 93 ms with the namespace present (median **92 ms**). PostgreSQL was
+checked directly for the lifecycle the flag models: a rollback removes a
+namespace created in that transaction, while dropping the last temporary object
+or committing `ON COMMIT DROP` keeps it.
+
+```sh
+cargo test --locked --lib large_baseline_type_resolution_after_temp_rollback -- --ignored --nocapture --test-threads=1
+```
+
+## Pre-state read footprint (2026-11-06)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. Before this change every transition copied all ten
+pre-state catalog families; a transition analysis now copies only the families
+and identities its rules can read. Composite-type actions that inspect every
+relation still use the full family, and routine drops keep the whole function
+family because drift resolves an unqualified signature after the drop has run.
+
+The first table measures 1,000 capture calls against a synchronized baseline.
+The second measures 1,000 `ALTER TABLE ... DROP COLUMN ... IF EXISTS` mutations
+and includes building each mutation's read footprint.
+
+| Relations | Capture, full | Capture, selective |
+| ---: | ---: | ---: |
+| 100 | 572 ms | 7 ms |
+| 1,000 | 8,438 ms | 14 ms |
+| 10,000 | 87,972 ms | 89 ms |
+
+| Relations | Mutations, full | Mutations, selective |
+| ---: | ---: | ---: |
+| 100 | 522 ms | 16 ms |
+| 1,000 | 7,322 ms | 28 ms |
+| 10,000 | 83,117 ms | 128 ms |
+
+A differential test runs the same 24-statement chain with selective and
+full-family capture and requires identical findings, including the
+`type-change-rewrite` and `require-concurrent-drop-index` diagnostics.
+
+```sh
+cargo test --locked --lib pre_state_capture_against_large_baselines -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib thousand_alter_mutations_against_large_baselines -- --ignored --nocapture --test-threads=1
+```
+
+## Autocommit statement undo journal (2026-11-07)
+
+Captured on the same aarch64 Android Linux host with Rust 1.100.0-nightly in the
+debug test profile. Ordinary autocommit statements previously cloned the whole
+`AnalysisState` before applying their mutations. They now record the same typed
+state deltas as the transaction undo log and discard them on success. The
+transaction-shape clone at `COMMIT`/`ROLLBACK` is also replaced by a statement
+journal plus a transaction-shape check, so the accumulated undo history is no
+longer cloned.
+
+| Scenario | Before | After |
+| --- | ---: | ---: |
+| 50 `ALTER TABLE` statements, 1,000 relations | 462,883 allocations / 130.0 MB / 640 ms | 13,208 allocations / 1.6 MB / 54-69 ms |
+| 1,000-statement create chain | 9,000 ms | 1,192 ms |
+| 503-statement transaction rollback | 400-450 ms | 382-385 ms |
+| 50 rename statements, 1,000 relations | 497,767 allocations / 134.6 MB / 746 ms | 97,467 allocations / 9.2 MB / 216 ms |
+
+`ALTER TABLE ... RENAME`, `ALTER SEQUENCE ... RENAME`, and `ALTER TYPE ...
+RENAME`/`SET SCHEMA` now record only the affected overlays instead of a
+`NamespaceSnapshot`. Type renames snapshot the renamed type, its dependent
+relations, functions, and extension members; their dependent sets are scanned
+before the undo record is pushed. Schema renames still use the full namespace
+snapshot, and dependency-edge lists are still copied for rename and cascade
+operations pending the graph work. Relation renames also still copy the
+pending-validation set and the baseline foreign-key set; those whole-structure
+copies remain in the rename path but are not yet delta-encoded.
+
+A schema rename is retained as a deliberate broad fallback: it rewrites every
+object family and the dependency graph, so a targeted delta would mirror the
+whole remap. A 1,000-relation baseline with one table in the renamed schema
+measured 10,346 allocations / 7.3 MB / 26 ms for the rename and rollback in the
+debug benchmark.
+
+A differential test runs every statement twice, once with the full state
+checkpoint and once with the journal, and requires identical findings plus
+identical complete `AnalysisState` after each statement. The chain includes a
+compound statement that applies one action and conflicts on the next, failed and
+successful savepoint operations, transaction-control conflicts, autocommit DDL,
+nested savepoints spanning relation, sequence, and type renames, repeated rename
+chains with rename-back and tombstone reuse, range and extension-member type
+renames, publication conflicts, and `ON COMMIT DROP`/`DELETE ROWS` temporary
+objects.
+
+```sh
+cargo test --locked --lib large_baseline_short_chain_allocations -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib large_baseline_rename_chain_allocations -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib large_baseline_schema_rename_allocations -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib ordered_thousand_statement_chain -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib long_transaction_rollback -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib statement_undo_journal_matches_full_checkpoint_after_every_statement
+```
+
+## Graph index resolution and definition updates (2026-11-08)
+
+Captured on the same host and debug test profile. The graph now keeps separate
+lazy cells for rename resolution, dependent-edge lookup, and resolved
+referenced/dependent adjacency. Cascade and cycle consumers build only the cell
+they need, and rename-chain resolution is memoized per unique endpoint instead
+of allocating a visited set for every edge endpoint. A single
+`IndexDefinition` update maintains the edge set incrementally, keeps the warm
+derived indexes, and uses the cached `by_dependent` positions. The fixture mixes
+index, foreign-key, trigger, and inheritance edges so both resolved adjacency
+cells are populated.
+
+| Scenario | Allocations | Allocated bytes | Elapsed |
+| --- | ---: | ---: | ---: |
+| cold index construction: 10,000 index edges, 1,000 FK edges, 1,000 trigger edges, 1,000 inheritance edges + 100-hop shared rename chain | 69,376 | 5.1 MB | 119 ms |
+| warm cascade lookup plus result materialization | 13 | 0.26 MB | 2 ms |
+| cold cascade lookup (index construction plus result materialization) | 30,076 | 2.0 MB | 62 ms |
+| 1,000 definition updates against the same warm graph | 21,000 | 0.66 MB | 30 ms |
+
+The definition-update loop prebuilds its 1,000 `ObjectId` keys before the
+allocator and timer start, so the reported cost covers
+`update_index_definition()` rather than caller-side key construction. The
+index-construction scenario forces every lazy cell directly, while the cascade
+scenarios include the returned-edge materialization they are labelled with.
+
+Before this change each definition update cloned every edge into a new
+`HashSet` and invalidated the derived index, so the update cost scaled with the
+whole graph rather than with the one changed payload.
+
+```sh
+cargo test --locked --lib large_graph_index_and_definition_update_allocations -- --ignored --nocapture --test-threads=1
+```
+
+The graph tests include a differential check that the memoized index build
+matches the endpoint-walk resolver for rename chains, shared endpoints, missing
+targets, and a rename cycle.

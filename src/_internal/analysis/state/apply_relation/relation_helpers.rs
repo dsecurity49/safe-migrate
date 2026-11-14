@@ -57,52 +57,57 @@ impl AnalysisState {
         let mut visited = HashSet::from([root.clone()]);
         let mut descendants = Vec::new();
         while let Some(parent) = pending.pop() {
-            for edge in self.local.graph.edges() {
-                if edge.referenced != parent
-                    || !matches!(
-                        edge.kind,
-                        DependencyKind::InheritanceOf | DependencyKind::PartitionOf
-                    )
-                    || !visited.insert(edge.dependent.clone())
-                {
-                    continue;
+            for child in self.local.graph.inheritance_children_of(&parent) {
+                if visited.insert(child.clone()) {
+                    pending.push(child.clone());
+                    descendants.push(child.clone());
                 }
-                pending.push(edge.dependent.clone());
-                descendants.push(edge.dependent.clone());
             }
         }
         descendants
     }
 
-    pub(super) fn rename_relation_column_metadata(
+    pub(super) fn rename_relations_column_metadata_batch(
         &mut self,
-        table: &ObjectId,
+        tables: &[ObjectId],
         from: &str,
         to: &str,
     ) {
-        self.snapshot_relation(table);
-        if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(table) {
-            relation.apply_column_action(&ColumnAction::Rename {
-                from: from.to_string(),
-                to: to.to_string(),
-            });
+        if tables.is_empty() {
+            return;
         }
-        let constraints = self
+        let table_set: HashSet<ObjectId> = tables.iter().cloned().collect();
+
+        // 1. Snapshot and mutate local relation metadata, reusing the action.
+        let action = ColumnAction::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        for table in tables {
+            self.snapshot_relation(table);
+            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(table) {
+                relation.apply_column_action(&action);
+            }
+        }
+
+        // 2. Scan constraints once across all affected tables.
+        let check_constraints_to_update: Vec<(ObjectId, String, String)> = self
             .local
             .constraints
             .iter()
             .filter(|((owner, _), constraint)| {
-                owner == table && constraint.kind == ConstraintKind::Check
+                table_set.contains(owner) && constraint.kind == ConstraintKind::Check
             })
-            .filter_map(|((_, name), constraint)| {
+            .filter_map(|((owner, name), constraint)| {
                 constraint
                     .definition
                     .as_deref()
-                    .map(|source| (name.clone(), source.to_string()))
+                    .map(|source| (owner.clone(), name.clone(), source.to_string()))
             })
-            .collect::<Vec<_>>();
-        for (name, source) in constraints {
-            self.snapshot_constraint(table, &name);
+            .collect();
+
+        for (table, name, source) in check_constraints_to_update {
+            self.snapshot_constraint(&table, &name);
             if let Some(constraint) = self.local.constraints.get_mut(&(table.clone(), name)) {
                 constraint.definition =
                     crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
@@ -113,30 +118,36 @@ impl AnalysisState {
                     );
             }
         }
-        self.snapshot_graph_full();
-        self.local.graph.rename_column_dependencies(table, from, to);
-        self.local.graph.rename_index_column(table, from, to);
-        let sequences = self
+
+        // 3. Identify owned sequences that belong to any of the tables for this column.
+        let sequences: Vec<ObjectId> = self
             .local
             .graph
             .edges()
             .iter()
             .filter(|edge| {
                 matches!(&edge.kind, DependencyKind::SequenceOwnedBy { column } if column == from)
+                    && table_set.contains(&edge.referenced)
             })
-            .map(|edge| (edge.dependent.clone(), edge.referenced == *table))
-            .filter_map(|(sequence, owned)| owned.then_some(sequence))
-            .collect::<Vec<_>>();
-        for sequence in sequences {
-            self.snapshot_sequence(&sequence);
-            if let Some(SequenceOverlay::Present(state)) = self.local.sequences.get_mut(&sequence)
+            .map(|edge| edge.dependent.clone())
+            .collect();
+
+        for sequence in &sequences {
+            self.snapshot_sequence(sequence);
+            if let Some(SequenceOverlay::Present(state)) = self.local.sequences.get_mut(sequence)
                 && let Some((_, column)) = &mut state.owned_by
             {
                 *column = to.to_string();
             }
-            self.local
-                .graph
-                .rename_owned_sequence_column(&sequence, from, to);
+        }
+
+        // 4. Mutate graph payloads in a single pass and record the delta for rollback.
+        if let Some(delta) = self
+            .local
+            .graph
+            .rename_columns_for_relations_recorded(&table_set, from, to)
+        {
+            self.record_graph_delta(delta);
         }
     }
 

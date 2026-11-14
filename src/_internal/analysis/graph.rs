@@ -3,6 +3,17 @@ use crate::_internal::model::index::{IndexDefinition, KeyCollation, ResolvedName
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
+fn remap_endpoint(endpoint: &mut ObjectId, mappings: &HashMap<ObjectId, ObjectId>) -> bool {
+    let Some(replacement) = mappings.get(endpoint) else {
+        return false;
+    };
+    if replacement == endpoint {
+        return false;
+    }
+    *endpoint = replacement.clone();
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DependencyKind {
     ForeignKey {
@@ -120,13 +131,44 @@ impl DependencyEdge {
 pub(crate) struct DependencyGraph {
     edges: Vec<DependencyEdge>,
     edge_set: HashSet<DependencyEdge>,
-    indexes: OnceCell<GraphIndexes>,
+    // Each lookup has its own lazy cell: rename resolution and dependent-edge
+    // lookups must not force the expensive resolved-adjacency build.
+    rename_index: OnceCell<HashMap<ObjectId, usize>>,
+    dependent_index: OnceCell<HashMap<ObjectId, Vec<usize>>>,
+    index_partition_index: OnceCell<HashMap<ObjectId, Vec<usize>>>,
+    resolved_indexes: OnceCell<ResolvedIndexes>,
+}
+
+/// All identity moves belonging to one logical rename statement.
+///
+/// Applying them together keeps the graph at one pass and one deduplication
+/// instead of one full rewrite per moved object.
+#[derive(Debug, Default)]
+pub(crate) struct GraphRenamePlan {
+    pub relations: HashMap<ObjectId, ObjectId>,
+    pub indexes: HashMap<ObjectId, ObjectId>,
+    pub sequences: HashMap<ObjectId, ObjectId>,
+    pub triggers: HashMap<ObjectId, ObjectId>,
+    pub routines: HashMap<ObjectId, ObjectId>,
+    pub types: HashMap<ObjectId, ObjectId>,
+}
+
+/// Undo record for a batched rename remap.
+///
+/// Only changed edges and edges removed by deduplication are retained; the
+/// untouched remainder is reconstructed from the live edge vector on rollback.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct GraphEdgeDelta {
+    original_len: usize,
+    changed: Vec<(usize, DependencyEdge)>,
+    removed: Vec<(usize, DependencyEdge)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct GraphIndexes {
-    rename_by_source: HashMap<ObjectId, usize>,
+struct ResolvedIndexes {
     by_resolved_referenced: HashMap<ObjectId, Vec<usize>>,
+    by_resolved_dependent: HashMap<ObjectId, Vec<usize>>,
 }
 
 impl Clone for DependencyGraph {
@@ -136,8 +178,18 @@ impl Clone for DependencyGraph {
             edge_set: self.edges.iter().cloned().collect(),
             // Indexes are derived state. Avoid duplicating them in statement
             // checkpoints; the clone builds them only if a lookup needs them.
-            indexes: OnceCell::new(),
+            rename_index: OnceCell::new(),
+            dependent_index: OnceCell::new(),
+            index_partition_index: OnceCell::new(),
+            resolved_indexes: OnceCell::new(),
         }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for DependencyGraph {
+    fn eq(&self, other: &Self) -> bool {
+        self.edges == other.edges && self.edge_set_is_valid() && other.edge_set_is_valid()
     }
 }
 
@@ -214,52 +266,235 @@ impl DependencyGraph {
     /// Confirms that every derived lookup points at the canonical edge list.
     /// This is intentionally cheap to call from invariant tests, not hot paths.
     pub(crate) fn indexes_are_valid(&self) -> bool {
-        self.indexes() == &Self::build_indexes(&self.edges)
+        let rename = Self::build_rename_index(&self.edges);
+        self.rename_index() == &rename
+            && self.dependent_index() == &Self::build_dependent_index(&self.edges)
+            && self.index_partition_index()
+                == &Self::build_index_partition_index(&self.edges, &rename)
+            && self.resolved_indexes() == &Self::build_resolved_indexes(&self.edges, &rename)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_set_is_valid(&self) -> bool {
+        self.edge_set.len() == self.edges.len()
+            && self.edge_set == self.edges.iter().cloned().collect()
+    }
+
+    /// Forces lazy index construction so benchmarks can measure it without
+    /// mixing in a cascade lookup or result materialization.
+    #[cfg(test)]
+    pub(crate) fn build_indexes_for_tests(&self) {
+        let _ = self.rename_index();
+        let _ = self.dependent_index();
+        let _ = self.index_partition_index();
+        let _ = self.resolved_indexes();
     }
 
     fn invalidate_indexes(&mut self) {
-        self.indexes.take();
+        self.rename_index.take();
+        self.dependent_index.take();
+        self.index_partition_index.take();
+        self.resolved_indexes.take();
     }
 
-    fn indexes(&self) -> &GraphIndexes {
-        self.indexes
-            .get_or_init(|| Self::build_indexes(&self.edges))
+    fn rename_index(&self) -> &HashMap<ObjectId, usize> {
+        self.rename_index
+            .get_or_init(|| Self::build_rename_index(&self.edges))
     }
 
-    fn build_indexes(edges: &[DependencyEdge]) -> GraphIndexes {
-        let mut indexes = GraphIndexes::default();
+    fn dependent_index(&self) -> &HashMap<ObjectId, Vec<usize>> {
+        self.dependent_index
+            .get_or_init(|| Self::build_dependent_index(&self.edges))
+    }
+
+    fn index_partition_index(&self) -> &HashMap<ObjectId, Vec<usize>> {
+        self.index_partition_index
+            .get_or_init(|| Self::build_index_partition_index(&self.edges, self.rename_index()))
+    }
+
+    fn build_index_partition_index(
+        edges: &[DependencyEdge],
+        rename_by_source: &HashMap<ObjectId, usize>,
+    ) -> HashMap<ObjectId, Vec<usize>> {
+        let mut by_referenced: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+        let mut resolved: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            if matches!(edge.kind, DependencyKind::IndexPartitionOf) {
+                let referenced = Self::resolve_rename_memo(
+                    edges,
+                    rename_by_source,
+                    &mut resolved,
+                    &edge.referenced,
+                );
+                by_referenced.entry(referenced).or_default().push(index);
+            }
+        }
+        by_referenced
+    }
+
+    fn resolved_indexes(&self) -> &ResolvedIndexes {
+        self.resolved_indexes
+            .get_or_init(|| Self::build_resolved_indexes(&self.edges, self.rename_index()))
+    }
+
+    fn build_rename_index(edges: &[DependencyEdge]) -> HashMap<ObjectId, usize> {
+        let mut rename_by_source = HashMap::new();
         for (index, edge) in edges.iter().enumerate() {
             if matches!(edge.kind, DependencyKind::RenameTo) {
-                indexes
-                    .rename_by_source
+                rename_by_source
                     .entry(edge.dependent.clone())
                     .or_insert(index);
             }
         }
+        rename_by_source
+    }
 
+    fn build_dependent_index(edges: &[DependencyEdge]) -> HashMap<ObjectId, Vec<usize>> {
+        let mut by_dependent: HashMap<ObjectId, Vec<usize>> = HashMap::new();
         for (index, edge) in edges.iter().enumerate() {
-            let referenced = Self::resolve_rename_with(edges, &indexes, &edge.referenced).clone();
-            indexes
-                .by_resolved_referenced
-                .entry(referenced)
+            by_dependent
+                .entry(edge.dependent.clone())
                 .or_default()
                 .push(index);
+        }
+        by_dependent
+    }
+
+    fn build_resolved_indexes(
+        edges: &[DependencyEdge],
+        rename_by_source: &HashMap<ObjectId, usize>,
+    ) -> ResolvedIndexes {
+        let mut indexes = ResolvedIndexes::default();
+        let mut resolved: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            if Self::cascade_kind(&edge.kind) {
+                let referenced = Self::resolve_rename_memo(
+                    edges,
+                    rename_by_source,
+                    &mut resolved,
+                    &edge.referenced,
+                );
+                indexes
+                    .by_resolved_referenced
+                    .entry(referenced)
+                    .or_default()
+                    .push(index);
+            }
+            if Self::cycle_kind(&edge.kind) {
+                let dependent = Self::resolve_rename_memo(
+                    edges,
+                    rename_by_source,
+                    &mut resolved,
+                    &edge.dependent,
+                );
+                indexes
+                    .by_resolved_dependent
+                    .entry(dependent)
+                    .or_default()
+                    .push(index);
+            }
         }
         indexes
     }
 
+    fn cascade_kind(kind: &DependencyKind) -> bool {
+        matches!(
+            kind,
+            DependencyKind::ViewDependency { .. }
+                | DependencyKind::ViewUsesType
+                | DependencyKind::IndexOnRelation { .. }
+                | DependencyKind::ForeignKey { .. }
+                | DependencyKind::InheritanceOf
+                | DependencyKind::PartitionOf
+                | DependencyKind::PartitionDetachPending
+        )
+    }
+
+    fn cycle_kind(kind: &DependencyKind) -> bool {
+        matches!(
+            kind,
+            DependencyKind::InheritanceOf
+                | DependencyKind::PartitionOf
+                | DependencyKind::PartitionDetachPending
+        )
+    }
+
+    /// Resolve one endpoint for index construction, caching acyclic results.
+    ///
+    /// A rename cycle returns the original input, exactly as
+    /// [`Self::resolve_rename_with`] does; cycle nodes are not cached because
+    /// their answer depends on where traversal started.
+    fn resolve_rename_memo(
+        edges: &[DependencyEdge],
+        rename_by_source: &HashMap<ObjectId, usize>,
+        resolved: &mut HashMap<ObjectId, ObjectId>,
+        id: &ObjectId,
+    ) -> ObjectId {
+        if let Some(cached) = resolved.get(id) {
+            return cached.clone();
+        }
+        let Some(first) = rename_by_source.get(id) else {
+            return id.clone();
+        };
+
+        let mut path = vec![id.clone()];
+        let mut visited = HashSet::new();
+        visited.insert(id.clone());
+        let mut current = edges[*first].referenced.clone();
+        loop {
+            if let Some(cached) = resolved.get(&current).cloned() {
+                for node in path {
+                    resolved.insert(node, cached.clone());
+                }
+                return cached;
+            }
+            if !visited.insert(current.clone()) {
+                return id.clone();
+            }
+            path.push(current.clone());
+            match rename_by_source.get(&current) {
+                Some(index) => current = edges[*index].referenced.clone(),
+                None => {
+                    for node in path {
+                        resolved.insert(node, current.clone());
+                    }
+                    return current;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn edges_for_dependents<'a>(
+        &'a self,
+        dependents: &HashSet<ObjectId>,
+    ) -> impl Iterator<Item = &'a DependencyEdge> {
+        let indexes = self.dependent_index();
+        let mut positions = dependents
+            .iter()
+            .flat_map(|id| indexes.get(id).into_iter().flatten().copied())
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        positions.into_iter().map(|index| &self.edges[index])
+    }
+
     fn resolve_rename_with<'a>(
         edges: &'a [DependencyEdge],
-        indexes: &GraphIndexes,
+        rename_by_source: &HashMap<ObjectId, usize>,
         id: &'a ObjectId,
     ) -> &'a ObjectId {
+        // Most catalog IDs have never been renamed; avoid the visited-set
+        // allocation and walk entirely for them.
+        if !rename_by_source.contains_key(id) {
+            return id;
+        }
         let mut current = id;
         let mut visited = HashSet::new();
         loop {
             if !visited.insert(current.clone()) {
                 return id;
             }
-            match indexes.rename_by_source.get(current) {
+            match rename_by_source.get(current) {
                 Some(index) => current = &edges[*index].referenced,
                 None => return current,
             }
@@ -268,8 +503,18 @@ impl DependencyGraph {
 
     fn resolved_referenced_edges(&self, id: &ObjectId) -> impl Iterator<Item = &DependencyEdge> {
         let target = self.resolve_rename(id);
-        self.indexes()
+        self.resolved_indexes()
             .by_resolved_referenced
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.edges[*index])
+    }
+
+    fn resolved_dependent_edges(&self, id: &ObjectId) -> impl Iterator<Item = &DependencyEdge> {
+        let target = self.resolve_rename(id);
+        self.resolved_indexes()
+            .by_resolved_dependent
             .get(target)
             .into_iter()
             .flatten()
@@ -391,31 +636,105 @@ impl DependencyGraph {
 
     /// The table an index is defined on, if the graph records one.
     pub(crate) fn index_table_of(&self, index: &ObjectId) -> Option<&ObjectId> {
-        self.edges
+        let position = self
+            .dependent_index()
+            .get(index)?
             .iter()
-            .find(|edge| {
-                edge.dependent == *index
-                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-            })
-            .map(|edge| &edge.referenced)
+            .copied()
+            .find(|position| {
+                matches!(
+                    self.edges[*position].kind,
+                    DependencyKind::IndexOnRelation { .. }
+                )
+            })?;
+        Some(&self.edges[position].referenced)
+    }
+
+    /// The definition recorded for an index dependent, if any.
+    pub(crate) fn index_definition_of(&self, id: &ObjectId) -> Option<&IndexDefinition> {
+        let position = self
+            .dependent_index()
+            .get(id)?
+            .iter()
+            .copied()
+            .find(|position| {
+                matches!(
+                    self.edges[*position].kind,
+                    DependencyKind::IndexOnRelation { .. }
+                )
+            })?;
+        match &self.edges[position].kind {
+            DependencyKind::IndexOnRelation { definition, .. } => Some(definition),
+            _ => None,
+        }
+    }
+
+    /// The parent index a child index is attached to, if any.
+    pub(crate) fn index_parent_of(&self, child: &ObjectId) -> Option<&ObjectId> {
+        let position = self
+            .dependent_index()
+            .get(child)?
+            .iter()
+            .copied()
+            .find(|position| {
+                matches!(self.edges[*position].kind, DependencyKind::IndexPartitionOf)
+            })?;
+        Some(&self.edges[position].referenced)
+    }
+
+    /// The child indexes attached to `parent`, if any.
+    pub(crate) fn index_partitions_of(&self, parent: &ObjectId) -> Vec<ObjectId> {
+        let target = self.resolve_rename(parent);
+        if let Some(positions) = self.index_partition_index().get(target) {
+            return positions
+                .iter()
+                .map(|&idx| self.edges[idx].dependent.clone())
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Rewrite a recorded index definition in place.
+    ///
+    /// Only one edge payload changes, so the edge set and derived indexes are
+    /// maintained incrementally instead of rebuilding both for the whole graph.
     pub(crate) fn update_index_definition(
         &mut self,
         index: &ObjectId,
         apply: impl FnOnce(&mut crate::_internal::model::index::IndexDefinition),
     ) {
-        self.mutate_edges(|edges| {
-            for edge in edges {
-                if edge.dependent == *index
-                    && let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind
-                {
-                    apply(definition);
-                    return;
-                }
-            }
+        let position = self.dependent_index().get(index).and_then(|positions| {
+            positions.iter().copied().find(|position| {
+                matches!(
+                    self.edges[*position].kind,
+                    DependencyKind::IndexOnRelation { .. }
+                )
+            })
         });
+        let Some(position) = position else {
+            return;
+        };
+        let previous = self.edges[position].clone();
+        let mut updated = previous.clone();
+        let DependencyKind::IndexOnRelation { definition, .. } = &mut updated.kind else {
+            unreachable!("position matched an IndexOnRelation edge");
+        };
+        apply(definition);
+        self.edge_set.remove(&previous);
+        if self.edge_set.insert(updated.clone()) {
+            self.edges[position] = updated;
+        } else {
+            // The update collapsed two distinct edges into one. Keep the
+            // earliest occurrence so the canonical order matches
+            // deduplicate_edges().
+            self.edges[position] = updated.clone();
+            if let Some(duplicate) = self.edges.iter().enumerate().find_map(|(candidate, edge)| {
+                (candidate != position && *edge == updated).then_some(candidate)
+            }) {
+                self.edges.remove(duplicate);
+            }
+            self.invalidate_indexes();
+        }
     }
 
     // Index definitions cache resolved collation names, so collation moves and
@@ -491,11 +810,63 @@ impl DependencyGraph {
             .collect()
     }
 
+    pub(crate) fn inheritance_children_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(id)
+                .filter(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                    )
+                })
+                .map(|edge| self.resolve_rename(&edge.dependent))
+                .collect();
+        }
+        let target = self.resolve_rename(id);
+        self.edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                ) && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
+            })
+            .map(|e| self.resolve_rename(&e.dependent))
+            .collect()
+    }
+
+    pub(crate) fn inheritance_parents_of(&self, child: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_dependent_edges(child)
+                .filter(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                    )
+                })
+                .map(|edge| self.resolve_rename(&edge.referenced))
+                .collect();
+        }
+        let target = self.resolve_rename(child);
+        self.edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                ) && (self.resolve_rename(&e.dependent) == target || &e.dependent == child)
+            })
+            .map(|e| self.resolve_rename(&e.referenced))
+            .collect()
+    }
+
     pub(crate) fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
         // A rename back to an earlier name is valid PostgreSQL. The indexed
         // resolver retains the same cycle fallback while avoiding a full edge
         // scan for every dependency lookup on large baselines.
-        Self::resolve_rename_with(&self.edges, self.indexes(), id)
+        Self::resolve_rename_with(&self.edges, self.rename_index(), id)
     }
 
     // Partition ancestry must remain acyclic.
@@ -514,12 +885,21 @@ impl DependencyGraph {
                 // attachment instead of looping or extending the cycle.
                 return true;
             }
-            let maybe_edge = self.edges.iter().find(|edge| {
-                matches!(
-                    edge.kind,
-                    DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
-                ) && self.resolve_rename(&edge.dependent) == current_parent
-            });
+            let maybe_edge = if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+                self.resolved_dependent_edges(current_parent).find(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                })
+            } else {
+                self.edges.iter().find(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    ) && self.resolve_rename(&edge.dependent) == current_parent
+                })
+            };
             if let Some(edge) = maybe_edge {
                 let p = self.resolve_rename(&edge.referenced);
                 if p == resolved_child {
@@ -549,15 +929,28 @@ impl DependencyGraph {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            for edge in self.edges.iter().filter(|edge| {
-                matches!(edge.kind, DependencyKind::InheritanceOf)
-                    && self.resolve_rename(&edge.dependent) == current
-            }) {
-                let ancestor = self.resolve_rename(&edge.referenced);
-                if ancestor == resolved_child {
-                    return true;
+            if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+                for edge in self
+                    .resolved_dependent_edges(current)
+                    .filter(|edge| matches!(edge.kind, DependencyKind::InheritanceOf))
+                {
+                    let ancestor = self.resolve_rename(&edge.referenced);
+                    if ancestor == resolved_child {
+                        return true;
+                    }
+                    pending.push(ancestor);
                 }
-                pending.push(ancestor);
+            } else {
+                for edge in self.edges.iter().filter(|edge| {
+                    matches!(edge.kind, DependencyKind::InheritanceOf)
+                        && self.resolve_rename(&edge.dependent) == current
+                }) {
+                    let ancestor = self.resolve_rename(&edge.referenced);
+                    if ancestor == resolved_child {
+                        return true;
+                    }
+                    pending.push(ancestor);
+                }
             }
         }
         false
@@ -611,111 +1004,230 @@ impl DependencyGraph {
     /// and publications are represented by a synthetic `public/<name>` ID, so
     /// a generic endpoint rewrite can otherwise corrupt an unrelated edge when
     /// two namespaces happen to share a name.
-    pub(crate) fn propagate_relation_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for edge in &mut self.edges {
-            match &mut edge.kind {
-                DependencyKind::RenameTo => {}
-                // Index-to-index: a relation rename never moves an index.
-                DependencyKind::IndexPartitionOf => {}
-                DependencyKind::ForeignKey { .. }
-                | DependencyKind::ViewDependency { .. }
-                | DependencyKind::InheritanceOf
-                | DependencyKind::PartitionOf
-                | DependencyKind::PartitionDetachPending
-                | DependencyKind::ConstraintDependency { .. }
-                | DependencyKind::ColumnGeneratedFrom { .. } => {
-                    if edge.dependent == *old_id {
-                        edge.dependent = new_id.clone();
-                    }
-                    if edge.referenced == *old_id {
-                        edge.referenced = new_id.clone();
-                    }
-                }
-                // A view reference follows only on the dependent side: the
-                // referenced routine or type may share the relation's name.
-                DependencyKind::ViewUsesRoutine { .. } | DependencyKind::ViewUsesType => {
-                    if edge.dependent == *old_id {
-                        edge.dependent = new_id.clone();
-                    }
-                }
-                DependencyKind::ColumnDefaultOnSequence { .. } => {
-                    if edge.dependent == *old_id {
-                        edge.dependent = new_id.clone();
-                    }
-                }
-                DependencyKind::IndexOnRelation { .. }
-                | DependencyKind::SequenceOwnedBy { .. }
-                | DependencyKind::TriggerOnTable { .. } => {
-                    if edge.referenced == *old_id {
-                        edge.referenced = new_id.clone();
-                    }
-                }
-                DependencyKind::ConstraintOnRelation { .. } => {
-                    if edge.dependent == *old_id {
-                        edge.dependent = new_id.clone();
-                    }
-                    if edge.referenced == *old_id {
-                        edge.referenced = new_id.clone();
-                    }
-                }
-                DependencyKind::PublicationIncludes { .. } => {
-                    if edge.dependent == *old_id {
-                        edge.dependent = new_id.clone();
-                    }
-                }
+    /// Apply every identity move in one pass.
+    ///
+    /// The typed match preserves the per-kind endpoint rules that a blind
+    /// `ObjectId` replacement would break; the single deduplication keeps
+    /// canonical edge order while avoiding one full rewrite per moved object.
+    pub(crate) fn apply_rename_plan(&mut self, plan: &GraphRenamePlan) {
+        let _ = self.apply_rename_plan_recorded(plan);
+    }
+
+    /// Apply a rename plan and return the minimal undo delta, or `None` when
+    /// no edge changed.
+    pub(crate) fn apply_rename_plan_recorded(
+        &mut self,
+        plan: &GraphRenamePlan,
+    ) -> Option<GraphEdgeDelta> {
+        let original_len = self.edges.len();
+        let mut changed = Vec::new();
+        for (index, edge) in self.edges.iter_mut().enumerate() {
+            if !Self::may_change(edge, plan) {
+                continue;
+            }
+            let original = edge.clone();
+            if Self::apply_plan_to_edge(edge, plan) {
+                changed.push((index, original));
             }
         }
-        self.deduplicate_edges();
+        if changed.is_empty() {
+            return None;
+        }
+        let removed = self.deduplicate_edges_recording(&changed);
+        self.invalidate_indexes();
+        Some(GraphEdgeDelta {
+            original_len,
+            changed,
+            removed,
+        })
+    }
+
+    /// Broad containment test used only to avoid cloning unaffected edges.
+    fn may_change(edge: &DependencyEdge, plan: &GraphRenamePlan) -> bool {
+        let hit = |map: &HashMap<ObjectId, ObjectId>, id: &ObjectId| map.contains_key(id);
+        match &edge.kind {
+            DependencyKind::RenameTo => false,
+            DependencyKind::TriggerOnTable {
+                trigger_id,
+                function_id,
+                ..
+            } => {
+                hit(&plan.relations, &edge.dependent)
+                    || hit(&plan.relations, &edge.referenced)
+                    || hit(&plan.triggers, &edge.dependent)
+                    || hit(&plan.triggers, trigger_id)
+                    || hit(&plan.routines, function_id)
+            }
+            _ => {
+                hit(&plan.relations, &edge.dependent)
+                    || hit(&plan.relations, &edge.referenced)
+                    || hit(&plan.indexes, &edge.dependent)
+                    || hit(&plan.indexes, &edge.referenced)
+                    || hit(&plan.sequences, &edge.dependent)
+                    || hit(&plan.sequences, &edge.referenced)
+                    || hit(&plan.triggers, &edge.dependent)
+                    || hit(&plan.triggers, &edge.referenced)
+                    || hit(&plan.routines, &edge.dependent)
+                    || hit(&plan.routines, &edge.referenced)
+                    || hit(&plan.types, &edge.dependent)
+                    || hit(&plan.types, &edge.referenced)
+            }
+        }
+    }
+
+    fn apply_plan_to_edge(edge: &mut DependencyEdge, plan: &GraphRenamePlan) -> bool {
+        let mut changed = false;
+        match &mut edge.kind {
+            DependencyKind::RenameTo => {}
+            // Index-to-index: a relation rename never moves an index, but an
+            // index rename or schema move changes both endpoints.
+            DependencyKind::IndexPartitionOf => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.indexes);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.indexes);
+            }
+            DependencyKind::ForeignKey { .. }
+            | DependencyKind::ViewDependency { .. }
+            | DependencyKind::InheritanceOf
+            | DependencyKind::PartitionOf
+            | DependencyKind::PartitionDetachPending
+            | DependencyKind::ConstraintDependency { .. }
+            | DependencyKind::ColumnGeneratedFrom { .. } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.relations);
+            }
+            // A view reference follows only on the dependent side: the
+            // referenced routine or type may share the relation's name.
+            DependencyKind::ViewUsesRoutine { unresolved_name } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+                if unresolved_name.is_none() {
+                    changed |= remap_endpoint(&mut edge.referenced, &plan.routines);
+                }
+            }
+            DependencyKind::ViewUsesType => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.types);
+            }
+            DependencyKind::ColumnDefaultOnSequence { .. } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.sequences);
+            }
+            DependencyKind::IndexOnRelation { .. } => {
+                changed |= remap_endpoint(&mut edge.referenced, &plan.relations);
+                changed |= remap_endpoint(&mut edge.dependent, &plan.indexes);
+            }
+            DependencyKind::SequenceOwnedBy { .. } => {
+                changed |= remap_endpoint(&mut edge.referenced, &plan.relations);
+                changed |= remap_endpoint(&mut edge.dependent, &plan.sequences);
+            }
+            DependencyKind::TriggerOnTable {
+                trigger_id,
+                function_id,
+                ..
+            } => {
+                changed |= remap_endpoint(&mut edge.referenced, &plan.relations);
+                changed |= remap_endpoint(&mut edge.dependent, &plan.triggers);
+                changed |= remap_endpoint(trigger_id, &plan.triggers);
+                changed |= remap_endpoint(function_id, &plan.routines);
+            }
+            DependencyKind::ConstraintOnRelation { .. } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.relations);
+            }
+            DependencyKind::PublicationIncludes { .. } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+            }
+        }
+        changed
+    }
+
+    fn deduplicate_edges_recording(
+        &mut self,
+        changed: &[(usize, DependencyEdge)],
+    ) -> Vec<(usize, DependencyEdge)> {
+        // Fast path: if reinserting only the changed edges produces no duplicates,
+        // we can avoid re-hashing and re-allocating the entire graph set.
+        let mut had_collision = false;
+        for (_, original) in changed {
+            self.edge_set.remove(original);
+        }
+        for (index, _) in changed {
+            if !self.edge_set.insert(self.edges[*index].clone()) {
+                had_collision = true;
+                break;
+            }
+        }
+
+        if !had_collision {
+            return Vec::new();
+        }
+
+        // Collision path: rebuild keeping the canonical first occurrences.
+        let changed_map: HashMap<usize, DependencyEdge> = changed.iter().cloned().collect();
+        let mut seen = HashSet::with_capacity(self.edges.len());
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.edges.len());
+        for (index, edge) in std::mem::take(&mut self.edges).into_iter().enumerate() {
+            if seen.insert(edge.clone()) {
+                kept.push(edge);
+            } else {
+                let original = changed_map
+                    .get(&index)
+                    .cloned()
+                    .unwrap_or_else(|| edge.clone());
+                removed.push((index, original));
+            }
+        }
+        self.edges = kept;
+        self.edge_set = seen;
+        removed
+    }
+
+    /// Restore the edge vector captured by a rename delta.
+    ///
+    /// Untouched edges are consumed from the live vector in order; additions
+    /// appended after the delta was recorded are dropped, so the accompanying
+    /// length marker sees the pre-rename length.
+    pub(crate) fn restore_edge_delta(&mut self, delta: GraphEdgeDelta) {
+        let mut current = std::mem::take(&mut self.edges).into_iter();
+        let mut changed = delta.changed.into_iter().collect::<HashMap<_, _>>();
+        let mut removed = delta.removed.into_iter().collect::<HashMap<_, _>>();
+        let mut restored = Vec::with_capacity(delta.original_len);
+        for index in 0..delta.original_len {
+            if let Some(edge) = removed.remove(&index) {
+                restored.push(edge);
+            } else {
+                let edge = current
+                    .next()
+                    .expect("graph edge delta must match the live edge count");
+                restored.push(changed.remove(&index).unwrap_or(edge));
+            }
+        }
+        self.edges = restored;
+        self.rebuild_edge_set();
         self.invalidate_indexes();
     }
 
-    /// Propagate an index rename.  Indexes are dependent endpoints of their
-    /// `IndexOnRelation` edges; they are not relation references.
-    pub(crate) fn propagate_index_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for edge in &mut self.edges {
-            if matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                && edge.dependent == *old_id
-            {
-                edge.dependent = new_id.clone();
-            }
-        }
-        self.deduplicate_edges();
-        self.invalidate_indexes();
+    #[cfg(test)]
+    pub(crate) fn propagate_relation_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        let mut plan = GraphRenamePlan::default();
+        plan.relations.insert(old_id.clone(), new_id.clone());
+        self.apply_rename_plan(&plan);
     }
 
     /// Propagate a sequence rename through every typed sequence endpoint.
     /// Ownership uses the sequence as a dependent; a column default uses it
     /// as a referenced object. Both must follow the canonical identity.
     pub(crate) fn propagate_sequence_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for edge in &mut self.edges {
-            match &edge.kind {
-                DependencyKind::SequenceOwnedBy { .. } if edge.dependent == *old_id => {
-                    edge.dependent = new_id.clone();
-                }
-                DependencyKind::ColumnDefaultOnSequence { .. } if edge.referenced == *old_id => {
-                    edge.referenced = new_id.clone();
-                }
-                _ => {}
-            }
-        }
-        self.deduplicate_edges();
-        self.invalidate_indexes();
+        let mut plan = GraphRenamePlan::default();
+        plan.sequences.insert(old_id.clone(), new_id.clone());
+        self.apply_rename_plan(&plan);
     }
 
     /// Propagate a trigger rename through its trigger edge and payload.
     pub(crate) fn propagate_trigger_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for edge in &mut self.edges {
-            if let DependencyKind::TriggerOnTable { trigger_id, .. } = &mut edge.kind
-                && *trigger_id == *old_id
-            {
-                *trigger_id = new_id.clone();
-                if edge.dependent == *old_id {
-                    edge.dependent = new_id.clone();
-                }
-            }
-        }
-        self.deduplicate_edges();
-        self.invalidate_indexes();
+        let mut plan = GraphRenamePlan::default();
+        plan.triggers.insert(old_id.clone(), new_id.clone());
+        self.apply_rename_plan(&plan);
     }
 
     /// Propagate a routine rename through its typed endpoints: trigger
@@ -723,32 +1235,9 @@ impl DependencyGraph {
     /// is the caller's decision, because only it can see the remaining
     /// overloads of the written name.
     pub(crate) fn propagate_function_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for edge in &mut self.edges {
-            match &mut edge.kind {
-                DependencyKind::TriggerOnTable { function_id, .. } if *function_id == *old_id => {
-                    *function_id = new_id.clone();
-                }
-                DependencyKind::ViewUsesRoutine {
-                    unresolved_name: None,
-                } if edge.referenced == *old_id => {
-                    edge.referenced = new_id.clone();
-                }
-                _ => {}
-            }
-        }
-        self.deduplicate_edges();
-        self.invalidate_indexes();
-    }
-
-    /// Propagate a type rename through view cast references.
-    pub(crate) fn propagate_type_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for edge in &mut self.edges {
-            if matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *old_id {
-                edge.referenced = new_id.clone();
-            }
-        }
-        self.deduplicate_edges();
-        self.invalidate_indexes();
+        let mut plan = GraphRenamePlan::default();
+        plan.routines.insert(old_id.clone(), new_id.clone());
+        self.apply_rename_plan(&plan);
     }
 
     /// Whether any view references `name` without a resolved signature.
@@ -791,36 +1280,253 @@ impl DependencyGraph {
         old_name: &str,
         new_name: &str,
     ) {
-        self.mutate_edges(|edges| {
-            for edge in edges {
-                if edge.dependent != *table_id {
-                    continue;
-                }
-                let name = match &mut edge.kind {
-                    DependencyKind::ForeignKey {
-                        constraint_name: Some(name),
-                        ..
-                    }
-                    | DependencyKind::ConstraintOnRelation {
-                        constraint_name: name,
-                        ..
-                    }
-                    | DependencyKind::ConstraintDependency {
-                        constraint_name: name,
-                        ..
-                    } => name,
-                    _ => continue,
-                };
-                if name == old_name {
-                    *name = new_name.to_string();
-                }
+        let _ = self.rename_constraint_recorded(table_id, old_name, new_name);
+    }
+
+    pub(crate) fn rename_constraint_recorded(
+        &mut self,
+        table_id: &ObjectId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Option<GraphEdgeDelta> {
+        let original_len = self.edges.len();
+        let mut changed = Vec::new();
+        for (index, edge) in self.edges.iter_mut().enumerate() {
+            if edge.dependent != *table_id {
+                continue;
             }
-        });
+            let matches = match &edge.kind {
+                DependencyKind::ForeignKey {
+                    constraint_name: Some(name),
+                    ..
+                }
+                | DependencyKind::ConstraintOnRelation {
+                    constraint_name: name,
+                    ..
+                }
+                | DependencyKind::ConstraintDependency {
+                    constraint_name: name,
+                    ..
+                } => name == old_name,
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+            let original = edge.clone();
+            let name = match &mut edge.kind {
+                DependencyKind::ForeignKey {
+                    constraint_name: Some(name),
+                    ..
+                }
+                | DependencyKind::ConstraintOnRelation {
+                    constraint_name: name,
+                    ..
+                }
+                | DependencyKind::ConstraintDependency {
+                    constraint_name: name,
+                    ..
+                } => name,
+                _ => unreachable!("constraint edge kind changed during rename"),
+            };
+            *name = new_name.to_string();
+            changed.push((index, original));
+        }
+        if changed.is_empty() {
+            return None;
+        }
+        let removed = self.deduplicate_edges_recording(&changed);
+        self.invalidate_indexes();
+        Some(GraphEdgeDelta {
+            original_len,
+            changed,
+            removed,
+        })
+    }
+
+    /// Rename table columns across multiple relations in a single recorded pass.
+    pub(crate) fn rename_columns_for_relations_recorded(
+        &mut self,
+        table_ids: &HashSet<ObjectId>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Option<GraphEdgeDelta> {
+        let original_len = self.edges.len();
+        let mut changed = Vec::new();
+
+        for index in 0..self.edges.len() {
+            let edge = &self.edges[index];
+            let needs_mutation = match &edge.kind {
+                DependencyKind::ForeignKey {
+                    from_columns,
+                    to_columns,
+                    ..
+                } => {
+                    (table_ids.contains(&edge.dependent)
+                        && from_columns.iter().any(|c| c == old_name))
+                        || (table_ids.contains(&edge.referenced)
+                            && to_columns.iter().any(|c| c == old_name))
+                }
+                DependencyKind::ConstraintOnRelation { columns, .. }
+                | DependencyKind::ConstraintDependency { columns, .. } => {
+                    table_ids.contains(&edge.dependent) && columns.iter().any(|c| c == old_name)
+                }
+                DependencyKind::ColumnGeneratedFrom {
+                    column,
+                    depends_on_column,
+                } => {
+                    (table_ids.contains(&edge.dependent) && column == old_name)
+                        || (table_ids.contains(&edge.referenced) && depends_on_column == old_name)
+                }
+                DependencyKind::ColumnDefaultOnSequence { column } => {
+                    table_ids.contains(&edge.dependent) && column == old_name
+                }
+                DependencyKind::IndexOnRelation {
+                    definition,
+                    dependency_columns,
+                    ..
+                } => {
+                    if !table_ids.contains(&edge.referenced) {
+                        false
+                    } else {
+                        let in_keys = definition
+                            .keys
+                            .iter()
+                            .chain(definition.included.iter())
+                            .any(|key| match &key.kind {
+                                crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                                    name == old_name
+                                }
+                                crate::_internal::model::index::IndexKeyKind::CatalogExpression(
+                                    expr,
+                                ) => expr
+                                    .referenced_columns()
+                                    .is_some_and(|cols| cols.contains(old_name)),
+                                crate::_internal::model::index::IndexKeyKind::Expression(_) => {
+                                    false
+                                }
+                            });
+                        in_keys || dependency_columns.iter().any(|c| c == old_name)
+                    }
+                }
+                DependencyKind::SequenceOwnedBy { column } => {
+                    table_ids.contains(&edge.referenced) && column == old_name
+                }
+                DependencyKind::ViewDependency {
+                    referenced_column: Some(column),
+                    ..
+                } => table_ids.contains(&edge.referenced) && column == old_name,
+                _ => false,
+            };
+
+            if !needs_mutation {
+                continue;
+            }
+
+            let original = self.edges[index].clone();
+            let edge = &mut self.edges[index];
+
+            match &mut edge.kind {
+                DependencyKind::ForeignKey {
+                    from_columns,
+                    to_columns,
+                    ..
+                } => {
+                    if table_ids.contains(&edge.dependent) {
+                        for column in from_columns {
+                            if column == old_name {
+                                *column = new_name.to_string();
+                            }
+                        }
+                    }
+                    if table_ids.contains(&edge.referenced) {
+                        for column in to_columns {
+                            if column == old_name {
+                                *column = new_name.to_string();
+                            }
+                        }
+                    }
+                }
+                DependencyKind::ConstraintOnRelation { columns, .. }
+                | DependencyKind::ConstraintDependency { columns, .. } => {
+                    for column in columns {
+                        if column == old_name {
+                            *column = new_name.to_string();
+                        }
+                    }
+                }
+                DependencyKind::ColumnGeneratedFrom {
+                    column,
+                    depends_on_column,
+                } => {
+                    if table_ids.contains(&edge.dependent) && column == old_name {
+                        *column = new_name.to_string();
+                    }
+                    if table_ids.contains(&edge.referenced) && depends_on_column == old_name {
+                        *depends_on_column = new_name.to_string();
+                    }
+                }
+                DependencyKind::ColumnDefaultOnSequence { column } => {
+                    *column = new_name.to_string();
+                }
+                DependencyKind::IndexOnRelation {
+                    definition,
+                    dependency_columns,
+                    ..
+                } => {
+                    for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                        match &mut key.kind {
+                            crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                                if name == old_name {
+                                    *name = new_name.to_string();
+                                }
+                            }
+                            crate::_internal::model::index::IndexKeyKind::CatalogExpression(
+                                expr,
+                            ) => {
+                                expr.rename_column(old_name, new_name);
+                            }
+                            crate::_internal::model::index::IndexKeyKind::Expression(_) => {}
+                        }
+                    }
+                    for column in dependency_columns.iter_mut() {
+                        if column == old_name {
+                            *column = new_name.to_string();
+                        }
+                    }
+                }
+                DependencyKind::SequenceOwnedBy { column } => {
+                    *column = new_name.to_string();
+                }
+                DependencyKind::ViewDependency {
+                    referenced_column: Some(column),
+                    ..
+                } => {
+                    *column = new_name.to_string();
+                }
+                _ => {}
+            }
+
+            changed.push((index, original));
+        }
+
+        if changed.is_empty() {
+            return None;
+        }
+
+        let removed = self.deduplicate_edges_recording(&changed);
+        self.invalidate_indexes();
+        Some(GraphEdgeDelta {
+            original_len,
+            changed,
+            removed,
+        })
     }
 
     /// Rename a table column in all typed dependency payloads that can carry
     /// column identity. The endpoint direction determines whether the column
     /// is source-side or referenced-side for foreign keys.
+    #[cfg(test)]
     pub(crate) fn rename_column_dependencies(
         &mut self,
         table_id: &ObjectId,
@@ -910,15 +1616,18 @@ impl DependencyGraph {
                 else {
                     continue;
                 };
-                let index_keys = definition
-                    .keys
-                    .iter_mut()
-                    .chain(&mut definition.included)
-                    .filter_map(|key| match &mut key.kind {
-                        crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
-                        crate::_internal::model::index::IndexKeyKind::Expression(_) => None,
-                    })
-                    .collect::<Vec<&mut String>>();
+                let mut index_keys = Vec::new();
+                for key in definition.keys.iter_mut().chain(&mut definition.included) {
+                    match &mut key.kind {
+                        crate::_internal::model::index::IndexKeyKind::Column(name) => {
+                            index_keys.push(name);
+                        }
+                        crate::_internal::model::index::IndexKeyKind::CatalogExpression(expr) => {
+                            expr.rename_column(old_name, new_name);
+                        }
+                        crate::_internal::model::index::IndexKeyKind::Expression(_) => {}
+                    }
+                }
                 for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {
                     if column == old_name {
                         *column = new_name.to_string();
@@ -961,16 +1670,6 @@ impl DependencyGraph {
         });
     }
 
-    /// Backwards-compatible relation rename entry point.
-    ///
-    /// New callers should use the typed helpers above.  Keeping this method
-    /// relation-scoped prevents the old all-endpoints behavior from silently
-    /// rewriting sequence, trigger, function, or publication identity data.
-    #[cfg(test)]
-    pub(crate) fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        self.propagate_relation_rename(old_id, new_id);
-    }
-
     /// Views that depend on a routine.
     ///
     /// A reference that resolved to an exact signature matches only that
@@ -1000,10 +1699,18 @@ impl DependencyGraph {
 
     /// Views whose body casts to a type.
     pub(crate) fn views_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        let target = self.resolve_rename(ty);
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(ty)
+                .filter(|edge| matches!(edge.kind, DependencyKind::ViewUsesType))
+                .collect();
+        }
         self.edges
             .iter()
             .filter(|edge| {
-                matches!(edge.kind, DependencyKind::ViewUsesType) && edge.referenced == *ty
+                matches!(edge.kind, DependencyKind::ViewUsesType)
+                    && (self.resolve_rename(&edge.referenced) == target || &edge.referenced == ty)
             })
             .collect()
     }
@@ -1072,6 +1779,7 @@ mod tests {
                 eligibility_known: true,
             },
         ));
+        graph.build_indexes_for_tests();
         graph.update_index_definition(&id("index"), |definition| {
             definition.valid = true;
             definition.ready = true;
@@ -1082,6 +1790,34 @@ mod tests {
         let updated = graph.edges()[0].clone();
         graph.add_edge(updated);
         assert_eq!(graph.edge_count(), 1);
+        // A definition payload is not part of the derived lookup structure, so
+        // the warm index survives the update.
+        assert!(graph.dependent_index.get().is_some());
+        assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn a_definition_update_collapsing_duplicates_keeps_the_earliest_edge() {
+        let mut graph = DependencyGraph::new();
+        let before = view_edge("before", "table");
+        let first = index_edge("index", "table", false);
+        let second = index_edge("index", "table", true);
+        let after = view_edge("after", "table");
+        graph.add_edge(before.clone());
+        graph.add_edge(first);
+        graph.add_edge(second.clone());
+        graph.add_edge(after.clone());
+        graph.build_indexes_for_tests();
+
+        graph.update_index_definition(&id("index"), |definition| {
+            definition.valid = true;
+            definition.ready = true;
+        });
+
+        assert_eq!(graph.edge_count(), 3);
+        assert_eq!(graph.edges(), [before, second, after]);
+        assert!(graph.edge_set_is_valid());
+        assert!(graph.indexes_are_valid());
     }
 
     #[test]
@@ -1142,6 +1878,172 @@ mod tests {
     }
 
     #[test]
+    fn rename_delta_restores_rewritten_and_deduplicated_edges() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(view_edge("view_a", "table"));
+        graph.add_edge(view_edge("view_b", "table"));
+        let before = graph.edges().to_vec();
+
+        let mut plan = GraphRenamePlan::default();
+        plan.relations.insert(id("view_b"), id("view_a"));
+        let delta = graph
+            .apply_rename_plan_recorded(&plan)
+            .expect("rename should change edges");
+        assert_eq!(graph.edge_count(), 1);
+        assert!(graph.indexes_are_valid());
+
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.edges(), before.as_slice());
+        assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn rename_delta_drops_edges_appended_after_it_was_recorded() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(view_edge("view_a", "table"));
+        graph.add_edge(view_edge("view_b", "table"));
+        let before = graph.edges().to_vec();
+
+        let mut plan = GraphRenamePlan::default();
+        plan.relations.insert(id("view_b"), id("view_a"));
+        let delta = graph
+            .apply_rename_plan_recorded(&plan)
+            .expect("rename should change edges");
+        graph.add_edge(view_edge("view_c", "table"));
+
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.edges(), before.as_slice());
+        assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn rename_delta_keeps_edges_added_before_it_was_recorded_until_the_length_marker_runs() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(view_edge("view_a", "table"));
+        graph.add_edge(view_edge("view_b", "table"));
+        let before = graph.edges().to_vec();
+        let before_len = graph.edge_count();
+        graph.add_edge(view_edge("renamed", "table"));
+
+        let mut plan = GraphRenamePlan::default();
+        plan.relations.insert(id("view_b"), id("view_a"));
+        let delta = graph
+            .apply_rename_plan_recorded(&plan)
+            .expect("rename should change edges");
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.edge_count(), before_len + 1);
+
+        graph.truncate(before_len);
+        assert_eq!(graph.edges(), before.as_slice());
+        assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn rename_plan_remaps_index_partition_of_endpoints() {
+        let mut graph = DependencyGraph::new();
+        let parent_idx = id("parent_idx");
+        let child_idx = id("child_idx");
+        let table = id("table");
+        let child_table = id("child_table");
+
+        let index_kind = || DependencyKind::IndexOnRelation {
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                nulls_not_distinct: Some(false),
+                predicate: IndexPredicate::None,
+                unestablished: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
+            dependency_columns: Vec::new(),
+            dependency_columns_known: true,
+            is_concurrent: false,
+            is_immediate: true,
+            eligibility_known: true,
+        };
+
+        graph.add_edge(DependencyEdge::new(parent_idx.clone(), table, index_kind()));
+        graph.add_edge(DependencyEdge::new(
+            child_idx.clone(),
+            child_table,
+            index_kind(),
+        ));
+        graph.add_edge(DependencyEdge::new(
+            child_idx.clone(),
+            parent_idx.clone(),
+            DependencyKind::IndexPartitionOf,
+        ));
+
+        let renamed_parent = id("renamed_parent_idx");
+        let renamed_child = id("renamed_child_idx");
+        let mut plan = GraphRenamePlan::default();
+        plan.indexes
+            .insert(parent_idx.clone(), renamed_parent.clone());
+        plan.indexes
+            .insert(child_idx.clone(), renamed_child.clone());
+
+        let delta = graph
+            .apply_rename_plan_recorded(&plan)
+            .expect("rename plan must record edge changes");
+
+        assert_eq!(graph.index_parent_of(&renamed_child), Some(&renamed_parent));
+        assert_eq!(graph.index_parent_of(&child_idx), None);
+
+        let partition_edge = graph
+            .edges()
+            .iter()
+            .find(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf))
+            .expect("partition edge must remain");
+        assert_eq!(partition_edge.dependent, renamed_child);
+        assert_eq!(partition_edge.referenced, renamed_parent);
+
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.index_parent_of(&child_idx), Some(&parent_idx));
+        assert_eq!(graph.index_parent_of(&renamed_child), None);
+    }
+
+    #[test]
+    fn interleaved_constraint_deltas_and_additions_restore_the_original_edges() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(relation_edge(
+            "table",
+            "table",
+            DependencyKind::ConstraintDependency {
+                constraint_name: "first".into(),
+                columns: vec!["id".into()],
+            },
+        ));
+        graph.add_edge(relation_edge(
+            "table",
+            "table",
+            DependencyKind::ConstraintDependency {
+                constraint_name: "second".into(),
+                columns: vec!["id".into()],
+            },
+        ));
+        let before = graph.edges().to_vec();
+        let first = graph
+            .rename_constraint_recorded(&id("table"), "first", "first_renamed")
+            .expect("first constraint rename should change an edge");
+        graph.add_edge(view_edge("view_a", "table"));
+        let second = graph
+            .rename_constraint_recorded(&id("table"), "second", "second_renamed")
+            .expect("second constraint rename should change an edge");
+        graph.add_edge(view_edge("view_b", "table"));
+
+        graph.restore_edge_delta(second);
+        graph.restore_edge_delta(first);
+        graph.truncate(before.len());
+        assert_eq!(graph.edges(), before.as_slice());
+        assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
     fn column_rename_updates_both_sides_of_self_referencing_fk() {
         let table = id("self_ref");
         let mut graph = DependencyGraph::new();
@@ -1183,8 +2085,79 @@ mod tests {
         assert_eq!(columns, &["new_id"]);
     }
 
+    #[test]
+    fn column_rename_updates_cached_view_columns_for_all_affected_relations() {
+        let mut graph = DependencyGraph::new();
+        for (view, table, column) in [
+            ("parent_view", "parent", Some("old_id")),
+            ("child_view", "child", Some("old_id")),
+            ("relation_level_view", "child", None),
+        ] {
+            graph.add_edge(DependencyEdge::new(
+                id(view),
+                id(table),
+                DependencyKind::ViewDependency {
+                    view_generation: 1,
+                    referenced_column: column.map(str::to_string),
+                },
+            ));
+        }
+        let before = graph.edges().to_vec();
+        let affected: HashSet<ObjectId> = [id("parent"), id("child")].into_iter().collect();
+
+        let delta = graph
+            .rename_columns_for_relations_recorded(&affected, "old_id", "new_id")
+            .expect("a precise view-column dependency should follow the rename");
+
+        let columns: Vec<_> = graph
+            .edges()
+            .iter()
+            .map(|edge| match &edge.kind {
+                DependencyKind::ViewDependency {
+                    referenced_column, ..
+                } => referenced_column.clone(),
+                _ => unreachable!("only view dependencies were inserted"),
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            vec![Some("new_id".to_string()), Some("new_id".to_string()), None,]
+        );
+
+        graph.restore_edge_delta(delta);
+        assert_eq!(graph.edges(), before.as_slice());
+        assert!(graph.indexes_are_valid());
+    }
+
     fn relation_edge(dependent: &str, referenced: &str, kind: DependencyKind) -> DependencyEdge {
         DependencyEdge::new(id(dependent), id(referenced), kind)
+    }
+
+    fn index_edge(dependent: &str, referenced: &str, valid: bool) -> DependencyEdge {
+        relation_edge(
+            dependent,
+            referenced,
+            DependencyKind::IndexOnRelation {
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid,
+                    ready: valid,
+                    live: true,
+                },
+                dependency_columns: Vec::new(),
+                dependency_columns_known: true,
+                is_concurrent: false,
+                is_immediate: true,
+                eligibility_known: true,
+            },
+        )
     }
 
     fn canonical_views<'a>(graph: &'a DependencyGraph, target: &ObjectId) -> Vec<&'a ObjectId> {
@@ -1240,7 +2213,7 @@ mod tests {
         ));
         assert_indexed_views_match_scan(&graph, &targets);
 
-        graph.propagate_rename(&b, &c);
+        graph.propagate_relation_rename(&b, &c);
         graph.add_edge(DependencyEdge::new(
             b.clone(),
             c.clone(),
@@ -1296,6 +2269,96 @@ mod tests {
 
         assert_eq!(graph.triggers_for_function(&trigger_function).len(), 1);
         assert!(graph.triggers_for_function(&overload).is_empty());
+    }
+
+    #[test]
+    fn index_table_lookup_matches_cold_and_warm_indexes() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(relation_edge(
+            "index",
+            "table",
+            DependencyKind::IndexOnRelation {
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
+                dependency_columns: Vec::new(),
+                dependency_columns_known: true,
+                is_concurrent: false,
+                is_immediate: true,
+                eligibility_known: true,
+            },
+        ));
+
+        assert_eq!(graph.index_table_of(&id("index")), Some(&id("table")));
+        graph.build_indexes_for_tests();
+        assert_eq!(graph.index_table_of(&id("index")), Some(&id("table")));
+        assert_eq!(graph.index_table_of(&id("missing")), None);
+    }
+
+    #[test]
+    fn memoized_index_resolution_matches_endpoint_walks() {
+        let a = id("a");
+        let b = id("b");
+        let c = id("c");
+        let d = id("d");
+        let x = id("x");
+        let y = id("y");
+        let z = id("z");
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(view_edge("v1", "a"));
+        graph.add_edge(view_edge("v2", "a"));
+        graph.add_edge(view_edge("v3", "b"));
+        graph.add_edge(view_edge("v4", "d"));
+        graph.add_edge(DependencyEdge::new(a, b.clone(), DependencyKind::RenameTo));
+        graph.add_edge(DependencyEdge::new(b, c.clone(), DependencyKind::RenameTo));
+        graph.add_edge(DependencyEdge::new(c, d.clone(), DependencyKind::RenameTo));
+        graph.add_edge(DependencyEdge::new(
+            x.clone(),
+            y.clone(),
+            DependencyKind::RenameTo,
+        ));
+        graph.add_edge(DependencyEdge::new(y, x.clone(), DependencyKind::RenameTo));
+        graph.add_edge(view_edge("vx", "x"));
+        graph.add_edge(DependencyEdge::new(
+            z.clone(),
+            x.clone(),
+            DependencyKind::RenameTo,
+        ));
+        graph.add_edge(view_edge("vz", "z"));
+
+        let edges = graph.edges();
+        let rename = DependencyGraph::build_rename_index(edges);
+        let built = DependencyGraph::build_resolved_indexes(edges, &rename);
+        let mut expected: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            if !DependencyGraph::cascade_kind(&edge.kind) {
+                continue;
+            }
+            let referenced =
+                DependencyGraph::resolve_rename_with(edges, &rename, &edge.referenced).clone();
+            expected.entry(referenced).or_default().push(index);
+        }
+
+        assert_eq!(built.by_resolved_referenced, expected);
+        assert_eq!(
+            built.by_resolved_referenced.get(&id("d")),
+            Some(&vec![0, 1, 2, 3])
+        );
+        assert_eq!(built.by_resolved_referenced.get(&x), Some(&vec![9]));
+        // An acyclic start that enters a cycle returns the original start
+        // rather than a node from the cycle.
+        assert_eq!(graph.resolve_rename(&z), &z);
+        assert_eq!(graph.resolve_rename(&x), &x);
     }
 
     #[test]
@@ -1433,5 +2496,46 @@ mod tests {
         assert!(graph.cascade_edges(&parent).iter().any(|edge| {
             edge.dependent == child && matches!(edge.kind, DependencyKind::InheritanceOf)
         }));
+    }
+
+    #[test]
+    fn large_graph_cycle_checks_use_indexes_and_match_unindexed() {
+        let mut graph = DependencyGraph::new();
+        for index in 0..DependencyGraph::CASCADE_INDEX_MIN_EDGES {
+            let child = id(&format!("part_child_{index}"));
+            let parent = id(&format!("part_parent_{index}"));
+            graph.add_edge(DependencyEdge::new(
+                child,
+                parent,
+                DependencyKind::PartitionOf,
+            ));
+        }
+        assert!(graph.cascade_index_is_worthwhile());
+        // part_parent_0 has child part_child_0; attaching part_parent_0 to part_child_0 creates a cycle
+        assert!(graph.check_partition_cycle(&id("part_child_0"), &id("part_parent_0")));
+        assert!(!graph.check_partition_cycle(&id("part_parent_0"), &id("unrelated")));
+
+        // Multi-parent inheritance cycle check with indexed vs unindexed comparison
+        let multi_child = id("multi_child");
+        let first_parent = id("first_parent");
+        let second_parent = id("second_parent");
+        let ancestor = id("ancestor_via_second");
+        graph.add_edge(DependencyEdge::new(
+            second_parent.clone(),
+            ancestor.clone(),
+            DependencyKind::InheritanceOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            multi_child.clone(),
+            first_parent,
+            DependencyKind::InheritanceOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            multi_child.clone(),
+            second_parent,
+            DependencyKind::InheritanceOf,
+        ));
+        assert!(graph.check_inheritance_cycle(&multi_child, &ancestor));
+        assert!(!graph.check_inheritance_cycle(&ancestor, &multi_child));
     }
 }

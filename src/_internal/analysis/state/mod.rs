@@ -7,7 +7,9 @@ use crate::_internal::analysis::namespace::{
     SESSION_TEMP_SCHEMA, SYSTEM_CATALOG_SCHEMA, SearchPathEntry, is_session_temp_schema,
 };
 use crate::_internal::analysis::settings::ScopedSetting;
-use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
+use crate::_internal::analysis::transaction::{
+    BaselineSet, NamespaceSnapshot, StateChange, TransactionFrame, TransactionFrameKind,
+};
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
@@ -54,6 +56,7 @@ mod hydrate;
 mod lookup;
 mod names;
 mod pre_state;
+pub(crate) use pre_state::{PreStateReadSet, ReadScope};
 mod publication;
 mod roles;
 mod rollback;
@@ -109,6 +112,10 @@ impl MutationResult {
     /// rule whose finding depends on a transition cannot have observed one.
     pub(crate) fn is_noop(&self) -> bool {
         matches!(self, Self::NoOp)
+    }
+
+    pub(crate) fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(_))
     }
 
     pub(crate) fn conflict(reason: impl Into<String>) -> Self {
@@ -174,6 +181,7 @@ pub(crate) struct CascadeResult {
     pub dropped_constraints: HashSet<(ObjectId, String)>,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone)]
 pub(crate) struct LocalState {
     pub schemas: HashMap<String, SchemaOverlay>,
@@ -203,10 +211,12 @@ pub(crate) struct LocalState {
     /// Collations of the synchronized cluster, used to resolve written
     /// `COLLATE` names. Empty only when no baseline supplied one.
     pub collations: crate::_internal::model::collation::CollationCatalogue,
-    /// Performance hint: a temporary object has been created in this session.
-    /// `temp_namespace_exists` derives the real answer, so this only has to be
-    /// a superset to stay correct across rollback and `ON COMMIT DROP`.
-    pub saw_temp_object: bool,
+    /// Whether the session temporary namespace has been created.
+    ///
+    /// PostgreSQL creates it with the first temporary object and keeps it after
+    /// that object is dropped, but a rollback that undoes the creation removes
+    /// it again. The flag is therefore snapshotted with the transaction.
+    pub temp_namespace_created: bool,
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
     pub default_search_path_template: Vec<String>,
@@ -244,6 +254,12 @@ pub(crate) struct LocalState {
     pub evidence: EvidenceLog,
     pub current_evidence_location: Option<EvidenceLocation>,
     pub transactions: Vec<TransactionFrame>,
+    /// Undo log for the autocommit statement currently being applied. `None`
+    /// outside a statement; explicit transactions use the innermost frame.
+    pub statement_undo_log: Option<Vec<StateChange>>,
+    /// Relations already snapshotted in the current statement. A wide ALTER
+    /// needs only the state before its first mutation for statement rollback.
+    pub statement_snapshot_ids: HashSet<ObjectId>,
     pub transaction_aborted: bool,
     pub pending_validation: HashSet<(ObjectId, String)>,
     pub generation_counter: u64,
@@ -260,7 +276,78 @@ pub(crate) struct PreState {
     pub extensions: HashMap<String, crate::_internal::model::extension::ExtensionState>,
     pub types: HashMap<ObjectId, crate::_internal::model::types::TypeState>,
     pub indexes: Vec<crate::_internal::analysis::graph::DependencyEdge>,
+    pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
+}
+
+impl PreState {
+    /// Relations whose columns or typed table use the composite type (or a composite container).
+    pub(crate) fn relations_using_composite(
+        &self,
+        composite: &ObjectId,
+    ) -> Vec<&crate::_internal::model::relation::RelationState> {
+        self.relations
+            .values()
+            .filter(|relation| {
+                if relation.of_type.as_ref() == Some(composite) {
+                    return true;
+                }
+                // The set is a cycle guard, not a memo: a successful traversal
+                // leaves partially explored containers behind that would hide
+                // the same container for the next relation.
+                let mut visiting = HashSet::new();
+                relation.columns.iter().any(|column| {
+                    column.type_id.as_ref().is_some_and(|id| {
+                        self.type_stores_composite_in_container(id, composite, &mut visiting)
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn type_stores_composite_in_container(
+        &self,
+        id: &ObjectId,
+        target: &ObjectId,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> bool {
+        let (element, _) = AnalysisState::strip_array_type_id(id);
+        if element == *target {
+            return true;
+        }
+        if !visiting.insert(element.clone()) {
+            return false;
+        }
+        let Some(type_state) = self.types.get(&element) else {
+            return false;
+        };
+        match &type_state.kind {
+            crate::_internal::model::types::TypeKind::Composite { fields } => {
+                fields.iter().any(|field| {
+                    field.data_type_id.as_ref().is_some_and(|f_id| {
+                        self.type_stores_composite_in_container(f_id, target, visiting)
+                    })
+                })
+            }
+            crate::_internal::model::types::TypeKind::Range { subtype_id, .. } => {
+                subtype_id.as_ref().is_some_and(|s_id| {
+                    self.type_stores_composite_in_container(s_id, target, visiting)
+                })
+            }
+            crate::_internal::model::types::TypeKind::Multirange { range } => {
+                range.as_ref().is_some_and(|r_id| {
+                    self.type_stores_composite_in_container(r_id, target, visiting)
+                })
+            }
+            crate::_internal::model::types::TypeKind::Domain { base_type_id, .. } => {
+                base_type_id.as_ref().is_some_and(|b_id| {
+                    self.type_stores_composite_in_container(b_id, target, visiting)
+                })
+            }
+            crate::_internal::model::types::TypeKind::Enum { .. }
+            | crate::_internal::model::types::TypeKind::Base { .. } => false,
+        }
+    }
 }
 
 struct HydratedRelationTypes {
@@ -270,6 +357,7 @@ struct HydratedRelationTypes {
     types: HashMap<ObjectId, TypeOverlay>,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone)]
 pub(crate) struct AnalysisState {
     pub pg_version_num: Option<u32>,
@@ -366,6 +454,12 @@ pub(crate) fn bare_routine_name(identity: &str) -> &str {
 
 #[cfg(test)]
 mod pre_state_tests;
+
+#[cfg(test)]
+mod temp_namespace_tests;
+
+#[cfg(test)]
+mod types_tests;
 
 #[cfg(test)]
 mod evidence_tests;

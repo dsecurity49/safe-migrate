@@ -698,7 +698,7 @@ impl AnalysisState {
                     .aggregates
                     .clone()
                     .unwrap_or_else(AggregateCatalogue::fallback),
-                saw_temp_object: false,
+                temp_namespace_created: false,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
                 default_search_path_template,
@@ -720,6 +720,8 @@ impl AnalysisState {
                 evidence: EvidenceLog::default(),
                 current_evidence_location: None,
                 transactions: Vec::new(),
+                statement_undo_log: None,
+                statement_snapshot_ids: HashSet::new(),
                 transaction_aborted: false,
                 pending_validation: HashSet::new(),
                 generation_counter: 0,
@@ -732,7 +734,102 @@ impl AnalysisState {
                 crate::_internal::analysis::evidence::EvidenceScope::Chain,
             );
         }
+        state.hydrate_range_type_references(&catalog_search_path);
         state
+    }
+
+    fn hydrate_range_type_references(&mut self, _catalog_search_path: &[SearchPathEntry]) {
+        let range_keys: Vec<ObjectId> = self
+            .local
+            .types
+            .iter()
+            .filter_map(|(id, overlay)| {
+                if let TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Range { .. },
+                    ..
+                }) = overlay
+                {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for range_id in range_keys {
+            let (opclass_str, canonical_str, diff_str, subtype_str) = {
+                let Some(TypeOverlay::Present(TypeState {
+                    kind:
+                        TypeKind::Range {
+                            opclass,
+                            canonical,
+                            subtype_diff,
+                            subtype,
+                            ..
+                        },
+                    ..
+                })) = self.local.types.get(&range_id)
+                else {
+                    continue;
+                };
+                (
+                    opclass.clone(),
+                    canonical.clone(),
+                    subtype_diff.clone(),
+                    subtype.clone(),
+                )
+            };
+
+            let opclass_id = opclass_str.as_deref().and_then(|written| {
+                let w = if let Some((s, n)) = written.split_once('.') {
+                    crate::_internal::model::index::WrittenName {
+                        schema: Some(s.to_string()),
+                        name: n.to_string(),
+                    }
+                } else {
+                    crate::_internal::model::index::WrittenName {
+                        schema: None,
+                        name: written.to_string(),
+                    }
+                };
+                self.local
+                    .opclasses
+                    .resolve(&w, "btree", self.search_path())
+                    .map(|o| ObjectId::new(o.family.schema.clone(), o.name.clone()))
+            });
+
+            let canonical_id = canonical_str.as_deref().and_then(|canon_name| {
+                self.resolve_internal_routine_id(canon_name, &range_id.name)
+            });
+
+            let subtype_diff_id = diff_str.as_deref().and_then(|diff_name| {
+                let subtype_name = subtype_str.as_deref().unwrap_or("anyelement");
+                let signature = format!("{subtype_name},{subtype_name}");
+                self.resolve_internal_routine_id(diff_name, &signature)
+            });
+
+            if let Some(TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Range {
+                        opclass_id: target_opclass_id,
+                        canonical_id: target_canon_id,
+                        subtype_diff_id: target_diff_id,
+                        ..
+                    },
+                ..
+            })) = self.local.types.get_mut(&range_id)
+            {
+                if target_opclass_id.is_none() {
+                    *target_opclass_id = opclass_id;
+                }
+                if target_canon_id.is_none() {
+                    *target_canon_id = canonical_id;
+                }
+                if target_diff_id.is_none() {
+                    *target_diff_id = subtype_diff_id;
+                }
+            }
+        }
     }
 
     /// Construct state from a cache after validating its cross-record

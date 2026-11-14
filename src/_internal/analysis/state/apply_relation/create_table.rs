@@ -1327,6 +1327,16 @@ impl AnalysisState {
                 .iter()
                 .map(|(column, generation, _)| (column.clone(), *generation)),
         );
+        if let Some(parent_id) = &create.partition_of
+            && let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent_id)
+        {
+            rel_state.identity_columns.extend(
+                parent
+                    .identity_columns
+                    .iter()
+                    .map(|(column, generation)| (column.clone(), *generation)),
+            );
+        }
         rel_state.generated_columns = inherited_generated_columns;
         rel_state.generated_columns.extend(like_generated_columns);
         rel_state.extended_statistics.extend(

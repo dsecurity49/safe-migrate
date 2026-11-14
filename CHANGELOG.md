@@ -5,6 +5,101 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## Unreleased (v0.13.0)
+
+- `ALTER TABLE IF EXISTS` on an absent relation is now a no-op instead of a
+  Tier 1 schema-drift or chain conflict; the unguarded form still reports drift.
+- `ALTER ROLE ... RENAME TO` now moves role state, membership references, and
+  role context to the new name. Role ownership and ACL references are not
+  modeled, so the chain is tainted instead of claiming exact confidence.
+- Statements skipped after a transaction abort are reported as not evaluated
+  with a `transaction_aborted` cause, and the report cannot remain at exact
+  confidence.
+- `SET NOT NULL` after a validated `CHECK (column IS NOT NULL)` now uses the
+  metadata-only fast path, matching PostgreSQL instead of warning about a full
+  table scan.
+- Added `lock-risk`, a size-independent Tier 3 advisory that names the lock
+  mode and targets of DDL. Row-count-based scan and rewrite findings no longer
+  repeat lock-mode text. Dedicated Tier 1/2 rules still provide their
+  actionable warnings.
+- `SET STORAGE` is now a size-independent Tier 3 `set-storage-lock` advisory;
+  it no longer claims to rewrite the table, and small tables no longer lose
+  the lock warning.
+- `type-change-rewrite` no longer reports on a column change that already
+  conflicted, removing a secondary finding that obscured the real conflict.
+- Catalog sync now filters scoped dependency lookups by in-scope OIDs before
+  joining `pg_depend`, avoiding a full catalog scan on every scoped sync.
+- Sequence runtime values are read in one batched query instead of one round
+  trip per sequence.
+- A multi-action `ALTER TABLE` now snapshots each relation once per statement,
+  avoiding quadratic snapshot cost for wide tables.
+- Trigger parentage now comes only from `pg_trigger.tgparentid`; a same-named
+  trigger on an inheritance child is no longer cached as a cloned parent edge.
+- View dependencies now include foreign tables, so dropping or altering a
+  foreign table that backs a view is visible to dependency checks.
+- Constraint lock predictions now live in `lock-risk`: `ACCESS EXCLUSIVE` for a
+  valid or `NOT VALID` `CHECK`, `SHARE ROW EXCLUSIVE` on both tables for a
+  valid or `NOT VALID` `FOREIGN KEY`, and `SHARE UPDATE EXCLUSIVE` for
+  `VALIDATE CONSTRAINT`, plus `ROW SHARE` on the referenced table when
+  validating a foreign key.
+- Partition lock predictions now match PostgreSQL: `ATTACH PARTITION` takes
+  `SHARE UPDATE EXCLUSIVE` on the parent, `ACCESS EXCLUSIVE` on the partition,
+  and `ACCESS EXCLUSIVE` on default partitions and subpartitions;
+  `DETACH PARTITION` also takes `SHARE` on tables referencing the parent, and
+  `DETACH PARTITION CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE` on the parent.
+- `lock-risk` now covers `UNIQUE`/`PRIMARY KEY ... USING INDEX` (including the
+  implicit `NOT NULL` scan for nullable primary-key columns) and reports
+  `REINDEX SCHEMA`/`DATABASE` per index instead of omitting them.
+- Lock reasons state that PostgreSQL holds the lock until the transaction ends
+  instead of implying a statement-scoped release.
+- Removed the unused `OperationKind` enum from the public API.
+- Cache validation indexes columns by name, avoiding quadratic validation for
+  very wide relations.
+- Cached column-level view dependencies now follow `ALTER TABLE ... RENAME
+  COLUMN`: a later drop of the renamed column is blocked or cascades the view,
+  and rollback restores the original dependency.
+- Dropping a column that was renamed earlier in the same transaction remains a
+  Tier 1 data-loss warning instead of being downgraded to Tier 3. Provenance
+  also follows table renames and schema moves, including name reuse, and
+  survives savepoint rollback and release.
+- `ALTER TYPE ... ALTER ATTRIBUTE ... TYPE` on a composite used by typed tables
+  now marks the rewrite uncertain when a dependent table has no row estimate,
+  instead of reporting it as exact.
+- `ALTER TYPE ... DROP ATTRIBUTE` on composite types used by table columns now
+  reports an `irreversible-migration` data-loss warning.
+- `EXECUTE '...'` normalization now handles statement boundaries, literals,
+  comments, and dollar-quoted bodies, including same-line `EXECUTE`.
+- `ALTER TABLE ... VALIDATE CONSTRAINT` is now checked by `blocking-constraint`:
+  large-table validation reports the full scan, while re-validation stays silent.
+- Partition foreign keys now follow PostgreSQL: attaching a partition clones the
+  parent's FKs, adding an FK to a partitioned table clones it onto existing
+  partitions, and a detached partition keeps the reference, so a later
+  `DROP TABLE ... RESTRICT` is no longer reported safe.
+- `ADD GENERATED ... AS IDENTITY` now creates the backing sequence, validates
+  its preconditions, and propagates identity to existing and new partitions;
+  partitioned identity sync no longer fails cache validation.
+- Function and procedure definitions with a string-literal `AS $$...$$` body no
+  longer mark the analysis chain as unsupported.
+- A failed compound statement no longer leaves its skipped checks in the report.
+- Composite-type dependency analysis now reports every table that reaches the
+  type through a shared container.
+- Cache format 12: catalog sync now parses `pg_get_expr` index predicates and
+  expression keys into the migration expression IR, range types re-hydrate
+  routine and operator-class identities, and search-path sync preserves
+  whitespace inside quoted identifiers. Re-run `safe-migrate sync`.
+- `lint` and `lint-chain --report-dir` write both reports in one pass; the GitHub
+  Action uses it, uploads artifacts, and reuses Cargo dependency caches.
+- Unevaluated checks now compact into a tiered summary; missing-schema reminders
+  name the schema and give a union-aware sync command.
+- `init github-actions` now guides recovery for unknown `origin/HEAD`
+  (`--branch` overrides), verifies GitHub CLI auth before writing secrets, and
+  reports partial secret configuration.
+- Analysis and rollback now use typed statement journals and targeted snapshots
+  instead of cloning full state, making large chains and renames faster and
+  leaner; see `docs/BENCHMARKS.md`.
+- PostgreSQL 14-18 version bounds now use one shared check across the public
+  API, cache validation, and sync.
+
 ## v0.12.0 — 2026-10-31
 
 - Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled

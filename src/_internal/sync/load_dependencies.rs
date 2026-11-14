@@ -68,6 +68,7 @@ pub(super) fn load_view_object_dependencies(
         .context("Failed to load view object dependencies from pg_rewrite/pg_depend")?;
 
     let mut dependencies: Vec<crate::_internal::db::cache::ViewObjectDependencyCache> = Vec::new();
+    let mut seen = HashSet::with_capacity(rows.len());
     for row in rows {
         let dependent = ObjectId::new(
             row.try_get::<_, String>("obj_schema")
@@ -108,7 +109,7 @@ pub(super) fn load_view_object_dependencies(
         };
         let dependency =
             crate::_internal::db::cache::ViewObjectDependencyCache { dependent, target };
-        if !dependencies.contains(&dependency) {
+        if seen.insert(dependency.clone()) {
             dependencies.push(dependency);
         }
     }
@@ -141,7 +142,7 @@ pub(super) fn load_view_dependencies(
               AND d.refclassid = 'pg_class'::regclass
               AND d.deptype = 'n'
               AND tc.oid <> vc.oid
-              AND tc.relkind IN ('r', 'p', 'v', 'm')
+              AND tc.relkind IN ('r', 'p', 'v', 'm', 'f')
               AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
               AND vn.nspname <> 'information_schema'
               AND tn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
@@ -203,42 +204,49 @@ pub(super) fn load_scoped_external_dependencies(
         });
     }
     let query = r#"
-        SELECT DISTINCT
-            ref_side.family AS ref_family,
-            ref_side.relkind AS ref_relkind,
-            ref_side.schema AS ref_schema,
-            ref_side.name AS ref_name,
-            ref_side.args AS ref_args,
-            dep_side.schema AS dep_schema,
-            dep_side.name AS dep_name
-        FROM pg_depend d
-        CROSS JOIN LATERAL (
+        WITH in_scope AS (
             SELECT 'r' AS family, c.relkind::text AS relkind,
-                   n.nspname AS schema, c.relname AS name, NULL::text[] AS args
+                   n.nspname AS schema, c.relname AS name, NULL::text[] AS args,
+                   'pg_class'::regclass AS refclassid, c.oid AS refobjid
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE d.refclassid = 'pg_class'::regclass AND c.oid = d.refobjid
+            WHERE n.nspname = ANY($1)
             UNION ALL
-            SELECT 't', NULL, n.nspname, t.typname, NULL::text[]
+            SELECT 't', NULL, n.nspname, t.typname, NULL::text[],
+                   'pg_type'::regclass, t.oid
             FROM pg_type t
             JOIN pg_namespace n ON n.oid = t.typnamespace
-            WHERE d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid
+            WHERE n.nspname = ANY($1)
             UNION ALL
             SELECT 'p', NULL, n.nspname, p.proname,
                    ARRAY(
                        SELECT pg_catalog.format_type(t, NULL)
                        FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
                        ORDER BY n
-                   )::text[]
+                   )::text[],
+                   'pg_proc'::regclass, p.oid
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid
+            WHERE n.nspname = ANY($1)
             UNION ALL
-            SELECT 'o', NULL, n.nspname, o.oprname, NULL::text[]
+            SELECT 'o', NULL, n.nspname, o.oprname, NULL::text[],
+                   'pg_operator'::regclass, o.oid
             FROM pg_operator o
             JOIN pg_namespace n ON n.oid = o.oprnamespace
-            WHERE d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid
-        ) ref_side
+            WHERE n.nspname = ANY($1)
+        )
+        SELECT DISTINCT
+            ref.family AS ref_family,
+            ref.relkind AS ref_relkind,
+            ref.schema AS ref_schema,
+            ref.name AS ref_name,
+            ref.args AS ref_args,
+            dep_side.schema AS dep_schema,
+            dep_side.name AS dep_name
+        FROM pg_depend d
+        JOIN in_scope ref
+          ON ref.refclassid = d.refclassid
+         AND ref.refobjid = d.refobjid
         LEFT JOIN LATERAL (
             SELECT n.nspname AS schema, c.relname AS name
             FROM pg_class c
@@ -269,8 +277,7 @@ pub(super) fn load_scoped_external_dependencies(
             JOIN pg_namespace n ON n.oid = t.typnamespace
             WHERE d.classid = 'pg_type'::regclass AND t.oid = d.objid
         ) dep_side ON TRUE
-        WHERE ref_side.schema = ANY($1)
-          AND (
+        WHERE (
             dep_side.schema IS NULL
             OR NOT (dep_side.schema = ANY($1))
           )

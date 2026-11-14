@@ -88,6 +88,39 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
+    fn execute_string_after_same_line_statement_is_analyzed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze("SELECT 1; EXECUTE 'DROP DATABASE production';", &mut state)
+            .expect("EXECUTE after another same-line statement must parse");
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "opaque-dynamic-sql"),
+            "the normalized EXECUTE statement must remain opaque"
+        );
+    }
+
+    #[test]
+    fn execute_text_inside_multiline_string_literal_is_analyzed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let result = engine.analyze(
+            "INSERT INTO logs (msg) VALUES ('first line\nEXECUTE ''second line''');",
+            &mut state,
+        );
+
+        assert!(
+            result.is_ok(),
+            "EXECUTE text inside a string literal must not be rewritten: {result:?}"
+        );
+    }
+
+    #[test]
     fn test_bug008_index_not_in_baseline_relations() {
         let mut cache = synced_cache();
         cache.indexes.push(baseline_index(
@@ -666,6 +699,34 @@ mod phase10_bug_fixes_and_sorting_tests {
         assert!(recipe.contains("\"Billing\""), "{recipe}");
         assert!(recipe.contains("audit_log"), "{recipe}");
         assert!(recipe.contains("audit_log and reporting"), "{recipe}");
+
+        // Union with existing scope prevents cache overwrite trap.
+        let scoped_recipe = NotEvaluated::recipe_with_scope(
+            EvidenceCode::CatalogCoverageIncomplete,
+            &["billing".to_string()],
+            Some(&["public".to_string(), "orders".to_string()]),
+        );
+        assert!(
+            scoped_recipe.contains("safe-migrate sync --schemas public,orders,billing"),
+            "{scoped_recipe}"
+        );
+
+        // A schema containing a comma cannot be passed safely to `--schemas` CLI argument;
+        // only safe-migrate.toml remedy is provided.
+        let comma_schema_recipe = NotEvaluated::recipe_with_scope(
+            EvidenceCode::CatalogCoverageIncomplete,
+            &["customer,data".to_string()],
+            Some(&["public".to_string()]),
+        );
+        assert!(
+            comma_schema_recipe
+                .contains("Add \"customer,data\" to `schemas` in safe-migrate.toml and re-sync."),
+            "{comma_schema_recipe}"
+        );
+        assert!(
+            !comma_schema_recipe.contains("--schemas"),
+            "comma-bearing schema must not generate a --schemas command"
+        );
 
         // With nothing to name, the recipe falls back to describing the fix.
         let generic_recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &[]);
@@ -1667,3 +1728,467 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 }
 // ─────────────────────────────────────────────
+
+mod audit_regressions {
+    use crate::common::*;
+    use safe_migrate::_internal::analysis::evidence::EvidenceCode;
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, RelationOverlay};
+    use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::db::cache::DbCache;
+    use safe_migrate::_internal::model::column::Column;
+    use safe_migrate::_internal::model::constraint::{ConstraintKind, ConstraintState};
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::model::role::{RoleOverlay, RoleState};
+
+    fn existing_table_cache() -> safe_migrate::_internal::db::cache::DbCache {
+        let mut cache = synced_cache();
+        cache.insert_baseline(
+            object_id("public", "existing_t"),
+            RelationState::new(
+                object_id("public", "existing_t"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache
+    }
+
+    #[test]
+    fn alter_table_if_exists_on_missing_relation_is_a_no_op() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "ALTER TABLE IF EXISTS missing_t ADD COLUMN c int;",
+                &mut state,
+            )
+            .expect("Squawk should parse ALTER TABLE IF EXISTS");
+
+        let findings: Vec<(&str, &str)> = violations
+            .iter()
+            .map(|v| (v.rule_id, v.object_name.as_str()))
+            .collect();
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "schema-drift" || v.rule_id == "chain-conflict"),
+            "IF EXISTS on an absent relation must not report drift/conflict: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_without_if_exists_still_reports_an_absent_relation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze("ALTER TABLE missing_t ADD COLUMN c int;", &mut state)
+            .expect("Squawk should parse ALTER TABLE");
+
+        assert!(
+            violations.iter().any(|v| v.rule_id == "schema-drift"),
+            "an unguarded ALTER TABLE must still report schema drift"
+        );
+    }
+
+    #[test]
+    fn alter_table_if_exists_on_existing_relation_still_applies() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(existing_table_cache());
+        let violations = engine
+            .analyze(
+                "ALTER TABLE IF EXISTS existing_t ADD COLUMN c int;",
+                &mut state,
+            )
+            .expect("Squawk should parse ALTER TABLE IF EXISTS");
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "schema-drift" || v.rule_id == "chain-conflict"),
+            "IF EXISTS on an existing relation must not be treated as absent"
+        );
+        assert!(matches!(
+            state.local.relations.get(&object_id("public", "existing_t")),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("c")
+        ));
+    }
+
+    #[test]
+    fn role_rename_is_not_a_silent_no_op() {
+        let engine = setup_engine();
+        let old_id = ObjectId::new("", "audit_role_old");
+        let mut cache = synced_cache();
+        cache.roles.insert(
+            old_id.clone(),
+            RoleState {
+                id: old_id,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut state = AnalysisState::with_baseline(cache, true);
+        let violations = engine
+            .analyze(
+                "ALTER ROLE audit_role_old RENAME TO audit_role_new; \
+                 ALTER ROLE audit_role_new LOGIN;",
+                &mut state,
+            )
+            .expect("Squawk should parse the role statements");
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a modeled role rename must not conflict with the following ALTER ROLE: {violations:?}"
+        );
+        assert!(
+            matches!(
+                state.local.roles.get(&ObjectId::new("", "audit_role_new")),
+                Some(RoleOverlay::Present(_))
+            ),
+            "the renamed role must be present under its new name"
+        );
+        assert_ne!(
+            state.confidence(),
+            &Confidence::Exact,
+            "role ownership and ACL references are not modeled, so confidence must be tainted"
+        );
+    }
+
+    #[test]
+    fn aborted_transaction_records_skipped_statement() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "BEGIN; \
+                 ALTER TABLE missing_t ADD COLUMN c int; \
+                 DROP TABLE orders; \
+                 COMMIT;",
+                &mut state,
+            )
+            .expect("Squawk should parse the transaction");
+
+        assert!(
+            state
+                .not_evaluated()
+                .iter()
+                .any(|entry| entry.cause == EvidenceCode::TransactionAborted),
+            "the statement skipped after the abort must be reported as not evaluated"
+        );
+        assert_ne!(
+            state.confidence(),
+            &Confidence::Exact,
+            "an aborted transaction cannot leave the report at exact confidence"
+        );
+    }
+
+    fn cache_with_role(name: &str) -> DbCache {
+        let id = ObjectId::new("", name);
+        let mut cache = synced_cache();
+        cache.roles.insert(
+            id.clone(),
+            RoleState {
+                id,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache
+    }
+
+    #[test]
+    fn role_rename_rolls_back_with_the_transaction() {
+        let engine = setup_engine();
+        let old_id = ObjectId::new("", "audit_role_old");
+        let new_id = ObjectId::new("", "audit_role_new");
+        let mut state = AnalysisState::with_baseline(cache_with_role("audit_role_old"), true);
+        engine
+            .analyze(
+                "BEGIN; ALTER ROLE audit_role_old RENAME TO audit_role_new; ROLLBACK;",
+                &mut state,
+            )
+            .expect("Squawk should parse the role transaction");
+
+        assert!(matches!(
+            state.local.roles.get(&old_id),
+            Some(RoleOverlay::Present(_))
+        ));
+        assert!(
+            !state.local.roles.contains_key(&new_id),
+            "rollback must remove the renamed role"
+        );
+    }
+
+    #[test]
+    fn role_rename_to_an_existing_role_conflicts() {
+        let engine = setup_engine();
+        let mut cache = cache_with_role("audit_role_old");
+        let taken = ObjectId::new("", "audit_role_taken");
+        cache.roles.insert(
+            taken.clone(),
+            RoleState {
+                id: taken,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut state = AnalysisState::with_baseline(cache, true);
+        let violations = engine
+            .analyze(
+                "ALTER ROLE audit_role_old RENAME TO audit_role_taken;",
+                &mut state,
+            )
+            .expect("Squawk should parse the role rename");
+
+        assert!(
+            violations.iter().any(|v| v.rule_id == "chain-conflict"),
+            "renaming onto an existing role must be a conflict: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn role_rename_updates_membership_references() {
+        let engine = setup_engine();
+        let old_id = ObjectId::new("", "audit_role_old");
+        let new_id = ObjectId::new("", "audit_role_new");
+        let mut cache = cache_with_role("audit_role_old");
+        let member_id = ObjectId::new("", "audit_role_member");
+        cache.roles.insert(
+            member_id.clone(),
+            RoleState {
+                id: member_id.clone(),
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: vec![old_id],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut state = AnalysisState::with_baseline(cache, true);
+        engine
+            .analyze(
+                "ALTER ROLE audit_role_old RENAME TO audit_role_new;",
+                &mut state,
+            )
+            .expect("Squawk should parse the role rename");
+
+        let Some(RoleOverlay::Present(member)) = state.local.roles.get(&member_id) else {
+            panic!("member role should remain present");
+        };
+        assert_eq!(member.member_of, vec![new_id]);
+    }
+
+    #[test]
+    fn role_rename_rolls_back_membership_references() {
+        let engine = setup_engine();
+        let old_id = ObjectId::new("", "audit_role_old");
+        let mut cache = cache_with_role("audit_role_old");
+        let member_id = ObjectId::new("", "audit_role_member");
+        cache.roles.insert(
+            member_id.clone(),
+            RoleState {
+                id: member_id.clone(),
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: vec![old_id.clone()],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut state = AnalysisState::with_baseline(cache, true);
+        engine
+            .analyze(
+                "BEGIN; ALTER ROLE audit_role_old RENAME TO audit_role_new; ROLLBACK;",
+                &mut state,
+            )
+            .expect("Squawk should parse the role transaction");
+
+        let Some(RoleOverlay::Present(member)) = state.local.roles.get(&member_id) else {
+            panic!("member role should remain present");
+        };
+        assert_eq!(member.member_of, vec![old_id]);
+    }
+
+    fn cache_with_nullable_note(validated: bool, definition: &str) -> DbCache {
+        let table = object_id("public", "check_not_null");
+        let mut cache = cache_with_table("public", "check_not_null", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .push(Column {
+                name: "note".to_string(),
+                data_type: Some("text".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: Some(-1),
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
+            });
+        cache.constraints.push(ConstraintState {
+            table_id: table,
+            name: "note_not_null_check".to_string(),
+            kind: ConstraintKind::Check,
+            validated,
+            definition: Some(definition.to_string()),
+            backing_index: None,
+        });
+        cache
+    }
+
+    #[test]
+    fn wide_alter_snapshots_the_relation_once_per_statement() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "BEGIN; \
+                 CREATE TABLE wide_t (id int); \
+                 ALTER TABLE wide_t ADD COLUMN a int, ADD COLUMN b int, ADD COLUMN c int;",
+                &mut state,
+            )
+            .expect("Squawk should parse the wide ALTER");
+
+        let wide_id = object_id("public", "wide_t");
+        let frame = state
+            .local
+            .transactions
+            .last()
+            .expect("the transaction frame should still be open");
+        let snapshots = frame
+            .undo_log
+            .iter()
+            .filter(|change| {
+                matches!(
+                    change,
+                    safe_migrate::_internal::analysis::transaction::StateChange::RelationSnapshot {
+                        id,
+                        ..
+                    } if id == &wide_id
+                )
+            })
+            .count();
+        assert_eq!(
+            snapshots, 2,
+            "CREATE and the multi-action ALTER each snapshot the relation once, not once per action"
+        );
+
+        engine
+            .analyze("ROLLBACK;", &mut state)
+            .expect("Squawk should parse ROLLBACK");
+        assert!(
+            !state.local.relations.contains_key(&wide_id),
+            "rollback must still remove the table created in the transaction"
+        );
+    }
+
+    #[test]
+    fn conflicted_statement_does_not_emit_secondary_findings() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(cache_with_nullable_note(true, "(note IS NOT NULL)"));
+        let violations = engine
+            .analyze(
+                "ALTER TABLE check_not_null ALTER COLUMN missing TYPE text;",
+                &mut state,
+            )
+            .expect("Squawk should parse the ALTER TABLE");
+
+        assert!(
+            violations.iter().any(|v| v.rule_id == "chain-conflict"),
+            "the missing column must remain a chain conflict: {violations:?}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "type-change-rewrite"),
+            "rules must not evaluate a statement that already conflicted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validated_check_implying_not_null_makes_set_not_null_fast() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(cache_with_nullable_note(true, "(note IS NOT NULL)"));
+        let violations = engine
+            .analyze(
+                "ALTER TABLE check_not_null ALTER COLUMN note SET NOT NULL;",
+                &mut state,
+            )
+            .expect("Squawk should parse SET NOT NULL");
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.reason.contains("Synchronous SET NOT NULL")),
+            "a validated CHECK (note IS NOT NULL) makes SET NOT NULL metadata-only: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validated_check_on_another_column_does_not_make_set_not_null_fast() {
+        let engine = setup_engine();
+        let mut state =
+            AnalysisState::new(cache_with_nullable_note(true, "other_column IS NOT NULL"));
+        let violations = engine
+            .analyze(
+                "ALTER TABLE check_not_null ALTER COLUMN note SET NOT NULL;",
+                &mut state,
+            )
+            .expect("Squawk should parse SET NOT NULL");
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.reason.contains("Synchronous SET NOT NULL")),
+            "a CHECK on a different column cannot prove note is not null: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn unvalidated_check_does_not_make_set_not_null_fast() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(cache_with_nullable_note(false, "note IS NOT NULL"));
+        let violations = engine
+            .analyze(
+                "ALTER TABLE check_not_null ALTER COLUMN note SET NOT NULL;",
+                &mut state,
+            )
+            .expect("Squawk should parse SET NOT NULL");
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.reason.contains("Synchronous SET NOT NULL")),
+            "an unvalidated CHECK cannot prove the column has no nulls: {violations:?}"
+        );
+    }
+}

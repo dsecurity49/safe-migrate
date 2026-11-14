@@ -108,7 +108,8 @@
     "safe_008_rename_table.sql",
     "safe_009_add_index.sql",
     "002_drop_column.sql",
-    "006_drop_column_if_exists.sql"
+    "006_drop_column_if_exists.sql",
+    "007_drop_composite_attribute_table_data.sql"
    ],
    "excluded_fixtures": [
     {
@@ -175,7 +176,9 @@
     "safe_006_drop_pub.sql",
     "safe_011_alter_pub_options.sql",
     "011_drop_extension_cascade.sql",
-    "safe_012_drop_extension_restrict.sql"
+    "012_drop_composite_attribute_cascade.sql",
+    "safe_012_drop_extension_restrict.sql",
+    "safe_013_composite_attributes_safe.sql"
    ],
    "excluded_fixtures": [
     {
@@ -358,6 +361,7 @@
     "012_lossy_timestamptz_to_date.sql",
     "013_lossy_varchar.sql",
     "014_lossy_int_to_smallint.sql",
+    "015_alter_composite_attribute_type_rewrite.sql",
     "safe_001_widen_varchar.sql",
     "safe_002_widen_int.sql",
     "safe_003_widen_varchar_limit.sql",
@@ -1204,10 +1208,6 @@
     "safe_014_domain_check_not_valid.sql"
    ],
    "excluded_fixtures": [
-    {
-     "fixture": "006_set_storage.sql",
-     "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
-    },
     {
      "fixture": "007_set_access_method.sql",
      "reason": "Table access method identity is not synchronized or normalized by the differential harness."
@@ -2769,7 +2769,71 @@
   "required_relations": [
    "public.test_table"
   ],
-  "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, extension dependencies, and index attachment."
+   "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, extension dependencies, and index attachment."
+  },
+  {
+   "rule_dir": "rule_33_set-storage-lock",
+   "enabled": false,
+   "fixtures": [],
+   "excluded_fixtures": [
+    {
+     "fixture": "001_set_storage.sql",
+     "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
+    }
+   ],
+   "schemas": [
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
+   ],
+   "scope": [
+    "relations",
+    "columns"
+   ]
+  },
+  {
+   "rule_dir": "rule_34_lock-risk",
+   "enabled": true,
+   "fixtures": [
+    "001_check_constraint.sql",
+    "002_not_valid_check.sql",
+    "003_not_valid_fk.sql",
+    "004_validate_fk.sql",
+    "005_attach_default_partition.sql",
+    "006_pk_using_index.sql",
+    "safe_001_concurrent_index.sql"
+   ],
+   "fixture_transactional": {
+    "safe_001_concurrent_index.sql": false
+   },
+   "fixture_autocommit": [
+    "safe_001_concurrent_index.sql"
+   ],
+   "schemas": [
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
+   ],
+   "scope": [
+    "relations",
+    "constraints",
+    "indexes"
+   ],
+   "required_relations": [
+    "public.parent",
+    "public.test_table"
+   ],
+   "notes": "Validates that lock-risk fixtures execute and that CONCURRENTLY index creation remains a no-finding path."
   }
  ]
 }

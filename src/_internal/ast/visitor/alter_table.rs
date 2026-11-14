@@ -591,6 +591,7 @@ impl AstVisitor {
         Some(StatementFact::AlterTable {
             name: table_name,
             only: node.table_relation_name()?.only_token().is_some(),
+            if_exists: node.if_exists().is_some(),
             actions,
         })
     }
@@ -667,6 +668,25 @@ impl AstVisitor {
                 column: col_name,
                 default: None,
             }),
+            AlterColumnOption::AddGenerated(add) => {
+                let generation = match add.generated_when()? {
+                    ast::GeneratedWhen::GeneratedAlways(_) => {
+                        crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
+                    }
+                    ast::GeneratedWhen::GeneratedByDefault(_) => {
+                        crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+                    }
+                };
+                let identity_sequence = match add.sequence_option_list() {
+                    Some(options) => Self::extract_sequence_options(options.sequence_options())?,
+                    None => Default::default(),
+                };
+                Some(AlterTableActionFact::AddIdentity {
+                    column: col_name,
+                    generation,
+                    identity_sequence: Box::new(identity_sequence),
+                })
+            }
             AlterColumnOption::SetExpression(se) => Some(AlterTableActionFact::SetExpression {
                 column: col_name,
                 expression_sql: se.expr()?.syntax().text().to_string(),

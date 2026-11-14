@@ -870,6 +870,7 @@ impl AnalysisState {
         for config in &extension.config_tables {
             co_dropped.insert(self.local.graph.resolve_rename(&config.table).clone());
         }
+        self.snapshot_co_dropped_objects();
         self.co_dropped_objects = co_dropped;
         if !cascade && self.extension_has_external_dependents(&members, &self.co_dropped_objects) {
             self.co_dropped_objects.clear();
@@ -1093,6 +1094,7 @@ impl AnalysisState {
             extension_try!(self.apply_alter_table(&AlterTable {
                 id: table,
                 only: false,
+                if_exists: false,
                 action: AlterTableActionMutation::DropConstraint {
                     name: constraint_name.to_string(),
                     if_exists: false,

@@ -224,3 +224,13 @@ fn alter_role_extracts_both_inherit_options() {
         assert_eq!(role.inherits, expected, "{sql}");
     }
 }
+
+#[test]
+fn alter_role_rename_extracts_new_name() {
+    let Some(StatementFact::AlterRole(role)) =
+        parse_and_extract_statement("ALTER ROLE app_user RENAME TO app_user_renamed;")
+    else {
+        panic!("expected alter role fact");
+    };
+    assert_eq!(role.rename_to.as_deref(), Some("app_user_renamed"));
+}

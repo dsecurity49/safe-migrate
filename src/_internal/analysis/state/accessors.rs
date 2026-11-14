@@ -31,6 +31,19 @@ impl AnalysisState {
             .to_string()
     }
 
+    pub(crate) fn routine_signature_id(
+        &self,
+        signature: &crate::_internal::analysis::facts::FunctionSigFact,
+    ) -> ObjectId {
+        let signature_name = format!(
+            "{}({})",
+            signature.name.name.resolve(),
+            signature.params.join(",")
+        );
+        let schema = self.resolve_function_schema(&signature.name, &signature_name);
+        ObjectId::new(schema, signature_name)
+    }
+
     pub(crate) fn resolve_relation_id(
         &self,
         name: &crate::_internal::ast::identifiers::QualifiedName,
@@ -80,7 +93,7 @@ impl AnalysisState {
         )
     }
 
-    /// Record a configured version, used only when the cache carries none.
+    /// Record a rule finding that could not be evaluated due to incomplete evidence.
     pub(crate) fn record_not_evaluated(
         &mut self,
         record: crate::_internal::report::violations::NotEvaluated,
@@ -90,6 +103,7 @@ impl AnalysisState {
             .iter()
             .any(|entry| entry.rule_id == record.rule_id && entry.cause == record.cause)
         {
+            self.snapshot_not_evaluated();
             self.not_evaluated.push(record);
         }
     }
@@ -179,17 +193,7 @@ impl AnalysisState {
     /// Whether this session has a temporary schema, which is searched before
     /// every explicit path entry for relations and types.
     pub(crate) fn temp_namespace_exists(&self) -> bool {
-        self.local.saw_temp_object
-            && (self
-                .local
-                .relations
-                .keys()
-                .any(|id| is_session_temp_schema(&id.schema))
-                || self
-                    .local
-                    .types
-                    .keys()
-                    .any(|id| is_session_temp_schema(&id.schema)))
+        self.local.temp_namespace_created
     }
 
     /// Entries to search for an unqualified relation or type, implicit first.
@@ -228,7 +232,10 @@ impl AnalysisState {
     }
 
     pub(crate) fn note_temp_object_created(&mut self) {
-        self.local.saw_temp_object = true;
+        if !self.local.temp_namespace_created {
+            self.snapshot_temp_namespace();
+            self.local.temp_namespace_created = true;
+        }
         // A path that names the temporary alias could not search it before the
         // namespace existed; now it can, at its written position.
         self.refresh_role_sensitive_search_path();

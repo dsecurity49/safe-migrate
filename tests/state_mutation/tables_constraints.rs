@@ -545,6 +545,55 @@ fn parenthesized_plain_column_keys_deparse_as_bare_columns() {
 }
 
 #[test]
+fn inherited_column_rename_across_table_rename_chains() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    engine
+        .analyze(
+            "CREATE TABLE p (a integer, b text);
+             CREATE TABLE c () INHERITS (p);
+             CREATE TABLE gc () INHERITS (c);
+             ALTER TABLE p RENAME TO p_renamed;
+             ALTER TABLE c RENAME TO c_renamed;
+             ALTER TABLE p_renamed RENAME TO p_final;
+             ALTER TABLE p_final RENAME COLUMN b TO b_renamed;",
+            &mut state,
+        )
+        .unwrap();
+
+    let Some(RelationOverlay::Present(p_rel)) = state.get_relation(&object_id("public", "p_final"))
+    else {
+        panic!("p_final relation should be present");
+    };
+    assert!(p_rel.has_column("b_renamed"));
+    assert!(!p_rel.has_column("b"));
+
+    let Some(RelationOverlay::Present(c_rel)) =
+        state.get_relation(&object_id("public", "c_renamed"))
+    else {
+        panic!("c_renamed relation should be present");
+    };
+    assert!(c_rel.has_column("b_renamed"));
+    assert!(!c_rel.has_column("b"));
+
+    let Some(RelationOverlay::Present(gc_rel)) = state.get_relation(&object_id("public", "gc"))
+    else {
+        panic!("gc relation should be present");
+    };
+    assert!(gc_rel.has_column("b_renamed"));
+    assert!(!gc_rel.has_column("b"));
+
+    assert_eq!(
+        gc_rel
+            .column_inheritance
+            .get("b_renamed")
+            .unwrap()
+            .parent_count,
+        1
+    );
+}
+
+#[test]
 fn create_table_inherits_copies_parent_columns_and_records_each_edge() {
     let engine = setup_engine();
     let mut state = setup_state();
@@ -1709,6 +1758,7 @@ fn foreign_table_accepts_the_statements_postgres_accepts() {
     let alter = Mutation::AlterTable(AlterTable {
         id: id.clone(),
         only: false,
+        if_exists: false,
         action: AlterTableActionMutation::AddColumn {
             name: "extra".to_string(),
             ty: Some("integer".to_string()),
