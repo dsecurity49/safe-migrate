@@ -641,6 +641,7 @@ impl SafeMigrateEngine {
                     let rule_context =
                         RuleContext::from_transition(transition, state, &self.config);
                     let violations = rule.evaluate(&rule_context);
+                    let coverage_gap = rule.not_evaluated_cause(&rule_context);
 
                     // A capability is relevant only when this rule actually
                     // produces a finding for the current mutation. Recording
@@ -706,6 +707,23 @@ impl SafeMigrateEngine {
                         // Severity belongs to the rule alone; certainty is
                         // derived per finding from the evidence log.
                         statement_violations.push(v);
+                    }
+
+                    if let Some(cause) = coverage_gap {
+                        state.record_not_evaluated(
+                            crate::_internal::report::violations::NotEvaluated {
+                                rule_id: rule.id(),
+                                tier: rule.default_tier(),
+                                cause,
+                                sql: Some(stmt_text.trim().to_string()),
+                                recipe: crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                    cause,
+                                    &[],
+                                    None,
+                                ),
+                                missing_schemas: Vec::new(),
+                            },
+                        );
                     }
                 }
 

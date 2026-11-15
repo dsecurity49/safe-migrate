@@ -28,8 +28,19 @@ pub(crate) fn for_mutation(
                 AlterTableActionMutation::AddForeignKey { to_table, .. } => {
                     reads.relations.insert(to_table.clone());
                 }
-                AlterTableActionMutation::AttachPartition { child, .. }
-                | AlterTableActionMutation::DetachPartition { child, .. } => {
+                AlterTableActionMutation::AttachPartition { child, .. } => {
+                    reads.relations.insert(child.clone());
+                    for relation in state.partition_scan_relations(child) {
+                        reads.relations.insert(relation);
+                    }
+                    for default in state.default_partitions_of(&alter.id) {
+                        reads.relations.insert(default.clone());
+                        for relation in state.partition_scan_relations(&default) {
+                            reads.relations.insert(relation);
+                        }
+                    }
+                }
+                AlterTableActionMutation::DetachPartition { child, .. } => {
                     reads.relations.insert(child.clone());
                 }
                 AlterTableActionMutation::SetNotNull { .. } => {

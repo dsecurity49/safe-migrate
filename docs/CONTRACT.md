@@ -108,7 +108,7 @@ Additional top-level objects are:
 | --- | --- |
 | `summary` | `total`, `tier1`, `tier2`, and `tier3` counts. |
 | `evidence` | Ordered, deduplicated reasons for conservative analysis. Each has a stable snake-case `code`, `statement` or `chain` scope, summary, and optional file/index. It contains no SQL or credentials. |
-| `not_evaluated` | Checks that did not run for want of evidence. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. |
+| `not_evaluated` | Checks that did not run, either for want of evidence or because the operation is outside the rule's modeled scope. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. |
 | `baseline` | Cache status, provenance, observed settings, and automatic-sync result. |
 
 The `baseline` shape is:
@@ -174,8 +174,8 @@ Human, JSON, and Markdown modes must use the same exit-status policy. An
 unevaluated Tier 1-capable check caps the verdict at `CAUTIOUS`; it does not
 change the exit status, because degraded analysis (no cache, or a baseline
 scoped away from the target) is a supported mode. The report lists every
-skipped check in `not_evaluated`, with the cause and what would make it
-evaluable, in each output mode.
+skipped check in `not_evaluated`, with the cause and either what would make it
+evaluable or what to review manually, in each output mode.
 
 ## Confidence
 

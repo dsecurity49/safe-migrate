@@ -1,7 +1,8 @@
 use serde::Serialize;
 use std::collections::HashSet;
 
-/// Stable, machine-readable causes for conservative analysis.
+/// Stable, machine-readable causes for conservative analysis, including
+/// evidence gaps and operations outside a rule's modeled scope.
 ///
 /// New variants are additive. Callers should use the serialized snake-case
 /// value as the compatibility contract rather than matching display text.
@@ -18,6 +19,7 @@ pub(crate) enum EvidenceCode {
     TransactionStateUnknown,
     TransactionAborted,
     UnmodeledState,
+    LockPredictionUnavailable,
 }
 
 impl EvidenceCode {
@@ -33,6 +35,7 @@ impl EvidenceCode {
             Self::TransactionStateUnknown => "transaction_state_unknown",
             Self::TransactionAborted => "transaction_aborted",
             Self::UnmodeledState => "unmodeled_state",
+            Self::LockPredictionUnavailable => "lock_prediction_unavailable",
         }
     }
 
@@ -53,6 +56,9 @@ impl EvidenceCode {
             }
             Self::UnmodeledState => {
                 "required PostgreSQL state is deliberately outside the semantic model"
+            }
+            Self::LockPredictionUnavailable => {
+                "the curated lock predictor does not cover this operation"
             }
         }
     }

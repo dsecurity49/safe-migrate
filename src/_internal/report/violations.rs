@@ -89,8 +89,9 @@ pub(crate) struct SourceLocation {
     pub column: usize,
 }
 
-/// A rule that could not state a finding for want of evidence. Reported apart
-/// from findings, because nothing is wrong with the migration.
+/// A rule that could not state a finding, either for want of evidence or
+/// because the operation is outside its modeled scope. Reported apart from
+/// findings, because nothing is wrong with the migration.
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct NotEvaluated {
@@ -99,7 +100,7 @@ pub(crate) struct NotEvaluated {
     pub cause: crate::_internal::analysis::evidence::EvidenceCode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    /// What would make this rule evaluable.
+    /// What would make this rule evaluable, or what to review manually.
     pub recipe: String,
     /// Out-of-scope schemas the boundary query actually observed, so the
     /// remedy can name them instead of asking the reader to find them.
@@ -189,6 +190,10 @@ impl NotEvaluated {
             }
             EvidenceCode::TransactionAborted => {
                 "Fix the statement that aborted the transaction, then re-run the analysis."
+                    .to_string()
+            }
+            EvidenceCode::LockPredictionUnavailable => {
+                "This operation is outside the curated lock predictor; review PostgreSQL lock behavior manually."
                     .to_string()
             }
         }

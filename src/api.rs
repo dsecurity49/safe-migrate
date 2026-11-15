@@ -576,8 +576,9 @@ impl Migration {
     }
 }
 
-/// A rule that could not state a finding for want of evidence. Nothing is
-/// wrong with the migration; these are the checks that did not run.
+/// A rule that could not state a finding, either for want of evidence or
+/// because the operation is outside its modeled scope. Nothing is wrong with
+/// the migration; these are the checks that did not run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct NotEvaluated {
@@ -585,12 +586,12 @@ pub struct NotEvaluated {
     pub rule_id: String,
     /// Tier this rule would have produced had it been evaluable.
     pub tier: Tier,
-    /// Why the evidence was unavailable.
+    /// Why the rule could not evaluate this statement.
     pub cause: String,
     /// SQL statement the rule could not judge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    /// What would make this rule evaluable.
+    /// What would make this rule evaluable, or what to review manually.
     pub recipe: String,
     /// Out-of-scope schemas the boundary query observed for this rule.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -617,7 +618,8 @@ pub struct AnalysisOutcome {
     confidence: Confidence,
     evidence: Vec<Evidence>,
     baseline: BaselineReport,
-    /// Rules that could not state a finding for want of evidence.
+    /// Rules that could not state a finding, including operations outside
+    /// their modeled scope.
     not_evaluated: Vec<crate::_internal::report::violations::NotEvaluated>,
     inner: InternalOutcome<InternalFinding>,
 }
@@ -651,7 +653,8 @@ impl AnalysisOutcome {
     }
 
     /// Rules that could not state a finding because the evidence they need was
-    /// unavailable, each with the cause and what would resolve it.
+    /// unavailable or the operation is outside their modeled scope, each with
+    /// the cause and what would resolve or clarify it.
     pub fn not_evaluated(&self) -> Vec<NotEvaluated> {
         self.not_evaluated.iter().map(NotEvaluated::from).collect()
     }
@@ -1798,6 +1801,8 @@ impl From<internal_evidence::EvidenceCode> for EvidenceCode {
             }
             internal_evidence::EvidenceCode::TransactionAborted => Self::TransactionAborted,
             internal_evidence::EvidenceCode::UnmodeledState => Self::UnmodeledState,
+            // Only used as a `not_evaluated` cause, not an evidence record.
+            internal_evidence::EvidenceCode::LockPredictionUnavailable => Self::UnmodeledState,
         }
     }
 }

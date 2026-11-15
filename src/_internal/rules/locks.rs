@@ -8,7 +8,7 @@ use crate::_internal::analysis::mutations::{
 use crate::_internal::analysis::state::{AnalysisState, PreState};
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::constraint::ConstraintKind;
-use crate::_internal::model::relation::{Persistence, RelationOverlay};
+use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 use std::collections::HashSet;
@@ -145,6 +145,192 @@ impl Rule for LockRiskRule {
             })
             .collect()
     }
+
+    fn not_evaluated_cause(
+        &self,
+        context: &RuleContext<'_>,
+    ) -> Option<crate::_internal::analysis::evidence::EvidenceCode> {
+        if context.result().is_noop() || context.result().is_conflict() {
+            return None;
+        }
+        let predictions = predict_locks(context.mutation(), context.pre_state(), context.state());
+        if !predictions.is_empty() {
+            return None;
+        }
+        if mutation_targets_only_temporary_relations(context.mutation(), context.pre_state()) {
+            return None;
+        }
+        lock_prediction_expected(context.mutation()).then_some(
+            crate::_internal::analysis::evidence::EvidenceCode::LockPredictionUnavailable,
+        )
+    }
+}
+
+/// Whether every relation this mutation names is known to be temporary.
+///
+/// Temporary relations do not warrant a coverage gap: their locks are local to
+/// the session and cannot block production traffic.
+fn mutation_targets_only_temporary_relations(mutation: &Mutation, pre_state: &PreState) -> bool {
+    let ids: Vec<&ObjectId> = match mutation {
+        Mutation::DropTable(drop) => drop.ids.iter().collect(),
+        Mutation::DropView(drop) => drop.ids.iter().collect(),
+        Mutation::DropMaterializedView(drop) => drop.ids.iter().collect(),
+        Mutation::AlterViewFamily(alter) => vec![&alter.id],
+        Mutation::ChangeRelationOwner { id, .. }
+        | Mutation::SetReloptions { id, .. }
+        | Mutation::ResetReloptions { id, .. } => vec![id],
+        Mutation::CreatePolicy(policy) => vec![&policy.table],
+        Mutation::DropPolicy(policy) => vec![&policy.table],
+        Mutation::CreateTrigger(trigger) => vec![&trigger.table],
+        Mutation::DropTrigger(trigger) => vec![&trigger.table],
+        Mutation::RenameTrigger(trigger) => vec![&trigger.table],
+        Mutation::Rename(rename) => vec![&rename.old_id],
+        Mutation::Grant(grant) => match &grant.target {
+            crate::_internal::analysis::mutations::ResolvedGrantTarget::Tables(ids) => {
+                ids.iter().collect()
+            }
+            _ => return false,
+        },
+        Mutation::Revoke(revoke) => match &revoke.target {
+            crate::_internal::analysis::mutations::ResolvedGrantTarget::Tables(ids) => {
+                ids.iter().collect()
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
+    !ids.is_empty()
+        && ids.iter().all(|id| {
+            pre_state
+                .relations
+                .get(*id)
+                .is_some_and(|relation| relation.persistence == Persistence::Temporary)
+        })
+}
+
+/// Whether PostgreSQL can take a relation lock for this mutation.
+///
+/// Any prediction means the curated predictor covers the operation, including
+/// temporary-only targets. This is the fallback for operations it does not
+/// model at all.
+fn lock_prediction_expected(mutation: &Mutation) -> bool {
+    match mutation {
+        Mutation::CreateTable(create) => create.partition_of.is_some(),
+        Mutation::AlterTable(alter) => !alter_table_action_is_known_metadata_only(&alter.action),
+        Mutation::CreateIndex(create) => !create.concurrently,
+        Mutation::DropIndex(drop) => !drop.concurrently,
+        Mutation::RefreshMaterializedView(refresh) => !refresh.concurrently,
+        Mutation::Reindex { concurrently, .. } => !concurrently,
+        Mutation::Vacuum { is_full, .. } => *is_full,
+        Mutation::DropTable(_)
+        | Mutation::DropView(_)
+        | Mutation::DropMaterializedView(_)
+        | Mutation::DropType(_)
+        | Mutation::DropDomain(_)
+        | Mutation::DropExtension(_)
+        | Mutation::AlterViewFamily(_)
+        | Mutation::AlterIndex(_)
+        | Mutation::AlterIndexAllInTablespace(_)
+        | Mutation::AlterType(_)
+        | Mutation::ChangeRelationOwner { .. }
+        | Mutation::SetReloptions { .. }
+        | Mutation::ResetReloptions { .. }
+        | Mutation::CreatePolicy(_)
+        | Mutation::DropPolicy(_)
+        | Mutation::CreateTrigger(_)
+        | Mutation::DropTrigger(_)
+        | Mutation::RenameTrigger(_)
+        | Mutation::Grant(_)
+        | Mutation::Revoke(_)
+        | Mutation::Rename(_) => true,
+        Mutation::CreateSchema(_)
+        | Mutation::AlterSchema(_)
+        | Mutation::DropSchema(_)
+        | Mutation::CreateView(_)
+        | Mutation::CreateMaterializedView(_)
+        | Mutation::CreateType(_)
+        | Mutation::RenameType(_)
+        | Mutation::CreateExtension(_)
+        | Mutation::AlterExtension(_)
+        | Mutation::CreateDomain(_)
+        | Mutation::AlterDomain(_)
+        | Mutation::RenameDomain(_)
+        | Mutation::CreateSequence(_)
+        | Mutation::AlterSequence(_)
+        | Mutation::DropSequence(_)
+        | Mutation::LockTable(_)
+        | Mutation::Truncate(_)
+        | Mutation::NoStateChange { .. }
+        | Mutation::SetColumnDefault { .. }
+        | Mutation::SearchPath(_)
+        | Mutation::TimeoutSetting(_)
+        | Mutation::ResetSettings(_)
+        | Mutation::CheckTimeouts { .. }
+        | Mutation::BeginTransaction
+        | Mutation::CommitTransaction
+        | Mutation::CommitAndChain
+        | Mutation::RollbackTransaction
+        | Mutation::RollbackAndChain
+        | Mutation::RollbackToSavepoint(_)
+        | Mutation::Savepoint(_)
+        | Mutation::ReleaseSavepoint(_)
+        | Mutation::CreateFunction(_)
+        | Mutation::AlterFunction(_)
+        | Mutation::DropFunction(_)
+        | Mutation::CreateProcedure(_)
+        | Mutation::AlterProcedure(_)
+        | Mutation::DropProcedure(_)
+        | Mutation::CreateAggregate(_)
+        | Mutation::AlterAggregate(_)
+        | Mutation::DropAggregate(_)
+        | Mutation::CreatePublication(_)
+        | Mutation::AlterPublication(_)
+        | Mutation::DropPublication(_)
+        | Mutation::CreateSubscription(_)
+        | Mutation::AlterSubscription(_)
+        | Mutation::DropSubscription(_)
+        | Mutation::CreateRole(_)
+        | Mutation::AlterRole(_)
+        | Mutation::DropRole(_)
+        | Mutation::CreateDatabase(_)
+        | Mutation::AlterDatabase(_)
+        | Mutation::DropDatabase(_)
+        | Mutation::SwitchRole { .. }
+        | Mutation::Opaque(_) => false,
+    }
+}
+
+/// Catalog-only actions that the lock predictor deliberately leaves silent.
+/// They take brief locks but do not scan or rewrite table data.
+fn alter_table_action_is_known_metadata_only(action: &AlterTableActionMutation) -> bool {
+    matches!(
+        action,
+        AlterTableActionMutation::AddColumn { .. }
+            | AlterTableActionMutation::DropColumn { .. }
+            | AlterTableActionMutation::RenameColumn { .. }
+            | AlterTableActionMutation::SetDefault { .. }
+            | AlterTableActionMutation::SetColumnOptions { .. }
+            | AlterTableActionMutation::ResetColumnOptions { .. }
+            | AlterTableActionMutation::SetTableOptions { .. }
+            | AlterTableActionMutation::ResetTableOptions { .. }
+            | AlterTableActionMutation::SetStatistics { .. }
+            | AlterTableActionMutation::SetCompression { .. }
+            | AlterTableActionMutation::DropGeneratedExpression { .. }
+            | AlterTableActionMutation::AlterConstraint { .. }
+            | AlterTableActionMutation::RenameConstraint { .. }
+            | AlterTableActionMutation::SetRowSecurity { .. }
+            | AlterTableActionMutation::SetForceRowSecurity { .. }
+            | AlterTableActionMutation::SetReplicaIdentity { .. }
+            | AlterTableActionMutation::SetRuleMode { .. }
+            | AlterTableActionMutation::SetTriggerMode { .. }
+            | AlterTableActionMutation::EnableTrigger { .. }
+            | AlterTableActionMutation::DisableTrigger { .. }
+            | AlterTableActionMutation::SetCluster { .. }
+            | AlterTableActionMutation::OwnerTo { .. }
+            | AlterTableActionMutation::DropNotNull { .. }
+            | AlterTableActionMutation::AlterColumnInheritance
+            | AlterTableActionMutation::SetOfType { .. }
+    )
 }
 
 fn target_is_temporary(pre_state: &PreState, id: &ObjectId) -> bool {
@@ -488,7 +674,7 @@ fn predict_alter_table(
             for descendant in state.local.graph.partition_descendants(child) {
                 push_partition_target(&mut targets, &mut seen, descendant, LockTargetRole::Child);
             }
-            for default in default_partitions(state, subject) {
+            for default in state.default_partitions_of(subject) {
                 for descendant in std::iter::once(default.clone())
                     .chain(state.local.graph.partition_descendants(&default))
                 {
@@ -638,26 +824,6 @@ fn push_partition_target(
             role,
         });
     }
-}
-
-fn default_partitions(state: &AnalysisState, parent: &ObjectId) -> Vec<ObjectId> {
-    state
-        .local
-        .graph
-        .partitions_of(parent)
-        .into_iter()
-        .filter(|child| {
-            matches!(
-                state.local.relations.get(child),
-                Some(RelationOverlay::Present(relation))
-                    if relation
-                        .partition_bound
-                        .as_deref()
-                        .is_some_and(|bound| bound.eq_ignore_ascii_case("DEFAULT"))
-            )
-        })
-        .map(|child| (*child).clone())
-        .collect()
 }
 
 fn referencing_tables(state: &AnalysisState, target: &ObjectId) -> Vec<ObjectId> {

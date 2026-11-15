@@ -216,7 +216,9 @@ row-count-based finding. Dedicated Tier 1/2 rules such as
 `blocking-mat-view-refresh`, and `vacuum-full` still provide the actionable
 warning; `lock-risk` adds the exact mode without replacing them. Brief
 metadata-only operations such as `ADD`/`DROP`/`RENAME COLUMN`, `SET DEFAULT`,
-and `ALTER TYPE` are not separately flagged.
+and `ALTER TYPE` are not separately flagged. Operations outside the curated
+predictor are listed under `not_evaluated` as `lock_prediction_unavailable`;
+that is a coverage gap, not evidence of safety.
 
 ## Migration timeouts
 

@@ -7,6 +7,11 @@ notes are available on the
 
 ## Unreleased (v0.13.0)
 
+- `blocking-partition-mutation` now estimates `ATTACH PARTITION` cost from the
+  candidate and default partition leaves rather than the parent, and `lock-risk`
+  lists operations outside the curated predictor under `not_evaluated` with
+  cause `lock_prediction_unavailable` instead of leaving them silently
+  unflagged.
 - Added `lock-risk`, a size-independent Tier 3 advisory that names the lock mode
   and targets for constraints (valid and `NOT VALID`), `VALIDATE CONSTRAINT`,
   column changes, index create/drop, `UNIQUE`/`PRIMARY KEY`/`EXCLUDE` (including

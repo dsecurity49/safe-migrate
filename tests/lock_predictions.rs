@@ -1,6 +1,9 @@
 use crate::common::*;
+use safe_migrate::_internal::analysis::evidence::EvidenceCode;
 use safe_migrate::_internal::analysis::state::AnalysisState;
-use safe_migrate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
+use safe_migrate::_internal::report::violations::{
+    NotEvaluated, ObjectKind, Violation, ViolationTier,
+};
 
 fn lock_findings(setup: &str, sql: &str) -> Vec<Violation> {
     let engine = setup_engine();
@@ -25,6 +28,20 @@ fn assert_reason_contains(setup: &str, sql: &str, expected: &[&str]) {
             .any(|reason| expected.iter().all(|needle| reason.contains(needle))),
         "expected a lock-risk reason containing {expected:?}, got {reasons:?}"
     );
+}
+
+fn lock_not_evaluated(setup: &str, sql: &str) -> Vec<NotEvaluated> {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(synced_cache());
+    engine.analyze(setup, &mut state).unwrap();
+    engine.analyze(sql, &mut state).unwrap();
+    state.not_evaluated().to_vec()
+}
+
+fn lock_prediction_gap(entries: &[NotEvaluated]) -> bool {
+    entries.iter().any(|entry| {
+        entry.rule_id == "lock-risk" && entry.cause == EvidenceCode::LockPredictionUnavailable
+    })
 }
 
 const TABLES: &str = "
@@ -577,5 +594,79 @@ fn lock_reason_mentions_transaction_lifetime() {
         TABLES,
         "ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0);",
         &["held until the transaction ends"],
+    );
+}
+
+#[test]
+fn uncovered_ddl_reports_lock_prediction_gap() {
+    let entries = lock_not_evaluated(TABLES, "DROP TABLE child;");
+    assert!(
+        lock_prediction_gap(&entries),
+        "uncovered DDL must be visible as not evaluated: {entries:?}"
+    );
+}
+
+#[test]
+fn uncovered_alter_table_action_reports_lock_prediction_gap() {
+    let entries = lock_not_evaluated(TABLES, "ALTER TABLE child SET TABLESPACE fast;");
+    assert!(
+        lock_prediction_gap(&entries),
+        "unpredicted ALTER TABLE work must be visible as not evaluated: {entries:?}"
+    );
+}
+
+#[test]
+fn covered_ddl_does_not_report_lock_prediction_gap() {
+    let entries = lock_not_evaluated(TABLES, "CREATE INDEX child_note_idx ON child(note);");
+    assert!(
+        !lock_prediction_gap(&entries),
+        "a predicted index build must not be reported as a coverage gap: {entries:?}"
+    );
+}
+
+#[test]
+fn metadata_only_alter_table_does_not_report_lock_prediction_gap() {
+    let entries = lock_not_evaluated(TABLES, "ALTER TABLE child ADD COLUMN note2 text;");
+    assert!(
+        !lock_prediction_gap(&entries),
+        "known metadata-only work is intentionally outside the predictor: {entries:?}"
+    );
+}
+
+#[test]
+fn concurrent_index_does_not_report_lock_prediction_gap() {
+    let entries = lock_not_evaluated(
+        TABLES,
+        "CREATE INDEX CONCURRENTLY child_note_idx ON child(note);",
+    );
+    assert!(
+        !lock_prediction_gap(&entries),
+        "concurrent index builds are deliberately not flagged: {entries:?}"
+    );
+}
+
+#[test]
+fn temporary_predicted_ddl_does_not_report_lock_prediction_gap() {
+    let entries = lock_not_evaluated(
+        "",
+        "CREATE TEMP TABLE scratch (id integer);
+         CREATE INDEX scratch_idx ON scratch(id);",
+    );
+    assert!(
+        !lock_prediction_gap(&entries),
+        "a predicted temporary operation is not a coverage gap: {entries:?}"
+    );
+}
+
+#[test]
+fn temporary_drop_does_not_report_lock_prediction_gap() {
+    let entries = lock_not_evaluated(
+        "",
+        "CREATE TEMP TABLE scratch (id integer);
+         DROP TABLE scratch;",
+    );
+    assert!(
+        !lock_prediction_gap(&entries),
+        "a temporary table drop is not a coverage gap: {entries:?}"
     );
 }

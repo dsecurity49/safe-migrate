@@ -1,4 +1,6 @@
 use super::*;
+use safe_migrate::_internal::db::cache::{DbCache, InheritanceCache};
+use safe_migrate::_internal::report::violations::Violation;
 
 #[test]
 fn test_rule_size_aware_toast_escalation() {
@@ -513,24 +515,10 @@ fn test_rule_partition_attach_detach() {
 
     let mut cache = crate::common::synced_cache();
 
-    cache.insert_baseline(
-        object_id("public", "p"),
-        RelationState::new(
-            object_id("public", "p"),
-            ObjectId::new("public", "postgres"),
-            0,
-            Some(500_000),
-            RelationKind::Table,
-            Persistence::Permanent,
-            0,
-        ),
-    );
+    baseline_table(&mut cache, "p", 500_000, Some("LIST"));
+    baseline_table(&mut cache, "c", 500_000, None);
 
     let mut state = AnalysisState::new(cache);
-
-    engine
-        .analyze("CREATE TABLE c(id int);", &mut state)
-        .unwrap();
 
     let v1 = engine
         .analyze(
@@ -556,6 +544,168 @@ fn test_rule_partition_attach_detach() {
         .unwrap();
 
     assert!(v2.iter().any(|v| v.rule_id.contains("partition")));
+}
+
+fn baseline_table(
+    cache: &mut DbCache,
+    name: &str,
+    rows: u64,
+    partition_type: Option<&str>,
+) -> ObjectId {
+    let id = object_id("public", name);
+    let mut relation = RelationState::new(
+        id.clone(),
+        ObjectId::new("public", "postgres"),
+        0,
+        Some(rows),
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    relation.last_analyze = Some("2026-01-01 00:00:00+00".to_string());
+    relation.partition_type = partition_type.map(str::to_string);
+    cache.insert_baseline(id.clone(), relation);
+    id
+}
+
+fn partition_violations(cache: DbCache, sql: &str) -> Vec<Violation> {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(cache);
+    engine.analyze(sql, &mut state).unwrap()
+}
+
+fn has_partition_tier1(violations: &[Violation], needle: &str) -> bool {
+    violations.iter().any(|violation| {
+        violation.rule_id == "blocking-partition-mutation"
+            && violation.tier == ViolationTier::Tier1
+            && violation.reason.contains(needle)
+    })
+}
+
+#[test]
+fn attach_partition_cost_uses_candidate_rows_not_parent_rows() {
+    let mut cache = synced_cache();
+    baseline_table(&mut cache, "p", 0, Some("LIST"));
+    baseline_table(&mut cache, "c", 500_000, None);
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        has_partition_tier1(&violations, "500000"),
+        "candidate partition rows must drive ATTACH cost: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_does_not_use_parent_rows() {
+    let mut cache = synced_cache();
+    baseline_table(&mut cache, "p", 500_000, Some("LIST"));
+    baseline_table(&mut cache, "c", 0, None);
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-partition-mutation"),
+        "a small candidate partition must not inherit the parent estimate: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_includes_default_partition_rows() {
+    let mut cache = synced_cache();
+    let parent = baseline_table(&mut cache, "p", 0, Some("LIST"));
+    baseline_table(&mut cache, "c", 0, None);
+    let default = baseline_table(&mut cache, "p_default", 500_000, None);
+    cache.relations.get_mut(&default).unwrap().partition_bound = Some("DEFAULT".into());
+    cache.inheritances.push(InheritanceCache {
+        child: default,
+        parent,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        has_partition_tier1(&violations, "default partition public.p_default"),
+        "the default partition scan must drive ATTACH cost: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_sums_candidate_and_default_rows() {
+    let mut cache = synced_cache();
+    let parent = baseline_table(&mut cache, "p", 0, Some("LIST"));
+    baseline_table(&mut cache, "c", 60_000, None);
+    let default = baseline_table(&mut cache, "p_default", 60_000, None);
+    cache.relations.get_mut(&default).unwrap().partition_bound = Some("DEFAULT".into());
+    cache.inheritances.push(InheritanceCache {
+        child: default,
+        parent,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        has_partition_tier1(&violations, "120000"),
+        "both scanned relations contribute rows: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_sums_nested_partition_leaves() {
+    let mut cache = synced_cache();
+    baseline_table(&mut cache, "p", 0, Some("RANGE"));
+    let child = baseline_table(&mut cache, "c", 0, Some("RANGE"));
+    let leaf = baseline_table(&mut cache, "c_leaf", 500_000, None);
+    cache.inheritances.push(InheritanceCache {
+        child: leaf,
+        parent: child,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations = partition_violations(
+        cache,
+        "ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+    );
+
+    assert!(
+        has_partition_tier1(&violations, "500000"),
+        "nested partition leaves must be scanned: {violations:?}"
+    );
+}
+
+#[test]
+fn detach_partition_cost_still_uses_parent_rows() {
+    let mut cache = synced_cache();
+    let parent = baseline_table(&mut cache, "p", 500_000, Some("LIST"));
+    let child = baseline_table(&mut cache, "c", 0, None);
+    cache.inheritances.push(InheritanceCache {
+        child,
+        parent,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations = partition_violations(cache, "ALTER TABLE p DETACH PARTITION c;");
+
+    assert!(
+        has_partition_tier1(&violations, "heavily utilized parent table public.p"),
+        "DETACH cost remains parent-based: {violations:?}"
+    );
 }
 
 #[test]

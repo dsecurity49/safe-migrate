@@ -554,14 +554,14 @@
    "rule_dir": "rule_12_blocking-partition-mutation",
    "enabled": true,
    "fixtures": [
-    "001_attach_partition.sql",
-    "003_attach_default.sql",
-    "007_attach_schema_qualified.sql"
+    "safe_009_attach_empty_partition.sql",
+    "safe_010_attach_empty_default.sql",
+    "safe_011_attach_empty_schema_qualified.sql"
    ],
    "fixture_min_pg_version": {
-    "001_attach_partition.sql": 150000,
-    "003_attach_default.sql": 150000,
-    "007_attach_schema_qualified.sql": 150000
+    "safe_009_attach_empty_partition.sql": 150000,
+    "safe_010_attach_empty_default.sql": 150000,
+    "safe_011_attach_empty_schema_qualified.sql": 150000
    },
    "excluded_fixtures": [
     {

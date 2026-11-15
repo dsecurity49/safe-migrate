@@ -383,6 +383,69 @@ impl AnalysisState {
         self.baseline_relations.contains(id)
     }
 
+    /// Immediate partitions of `parent` whose bound is `DEFAULT`.
+    pub(crate) fn default_partitions_of(&self, parent: &ObjectId) -> Vec<ObjectId> {
+        self.local
+            .graph
+            .partitions_of(parent)
+            .into_iter()
+            .filter(|child| {
+                matches!(
+                    self.local.relations.get(*child),
+                    Some(RelationOverlay::Present(relation))
+                        if relation
+                            .partition_bound
+                            .as_deref()
+                            .is_some_and(|bound| bound.eq_ignore_ascii_case("DEFAULT"))
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Leaf relations PostgreSQL scans when attaching `root`.
+    ///
+    /// Foreign tables are not scanned, and a partitioned table contributes
+    /// only its leaves; a partitioned table with no partitions contributes
+    /// nothing.
+    pub(crate) fn partition_scan_relations(&self, root: &ObjectId) -> Vec<ObjectId> {
+        let mut leaves = Vec::new();
+        let mut visited = HashSet::new();
+        self.collect_partition_scan_relations(root, &mut visited, &mut leaves);
+        leaves
+    }
+
+    fn collect_partition_scan_relations(
+        &self,
+        relation_id: &ObjectId,
+        visited: &mut HashSet<ObjectId>,
+        leaves: &mut Vec<ObjectId>,
+    ) {
+        if !visited.insert(relation_id.clone()) {
+            return;
+        }
+        let relation = match self.local.relations.get(relation_id) {
+            Some(RelationOverlay::Present(relation)) => relation,
+            Some(RelationOverlay::Dropped) | None => {
+                leaves.push(relation_id.clone());
+                return;
+            }
+        };
+        if relation.kind != RelationKind::Table {
+            return;
+        }
+        let partitions = self.local.graph.partitions_of(relation_id);
+        if partitions.is_empty() {
+            if relation.partition_type.is_none() {
+                leaves.push(relation_id.clone());
+            }
+            return;
+        }
+        for partition in partitions {
+            self.collect_partition_scan_relations(partition, visited, leaves);
+        }
+    }
+
     pub(crate) fn baseline_fk_dependency_is_known(&self, id: &ObjectId) -> bool {
         self.baseline_fk_dependencies.contains(id)
     }
