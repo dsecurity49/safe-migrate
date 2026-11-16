@@ -268,6 +268,8 @@ impl PrivilegeMatrix {
         }
     }
 
+    /// Revokes one grantor's contribution; provenance-free rows lose the
+    /// effective grant because another source cannot be proven.
     pub(crate) fn revoke_from(
         &mut self,
         role: &ObjectId,
@@ -358,6 +360,8 @@ impl PrivilegeMatrix {
         }
     }
 
+    /// Removes one grantor's grant option, clearing the option when no
+    /// source remains.
     pub(crate) fn revoke_grant_option_from(
         &mut self,
         role: &ObjectId,
@@ -774,6 +778,7 @@ impl RelationState {
         }
     }
 
+    /// Apply a column change and keep derived metadata in sync.
     pub(crate) fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
             ColumnAction::Add {
@@ -783,6 +788,8 @@ impl RelationState {
                 default,
             } => {
                 if !self.columns.iter().any(|c| c.name == *name) {
+                    // Serial is stored as its concrete integer type plus a
+                    // nextval default, so model that shape directly.
                     let serial_type = data_type
                         .as_deref()
                         .map(str::trim)
@@ -826,6 +833,8 @@ impl RelationState {
                 self.generated_columns.remove(name);
             }
             ColumnAction::Rename { from, to } => {
+                // Renaming also rewrites every stored expression and derived
+                // map that names the column.
                 if let Some(pos) = self.columns.iter().position(|c| c.name == *from)
                     && !self.columns.iter().any(|c| c.name == *to)
                 {

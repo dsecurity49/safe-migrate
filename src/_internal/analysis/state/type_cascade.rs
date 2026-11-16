@@ -147,6 +147,7 @@ impl AnalysisState {
             let alter = AlterTable {
                 id: relation_id,
                 only: false,
+                if_exists: false,
                 action: AlterTableActionMutation::DropColumn {
                     name: column,
                     if_exists: true,

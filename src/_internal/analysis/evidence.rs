@@ -1,6 +1,8 @@
 use serde::Serialize;
+use std::collections::HashSet;
 
-/// Stable, machine-readable causes for conservative analysis.
+/// Stable, machine-readable causes for conservative analysis, including
+/// evidence gaps and operations outside a rule's modeled scope.
 ///
 /// New variants are additive. Callers should use the serialized snake-case
 /// value as the compatibility contract rather than matching display text.
@@ -15,7 +17,9 @@ pub(crate) enum EvidenceCode {
     UnresolvedReference,
     UnknownObjectState,
     TransactionStateUnknown,
+    TransactionAborted,
     UnmodeledState,
+    LockPredictionUnavailable,
 }
 
 impl EvidenceCode {
@@ -29,7 +33,9 @@ impl EvidenceCode {
             Self::UnresolvedReference => "unresolved_reference",
             Self::UnknownObjectState => "unknown_object_state",
             Self::TransactionStateUnknown => "transaction_state_unknown",
+            Self::TransactionAborted => "transaction_aborted",
             Self::UnmodeledState => "unmodeled_state",
+            Self::LockPredictionUnavailable => "lock_prediction_unavailable",
         }
     }
 
@@ -45,8 +51,14 @@ impl EvidenceCode {
             Self::UnresolvedReference => "an object reference could not be resolved exactly",
             Self::UnknownObjectState => "the required object state is unknown",
             Self::TransactionStateUnknown => "transaction state cannot be modeled exactly",
+            Self::TransactionAborted => {
+                "the transaction was aborted before this statement could run"
+            }
             Self::UnmodeledState => {
                 "required PostgreSQL state is deliberately outside the semantic model"
+            }
+            Self::LockPredictionUnavailable => {
+                "the curated lock predictor does not cover this operation"
             }
         }
     }
@@ -94,10 +106,11 @@ impl EvidenceRecord {
     }
 }
 
-/// Ordered, deduplicated evidence carried by analysis state.
+/// Insertion-ordered, deduplicated evidence carried by analysis state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EvidenceLog {
     records: Vec<EvidenceRecord>,
+    seen: HashSet<EvidenceRecord>,
 }
 
 impl EvidenceLog {
@@ -106,17 +119,26 @@ impl EvidenceLog {
     }
 
     pub(crate) fn contains(&self, record: &EvidenceRecord) -> bool {
-        self.records.contains(record)
+        self.seen.contains(record)
     }
 
     /// Returns whether the record was newly inserted.
     pub(crate) fn insert(&mut self, record: EvidenceRecord) -> bool {
-        if self.contains(&record) {
+        if !self.seen.insert(record.clone()) {
             return false;
         }
         self.records.push(record);
-        self.records.sort();
         true
+    }
+
+    /// Restore the log to `len` records, as recorded before a transaction
+    /// mutation.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        while self.records.len() > len {
+            if let Some(record) = self.records.pop() {
+                self.seen.remove(&record);
+            }
+        }
     }
 }
 
@@ -125,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evidence_is_deduplicated_and_stably_ordered() {
+    fn evidence_is_deduplicated_in_insertion_order() {
         let mut log = EvidenceLog::default();
         let stale = EvidenceRecord::new(EvidenceCode::BaselineStale, EvidenceScope::Chain);
         let unsupported =
@@ -139,6 +161,28 @@ mod tests {
         assert!(log.insert(unsupported.clone()));
         assert!(log.insert(stale.clone()));
         assert!(!log.insert(unsupported.clone()));
-        assert_eq!(log.records(), &[stale, unsupported]);
+        assert_eq!(log.records(), &[unsupported.clone(), stale.clone()]);
+
+        let mut report_order = log.records().to_vec();
+        report_order.sort();
+        assert_eq!(report_order, vec![stale, unsupported]);
+    }
+
+    #[test]
+    fn truncate_restores_length_and_membership() {
+        let mut log = EvidenceLog::default();
+        let stale = EvidenceRecord::new(EvidenceCode::BaselineStale, EvidenceScope::Chain);
+        let unsupported =
+            EvidenceRecord::new(EvidenceCode::UnsupportedStatement, EvidenceScope::Statement);
+
+        assert!(log.insert(stale.clone()));
+        assert!(log.insert(unsupported.clone()));
+        log.truncate(1);
+        assert_eq!(log.records(), &[stale]);
+        assert!(!log.contains(&unsupported));
+        assert!(log.insert(unsupported.clone()));
+        log.truncate(0);
+        assert!(log.records().is_empty());
+        assert!(!log.contains(&unsupported));
     }
 }

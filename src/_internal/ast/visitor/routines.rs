@@ -491,6 +491,7 @@ impl AstVisitor {
                 .map(|ty| ty.syntax().text().to_string())
     }
 
+    /// Extract an aggregate's signature, kind, and direct-argument count.
     pub(super) fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
         let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
         let attributes = Self::extract_attribute_list(node.attribute_list());

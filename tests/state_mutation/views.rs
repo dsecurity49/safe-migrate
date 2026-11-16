@@ -236,6 +236,169 @@ fn cached_view_column_dependencies_allow_dropping_an_unreferenced_column() {
     ));
 }
 
+fn view_column_dependency_cache() -> (
+    safe_migrate::_internal::db::cache::DbCache,
+    ObjectId,
+    ObjectId,
+) {
+    let table_id = object_id("public", "orders");
+    let view_id = object_id("public", "orders_view");
+    let mut cache = synced_cache();
+    let mut table = RelationState::new(
+        table_id.clone(),
+        object_id("public", "owner"),
+        0,
+        Some(10),
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    for name in ["id", "customer_id"] {
+        table.apply_column_action(&ColumnAction::Add {
+            name: name.to_string(),
+            data_type: Some("integer".to_string()),
+            not_null: false,
+            default: None,
+        });
+    }
+    cache.insert_baseline(table_id.clone(), table);
+    cache.insert_baseline(
+        view_id.clone(),
+        RelationState::new(
+            view_id.clone(),
+            object_id("public", "owner"),
+            0,
+            None,
+            RelationKind::View,
+            Persistence::Permanent,
+            0,
+        ),
+    );
+    cache.dependencies.push(ViewDependencyCache {
+        dependent: view_id.clone(),
+        referenced: table_id.clone(),
+        referenced_column: Some("customer_id".to_string()),
+    });
+    (cache, table_id, view_id)
+}
+
+fn cached_view_column(
+    state: &AnalysisState,
+    view_id: &ObjectId,
+    table_id: &ObjectId,
+) -> Option<Option<String>> {
+    state
+        .local
+        .graph
+        .edges()
+        .iter()
+        .find_map(|edge| match &edge.kind {
+            DependencyKind::ViewDependency {
+                referenced_column, ..
+            } if edge.dependent == *view_id && edge.referenced == *table_id => {
+                Some(referenced_column.clone())
+            }
+            _ => None,
+        })
+}
+
+#[test]
+fn cached_view_column_dependency_follows_column_rename() {
+    let (cache, table_id, view_id) = view_column_dependency_cache();
+    let engine = setup_engine();
+
+    let mut state = AnalysisState::new(cache.clone());
+    engine
+        .analyze(
+            "ALTER TABLE orders RENAME COLUMN customer_id TO account_id;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(
+        cached_view_column(&state, &view_id, &table_id),
+        Some(Some("account_id".to_string()))
+    );
+
+    let findings = engine
+        .analyze("ALTER TABLE orders DROP COLUMN account_id;", &mut state)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "the renamed column is still referenced by the view: {findings:?}"
+    );
+    assert!(state.relation_is_present(&view_id));
+
+    let mut cascade_state = AnalysisState::new(cache);
+    engine
+        .analyze(
+            "ALTER TABLE orders RENAME COLUMN customer_id TO account_id;",
+            &mut cascade_state,
+        )
+        .unwrap();
+    let findings = engine
+        .analyze(
+            "ALTER TABLE orders DROP COLUMN account_id CASCADE;",
+            &mut cascade_state,
+        )
+        .unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "{findings:?}"
+    );
+    assert!(matches!(
+        cascade_state.get_relation(&view_id),
+        Some(RelationOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn cached_view_column_dependency_rename_rolls_back() {
+    let (cache, table_id, view_id) = view_column_dependency_cache();
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze(
+            "BEGIN; ALTER TABLE orders RENAME COLUMN customer_id TO account_id;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(
+        cached_view_column(&state, &view_id, &table_id),
+        Some(Some("account_id".to_string()))
+    );
+
+    engine.analyze("ROLLBACK;", &mut state).unwrap();
+    assert_eq!(
+        cached_view_column(&state, &view_id, &table_id),
+        Some(Some("customer_id".to_string()))
+    );
+}
+
+#[test]
+fn column_rename_leaves_relation_level_view_dependency_unchanged() {
+    let (mut cache, table_id, view_id) = view_column_dependency_cache();
+    for dependency in &mut cache.dependencies {
+        if dependency.dependent == view_id && dependency.referenced == table_id {
+            dependency.referenced_column = None;
+        }
+    }
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze(
+            "ALTER TABLE orders RENAME COLUMN customer_id TO account_id;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(cached_view_column(&state, &view_id, &table_id), Some(None));
+}
+
 #[test]
 fn scoped_view_dependencies_keep_edges_to_omitted_schemas() {
     let view_id = object_id("app", "v");
@@ -692,6 +855,16 @@ fn a_view_depends_on_the_types_its_body_casts_to() {
         ),
         0,
         "CASCADE applies the drop; the view fallout is reported as unmodeled"
+    );
+    assert_eq!(
+        conflicts(
+            "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT ARRAY[1]::ct[] AS r;
+                 ALTER TYPE ct RENAME TO ct2;
+                 DROP TYPE ct2;"
+        ),
+        1,
+        "a cast to an array of a user type must track type renames and block dropping it"
     );
     assert_eq!(
         conflicts(

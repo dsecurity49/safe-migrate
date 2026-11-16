@@ -1,6 +1,8 @@
 use super::*;
 
 impl AnalysisState {
+    /// Drop tables and their cascade closure, keeping unknown targets and
+    /// dependents conservative.
     pub(in crate::_internal::analysis::state) fn apply_drop_table(
         &mut self,
         drop_table: &DropTable,
@@ -394,13 +396,8 @@ impl AnalysisState {
     /// harness and destructive-transition dependency checks agree with
     /// PostgreSQL.
     pub(super) fn register_not_null_constraint(&mut self, table: &ObjectId, column: &str) {
-        // PostgreSQL only materializes NOT NULL columns as `pg_constraint`
-        // rows (`contype = 'n'`) on PG18+. On PG17 and earlier a NOT NULL
-        // column is tracked purely by its nullability attribute, so recording
-        // it as a distinct constraint would add normalized state that the live
-        // database never lists. Column nullability is still carried by the
-        // column itself; only this separate constraint representation is
-        // suppressed.
+        // Before PG18, nullability is tracked only on the column itself; adding
+        // constraint state here would be state the live catalog never lists.
         if self.pg_version().conservative_num() < 180_000 {
             return;
         }

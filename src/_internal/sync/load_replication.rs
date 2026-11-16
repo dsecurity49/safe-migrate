@@ -1,5 +1,6 @@
 use super::*;
 
+/// Load publications, including the PG18 generated-columns setting.
 pub(super) fn load_publications(
     client: &mut impl GenericClient,
     pg_version_num: u32,
@@ -211,6 +212,7 @@ pub(super) fn load_publications(
     Ok(publications)
 }
 
+/// Load subscriptions without connection strings, which are never cached.
 pub(super) fn load_subscriptions(
     client: &mut impl GenericClient,
     pg_version_num: u32,

@@ -1,5 +1,6 @@
 use super::*;
 
+/// Load relations and columns in scope, plus foreign-key endpoints.
 pub(super) fn load_relations_and_columns(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,
@@ -416,6 +417,7 @@ pub(super) struct RelationGrant {
     pub(super) is_grantable: bool,
 }
 
+/// Load relation triggers, policies, rules, and grants.
 pub(super) fn load_relation_decorations(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -554,6 +556,8 @@ pub(super) fn load_relation_decorations(
     Ok((decorations, grants))
 }
 
+/// Load visible triggers, including their enabled mode and the parent trigger
+/// identity PostgreSQL records for partitioned-table clones.
 pub(super) fn load_triggers(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -567,9 +571,9 @@ pub(super) fn load_triggers(
             t.tgname AS trigger_name,
             t.tgenabled::text AS enabled_mode,
             (t.tgtype & 1) <> 0 AS row_level,
-            COALESCE(pn.nspname, inferred_pn.nspname) AS parent_table_schema,
-            COALESCE(pc.relname, inferred_pc.relname) AS parent_table_name,
-            COALESCE(pt.tgname, inferred_pt.tgname) AS parent_trigger_name,
+            pn.nspname AS parent_table_schema,
+            pc.relname AS parent_table_name,
+            pt.tgname AS parent_trigger_name,
             fn.nspname AS function_schema,
             f.proname || '()' AS function_name
         FROM pg_trigger t
@@ -580,29 +584,8 @@ pub(super) fn load_triggers(
         LEFT JOIN pg_trigger pt ON pt.oid = t.tgparentid
         LEFT JOIN pg_class pc ON pc.oid = pt.tgrelid
         LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
-        LEFT JOIN LATERAL (
-            SELECT parent_t.oid AS trigger_oid,
-                   parent_c.oid AS table_oid,
-                   parent_c.relname,
-                   parent_n.nspname,
-                   parent_t.tgname
-            FROM pg_inherits inheritance
-            JOIN pg_trigger parent_t
-              ON parent_t.tgrelid = inheritance.inhparent
-             AND parent_t.tgname = t.tgname
-             AND parent_t.tgisinternal = false
-            JOIN pg_class parent_c ON parent_c.oid = parent_t.tgrelid
-            JOIN pg_namespace parent_n ON parent_n.oid = parent_c.relnamespace
-            WHERE inheritance.inhrelid = t.tgrelid
-            -- A cloned trigger normally keeps the same function OID.  Older
-            -- PostgreSQL releases have catalog cases where that linkage is
-            -- not stable, so prefer an exact function match but retain the
-            -- unique parent/name relationship as a compatibility fallback.
-            ORDER BY (parent_t.tgfoid = t.tgfoid) DESC, parent_t.oid
-            LIMIT 1
-        ) inferred_pt ON true
-        LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid
-        LEFT JOIN pg_namespace inferred_pn ON inferred_pn.oid = inferred_pc.relnamespace
+        -- Parentage is catalog state, not an inference from inheritance and
+        -- name: independently-created triggers can share both.
         WHERE (t.tgisinternal = false OR (t.tgparentid <> 0 AND pt.tgisinternal = false))
           AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -661,6 +644,7 @@ pub(super) fn load_triggers(
         .collect()
 }
 
+/// Loads inheritance and partition-parent edges, including detach-pending state.
 pub(super) fn load_inheritances(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,

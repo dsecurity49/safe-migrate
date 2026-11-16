@@ -11,6 +11,9 @@ use zeroize::{Zeroize, Zeroizing};
 pub(crate) const CACHE_KEY_ENV: &str = "SAFE_MIGRATE_CACHE_KEY";
 pub(crate) const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_CACHE_DECODE_BYTES: usize = 256 * 1024 * 1024;
+// Not AEAD-bound: a modified marker fails the format check, and binding it
+// would not detect a cache transplanted from another database because offline
+// loading has no independent database identity to compare against.
 const ENCRYPTED_CACHE_MAGIC: &[u8] = b"SMENC001";
 const NONCE_LENGTH: usize = 24;
 
@@ -221,6 +224,20 @@ mod tests {
             modified[last] ^= 1;
             assert!(unprotect_cache_bytes(modified, true).is_err());
         });
+    }
+
+    #[test]
+    fn encrypted_cache_rejects_tampered_envelope_metadata() {
+        let key = decode_hex_key(&"42".repeat(32)).unwrap();
+        let encrypted = protect_cache_bytes_with_key(b"cache payload".to_vec(), &key).unwrap();
+
+        let mut tampered_magic = encrypted.clone();
+        tampered_magic[0] ^= 1;
+        assert!(unprotect_cache_bytes_with_key(tampered_magic, &key).is_err());
+
+        let mut tampered_nonce = encrypted;
+        tampered_nonce[ENCRYPTED_CACHE_MAGIC.len()] ^= 1;
+        assert!(unprotect_cache_bytes_with_key(tampered_nonce, &key).is_err());
     }
 
     #[test]

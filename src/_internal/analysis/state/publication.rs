@@ -102,6 +102,7 @@ impl AnalysisState {
         }
     }
 
+    /// Validate explicit publication objects, tainting when absence is unproven.
     pub(super) fn validate_publication_scope(
         &mut self,
         scope: &crate::_internal::analysis::facts::PublicationScope,

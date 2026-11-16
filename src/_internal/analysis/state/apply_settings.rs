@@ -96,6 +96,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Switch the effective role and refresh role-sensitive search-path state.
     pub(super) fn apply_switch_role(
         &mut self,
         role: &Option<RoleFact>,

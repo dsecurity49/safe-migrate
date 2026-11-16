@@ -60,6 +60,9 @@ impl Resolver {
         }
     }
 
+    /// Resolve a view's columns, updatability, routines, and cast dependencies
+    /// against the current state. Materialized-view sources disable automatic
+    /// updatability even when the SELECT shape qualifies.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_view(
         name: &QualifiedName,
@@ -216,6 +219,8 @@ impl Resolver {
             .collect()
     }
 
+    /// Classifies an aggregate call as local, outer, or unknown by combining
+    /// its references; a subquery is never proven local.
     fn aggregate_correlation(
         candidate: &AggregateCandidateFact,
         source: Option<&ObjectId>,
@@ -249,6 +254,8 @@ impl Resolver {
         }
     }
 
+    /// Resolves one aggregate reference against the query scopes: aliases in
+    /// scope are local, source columns are outer, incomplete metadata is unknown.
     fn reference_correlation(
         reference: &AggregateReferenceFact,
         scopes: &[AggregateScopeFact],

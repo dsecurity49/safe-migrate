@@ -105,6 +105,9 @@ impl AnalysisState {
         }
     }
 
+    /// Move every modeled identity and reference from the old schema to the new
+    /// one. Rename edges keep old names resolvable, and the old schema is marked
+    /// dropped.
     pub(super) fn rename_schema_namespace(&mut self, old_name: &str, new_name: &str) {
         self.snapshot_namespace();
 

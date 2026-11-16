@@ -1,4 +1,6 @@
 use super::*;
+use safe_migrate::_internal::db::cache::{DbCache, InheritanceCache};
+use safe_migrate::_internal::report::violations::Violation;
 
 #[test]
 fn test_rule_size_aware_toast_escalation() {
@@ -97,6 +99,221 @@ fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
         .unwrap();
 
     assert!(!v2.iter().any(|v| v.rule_id == "blocking-constraint"));
+}
+
+#[test]
+fn test_rule_blocking_constraint_reports_lock_modes() {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(crate::common::synced_cache());
+
+    engine
+        .analyze(
+            "CREATE TABLE parent (id integer PRIMARY KEY);
+             CREATE TABLE child (id integer, parent_id integer);",
+            &mut state,
+        )
+        .unwrap();
+    for overlay in state.local.relations.values_mut() {
+        if let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) =
+            overlay
+        {
+            relation.estimated_rows = Some(500_000);
+            relation.last_analyze = Some("2026-01-01 00:00:00".to_string());
+        }
+    }
+
+    let check_findings = engine
+        .analyze(
+            "ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0);",
+            &mut state,
+        )
+        .unwrap();
+    let check = check_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "blocking-constraint" && violation.reason.contains("child_check")
+        })
+        .expect("valid CHECK constraint should be reported");
+    assert!(!check.reason.contains("ACCESS EXCLUSIVE"), "{check:#?}");
+    assert!(
+        !check.recipe.contains("ACCESS EXCLUSIVE") && !check.recipe.contains("FOREIGN KEY"),
+        "CHECK scan recipe must not repeat lock-mode text: {check:#?}"
+    );
+    let check_lock = check_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk" && violation.reason.contains("CHECK constraint")
+        })
+        .expect("valid CHECK constraint must have a separate lock-risk finding");
+    assert!(
+        check_lock.reason.contains("ACCESS EXCLUSIVE"),
+        "{check_lock:#?}"
+    );
+
+    let foreign_key_findings = engine
+        .analyze(
+            "ALTER TABLE child ADD CONSTRAINT child_fk FOREIGN KEY (parent_id) REFERENCES parent(id);",
+            &mut state,
+        )
+        .unwrap();
+    let foreign_key = foreign_key_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "blocking-constraint" && violation.reason.contains("child_fk")
+        })
+        .expect("valid FOREIGN KEY constraint should be reported");
+    assert!(
+        !foreign_key.reason.contains("SHARE ROW EXCLUSIVE"),
+        "{foreign_key:#?}"
+    );
+    assert!(
+        foreign_key.reason.contains("child") && foreign_key.reason.contains("parent"),
+        "{foreign_key:#?}"
+    );
+    assert!(
+        !foreign_key.recipe.contains("SHARE ROW EXCLUSIVE")
+            && foreign_key.recipe.contains("FOREIGN KEY")
+            && !foreign_key.recipe.contains("CHECK"),
+        "FOREIGN KEY scan recipe must not repeat lock-mode text: {foreign_key:#?}"
+    );
+    let foreign_key_lock = foreign_key_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk" && violation.reason.contains("FOREIGN KEY")
+        })
+        .expect("valid FOREIGN KEY must have a separate lock-risk finding");
+    assert!(
+        foreign_key_lock.reason.contains("SHARE ROW EXCLUSIVE")
+            && foreign_key_lock.reason.contains("child")
+            && foreign_key_lock.reason.contains("parent"),
+        "{foreign_key_lock:#?}"
+    );
+
+    engine
+        .analyze(
+            "ALTER TABLE child ADD CONSTRAINT child_fk_pending FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    let validate_findings = engine
+        .analyze(
+            "ALTER TABLE child VALIDATE CONSTRAINT child_fk_pending;",
+            &mut state,
+        )
+        .unwrap();
+    let validate = validate_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "blocking-constraint"
+                && violation.reason.contains("child_fk_pending")
+        })
+        .expect("validating a pending constraint should be reported");
+    assert!(
+        !validate.reason.contains("SHARE UPDATE EXCLUSIVE"),
+        "{validate:#?}"
+    );
+    let validate_lock = validate_findings
+        .iter()
+        .find(|violation| {
+            violation.rule_id == "lock-risk" && violation.reason.contains("Validating a constraint")
+        })
+        .expect("VALIDATE must have a separate lock-risk finding");
+    assert!(
+        validate_lock.reason.contains("SHARE UPDATE EXCLUSIVE"),
+        "{validate_lock:#?}"
+    );
+}
+
+#[test]
+fn test_rule_blocking_constraint_validate_scans_large_table() {
+    let engine = setup_engine();
+    let mut cache = crate::common::synced_cache();
+    cache.insert_baseline(
+        object_id("public", "t"),
+        RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500_000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        ),
+    );
+    let mut state = AnalysisState::new(cache);
+
+    let added = engine
+        .analyze(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !added
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "NOT VALID must not be reported as blocking: {added:#?}"
+    );
+
+    let validated = engine
+        .analyze("ALTER TABLE t VALIDATE CONSTRAINT c;", &mut state)
+        .unwrap();
+    let finding = validated
+        .iter()
+        .find(|violation| violation.rule_id == "blocking-constraint")
+        .expect("validating a large table must be reported");
+    assert_eq!(finding.tier, ViolationTier::Tier1);
+    assert_eq!(finding.object_kind, ObjectKind::Table);
+    assert!(
+        finding.reason.contains("'c'") && finding.reason.contains("scans the table"),
+        "{finding:#?}"
+    );
+
+    let again = engine
+        .analyze("ALTER TABLE t VALIDATE CONSTRAINT c;", &mut state)
+        .unwrap();
+    assert!(
+        !again
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "re-validating a valid constraint scans nothing: {again:#?}"
+    );
+}
+
+#[test]
+fn test_rule_blocking_constraint_validate_small_table_is_silent() {
+    let engine = setup_engine();
+    let mut cache = crate::common::synced_cache();
+    cache.insert_baseline(
+        object_id("public", "t"),
+        RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        ),
+    );
+    let mut state = AnalysisState::new(cache);
+
+    engine
+        .analyze(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0) NOT VALID;",
+            &mut state,
+        )
+        .unwrap();
+    let violations = engine
+        .analyze("ALTER TABLE t VALIDATE CONSTRAINT c;", &mut state)
+        .unwrap();
+
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-constraint"),
+        "{violations:#?}"
+    );
 }
 
 fn domain_rule_state(column_type: &str, relation_rows: u64) -> AnalysisState {
@@ -298,24 +515,10 @@ fn test_rule_partition_attach_detach() {
 
     let mut cache = crate::common::synced_cache();
 
-    cache.insert_baseline(
-        object_id("public", "p"),
-        RelationState::new(
-            object_id("public", "p"),
-            ObjectId::new("public", "postgres"),
-            0,
-            Some(500_000),
-            RelationKind::Table,
-            Persistence::Permanent,
-            0,
-        ),
-    );
+    baseline_table(&mut cache, "p", 500_000, Some("LIST"));
+    baseline_table(&mut cache, "c", 500_000, None);
 
     let mut state = AnalysisState::new(cache);
-
-    engine
-        .analyze("CREATE TABLE c(id int);", &mut state)
-        .unwrap();
 
     let v1 = engine
         .analyze(
@@ -341,6 +544,168 @@ fn test_rule_partition_attach_detach() {
         .unwrap();
 
     assert!(v2.iter().any(|v| v.rule_id.contains("partition")));
+}
+
+fn baseline_table(
+    cache: &mut DbCache,
+    name: &str,
+    rows: u64,
+    partition_type: Option<&str>,
+) -> ObjectId {
+    let id = object_id("public", name);
+    let mut relation = RelationState::new(
+        id.clone(),
+        ObjectId::new("public", "postgres"),
+        0,
+        Some(rows),
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    relation.last_analyze = Some("2026-01-01 00:00:00+00".to_string());
+    relation.partition_type = partition_type.map(str::to_string);
+    cache.insert_baseline(id.clone(), relation);
+    id
+}
+
+fn partition_violations(cache: DbCache, sql: &str) -> Vec<Violation> {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(cache);
+    engine.analyze(sql, &mut state).unwrap()
+}
+
+fn has_partition_tier1(violations: &[Violation], needle: &str) -> bool {
+    violations.iter().any(|violation| {
+        violation.rule_id == "blocking-partition-mutation"
+            && violation.tier == ViolationTier::Tier1
+            && violation.reason.contains(needle)
+    })
+}
+
+#[test]
+fn attach_partition_cost_uses_candidate_rows_not_parent_rows() {
+    let mut cache = synced_cache();
+    baseline_table(&mut cache, "p", 0, Some("LIST"));
+    baseline_table(&mut cache, "c", 500_000, None);
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        has_partition_tier1(&violations, "500000"),
+        "candidate partition rows must drive ATTACH cost: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_does_not_use_parent_rows() {
+    let mut cache = synced_cache();
+    baseline_table(&mut cache, "p", 500_000, Some("LIST"));
+    baseline_table(&mut cache, "c", 0, None);
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "blocking-partition-mutation"),
+        "a small candidate partition must not inherit the parent estimate: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_includes_default_partition_rows() {
+    let mut cache = synced_cache();
+    let parent = baseline_table(&mut cache, "p", 0, Some("LIST"));
+    baseline_table(&mut cache, "c", 0, None);
+    let default = baseline_table(&mut cache, "p_default", 500_000, None);
+    cache.relations.get_mut(&default).unwrap().partition_bound = Some("DEFAULT".into());
+    cache.inheritances.push(InheritanceCache {
+        child: default,
+        parent,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        has_partition_tier1(&violations, "default partition public.p_default"),
+        "the default partition scan must drive ATTACH cost: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_sums_candidate_and_default_rows() {
+    let mut cache = synced_cache();
+    let parent = baseline_table(&mut cache, "p", 0, Some("LIST"));
+    baseline_table(&mut cache, "c", 60_000, None);
+    let default = baseline_table(&mut cache, "p_default", 60_000, None);
+    cache.relations.get_mut(&default).unwrap().partition_bound = Some("DEFAULT".into());
+    cache.inheritances.push(InheritanceCache {
+        child: default,
+        parent,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations =
+        partition_violations(cache, "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);");
+
+    assert!(
+        has_partition_tier1(&violations, "120000"),
+        "both scanned relations contribute rows: {violations:?}"
+    );
+}
+
+#[test]
+fn attach_partition_cost_sums_nested_partition_leaves() {
+    let mut cache = synced_cache();
+    baseline_table(&mut cache, "p", 0, Some("RANGE"));
+    let child = baseline_table(&mut cache, "c", 0, Some("RANGE"));
+    let leaf = baseline_table(&mut cache, "c_leaf", 500_000, None);
+    cache.inheritances.push(InheritanceCache {
+        child: leaf,
+        parent: child,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations = partition_violations(
+        cache,
+        "ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+    );
+
+    assert!(
+        has_partition_tier1(&violations, "500000"),
+        "nested partition leaves must be scanned: {violations:?}"
+    );
+}
+
+#[test]
+fn detach_partition_cost_still_uses_parent_rows() {
+    let mut cache = synced_cache();
+    let parent = baseline_table(&mut cache, "p", 500_000, Some("LIST"));
+    let child = baseline_table(&mut cache, "c", 0, None);
+    cache.inheritances.push(InheritanceCache {
+        child,
+        parent,
+        sequence: 0,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    let violations = partition_violations(cache, "ALTER TABLE p DETACH PARTITION c;");
+
+    assert!(
+        has_partition_tier1(&violations, "heavily utilized parent table public.p"),
+        "DETACH cost remains parent-based: {violations:?}"
+    );
 }
 
 #[test]

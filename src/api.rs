@@ -8,7 +8,6 @@
 //! # fn main() -> Result<(), safe_migrate::api::Error> {
 //! use safe_migrate::api::{self, Baseline, Config};
 //! use std::path::Path;
-//!
 //! let config = Config::load_from_file(Path::new("safe-migrate.toml"))?;
 //! let baseline = Baseline::load_optional(Path::new(".safe-migrate.cache"), &config)?;
 //! let outcome = api::analyze(&config, "001.sql", "CREATE TABLE users (id bigint);", &baseline)?;
@@ -64,7 +63,7 @@ use crate::_internal::report::reporter::{
 };
 use crate::_internal::report::violations::{
     ObjectKind as InternalObjectKind, ReportFinding as InternalFinding,
-    Violation as InternalViolation, ViolationTier as InternalTier,
+    ViolationTier as InternalTier,
 };
 use crate::_internal::rules::registry::{
     self, RuleConfigurationField as InternalRuleConfigurationField,
@@ -352,116 +351,6 @@ pub enum Tier {
     Tier3,
 }
 
-/// Stable category of the SQL operation that produced a finding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub enum OperationKind {
-    /// Drops a table column.
-    DropColumn,
-    /// Drops a table.
-    DropTable,
-    /// Drops an index.
-    DropIndex,
-    /// Drops a view.
-    DropView,
-    /// Drops a materialized view.
-    DropMaterializedView,
-    /// Drops a function.
-    DropFunction,
-    /// Drops a procedure.
-    DropProcedure,
-    /// Drops a schema.
-    DropSchema,
-    /// Drops a database.
-    DropDatabase,
-    /// Drops a sequence.
-    DropSequence,
-    /// Drops a domain.
-    DropDomain,
-    /// Drops a type.
-    DropType,
-    /// Drops a publication.
-    DropPublication,
-    /// Drops a trigger.
-    DropTrigger,
-    /// Drops a row-level security policy.
-    DropPolicy,
-    /// Adds a table column.
-    AddColumn,
-    /// Changes a column's data type.
-    AlterColumnType,
-    /// Adds a table constraint.
-    AddConstraint,
-    /// Creates an index.
-    CreateIndex,
-    /// Creates a table.
-    CreateTable,
-    /// Creates a view.
-    CreateView,
-    /// Creates a function.
-    CreateFunction,
-    /// Creates a procedure.
-    CreateProcedure,
-    /// Changes a function.
-    AlterFunction,
-    /// Changes a procedure.
-    AlterProcedure,
-    /// Refreshes a materialized view.
-    RefreshMaterializedView,
-    /// Reindexes a table, index, database, schema, or system.
-    Reindex,
-    /// Attaches a partition.
-    AttachPartition,
-    /// Detaches a partition.
-    DetachPartition,
-    /// Runs `VACUUM FULL`.
-    VacuumFull,
-    /// Acquires an explicit table lock.
-    LockTable,
-    /// Removes all rows from one or more tables.
-    TruncateTable,
-    /// Grants privileges.
-    Grant,
-    /// Revokes privileges.
-    RevokeGrant,
-    /// Changes a type definition.
-    AlterType,
-    /// Creates a trigger.
-    CreateTrigger,
-    /// Creates a row-level security policy.
-    CreatePolicy,
-    /// Disables a trigger.
-    DisableTrigger,
-    /// Enables a trigger.
-    EnableTrigger,
-    /// Renames a table.
-    RenameTable,
-    /// Renames a table column.
-    RenameColumn,
-    /// Renames an object with no more specific category.
-    Rename,
-    /// SQL whose effects cannot be modeled precisely.
-    OpaqueSql,
-    /// Creates a schema.
-    CreateSchema,
-    /// Sets or drops a column default.
-    SetDefault,
-    /// Creates a sequence.
-    CreateSequence,
-    /// Creates a domain.
-    CreateDomain,
-    /// Changes a schema.
-    AlterSchema,
-    /// Represents a conflict detected before execution.
-    Conflict,
-    /// Represents an irreversible operation.
-    Irreversible,
-    /// Represents a reference that could not be resolved safely.
-    UnresolvedReference,
-    /// A named operation outside the stable categories above.
-    Other(String),
-}
-
 /// Stable category of the database object associated with a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[non_exhaustive]
@@ -571,6 +460,8 @@ pub enum EvidenceCode {
     UnknownObjectState,
     /// Transaction state became uncertain.
     TransactionStateUnknown,
+    /// The transaction was aborted before the statement could run.
+    TransactionAborted,
     /// A state transition was deliberately treated as opaque.
     UnmodeledState,
 }
@@ -684,8 +575,9 @@ impl Migration {
     }
 }
 
-/// A rule that could not state a finding for want of evidence. Nothing is
-/// wrong with the migration; these are the checks that did not run.
+/// A rule that could not state a finding, either for want of evidence or
+/// because the operation is outside its modeled scope. Nothing is wrong with
+/// the migration; these are the checks that did not run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct NotEvaluated {
@@ -693,12 +585,12 @@ pub struct NotEvaluated {
     pub rule_id: String,
     /// Tier this rule would have produced had it been evaluable.
     pub tier: Tier,
-    /// Why the evidence was unavailable.
+    /// Why the rule could not evaluate this statement.
     pub cause: String,
     /// SQL statement the rule could not judge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    /// What would make this rule evaluable.
+    /// What would make this rule evaluable, or what to review manually.
     pub recipe: String,
     /// Out-of-scope schemas the boundary query observed for this rule.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -725,7 +617,8 @@ pub struct AnalysisOutcome {
     confidence: Confidence,
     evidence: Vec<Evidence>,
     baseline: BaselineReport,
-    /// Rules that could not state a finding for want of evidence.
+    /// Rules that could not state a finding, including operations outside
+    /// their modeled scope.
     not_evaluated: Vec<crate::_internal::report::violations::NotEvaluated>,
     inner: InternalOutcome<InternalFinding>,
 }
@@ -759,7 +652,8 @@ impl AnalysisOutcome {
     }
 
     /// Rules that could not state a finding because the evidence they need was
-    /// unavailable, each with the cause and what would resolve it.
+    /// unavailable or the operation is outside their modeled scope, each with
+    /// the cause and what would resolve or clarify it.
     pub fn not_evaluated(&self) -> Vec<NotEvaluated> {
         self.not_evaluated.iter().map(NotEvaluated::from).collect()
     }
@@ -776,8 +670,8 @@ impl AnalysisOutcome {
 
     /// Return the overall deployment verdict.
     pub fn verdict(&self) -> Verdict {
-        crate::_internal::report::reporter::compute_verdict_with(
-            &self.violations(),
+        crate::_internal::report::reporter::compute_verdict_with_iter(
+            self.inner.findings.iter().map(|finding| &finding.violation),
             &self.not_evaluated,
         )
         .into()
@@ -785,8 +679,8 @@ impl AnalysisOutcome {
 
     /// Return the canonical deployment recommendation for this result.
     pub fn recommendation(&self) -> &'static str {
-        crate::_internal::report::reporter::compute_verdict_with(
-            &self.violations(),
+        crate::_internal::report::reporter::compute_verdict_with_iter(
+            self.inner.findings.iter().map(|finding| &finding.violation),
             &self.not_evaluated,
         )
         .recommendation(&self.inner.confidence)
@@ -893,14 +787,6 @@ impl AnalysisOutcome {
     pub fn with_auto_sync_status(mut self, status: AutoSyncStatus) -> Self {
         self.baseline.auto_sync = status;
         self
-    }
-
-    fn violations(&self) -> Vec<InternalViolation> {
-        self.inner
-            .findings
-            .iter()
-            .map(|finding| finding.violation.clone())
-            .collect()
     }
 }
 
@@ -1113,6 +999,8 @@ fn decode_cache(
     decode_cache_payload(path, decrypted, encrypted)
 }
 
+/// Decode a compressed cache payload, enforcing the magic header, format
+/// version, decoded-size limit, and absence of trailing data.
 fn decode_cache_payload(
     path: &Path,
     decrypted: Vec<u8>,
@@ -1588,7 +1476,7 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
         ));
     }
     if let Some(assumed_version) = config.assumed_postgres_version()
-        && !(140_000..=180_999).contains(&assumed_version)
+        && !crate::_internal::sync::is_supported_postgres_version(assumed_version)
     {
         return Err(Error::configuration(
             "assume_pg_version must be a PostgreSQL 14–18 version number",
@@ -1607,6 +1495,30 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
     registry::validate_rule_configuration(config).map_err(Error::configuration)
 }
 
+fn materialize_rule(config: &Config, descriptor: &registry::RuleDescriptor) -> Rule {
+    Rule {
+        id: descriptor.id.to_owned(),
+        title: descriptor.title.to_owned(),
+        summary: descriptor.summary.to_owned(),
+        impact: descriptor.impact.to_owned(),
+        default_tier: descriptor.default_tier().into(),
+        recipe: descriptor.recipe().to_owned(),
+        supported_configuration_fields: descriptor
+            .supported_configuration_fields
+            .iter()
+            .copied()
+            .map(RuleConfigurationField::from)
+            .collect(),
+        enabled: !config.is_rule_disabled(descriptor.id),
+        tier1_threshold_rows: descriptor
+            .supports(InternalRuleConfigurationField::Tier1ThresholdRows)
+            .then(|| config.rule_tier1_threshold(descriptor.id)),
+        tier2_threshold_rows: descriptor
+            .supports(InternalRuleConfigurationField::Tier2ThresholdRows)
+            .then(|| config.rule_tier2_threshold(descriptor.id)),
+    }
+}
+
 /// Return every primary rule with its effective configuration.
 ///
 /// # Errors
@@ -1616,27 +1528,7 @@ pub fn rules(config: &Config) -> Result<Vec<Rule>, Error> {
     validate_config(config)?;
     Ok(registry::PRIMARY_RULES
         .iter()
-        .map(|descriptor| Rule {
-            id: descriptor.id.to_owned(),
-            title: descriptor.title.to_owned(),
-            summary: descriptor.summary.to_owned(),
-            impact: descriptor.impact.to_owned(),
-            default_tier: descriptor.default_tier().into(),
-            recipe: descriptor.recipe().to_owned(),
-            supported_configuration_fields: descriptor
-                .supported_configuration_fields
-                .iter()
-                .copied()
-                .map(RuleConfigurationField::from)
-                .collect(),
-            enabled: !config.is_rule_disabled(descriptor.id),
-            tier1_threshold_rows: descriptor
-                .supports(InternalRuleConfigurationField::Tier1ThresholdRows)
-                .then(|| config.rule_tier1_threshold(descriptor.id)),
-            tier2_threshold_rows: descriptor
-                .supports(InternalRuleConfigurationField::Tier2ThresholdRows)
-                .then(|| config.rule_tier2_threshold(descriptor.id)),
-        })
+        .map(|descriptor| materialize_rule(config, descriptor))
         .collect())
 }
 
@@ -1647,10 +1539,10 @@ pub fn rules(config: &Config) -> Result<Vec<Rule>, Error> {
 /// Returns [`ErrorKind::Configuration`] when `config` is invalid, or
 /// [`ErrorKind::UnknownRule`] when `rule_id` is not registered.
 pub fn rule(config: &Config, rule_id: &str) -> Result<Rule, Error> {
-    rules(config)?
-        .into_iter()
-        .find(|rule| rule.id == rule_id)
-        .ok_or_else(|| Error::new(ErrorKind::UnknownRule, rule_id))
+    validate_config(config)?;
+    let descriptor = registry::find_primary_rule(rule_id)
+        .ok_or_else(|| Error::new(ErrorKind::UnknownRule, rule_id))?;
+    Ok(materialize_rule(config, descriptor))
 }
 
 /// Synchronize PostgreSQL metadata into a cache that can later be loaded as a
@@ -1908,7 +1800,10 @@ impl From<internal_evidence::EvidenceCode> for EvidenceCode {
             internal_evidence::EvidenceCode::TransactionStateUnknown => {
                 Self::TransactionStateUnknown
             }
+            internal_evidence::EvidenceCode::TransactionAborted => Self::TransactionAborted,
             internal_evidence::EvidenceCode::UnmodeledState => Self::UnmodeledState,
+            // Only used as a `not_evaluated` cause, not an evidence record.
+            internal_evidence::EvidenceCode::LockPredictionUnavailable => Self::UnmodeledState,
         }
     }
 }
@@ -1924,6 +1819,7 @@ impl From<EvidenceCode> for internal_evidence::EvidenceCode {
             EvidenceCode::UnresolvedReference => Self::UnresolvedReference,
             EvidenceCode::UnknownObjectState => Self::UnknownObjectState,
             EvidenceCode::TransactionStateUnknown => Self::TransactionStateUnknown,
+            EvidenceCode::TransactionAborted => Self::TransactionAborted,
             EvidenceCode::UnmodeledState => Self::UnmodeledState,
         }
     }

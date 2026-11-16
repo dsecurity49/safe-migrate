@@ -84,6 +84,46 @@ fn evidence_added_in_a_transaction_rolls_back_with_confidence() {
 }
 
 #[test]
+fn evidence_rolls_back_at_savepoints_and_can_be_reinserted() {
+    use crate::_internal::analysis::mutations::{RollbackToSavepointMutation, SavepointMutation};
+
+    let mut state = AnalysisState::new(DbCache::new());
+    state.apply(&Mutation::BeginTransaction, None);
+    let chain = EvidenceRecord::new(
+        EvidenceCode::CatalogCoverageIncomplete,
+        EvidenceScope::Chain,
+    );
+    state.record_evidence(chain.clone());
+    state.apply(
+        &Mutation::Savepoint(SavepointMutation {
+            name: "before_statement".to_string(),
+        }),
+        None,
+    );
+    let statement =
+        EvidenceRecord::new(EvidenceCode::UnsupportedStatement, EvidenceScope::Statement);
+    state.record_evidence(statement.clone());
+    assert_eq!(state.evidence().len(), 2);
+
+    state.apply(
+        &Mutation::RollbackToSavepoint(RollbackToSavepointMutation {
+            name: "before_statement".to_string(),
+        }),
+        None,
+    );
+    assert_eq!(state.evidence(), std::slice::from_ref(&chain));
+    assert_eq!(state.local.confidence, Confidence::Tainted);
+
+    state.record_evidence(statement.clone());
+    assert_eq!(state.evidence().len(), 2);
+
+    state.apply(&Mutation::RollbackTransaction, None);
+    assert_eq!(state.local.confidence, Confidence::Exact);
+    assert!(state.evidence().is_empty());
+    assert!(!state.local.evidence.contains(&statement));
+}
+
+#[test]
 fn invalid_transaction_control_records_typed_evidence() {
     let mut state = AnalysisState::new(DbCache::new());
     let result = state.apply(
@@ -185,6 +225,7 @@ fn role_inherit_option_is_preserved_across_mutations() {
             via_legacy_group_syntax: false,
         },
         inherits: Some(true),
+        rename_to: None,
     });
     assert_eq!(state.apply(&alter, None), MutationResult::Applied);
     let Some(crate::_internal::model::role::RoleOverlay::Present(role)) =
@@ -450,6 +491,7 @@ fn baseline_drop_column_applies_and_taints_without_dependency_coverage() {
         &Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
             id: table_id.clone(),
             only: false,
+            if_exists: false,
             action: crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
                 name: "id".to_string(),
                 if_exists: false,

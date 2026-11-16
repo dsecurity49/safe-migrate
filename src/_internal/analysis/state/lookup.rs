@@ -150,13 +150,12 @@ impl AnalysisState {
     }
 
     pub(super) fn snapshot_baseline_foreign_keys(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame
-                .undo_log
-                .push(StateChange::BaselineForeignKeysSnapshot {
-                    previous: self.baseline_foreign_keys.clone(),
-                });
+        if !self.local.records_undo() {
+            return;
         }
+        let previous = self.baseline_foreign_keys.clone();
+        self.local
+            .push_undo(StateChange::BaselineForeignKeysSnapshot { previous });
     }
 
     /// Remove constraint metadata and baseline FK identities for objects that

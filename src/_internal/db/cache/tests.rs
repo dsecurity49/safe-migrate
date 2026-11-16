@@ -74,15 +74,18 @@ fn every_legacy_cache_variant_is_rejected_generically() {
 }
 
 #[test]
-fn current_cache_format_is_v11() {
-    assert_eq!(CACHE_FORMAT_VERSION, 11);
-    assert_eq!(DbCacheVersioned::V11(Box::default()).format_version(), 11);
-    assert_eq!(CACHE_MAGIC, b"SMCACHE11");
+fn current_cache_format_is_v12() {
+    assert_eq!(CACHE_FORMAT_VERSION, 12);
+    assert_eq!(DbCacheVersioned::V12(Box::default()).format_version(), 12);
+    assert_eq!(CACHE_MAGIC, b"SMCACHE12");
 }
 
 #[test]
 fn legacy_cache_versions_are_rejected_before_validation() {
     assert!(DbCacheVersioned::V9(Box::default()).into_cache().is_err());
+    let v11 = DbCacheVersioned::V11(Box::default());
+    assert_eq!(v11.format_version(), 11);
+    assert!(v11.into_cache().is_err());
     assert!(DbCacheVersioned::V1.into_cache().is_err());
 }
 
@@ -124,7 +127,13 @@ fn current_cache_rejects_an_unsupported_postgresql_version() {
     cache.pg_version_num = Some(130_000);
 
     let error = cache.validate_semantics().unwrap_err();
-    assert!(error.contains("PostgreSQL 14 or newer"));
+    assert!(error.contains("PostgreSQL 14 through 18 is required"));
+
+    let mut cache = synced_cache();
+    cache.pg_version_num = Some(190_000);
+
+    let error = cache.validate_semantics().unwrap_err();
+    assert!(error.contains("PostgreSQL 14 through 18 is required"));
 }
 
 #[test]
@@ -251,7 +260,7 @@ fn current_cache_rejects_mismatched_embedded_identity() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("schema cache key 'app'"));
@@ -262,7 +271,7 @@ fn current_cache_rejects_mismatched_schema_coverage() {
     let mut cache = synced_cache();
     cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("schema coverage disagrees"));
@@ -799,7 +808,7 @@ fn current_cache_rejects_malformed_publication_scope_metadata() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("empty or duplicate table column"));
@@ -835,7 +844,7 @@ fn current_cache_rejects_subscription_owner_outside_role_catalog() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("owner 'missing_owner' is absent"));
@@ -1162,7 +1171,7 @@ fn current_cache_rejects_dangling_index_relationship() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("references missing relation 'public.items'"));
@@ -1194,7 +1203,7 @@ fn current_cache_rejects_index_in_a_different_schema_than_relation() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("must be in the same schema as indexed relation"));
@@ -1228,7 +1237,7 @@ fn current_cache_rejects_index_colliding_with_relation_namespace_object() {
         is_immediate: true,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("collides with another relation-namespace object"));
@@ -1255,7 +1264,7 @@ fn current_cache_rejects_sequence_colliding_with_relation_namespace_object() {
         },
     );
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("collides with another relation-namespace object"));
@@ -1275,7 +1284,7 @@ fn current_cache_rejects_trigger_in_a_different_schema_than_table() {
         enabled_mode: TriggerEnableMode::Origin,
     });
 
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("must be in the same schema as trigger table"));
@@ -1337,7 +1346,7 @@ fn current_cache_validates_stable_direct_inheritance() {
     );
 
     cache.inheritances[0].detach_pending = true;
-    let error = DbCacheVersioned::V11(Box::new(cache))
+    let error = DbCacheVersioned::V12(Box::new(cache))
         .into_cache()
         .unwrap_err();
     assert!(error.contains("pending detach requires"));
@@ -1363,6 +1372,73 @@ fn current_cache_accepts_pending_partition_detach() {
         detach_pending: true,
     });
     assert!(DbCacheVersioned::current(cache).into_cache().is_ok());
+}
+
+#[test]
+fn current_cache_accepts_partition_identity_inherited_through_nested_partitions() {
+    let root = ObjectId::new("public", "events");
+    let middle = ObjectId::new("public", "events_2026");
+    let leaf = ObjectId::new("public", "events_2026_01");
+    let sequence_id = ObjectId::new("public", "events_id_seq");
+    let mut cache = synced_cache();
+    cache.search_path.clear();
+
+    for id in [&root, &middle, &leaf] {
+        let mut relation = table(id.clone(), &["id"]);
+        relation.identity_columns.insert(
+            "id".to_string(),
+            crate::_internal::model::relation::IdentityGeneration::Always,
+        );
+        cache.insert_baseline(id.clone(), relation);
+    }
+    cache.sequences.insert(
+        sequence_id.clone(),
+        SequenceState {
+            id: sequence_id,
+            owner: ObjectId::new("", "postgres"),
+            owned_by: Some((root.clone(), "id".to_string())),
+            kind: SequenceKind::Identity,
+            parameters: Default::default(),
+            runtime: crate::_internal::model::sequence::SequenceRuntime::unknown(),
+            runtime_exact: false,
+            generation: 0,
+        },
+    );
+    cache.inheritances.push(InheritanceCache {
+        child: middle.clone(),
+        parent: root.clone(),
+        sequence: 1,
+        is_partition: true,
+        detach_pending: false,
+    });
+    cache.inheritances.push(InheritanceCache {
+        child: leaf.clone(),
+        parent: middle.clone(),
+        sequence: 1,
+        is_partition: true,
+        detach_pending: false,
+    });
+
+    assert!(cache.validate_semantics().is_ok());
+}
+
+#[test]
+fn current_cache_rejects_identity_without_owned_sequence_on_non_partition() {
+    let id = ObjectId::new("public", "items");
+    let mut cache = synced_cache();
+    cache.search_path.clear();
+    let mut relation = table(id.clone(), &["id"]);
+    relation.identity_columns.insert(
+        "id".to_string(),
+        crate::_internal::model::relation::IdentityGeneration::Always,
+    );
+    cache.insert_baseline(id, relation);
+
+    let error = cache.validate_semantics().unwrap_err();
+    assert!(
+        error.contains("must have exactly one owned identity sequence"),
+        "{error}"
+    );
 }
 
 #[test]

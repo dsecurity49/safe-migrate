@@ -89,8 +89,10 @@ pub(crate) struct SourceLocation {
     pub column: usize,
 }
 
-/// A rule that could not state a finding for want of evidence. Reported apart
-/// from findings, because nothing is wrong with the migration.
+/// A rule that could not state a finding, either for want of evidence or
+/// because the operation is outside its modeled scope. Reported apart from
+/// findings, because nothing is wrong with the migration.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct NotEvaluated {
     pub rule_id: &'static str,
@@ -98,7 +100,7 @@ pub(crate) struct NotEvaluated {
     pub cause: crate::_internal::analysis::evidence::EvidenceCode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    /// What would make this rule evaluable.
+    /// What would make this rule evaluable, or what to review manually.
     pub recipe: String,
     /// Out-of-scope schemas the boundary query actually observed, so the
     /// remedy can name them instead of asking the reader to find them.
@@ -108,20 +110,61 @@ pub(crate) struct NotEvaluated {
 
 impl NotEvaluated {
     /// The command or setting that would supply the missing evidence.
+    #[cfg(test)]
     pub(crate) fn recipe_for(
         cause: crate::_internal::analysis::evidence::EvidenceCode,
         missing_schemas: &[String],
+    ) -> String {
+        Self::recipe_with_scope(cause, missing_schemas, None)
+    }
+
+    /// Union-aware recipe that provides concrete sync CLI flags without overwriting existing scope.
+    pub(crate) fn recipe_with_scope(
+        cause: crate::_internal::analysis::evidence::EvidenceCode,
+        missing_schemas: &[String],
+        existing_scope: Option<&[String]>,
     ) -> String {
         use crate::_internal::analysis::evidence::EvidenceCode;
         match cause {
             EvidenceCode::BaselineUnavailable => {
                 "Run `safe-migrate sync` to build a baseline.".to_string()
             }
-            EvidenceCode::CatalogCoverageIncomplete if !missing_schemas.is_empty() => {
-                format!(
-                    "Add {} to `schemas` in safe-migrate.toml, then re-sync.",
-                    quote_schema_list(missing_schemas)
-                )
+            EvidenceCode::CatalogCoverageIncomplete | EvidenceCode::UnknownObjectState
+                if !missing_schemas.is_empty() =>
+            {
+                let mut union = Vec::new();
+                if let Some(existing) = existing_scope {
+                    for s in existing {
+                        if !union.contains(s) {
+                            union.push(s.clone());
+                        }
+                    }
+                }
+                for s in missing_schemas {
+                    if !union.contains(s) {
+                        union.push(s.clone());
+                    }
+                }
+                if union.iter().any(|s| s.contains(',')) {
+                    format!(
+                        "Add {} to `schemas` in safe-migrate.toml and re-sync.",
+                        quote_schema_list(missing_schemas)
+                    )
+                } else {
+                    let raw_arg = union.join(",");
+                    let shell_arg = if raw_arg.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ',' | '.')
+                    }) {
+                        raw_arg
+                    } else {
+                        format!("'{}'", raw_arg.replace('\'', "'\\''"))
+                    };
+                    format!(
+                        "Add {} to `schemas` in safe-migrate.toml and re-sync, or run: safe-migrate sync --schemas {}",
+                        quote_schema_list(missing_schemas),
+                        shell_arg
+                    )
+                }
             }
             EvidenceCode::CatalogCoverageIncomplete => {
                 "Add the referenced schema to `schemas` in safe-migrate.toml, then re-sync."
@@ -143,6 +186,14 @@ impl NotEvaluated {
             }
             EvidenceCode::UnknownObjectState | EvidenceCode::TransactionStateUnknown => {
                 "Re-run `safe-migrate sync` with a wider schema scope so the object state is known, then re-run the analysis."
+                    .to_string()
+            }
+            EvidenceCode::TransactionAborted => {
+                "Fix the statement that aborted the transaction, then re-run the analysis."
+                    .to_string()
+            }
+            EvidenceCode::LockPredictionUnavailable => {
+                "This operation is outside the curated lock predictor; review PostgreSQL lock behavior manually."
                     .to_string()
             }
         }

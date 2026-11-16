@@ -5,6 +5,48 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## Unreleased (v0.13.0)
+
+- `blocking-partition-mutation` now estimates `ATTACH PARTITION` cost from the
+  candidate and default partition leaves rather than the parent, and `lock-risk`
+  lists operations outside the curated predictor under `not_evaluated` with
+  cause `lock_prediction_unavailable` instead of leaving them silently
+  unflagged.
+- Added `lock-risk`, a size-independent Tier 3 advisory that names the lock mode
+  and targets for constraints (valid and `NOT VALID`), `VALIDATE CONSTRAINT`,
+  column changes, index create/drop, `UNIQUE`/`PRIMARY KEY`/`EXCLUDE` (including
+  `USING INDEX`), partition attach/detach (including default partitions,
+  subpartitions, and referencing tables), `REINDEX` per index, materialized-view
+  refresh, `TRUNCATE`, and domain constraints. `SET STORAGE` is covered by the
+  parallel `set-storage-lock` advisory. Row-count-based scan and rewrite findings
+  no longer repeat lock-mode text, and lock reasons state that PostgreSQL holds
+  the lock until the transaction ends.
+- State tracking now matches PostgreSQL for `ALTER TABLE IF EXISTS` on an absent
+  relation (a no-op, not drift), `ALTER ROLE ... RENAME TO`, statements skipped
+  after a transaction abort, and `SET NOT NULL` after a validated
+  `CHECK ... IS NOT NULL` (metadata-only). `type-change-rewrite` no longer fires
+  on an already-conflicted change.
+- Partition and dependency modeling now covers cloned foreign keys on attach and
+  add, identity propagation to existing and new partitions, view dependencies on
+  foreign tables, trigger parentage, renamed-column view dependencies, composite
+  rewrites and attribute drops, and transitive composite dependents.
+  `blocking-constraint` checks `VALIDATE CONSTRAINT`; `EXECUTE` normalization
+  handles statement boundaries and dollar-quoted bodies; string-literal function
+  bodies no longer taint the chain; failed compound statements no longer leave
+  skipped checks in the report.
+- Catalog sync and analysis are faster: scoped dependency lookups filter by
+  in-scope OIDs, sequence runtime values are read in one batch, multi-action
+  `ALTER TABLE` snapshots each relation once, cache validation indexes columns by
+  name, and typed journals with targeted snapshots replace full-state clones.
+  Cache format 12 adds parsed index predicates and expression keys, range-type
+  routine and operator-class identities, and search-path whitespace preservation;
+  re-run `safe-migrate sync`.
+- `lint` and `lint-chain --report-dir` write both reports in one pass, unevaluated
+  checks compact into a tiered summary, `init github-actions` guides unknown
+  `origin/HEAD` recovery and verifies CLI auth before writing secrets, and
+  PostgreSQL 14-18 bounds share one check across the public API, cache
+  validation, and sync. The unused `OperationKind` enum is removed.
+
 ## v0.12.0 — 2026-10-31
 
 - Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled

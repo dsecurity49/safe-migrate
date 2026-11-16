@@ -6,6 +6,7 @@ pub(crate) mod expressions;
 pub(crate) mod functions;
 pub(crate) mod idempotency;
 pub(crate) mod indexes;
+pub(crate) mod locks;
 pub(crate) mod opaque;
 pub(crate) mod partitions;
 pub(crate) mod policies;
@@ -16,7 +17,8 @@ pub(crate) mod transactions;
 pub(crate) mod triggers;
 pub(crate) mod views;
 
-use crate::_internal::analysis::mutations::Mutation;
+use crate::_internal::analysis::graph::DependencyKind;
+use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::_internal::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::_internal::report::violations::{Violation, ViolationTier};
 use crate::api::config::Config;
@@ -26,6 +28,7 @@ use crate::api::config::Config;
 /// Keeping this bundle immutable prevents the engine from accidentally
 /// evaluating a rule against state from a different statement and provides a
 /// single extension point for evidence/capability metadata.
+#[derive(Clone, Copy)]
 pub(crate) struct TransitionRecord<'a> {
     mutation: &'a Mutation,
     result: &'a MutationResult,
@@ -118,39 +121,57 @@ impl RuleCapability {
 
         let mut targets = Vec::new();
         match mutation {
-            crate::_internal::analysis::mutations::Mutation::AlterTable(alter) => {
-                targets.push(&alter.id);
-                if let crate::_internal::analysis::mutations::AlterTableActionMutation::AddForeignKey {
-                    to_table,
-                    ..
-                } = &alter.action
-                {
-                    targets.push(to_table);
+            Mutation::AlterTable(alter) => {
+                if let AlterTableActionMutation::AttachPartition { child, .. } = &alter.action {
+                    targets.extend(state.partition_scan_relations(child));
+                    for default in state.default_partitions_of(&alter.id) {
+                        targets.extend(state.partition_scan_relations(&default));
+                    }
+                } else {
+                    targets.push(alter.id.clone());
+                }
+                if let AlterTableActionMutation::AddForeignKey { to_table, .. } = &alter.action {
+                    targets.push(to_table.clone());
                 }
             }
-            crate::_internal::analysis::mutations::Mutation::CreateIndex(create) => {
-                targets.push(&create.table);
+            Mutation::CreateIndex(create) => {
+                targets.push(create.table.clone());
             }
-            crate::_internal::analysis::mutations::Mutation::RefreshMaterializedView(refresh) => {
-                targets.push(&refresh.id);
+            Mutation::RefreshMaterializedView(refresh) => {
+                targets.push(refresh.id.clone());
             }
-            crate::_internal::analysis::mutations::Mutation::AlterDomain(alter) => {
+            Mutation::AlterDomain(alter) => {
                 targets.extend(
                     state
                         .relations_using_domain(&alter.id)
                         .into_iter()
-                        .map(|relation| &relation.id),
+                        .map(|relation| relation.id.clone()),
                 );
             }
-            crate::_internal::analysis::mutations::Mutation::DropIndex(drop) => {
+            Mutation::AlterType(alter) => {
+                if let crate::_internal::analysis::mutations::AlterTypeActionMutation::AlterAttributeType {
+                    name, ..
+                } = &alter.action
+                {
+                    targets.extend(
+                        pre_state
+                            .relations
+                            .values()
+                            .filter(|relation| {
+                                relation.of_type.as_ref() == Some(&alter.id)
+                                    && relation.has_column(name)
+                            })
+                            .map(|relation| relation.id.clone()),
+                    );
+                }
+            }
+            Mutation::DropIndex(drop) => {
                 for index_id in &drop.ids {
                     targets.extend(pre_state.indexes.iter().filter_map(|edge| {
                         if edge.dependent == *index_id {
-                            if let crate::_internal::analysis::graph::DependencyKind::IndexOnRelation {
-                                ..
-                            } = edge.kind
+                            if let DependencyKind::IndexOnRelation { .. } = edge.kind
                             {
-                                Some(&edge.referenced)
+                                Some(edge.referenced.clone())
                             } else {
                                 None
                             }
@@ -169,7 +190,7 @@ impl RuleCapability {
         targets.into_iter().all(|id| {
             pre_state
                 .relations
-                .get(id)
+                .get(&id)
                 .is_some_and(|relation| relation.estimated_rows.is_some())
         })
     }
@@ -208,6 +229,7 @@ pub(crate) const BASELINE_STATS_DEPENDENCY_CAPABILITIES: &[RuleCapability] = &[
 pub(crate) const TRANSACTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::TransactionState];
 
 impl<'a> RuleContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         mutation: &'a Mutation,
         result: &'a MutationResult,
@@ -216,8 +238,20 @@ impl<'a> RuleContext<'a> {
         config: &'a Config,
         cascade_closure: Option<&'a CascadeResult>,
     ) -> Self {
+        Self::from_transition(
+            TransitionRecord::new(mutation, result, pre_state, cascade_closure),
+            state,
+            config,
+        )
+    }
+
+    pub(crate) fn from_transition(
+        transition: TransitionRecord<'a>,
+        state: &'a AnalysisState,
+        config: &'a Config,
+    ) -> Self {
         Self {
-            transition: TransitionRecord::new(mutation, result, pre_state, cascade_closure),
+            transition,
             state,
             config,
         }
@@ -267,6 +301,16 @@ pub(crate) trait Rule {
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
         &[]
+    }
+
+    /// A cause means this rule ran but deliberately did not assess the
+    /// transition. The engine records it under `not_evaluated`, so silence is
+    /// not mistaken for a safe result.
+    fn not_evaluated_cause(
+        &self,
+        _context: &RuleContext<'_>,
+    ) -> Option<crate::_internal::analysis::evidence::EvidenceCode> {
+        None
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation>;

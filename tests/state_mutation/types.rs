@@ -1543,6 +1543,123 @@ fn type_change_rewrite_matches_postgres_rewrite_behaviour() {
     }
 }
 
+fn insert_composite_item(cache: &mut safe_migrate::_internal::db::cache::DbCache) -> ObjectId {
+    let type_id = object_id("public", "item");
+    cache.types.insert(
+        type_id.clone(),
+        TypeState {
+            id: type_id.clone(),
+            generation: 0,
+            owner: object_id("public", "owner"),
+            kind: TypeKind::Composite {
+                fields: vec![safe_migrate::_internal::model::types::CompositeFieldState {
+                    name: "a".to_string(),
+                    data_type: "integer".to_string(),
+                    data_type_id: None,
+                    collation: None,
+                    collation_id: None,
+                }],
+            },
+        },
+    );
+    type_id
+}
+
+fn typed_table_rewrite_state(estimated_rows: Option<u64>) -> AnalysisState {
+    let mut cache = synced_cache();
+    let type_id = insert_composite_item(&mut cache);
+    let table_id = object_id("public", "typed");
+    let mut table = RelationState::new(
+        table_id.clone(),
+        object_id("public", "owner"),
+        0,
+        estimated_rows,
+        RelationKind::Table,
+        Persistence::Permanent,
+        0,
+    );
+    table.of_type = Some(type_id.clone());
+    let mut column =
+        Column::migration_created("a".to_string(), Some("integer".to_string()), false, None);
+    column.type_id = Some(type_id);
+    table.columns.push(column);
+    cache.insert_baseline(table_id, table);
+    AnalysisState::new(cache)
+}
+
+#[test]
+fn composite_attribute_rewrite_requires_typed_table_row_statistics() {
+    let engine = setup_engine();
+
+    let mut missing_stats = typed_table_rewrite_state(None);
+    let findings = engine
+        .analyze(
+            "ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut missing_stats,
+        )
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "type-change-rewrite"),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        missing_stats.local.confidence,
+        Confidence::Tainted,
+        "missing typed-table statistics must mark the rewrite uncertain: {:?}",
+        missing_stats.evidence()
+    );
+    assert!(
+        missing_stats
+            .evidence()
+            .iter()
+            .any(|record| record.code == EvidenceCode::CatalogCoverageIncomplete)
+    );
+
+    let mut known_stats = typed_table_rewrite_state(Some(1_000));
+    let findings = engine
+        .analyze(
+            "ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut known_stats,
+        )
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "type-change-rewrite"),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        known_stats.local.confidence,
+        Confidence::Exact,
+        "known typed-table statistics keep the rewrite exact: {:?}",
+        known_stats.evidence()
+    );
+
+    let mut cache = synced_cache();
+    insert_composite_item(&mut cache);
+    let mut no_typed_table = AnalysisState::new(cache);
+    let findings = engine
+        .analyze(
+            "ALTER TYPE public.item ALTER ATTRIBUTE a TYPE text CASCADE;",
+            &mut no_typed_table,
+        )
+        .unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "type-change-rewrite"),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        no_typed_table.local.confidence,
+        Confidence::Exact,
+        "a composite without typed tables needs no relation statistics: {:?}",
+        no_typed_table.evidence()
+    );
+}
+
 #[test]
 fn type_change_rewrite_handles_typed_tables_when_composite_fields_change() {
     let engine = setup_engine();
@@ -2334,18 +2451,42 @@ fn range_subtype_diff_is_a_routine_dependency_that_tracks_renames() {
 
     engine
         .analyze(
-            "DROP FUNCTION public.diff2(integer, integer) CASCADE;",
+            "CREATE TYPE public.my_int AS (val integer);
+             CREATE FUNCTION public.diff_custom(public.my_int, public.my_int) RETURNS double precision
+                 LANGUAGE sql IMMUTABLE AS 'SELECT 1.0';
+             CREATE TYPE public.custom_range AS RANGE (subtype = public.my_int, subtype_diff = public.diff_custom);
+             ALTER TYPE public.my_int RENAME TO my_int_renamed;",
             &mut state,
         )
         .unwrap();
-    assert!(!matches!(
-        state.local.types.get(&range),
-        Some(TypeOverlay::Present(_))
-    ));
-    assert!(!matches!(
-        state.local.types.get(&object_id("public", "r_multirange")),
-        Some(TypeOverlay::Present(_))
-    ));
+
+    let renamed_func = object_id(
+        "public",
+        "diff_custom(public.my_int_renamed,public.my_int_renamed)",
+    );
+    let custom_range = object_id("public", "custom_range");
+    match state.local.types.get(&custom_range) {
+        Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Range {
+                subtype_diff_id, ..
+            },
+            ..
+        })) => assert_eq!(subtype_diff_id.as_ref(), Some(&renamed_func)),
+        other => panic!("expected custom_range type, got {other:?}"),
+    }
+
+    let violations = engine
+        .analyze(
+            "DROP FUNCTION public.diff_custom(public.my_int_renamed, public.my_int_renamed);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "{violations:#?}"
+    );
 }
 
 #[test]
@@ -2468,9 +2609,10 @@ fn composite_attribute_alterations_synchronize_typed_tables() {
         .analyze(
             "CREATE TYPE item_t AS (a integer, b text);
              CREATE TABLE typed_items OF item_t;
-             ALTER TYPE item_t ADD ATTRIBUTE c boolean CASCADE;
-             ALTER TYPE item_t RENAME ATTRIBUTE b TO b_renamed CASCADE;
-             ALTER TYPE item_t DROP ATTRIBUTE a CASCADE;",
+             ALTER TYPE item_t RENAME TO item_t_renamed;
+             ALTER TYPE item_t_renamed ADD ATTRIBUTE c boolean CASCADE;
+             ALTER TYPE item_t_renamed RENAME ATTRIBUTE b TO b_renamed CASCADE;
+             ALTER TYPE item_t_renamed DROP ATTRIBUTE a CASCADE;",
             &mut state,
         )
         .unwrap();
@@ -2480,6 +2622,10 @@ fn composite_attribute_alterations_synchronize_typed_tables() {
         panic!("typed_items should be present");
     };
 
+    assert_eq!(
+        tbl.of_type.as_ref(),
+        Some(&object_id("public", "item_t_renamed"))
+    );
     assert!(!tbl.has_column("a"));
     assert!(tbl.has_column("b_renamed"));
     assert!(tbl.has_column("c"));
@@ -3039,4 +3185,122 @@ fn alter_type_owner_taints_when_the_role_catalog_is_incomplete() {
         panic!("ownership_probe should be present");
     };
     assert_eq!(probe.owner, object_id("", "unverified_owner"));
+}
+
+#[test]
+fn dropping_composite_attribute_warns_of_data_loss_on_dependent_tables() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let violations = engine
+        .analyze(
+            "CREATE TYPE user_profile AS (username text, bio text);
+             CREATE TABLE users (id int, profile user_profile);
+             ALTER TYPE user_profile DROP ATTRIBUTE bio;",
+            &mut state,
+        )
+        .unwrap();
+
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.rule_id == "irreversible-migration"
+                && v.object_name.starts_with("public.user_profile")
+                && v.reason
+                    .contains("Dropping attribute 'bio' from a composite type in use by tables")),
+        "expected irreversible-migration rule on ALTER TYPE DROP ATTRIBUTE for table column: {violations:#?}"
+    );
+}
+
+#[test]
+fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
+    let mut cache = crate::_internal::db::cache::DbCache::new();
+    let diff_id = object_id("public", "my_diff(integer,integer)");
+    cache.functions.insert(
+        diff_id.clone(),
+        crate::_internal::model::function::FunctionState {
+            id: diff_id.clone(),
+            arg_types: vec!["integer".into(), "integer".into()],
+            arg_type_ids: vec![
+                Some(object_id("pg_catalog", "int4")),
+                Some(object_id("pg_catalog", "int4")),
+            ],
+            parameters: vec![],
+            default_count: 0,
+            return_type: "double precision".into(),
+            return_type_id: Some(object_id("pg_catalog", "float8")),
+            volatility: crate::_internal::model::function::Volatility::Immutable,
+            language: "sql".into(),
+            returns_set: false,
+            routine_kind: crate::_internal::model::function::RoutineKind::Function,
+            internal_type_owner: None,
+            security: crate::_internal::model::function::SecurityMode::Invoker,
+            aggregate: None,
+        },
+    );
+
+    let range_id = object_id("public", "custom_range");
+    let opclass_id = object_id("public", "custom_opclass");
+    cache.opclasses = Some(
+        crate::_internal::model::opclass::OpclassCatalogue::from_entries(vec![
+            crate::_internal::model::opclass::OpclassEntry {
+                name: "custom_opclass".into(),
+                namespace: "public".into(),
+                family: crate::_internal::model::index::ResolvedName {
+                    schema: "public".into(),
+                    name: "custom_family".into(),
+                },
+                intype: "int4".into(),
+                aliases: vec!["integer".into()],
+                method: "btree".into(),
+                is_default: false,
+            },
+        ]),
+    );
+    cache.types.insert(
+        range_id.clone(),
+        TypeState {
+            id: range_id.clone(),
+            generation: 1,
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Range {
+                subtype: Some("integer".into()),
+                subtype_id: None,
+                multirange: None,
+                collation: None,
+                collation_id: None,
+                opclass: Some("custom_opclass".into()),
+                opclass_id: None,
+                canonical: None,
+                canonical_id: None,
+                subtype_diff: Some("my_diff".into()),
+                subtype_diff_id: None,
+            },
+        },
+    );
+
+    let state = AnalysisState::with_baseline(cache, true);
+    let Some(TypeOverlay::Present(TypeState {
+        kind:
+            TypeKind::Range {
+                opclass_id: hydrated_opclass_id,
+                subtype_diff_id,
+                ..
+            },
+        ..
+    })) = state.local.types.get(&range_id)
+    else {
+        panic!("custom_range must be present");
+    };
+
+    assert_eq!(
+        hydrated_opclass_id.as_ref(),
+        Some(&opclass_id),
+        "opclass_id must be hydrated from baseline cache"
+    );
+    assert_eq!(
+        subtype_diff_id.as_ref(),
+        Some(&diff_id),
+        "subtype_diff_id must be hydrated from baseline cache"
+    );
 }

@@ -1,5 +1,7 @@
 use super::*;
 
+/// Load table constraints, retaining a backing index only for key and
+/// exclusion constraints, where `conindid` names the index they own.
 pub(super) fn load_constraints(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -141,6 +143,8 @@ pub(super) fn load_constraint_keys(
         .collect()
 }
 
+/// Load the columns a CHECK or exclusion constraint depends on, combining
+/// catalog dependency rows with the constraint key columns.
 pub(super) fn load_constraint_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -330,6 +334,7 @@ pub(super) fn load_default_sequence_dependencies(
         .collect()
 }
 
+/// Load foreign keys with their ordered columns and equality operators.
 pub(super) fn load_foreign_keys(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,

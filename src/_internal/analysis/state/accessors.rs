@@ -31,6 +31,19 @@ impl AnalysisState {
             .to_string()
     }
 
+    pub(crate) fn routine_signature_id(
+        &self,
+        signature: &crate::_internal::analysis::facts::FunctionSigFact,
+    ) -> ObjectId {
+        let signature_name = format!(
+            "{}({})",
+            signature.name.name.resolve(),
+            signature.params.join(",")
+        );
+        let schema = self.resolve_function_schema(&signature.name, &signature_name);
+        ObjectId::new(schema, signature_name)
+    }
+
     pub(crate) fn resolve_relation_id(
         &self,
         name: &crate::_internal::ast::identifiers::QualifiedName,
@@ -80,7 +93,7 @@ impl AnalysisState {
         )
     }
 
-    /// Record a configured version, used only when the cache carries none.
+    /// Record a rule finding that could not be evaluated due to incomplete evidence.
     pub(crate) fn record_not_evaluated(
         &mut self,
         record: crate::_internal::report::violations::NotEvaluated,
@@ -90,6 +103,7 @@ impl AnalysisState {
             .iter()
             .any(|entry| entry.rule_id == record.rule_id && entry.cause == record.cause)
         {
+            self.snapshot_not_evaluated();
             self.not_evaluated.push(record);
         }
     }
@@ -179,17 +193,7 @@ impl AnalysisState {
     /// Whether this session has a temporary schema, which is searched before
     /// every explicit path entry for relations and types.
     pub(crate) fn temp_namespace_exists(&self) -> bool {
-        self.local.saw_temp_object
-            && (self
-                .local
-                .relations
-                .keys()
-                .any(|id| is_session_temp_schema(&id.schema))
-                || self
-                    .local
-                    .types
-                    .keys()
-                    .any(|id| is_session_temp_schema(&id.schema)))
+        self.local.temp_namespace_created
     }
 
     /// Entries to search for an unqualified relation or type, implicit first.
@@ -228,7 +232,10 @@ impl AnalysisState {
     }
 
     pub(crate) fn note_temp_object_created(&mut self) {
-        self.local.saw_temp_object = true;
+        if !self.local.temp_namespace_created {
+            self.snapshot_temp_namespace();
+            self.local.temp_namespace_created = true;
+        }
         // A path that names the temporary alias could not search it before the
         // namespace existed; now it can, at its written position.
         self.refresh_role_sensitive_search_path();
@@ -267,8 +274,6 @@ impl AnalysisState {
         })
     }
 
-    /// Whether the index backs an exclusion constraint, which PostgreSQL
-    /// refuses to rebuild concurrently.
     /// Whether `index` or the relation it backs is temporary.
     ///
     /// The index's own identity carries its schema, so a temporary index is
@@ -296,6 +301,8 @@ impl AnalysisState {
         }
     }
 
+    /// Whether the index backs an exclusion constraint, which PostgreSQL
+    /// refuses to rebuild concurrently.
     pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {
         self.local.constraints.values().any(|constraint| {
             matches!(constraint.kind, ConstraintKind::Exclusion)
@@ -374,6 +381,69 @@ impl AnalysisState {
     /// family-specific baseline storage representation.
     pub(crate) fn baseline_relation_is_known(&self, id: &ObjectId) -> bool {
         self.baseline_relations.contains(id)
+    }
+
+    /// Immediate partitions of `parent` whose bound is `DEFAULT`.
+    pub(crate) fn default_partitions_of(&self, parent: &ObjectId) -> Vec<ObjectId> {
+        self.local
+            .graph
+            .partitions_of(parent)
+            .into_iter()
+            .filter(|child| {
+                matches!(
+                    self.local.relations.get(*child),
+                    Some(RelationOverlay::Present(relation))
+                        if relation
+                            .partition_bound
+                            .as_deref()
+                            .is_some_and(|bound| bound.eq_ignore_ascii_case("DEFAULT"))
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Leaf relations PostgreSQL scans when attaching `root`.
+    ///
+    /// Foreign tables are not scanned, and a partitioned table contributes
+    /// only its leaves; a partitioned table with no partitions contributes
+    /// nothing.
+    pub(crate) fn partition_scan_relations(&self, root: &ObjectId) -> Vec<ObjectId> {
+        let mut leaves = Vec::new();
+        let mut visited = HashSet::new();
+        self.collect_partition_scan_relations(root, &mut visited, &mut leaves);
+        leaves
+    }
+
+    fn collect_partition_scan_relations(
+        &self,
+        relation_id: &ObjectId,
+        visited: &mut HashSet<ObjectId>,
+        leaves: &mut Vec<ObjectId>,
+    ) {
+        if !visited.insert(relation_id.clone()) {
+            return;
+        }
+        let relation = match self.local.relations.get(relation_id) {
+            Some(RelationOverlay::Present(relation)) => relation,
+            Some(RelationOverlay::Dropped) | None => {
+                leaves.push(relation_id.clone());
+                return;
+            }
+        };
+        if relation.kind != RelationKind::Table {
+            return;
+        }
+        let partitions = self.local.graph.partitions_of(relation_id);
+        if partitions.is_empty() {
+            if relation.partition_type.is_none() {
+                leaves.push(relation_id.clone());
+            }
+            return;
+        }
+        for partition in partitions {
+            self.collect_partition_scan_relations(partition, visited, leaves);
+        }
     }
 
     pub(crate) fn baseline_fk_dependency_is_known(&self, id: &ObjectId) -> bool {

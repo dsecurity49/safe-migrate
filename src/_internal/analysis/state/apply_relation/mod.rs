@@ -453,6 +453,7 @@ enum TypedBound {
     },
 }
 
+/// Parse a partition bound into typed datums; `None` when it cannot be modeled.
 fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
     use squawk_syntax::SyntaxKind;
     use squawk_syntax::ast::{AstNode, Expr, PartitionType, SourceFile, Stmt};
@@ -627,6 +628,7 @@ fn alter_table_action_permits(
             table || partitioned_table || (using_index.is_none() && foreign)
         }
         Action::SetDefault { .. } => table || partitioned_table || view || foreign,
+        Action::AddIdentity { .. } => table || partitioned_table,
         Action::SetColumnOptions { .. }
         | Action::ResetColumnOptions { .. }
         | Action::SetStorage { .. } => table || partitioned_table || matview || foreign,
