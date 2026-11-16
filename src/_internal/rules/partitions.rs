@@ -38,6 +38,8 @@ impl Rule for PartitionLockRule {
 }
 
 impl PartitionLockRule {
+    /// Size an attach by the new partition plus every default partition it
+    /// must scan; HASH parents use half the normal thresholds.
     fn evaluate_attach(
         &self,
         context: &RuleContext<'_>,
@@ -119,6 +121,8 @@ impl PartitionLockRule {
         violations
     }
 
+    /// Tiers a partition detach by parent size and hash partitioning;
+    /// temporary parents are skipped.
     fn evaluate_detach(
         &self,
         context: &RuleContext<'_>,
@@ -224,6 +228,8 @@ impl PartitionLockRule {
     }
 }
 
+/// Accumulate the rows a partition scan touches, using default estimates for
+/// leaves absent from the baseline and recording stale or missing statistics.
 fn accumulate_scan_rows(
     context: &RuleContext<'_>,
     root: &crate::_internal::ast::identifiers::ObjectId,

@@ -84,6 +84,8 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Rename a role in place, rewriting membership and grantor references,
+    /// tombstoning the old name, and advancing the generation counter.
     fn apply_rename_role(&mut self, old_id: &ObjectId, new_name: &str) -> MutationResult {
         let new_id = ObjectId::new("", new_name);
         match self.role_lookup(&new_id) {
@@ -322,6 +324,8 @@ impl AnalysisState {
         }
     }
 
+    /// Record a GRANT on the modeled objects. Incomplete catalog coverage taints
+    /// the result rather than inventing a denial.
     pub(super) fn apply_grant(&mut self, grant: &GrantMutation) -> MutationResult {
         let pg_version = self.pg_version().conservative_num();
         if let Err(result) = self.validate_grant_targets(&grant.target) {
@@ -739,6 +743,8 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Record a REVOKE on the modeled objects, with the same taint-on-unknown
+    /// policy as GRANT.
     pub(super) fn apply_revoke(&mut self, revoke: &RevokeMutation) -> MutationResult {
         if let Err(result) = self.validate_grant_targets(&revoke.target) {
             return result;

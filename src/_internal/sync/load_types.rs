@@ -33,6 +33,8 @@ pub(super) fn load_casts(
     ))
 }
 
+/// Load built-in aggregate signatures, collapsing polymorphic arguments to
+/// `Any` and grouping `pg_proc` rows by aggregate OID.
 pub(super) fn load_aggregates(
     client: &mut impl GenericClient,
 ) -> Result<crate::_internal::model::aggregate::AggregateCatalogue> {
@@ -128,6 +130,13 @@ pub(super) fn load_aggregates(
     Ok(AggregateCatalogue::new(entries))
 }
 
+/// Load the declarable built-in types from `pg_catalog`.
+/// Arrays are described by `typarray` plus `[]`, composites belong to the
+/// relation cache, and pseudo-types need no mapping, so only `typtype` `b`,
+/// `r`, and `m` survive. Arrays are excluded by `typcategory`, not `typelem`:
+/// `name`, `box`, `line`, `lseg`, and `point` all carry a non-zero `typelem`.
+/// Must run after `search_path` is pinned to `pg_catalog`, or `format_type`
+/// schema-qualifies every name.
 pub(super) fn load_builtin_types(
     client: &mut impl GenericClient,
 ) -> Result<crate::_internal::model::builtin_type::BuiltinTypeCatalogue> {
@@ -193,6 +202,9 @@ pub(super) fn load_builtin_types(
     Ok(crate::_internal::model::builtin_type::BuiltinTypeCatalogue::new(types))
 }
 
+/// Load user-addressable enum, domain, composite, range, multirange, and base
+/// types, then attach composite fields and domain constraints. Array types are
+/// excluded because PostgreSQL never lets `ALTER TYPE` or `DROP TYPE` name them.
 pub(super) fn load_types(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -539,6 +551,7 @@ pub(super) fn load_types(
     Ok(types)
 }
 
+/// Loads composite type fields in attribute order with their collations.
 fn load_composite_fields(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -608,6 +621,7 @@ fn load_composite_fields(
     Ok(())
 }
 
+/// Loads domain check constraints with their validated state and definitions.
 fn load_domain_constraints(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,

@@ -1,6 +1,8 @@
 use super::*;
 
 impl AnalysisState {
+    /// Apply one mutation, aborting the enclosing transaction on conflict. The
+    /// dependency-index invariant is checked in debug builds.
     pub(crate) fn apply(
         &mut self,
         mutation: &Mutation,

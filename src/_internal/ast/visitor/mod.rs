@@ -199,6 +199,7 @@ impl AstVisitor {
         matches!(scope, Some(ast::SetScope::LocalScope(_)))
     }
 
+    /// Turn a parsed statement into its typed fact, or `None` when unsupported.
     pub(crate) fn extract(stmt: &Stmt) -> Option<StatementFact> {
         let syntax = stmt.syntax();
         match stmt {

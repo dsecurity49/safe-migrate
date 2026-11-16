@@ -70,6 +70,7 @@ impl AnalysisState {
         }
     }
 
+    /// Rename a relation and move its dependent objects with it.
     pub(in crate::_internal::analysis::state) fn apply_rename_relation(
         &mut self,
         rename: &Rename,
@@ -142,6 +143,8 @@ impl AnalysisState {
         }
 
         let schema_move = rename.old_id.schema != rename.new_id.schema;
+        // A schema move takes owned sequences and indexes on the relation with
+        // it, since their identities include the schema.
         let mut associated_sequence_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
             self.local
                 .sequences
@@ -506,6 +509,8 @@ impl AnalysisState {
     }
 
     // The caller snapshots the graph before changing these coupled identities.
+    /// Repoint constraints, cluster settings, and replica identity at a renamed
+    /// index. Constraints that own the index follow its name; others keep theirs.
     pub(super) fn rename_index_catalog_references(&mut self, old: &ObjectId, new: &ObjectId) {
         let mut constraint_keys = self
             .local

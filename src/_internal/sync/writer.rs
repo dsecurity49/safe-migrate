@@ -26,6 +26,8 @@ pub(super) fn write_cache_with_protection(
     )
 }
 
+/// Validate, encode, and atomically install a cache file, enforcing decoded
+/// and encoded size limits before replacing the destination.
 pub(super) fn write_cache_with_protection_and_limits(
     out_path: &Path,
     cache: DbCache,
@@ -153,6 +155,8 @@ impl<W: Write> Write for SizeLimitedWriter<W> {
     }
 }
 
+/// Installs the temporary cache at `out_path`, syncing the parent on Unix and
+/// staging a backup on Windows.
 #[cfg(not(windows))]
 pub(super) fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
     temp_file
@@ -176,6 +180,8 @@ pub(super) fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result
     Ok(())
 }
 
+/// Installs the temporary cache at `out_path`, syncing the parent on Unix and
+/// staging a backup on Windows.
 #[cfg(windows)]
 pub(super) fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
     let backup = out_path.with_extension("safe-migrate.backup");

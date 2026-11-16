@@ -1,6 +1,7 @@
 use super::*;
 
 impl AstVisitor {
+    /// Extract table identity, persistence, partitioning, and column facts.
     pub(super) fn extract_create_table(node: &CreateTable) -> Option<StatementFact> {
         let path = node.table_name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;

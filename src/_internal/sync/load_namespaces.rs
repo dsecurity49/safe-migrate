@@ -32,6 +32,7 @@ pub(super) fn load_schemas(
         .collect()
 }
 
+/// Load sequences, including out-of-scope ones whose ownership touches scope.
 pub(super) fn load_sequences(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -204,6 +205,8 @@ pub(super) fn load_sequences(
     Ok(sequences)
 }
 
+/// Reads sequence runtime values, using `pg_get_sequence_data` on PG18+ and
+/// direct selects on older servers.
 fn load_sequence_runtimes(
     client: &mut impl GenericClient,
     ids: &[ObjectId],

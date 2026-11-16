@@ -13,6 +13,8 @@ use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 
 impl Resolver {
+    /// Resolves publication object names against the search path; the
+    /// `CURRENT_SCHEMA` shorthand expands to the first search-path schema.
     fn resolve_publication_object(
         object: &PublicationObjectFact,
         state: &AnalysisState,

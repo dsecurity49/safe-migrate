@@ -70,6 +70,8 @@ impl ReindexTargetMutation {
     }
 }
 
+/// A state change with names resolved to concrete object identities. A compound
+/// statement may produce several, applied in order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Mutation {
     CreateSchema(CreateSchemaMutation),

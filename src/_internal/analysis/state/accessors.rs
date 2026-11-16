@@ -274,8 +274,6 @@ impl AnalysisState {
         })
     }
 
-    /// Whether the index backs an exclusion constraint, which PostgreSQL
-    /// refuses to rebuild concurrently.
     /// Whether `index` or the relation it backs is temporary.
     ///
     /// The index's own identity carries its schema, so a temporary index is
@@ -303,6 +301,8 @@ impl AnalysisState {
         }
     }
 
+    /// Whether the index backs an exclusion constraint, which PostgreSQL
+    /// refuses to rebuild concurrently.
     pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {
         self.local.constraints.values().any(|constraint| {
             matches!(constraint.kind, ConstraintKind::Exclusion)

@@ -134,6 +134,7 @@ impl AnalysisState {
         schemas
     }
 
+    /// Resolve cached column and type references against the catalog.
     pub(super) fn hydrate_relation_type_overlays(
         cache: &DbCache,
         search_path: &[SearchPathEntry],
@@ -222,6 +223,9 @@ impl AnalysisState {
         }
     }
 
+    /// Build the starting state from a synchronized cache. Availability is
+    /// explicit because an empty cache can be valid; search path and role
+    /// context are preserved for accurate name resolution.
     pub(crate) fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let baseline_coverage = cache.coverage.clone();
         let baseline_boundary_queries_complete =
@@ -738,6 +742,7 @@ impl AnalysisState {
         state
     }
 
+    /// Fill missing range IDs by resolving the names stored in the cache.
     fn hydrate_range_type_references(&mut self, _catalog_search_path: &[SearchPathEntry]) {
         let range_keys: Vec<ObjectId> = self
             .local
@@ -803,6 +808,7 @@ impl AnalysisState {
             });
 
             let subtype_diff_id = diff_str.as_deref().and_then(|diff_name| {
+                // A subtype-diff routine is keyed by two subtype arguments.
                 let subtype_name = subtype_str.as_deref().unwrap_or("anyelement");
                 let signature = format!("{subtype_name},{subtype_name}");
                 self.resolve_internal_routine_id(diff_name, &signature)

@@ -1,5 +1,6 @@
 use super::*;
 
+/// Load extensions and their schemas, versions, owners, and relocatability.
 pub(super) fn load_extensions(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,

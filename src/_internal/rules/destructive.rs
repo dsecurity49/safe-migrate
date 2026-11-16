@@ -29,6 +29,8 @@ impl Rule for CascadingDropRule {
         BASELINE_RELATION_CAPABILITIES
     }
 
+    /// Flags CASCADE on type drops and on table drops that remove baseline
+    /// objects or pull FK-dependent tables outside the dropped set.
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mutation = context.mutation();
         let result = context.result();
@@ -643,6 +645,7 @@ impl Rule for GeneralCascadeRule {
         "Using CASCADE on DROP operations can silently delete dependent objects. Explicitly drop dependencies to avoid accidental data loss."
     }
 
+    /// Flags CASCADE on drops of objects that can silently remove dependents.
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mutation = context.mutation();
         let cascade_info: Option<(ObjectKind, String)> = match mutation {
@@ -724,6 +727,8 @@ impl Rule for GeneralCascadeRule {
 pub(crate) struct TypeChangeRewriteRule;
 
 impl TypeChangeRewriteRule {
+    /// True when PostgreSQL can change the type without rewriting the table:
+    /// same identity or compatible text/numeric widening.
     fn is_type_change_safe(
         old_type: &str,
         new_type: &str,

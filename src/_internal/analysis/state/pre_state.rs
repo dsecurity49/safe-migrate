@@ -205,6 +205,7 @@ impl AnalysisState {
         pre_state
     }
 
+    /// Copy the catalog families a rule reads into `pre_state`.
     pub(crate) fn capture_pre_state_into(&self, pre_state: &mut PreState, reads: &PreStateReadSet) {
         let PreState {
             relations,
@@ -368,6 +369,8 @@ fn sync_selected_map<K, V, O, F>(
         ReadScope::None => target.clear(),
         ReadScope::All => sync_present_map(target, source, present),
         ReadScope::Selected(ids) => {
+            // Update in place so untouched entries keep their allocation, and
+            // prune keys outside the new scope before inserting fresh values.
             target.retain(|key, _| ids.contains(key));
             target.reserve(ids.len().saturating_sub(target.len()));
             for id in ids {

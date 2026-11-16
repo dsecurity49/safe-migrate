@@ -2,6 +2,7 @@ use super::*;
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::expr_visitor::ExprVisitor;
 
+/// Load indexes with their keys, collations, operator classes, and predicates.
 pub(super) fn load_indexes(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -294,24 +295,6 @@ pub(super) fn load_indexes(
     Ok(indexes)
 }
 
-///
-/// Only what a migration can actually declare is kept. Arrays are excluded
-/// because `typarray` plus `[]` already describes them, composites because a
-/// table's row type belongs to the relation cache, and pseudo-types because
-/// `format_type` already returns their `typname`, so they need no mapping.
-///
-/// Arrays are identified by `typcategory`, not `typelem`: `name`, `box`,
-/// `line`, `lseg` and `point` all carry a non-zero `typelem` recording their
-/// array linkage while being ordinary declarable types themselves.
-///
-/// Must run after the connection pins `search_path` to `pg_catalog`, otherwise
-/// `format_type` schema-qualifies every name.
-/// Whether every key of an index uses the default sort order.
-///
-/// The bits are normalized through [`IndexOrder`] rather than tested for zero,
-/// because `DESC NULLS FIRST` is stored as `3` and is the same order as `0`.
-/// They are also ignored entirely when the access method cannot order, since
-/// `indoption` bits are access-method specific.
 /// One key's operator-class identity from the catalog: the resolved family,
 /// plus whether PostgreSQL chose it as the access method's default.
 pub(super) fn synced_opclass(

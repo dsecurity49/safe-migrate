@@ -383,6 +383,8 @@ fn run_github_actions(
     install_github_actions(migration_path, branch, output_dir, force, configure_secrets)
 }
 
+/// Installs both workflows after validating symlinks, destinations, and
+/// overwrite policy; secrets are configured only after files are written.
 fn install_github_actions(
     migration_path: &str,
     branch: &str,

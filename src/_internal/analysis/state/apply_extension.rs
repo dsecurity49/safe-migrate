@@ -107,6 +107,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Apply an extension action; updates and unmodeled effects taint the chain.
     pub(super) fn apply_alter_extension(
         &mut self,
         alter: &AlterExtensionMutation,
@@ -227,6 +228,8 @@ impl AnalysisState {
         }
     }
 
+    /// Move namespace-bearing members to a new schema on a clone, so a collision
+    /// rolls back the statement.
     fn apply_alter_extension_set_schema(&mut self, name: &str, new_schema: &str) -> MutationResult {
         // PostgreSQL moves every namespace-bearing member through
         // AlterObjectNamespace_oid. Apply on a clone so a late collision leaves
@@ -730,6 +733,8 @@ impl AnalysisState {
         })
     }
 
+    /// Checks user types and index keys outside the co-dropped set for
+    /// references to the collation.
     fn collation_has_external_dependents(
         &self,
         collation: &ObjectId,
@@ -848,6 +853,8 @@ impl AnalysisState {
         co_dropped
     }
 
+    /// Drop an extension's members in dependency order. Without CASCADE, any
+    /// outside dependent blocks the drop; incomplete membership taints the result.
     fn drop_extension_members(
         &mut self,
         extension: &ExtensionState,
@@ -1149,6 +1156,8 @@ impl AnalysisState {
         (functions, procedures, aggregates, internal)
     }
 
+    /// Drops extension-owned functions, procedures, and aggregates through
+    /// their normal handlers; missing signatures taint the chain.
     fn drop_extension_routines(
         &mut self,
         functions: &[ObjectId],
@@ -1224,6 +1233,8 @@ impl AnalysisState {
         })
     }
 
+    /// Topologically orders type drops so dependent types go first; falls back
+    /// to input order on a cycle.
     fn extension_type_drop_order(&self, types: &[ObjectId]) -> Vec<ObjectId> {
         let members = types.iter().cloned().collect::<HashSet<_>>();
         let mut indegree = types
@@ -1341,6 +1352,8 @@ impl AnalysisState {
         )))
     }
 
+    /// Resolve an extension member against local overlays and baseline
+    /// coverage, distinguishing present, absent, and unknown membership.
     fn extension_member_presence(&self, member: &ExtensionMember) -> ExtensionMemberPresence {
         let member = self.resolve_extension_member(member);
         match &member.kind {

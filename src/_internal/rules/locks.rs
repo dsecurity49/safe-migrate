@@ -376,6 +376,7 @@ fn format_reason(operation: &str, work: LockWork, targets: &[LockTarget]) -> Str
     )
 }
 
+/// Translate a mutation into the locks PostgreSQL would take.
 fn predict_locks(
     mutation: &Mutation,
     pre_state: &PreState,
@@ -392,6 +393,7 @@ fn predict_locks(
             if !domain_action_takes_share_lock(action) {
                 return Vec::new();
             }
+            // Validating a domain constraint scans every table using the domain.
             let targets = state
                 .relations_using_domain(&alter.id)
                 .into_iter()
@@ -424,6 +426,8 @@ fn predict_locks(
             .ids
             .iter()
             .filter_map(|index| {
+                // The lock lands on the table, so resolve the owning relation
+                // from the pre-state graph.
                 let table = relation_for_index(pre_state, index)?;
                 Some(LockPrediction {
                     object_kind: ObjectKind::Index,
@@ -488,6 +492,7 @@ fn predict_locks(
     }
 }
 
+/// Predict the locks for one ALTER TABLE action and its referenced tables.
 fn predict_alter_table(
     subject: &ObjectId,
     action: &AlterTableActionMutation,

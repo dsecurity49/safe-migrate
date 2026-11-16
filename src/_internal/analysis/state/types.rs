@@ -2,6 +2,8 @@ use super::*;
 use crate::_internal::model::relation::RelationState;
 
 impl AnalysisState {
+    /// Resolve a type spelling against local overlays, row types, and the
+    /// search path, preserving array element identity.
     pub(super) fn resolve_type_reference_from_catalog(
         raw: &str,
         types: &HashMap<ObjectId, TypeOverlay>,
@@ -105,6 +107,8 @@ impl AnalysisState {
         (ObjectId::new(&id.schema, name), is_array)
     }
 
+    /// Collect a domain and every domain derived from it through local
+    /// base-type links; baseline-only derivations are not followed.
     pub(crate) fn domain_closure(&self, domain: &ObjectId) -> HashSet<ObjectId> {
         let mut derived_by_base: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         for (id, overlay) in &self.local.types {

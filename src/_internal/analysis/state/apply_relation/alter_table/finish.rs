@@ -1,6 +1,8 @@
 use super::*;
 
 impl AnalysisState {
+    /// Finish an ALTER TABLE after its action: update graph edges, owned
+    /// sequences, and cascade effects.
     pub(super) fn alter_table_finish(
         &mut self,
         alter: &AlterTable,

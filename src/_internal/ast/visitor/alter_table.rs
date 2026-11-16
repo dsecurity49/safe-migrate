@@ -1,6 +1,8 @@
 use super::*;
 
 impl AstVisitor {
+    /// Turn ALTER TABLE syntax into actions, preserving their order and marking
+    /// unsupported actions as opaque.
     pub(super) fn extract_alter_table(node: &AlterTable) -> Option<StatementFact> {
         let path = node.table_relation_name()?.table_name_ref()?.path_ref()?;
         let table_name = Self::path_ref_to_qualified_name(&path)?;
@@ -779,6 +781,7 @@ impl AstVisitor {
         (!attributes.is_empty()).then_some(attributes)
     }
 
+    /// Extract one ADD CONSTRAINT action, preserving NOT VALID.
     pub(super) fn extract_add_constraint_fact(
         ac: &squawk_syntax::ast::AddConstraint,
     ) -> Option<AlterTableActionFact> {

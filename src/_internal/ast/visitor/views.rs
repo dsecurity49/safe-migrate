@@ -111,6 +111,9 @@ impl AstVisitor {
         }
     }
 
+    /// Decide whether a view select is updatable. Two readings are returned
+    /// because an unqualified call may be an aggregate; the resolver narrows
+    /// that later.
     pub(super) fn select_updatability(select: &ast::Select) -> ViewUpdatabilityOutcome {
         use crate::_internal::analysis::facts::ViewUpdatabilityFact as V;
         use crate::_internal::model::relation::ViewUpdatabilityReason as R;
@@ -631,6 +634,8 @@ impl AstVisitor {
         scope
     }
 
+    /// Collects relation aliases from one `FROM` item, recursing through joins
+    /// and marking subqueries or unknown items unresolved.
     fn collect_scope_item(item: &ast::FromListItem, scope: &mut AggregateScopeFact) {
         match item {
             ast::FromListItem::JoinExpr(join) => {
@@ -1110,6 +1115,8 @@ impl AstVisitor {
         })
     }
 
+    /// Collect relation names referenced by a view body, skipping CTE
+    /// declarations, keywords, and path segments used only inside expressions.
     pub(super) fn extract_view_dependencies(
         syntax: &squawk_syntax::SyntaxNode,
     ) -> Vec<QualifiedName> {

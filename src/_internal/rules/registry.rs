@@ -375,6 +375,8 @@ pub(crate) fn rule_title(id: &str) -> Option<&'static str> {
 #[cfg(test)]
 pub(crate) const ALL_SECONDARY_RULES: &[SecondaryRule] = SECONDARY_RULES;
 
+/// Validates global and per-rule thresholds; tier 1 must be at least tier 2,
+/// and only supported fields may be set.
 pub(crate) fn validate_rule_configuration(
     config: &crate::api::config::Config,
 ) -> Result<(), String> {

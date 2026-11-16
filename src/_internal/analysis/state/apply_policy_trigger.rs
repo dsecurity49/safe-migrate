@@ -96,6 +96,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Create a trigger after checking the target and function return type.
     pub(super) fn apply_create_trigger(
         &mut self,
         create_trigger: &CreateTriggerMutation,
@@ -266,6 +267,8 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Rename a trigger's overlay and graph identity, update the owning
+    /// relation's trigger list, and record a rename edge.
     pub(super) fn apply_rename_trigger(
         &mut self,
         rename_trigger: &RenameTriggerMutation,

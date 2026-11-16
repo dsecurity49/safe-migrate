@@ -384,6 +384,8 @@ impl Reporter {
         compute_verdict(violations) == Verdict::Halt
     }
 
+    /// Render the human report, grouping violations that share a SQL statement
+    /// and object under one primary finding.
     pub(crate) fn print_report(
         violations: &[Violation],
         confidence: &Confidence,

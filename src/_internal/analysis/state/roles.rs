@@ -1,6 +1,8 @@
 use super::*;
 
 impl AnalysisState {
+    /// Expand `ALL` into its concrete privileges and reject `MAINTAIN` on
+    /// servers older than PostgreSQL 17.
     pub(super) fn resolve_grant_privileges(
         &mut self,
         spec: &crate::_internal::analysis::facts::PrivilegeSpec,

@@ -67,6 +67,8 @@ impl AnalysisState {
         descendants
     }
 
+    /// Propagate a column rename through relation metadata, CHECK definitions,
+    /// owned sequences, and graph payloads, snapshotting every touched object.
     pub(super) fn rename_relations_column_metadata_batch(
         &mut self,
         tables: &[ObjectId],

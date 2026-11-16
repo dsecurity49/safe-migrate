@@ -4,6 +4,8 @@ use squawk_syntax::ast::{AstNode, Expr};
 pub(crate) struct ExprVisitor;
 
 impl ExprVisitor {
+    /// Rewrite column references in a partition key clause by parsing it as
+    /// the key list of a synthetic `CREATE TABLE`, then renaming only columns.
     pub(crate) fn rename_partition_key_source(
         source: &str,
         table: &str,
@@ -39,6 +41,8 @@ impl ExprVisitor {
         Some(result)
     }
 
+    /// Rename unqualified or table-qualified column references in a deparsed
+    /// expression, leaving function callee names unchanged.
     pub(crate) fn rename_column_source(
         source: &str,
         table: &str,

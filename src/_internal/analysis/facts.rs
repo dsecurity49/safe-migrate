@@ -184,6 +184,7 @@ pub(crate) enum AlterSchemaActionFact {
     OwnerTo { new_owner: RoleFact },
 }
 
+/// What a parsed statement means, before names are resolved against the schema.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StatementFact {
     CreateSchema {

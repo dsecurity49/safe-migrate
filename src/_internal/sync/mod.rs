@@ -449,7 +449,6 @@ mod atomic_write_tests {
     use super::*;
 
     /// The writer validates coverage before encoding, so writer tests need a
-    /// The writer validates coverage before encoding, so writer tests need a
     /// cache that claims the families a real synchronization would record.
     fn writable_cache() -> DbCache {
         use crate::_internal::db::cache::{CatalogCoverage, SchemaCoverage};

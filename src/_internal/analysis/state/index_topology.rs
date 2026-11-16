@@ -279,13 +279,9 @@ impl AnalysisState {
     }
 
     /// Whether the definitions describe the same index shape.
-    ///
-    /// The comparison is exactly [`IndexDefinition::attach_equivalence`], so it
-    /// covers the properties PostgreSQL's `CompareIndexInfo` covers and no
-    /// others — notably not sort order, which server and simulator both ignore
-    /// when attaching. Lifecycle state plays no part either: PostgreSQL
-    /// attaches to a parent that is invalid precisely because partitions are
-    /// still missing.
+    /// This is exactly [`IndexDefinition::attach_equivalence`], so sort order
+    /// and lifecycle state play no part: PostgreSQL attaches to an invalid
+    /// parent precisely because partitions are still missing.
     fn compare_index_definitions(&self, parent: &ObjectId, child: &ObjectId) -> IndexComparison {
         let (Some(parent_definition), Some(child_definition)) = (
             self.index_definition_of(parent),
@@ -532,6 +528,7 @@ impl AnalysisState {
         self.ensure_partition_index_child_with_context(parent, table, template, rule, &backing)
     }
 
+    /// Recursion for `ensure_partition_index_child` with cached backing constraints.
     fn ensure_partition_index_child_with_context(
         &mut self,
         parent: &ObjectId,
@@ -572,6 +569,8 @@ impl AnalysisState {
                     {
                         return false;
                     }
+                    // A child may reuse an index only when its backing constraint
+                    // kind matches the parent's; creation can also reuse a fresh match.
                     match (parent_backing, backing.get(&edge.dependent).copied()) {
                         (Some(_), None) => false,
                         (Some(parent_kind), Some(child_kind)) => {

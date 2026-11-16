@@ -1,6 +1,7 @@
 use super::*;
 
 impl AnalysisState {
+    /// Apply CREATE TABLE, expanding inheritance, LIKE, and partition sources.
     pub(in crate::_internal::analysis::state) fn apply_create_table(
         &mut self,
         create: &CreateTable,
@@ -97,6 +98,9 @@ impl AnalysisState {
             };
             sources_complete &= parent.columns_complete;
             for column in &parent.columns {
+                // Two parents may contribute the same column; PostgreSQL keeps
+                // it only when the types and defaults agree, and NOT NULL is the
+                // stricter of the two.
                 if !inherited_names.insert(column.name.clone()) {
                     let existing = inherited_columns
                         .iter_mut()
@@ -195,6 +199,8 @@ impl AnalysisState {
         // `INCLUDING` contract without inventing unrelated catalog objects.
         for like_source in &create.like_sources {
             let source_id = &like_source.relation;
+            // A composite type is also a valid row type, so LIKE can copy its
+            // fields even though it is not a relation.
             if !self.relation_is_present(source_id)
                 && let Some(crate::_internal::model::types::TypeOverlay::Present(
                     crate::_internal::model::types::TypeState {
@@ -499,6 +505,8 @@ impl AnalysisState {
                     parent_id
                 ));
             }
+            // A partition takes the parent's columns and CHECK constraints;
+            // parent indexes become templates for the child's attached indexes.
             for column in &parent.columns {
                 if !inherited_names.insert(column.name.clone()) {
                     return MutationResult::conflict(format!(
@@ -914,6 +922,8 @@ impl AnalysisState {
                     })
                     .unwrap_or_default()
             };
+            // Missing type evidence is not a mismatch: taint instead of
+            // rejecting a statement PostgreSQL may accept.
             let mut type_evidence_unknown = false;
             let type_mismatch =
                 source_types

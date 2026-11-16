@@ -20,6 +20,7 @@ impl AstVisitor {
         })
     }
 
+    /// Extract sequence options and the single identity action.
     pub(super) fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
         let path = node.sequence_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;

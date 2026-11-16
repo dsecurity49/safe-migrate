@@ -396,6 +396,9 @@ impl SafeMigrateEngine {
         self.analyze_parsed_file(filename, sql, sql, &parsed, state)
     }
 
+    /// Analyze one file statement by statement. Each statement is atomic: its
+    /// state, findings, and deduplication keys are kept only if every action
+    /// succeeds.
     fn analyze_parsed_file(
         &self,
         filename: &str,
@@ -835,6 +838,8 @@ impl SafeMigrateEngine {
         )
     }
 
+    /// Scans a comment for `safe-migrate: ignore-file(...)` and
+    /// `safe-migrate: ignore(...)` directives.
     fn parse_directives(
         text: &str,
         file_ignores: &mut HashSet<String>,
@@ -868,6 +873,8 @@ impl SafeMigrateEngine {
         }
     }
 
+    /// Returns the first token after leading whitespace, line comments, and
+    /// block comments.
     fn strip_sql_leading_comments(s: &str) -> &str {
         let mut pos = 0;
         let bytes = s.as_bytes();
@@ -904,6 +911,8 @@ fn starts_with_keyword(bytes: &[u8], start: usize, word: &[u8]) -> bool {
         && bytes.get(end).is_none_or(|byte| !is_identifier_byte(*byte))
 }
 
+/// Reports whether the next SQL token is a string or dollar-quoted literal,
+/// skipping whitespace and comments.
 fn next_token_is_string(bytes: &[u8], mut index: usize) -> bool {
     loop {
         while index < bytes.len() && bytes[index].is_ascii_whitespace() {
@@ -993,6 +1002,8 @@ fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
+/// Validates a dollar-quote tag and returns the offset just past its closing
+/// delimiter, or the end of input if unterminated.
 fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
     if bytes.get(start) != Some(&b'$') {
         return None;

@@ -284,6 +284,7 @@ impl AnalysisState {
         }
     }
 
+    /// Rebuild the CHECK predicates PostgreSQL derives for a partition bound.
     pub(super) fn synthesize_partition_check_clauses(
         &self,
         strategy: &str,
@@ -298,6 +299,8 @@ impl AnalysisState {
         let mut column_types = Vec::new();
         let mut comparison_lefts = Vec::new();
 
+        // Only builtin scalar types can be deparsed back into the literals the
+        // predicate needs; unknown types return None rather than a guess.
         for (key_name, key) in keys {
             let col_type = relation
                 .columns
@@ -339,6 +342,8 @@ impl AnalysisState {
                 clauses.push(format!("({key} IS NOT NULL)"));
             }
 
+            // A RANGE lower bound is lexicographic: earlier keys compare by
+            // equality, and the last finite key compares with >= or >.
             let mut k_lower = keys.len();
             for (i, datum) in lower_datums.iter().enumerate() {
                 if matches!(datum.kind, DatumKind::UnboundedMin) {
@@ -383,6 +388,8 @@ impl AnalysisState {
                 }
             }
 
+            // The upper bound follows the same prefix rule, but MAXVALUE makes
+            // the final comparison inclusive while ordinary bounds stay strict.
             let mut k_upper = keys.len();
             let mut is_maxvalue = false;
             for (i, datum) in upper_datums.iter().enumerate() {
@@ -445,6 +452,8 @@ impl AnalysisState {
                 return None;
             };
 
+            // NULL is itself a LIST member, so it becomes a separate IS NULL
+            // branch rather than making the whole predicate unknown.
             let has_null = datums.iter().any(|d| matches!(d.kind, DatumKind::Null));
             let non_null_datums: Vec<_> = datums
                 .iter()
@@ -590,6 +599,7 @@ impl AnalysisState {
         }
     }
 
+    /// Check whether a child can attach to a partitioned parent.
     pub(super) fn partition_attachment_is_compatible(
         &self,
         parent_id: &ObjectId,
@@ -607,6 +617,8 @@ impl AnalysisState {
                 child_id, parent_id
             ));
         }
+        // PostgreSQL requires matching names, order, types, NOT NULL state, and
+        // generated-column state across the whole column list.
         for parent_column in &parent.columns {
             let Some(child_column) = child
                 .columns
@@ -664,6 +676,8 @@ impl AnalysisState {
             }
         }
 
+        // Every parent CHECK constraint must exist on the child with the same
+        // expression; a missing definition leaves the answer unprovable.
         let child_checks: std::collections::HashMap<&str, &ConstraintState> = self
             .local
             .constraints
@@ -697,6 +711,8 @@ impl AnalysisState {
             }
         }
 
+        // A parent key constraint must have a matching child constraint backed
+        // by the same ordered key columns.
         for parent_constraint in self.local.constraints.values().filter(|constraint| {
             constraint.table_id == *parent_id
                 && matches!(
@@ -748,6 +764,8 @@ impl AnalysisState {
             }
         }
 
+        // A child may not define a row trigger that conflicts with the parent's
+        // partition trigger plan.
         for parent_trigger in self.partition_row_trigger_plans(parent_id) {
             let child_trigger_id = Self::trigger_key(child_id, &parent_trigger.name);
             if matches!(
@@ -1230,6 +1248,8 @@ impl AnalysisState {
         }
     }
 
+    /// Finds the identity sequence owned by a column, walking partition
+    /// ancestors.
     fn owned_identity_sequence(&self, table: &ObjectId, column: &str) -> Option<ObjectId> {
         let mut pending = vec![table.clone()];
         let mut visited = HashSet::from([table.clone()]);
@@ -1280,6 +1300,8 @@ impl AnalysisState {
             .collect()
     }
 
+    /// Clone a parent foreign key onto a new partition, preserving validation
+    /// state and choosing a non-colliding constraint name.
     fn clone_partition_foreign_key(
         &mut self,
         parent_edge: &DependencyEdge,

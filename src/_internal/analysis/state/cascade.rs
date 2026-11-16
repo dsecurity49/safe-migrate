@@ -1,6 +1,8 @@
 use super::*;
 
 impl AnalysisState {
+    /// Collect everything a cascading drop removes from `target_oid`, following
+    /// current dependency edges through the whole closure.
     pub(crate) fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
         let mut result = CascadeResult::default();
         let mut visited = HashSet::new();
@@ -47,6 +49,10 @@ impl AnalysisState {
         }
     }
 
+    /// Walk the dependency graph depth-first from `current`, resolving renames
+    /// and skipping edges from an older relation incarnation. Views, partitions,
+    /// and inheriting tables join the traversal; indexes and foreign keys are
+    /// recorded as removed objects.
     pub(super) fn walk_cascade(
         &self,
         current: &ObjectId,

@@ -22,10 +22,13 @@ struct AlterTableContext {
 }
 
 impl AnalysisState {
+    /// Validate and apply one ALTER TABLE action, then update graph and cascade effects.
     pub(in crate::_internal::analysis::state) fn apply_alter_table(
         &mut self,
         alter: &AlterTable,
     ) -> MutationResult {
+        // A column rename recurses into inheritance children, so collect the
+        // closure once and use the same set for validation and application.
         let recursive_rename_descendants = if !alter.only
             && matches!(alter.action, AlterTableActionMutation::RenameColumn { .. })
         {

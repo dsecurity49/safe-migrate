@@ -12,6 +12,7 @@ use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::report::violations::ObjectKind;
 impl Resolver {
+    /// Resolve CREATE TABLE inputs and sources into a mutation.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_table(
         name: &QualifiedName,
@@ -226,6 +227,7 @@ impl Resolver {
         })
     }
 
+    /// Resolve ALTER TABLE actions in order; missing targets and RENAMEs are separate.
     pub(super) fn resolve_alter_table(
         name: &QualifiedName,
         only: bool,

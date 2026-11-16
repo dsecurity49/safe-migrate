@@ -64,6 +64,7 @@ mod schemas;
 mod snapshots;
 mod types;
 
+/// Whether every relevant catalog fact was known when the analysis ran.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Confidence {
     Exact,
@@ -181,6 +182,8 @@ pub(crate) struct CascadeResult {
     pub dropped_constraints: HashSet<(ObjectId, String)>,
 }
 
+/// The mutable schema model for the migration being analyzed. Statements
+/// update this copy, not the synchronized baseline.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone)]
 pub(crate) struct LocalState {
@@ -265,6 +268,8 @@ pub(crate) struct LocalState {
     pub generation_counter: u64,
 }
 
+/// The state rules may read before a statement runs, limited to the catalog
+/// families each rule declared it needs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PreState {
     pub relations: HashMap<ObjectId, crate::_internal::model::relation::RelationState>,
@@ -357,6 +362,8 @@ struct HydratedRelationTypes {
     types: HashMap<ObjectId, TypeOverlay>,
 }
 
+/// Everything the analyzer knows while walking a migration: baseline coverage,
+/// local schema state, transactions, evidence, and rule bookkeeping.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone)]
 pub(crate) struct AnalysisState {

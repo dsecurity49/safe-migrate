@@ -1,5 +1,6 @@
 use super::*;
 
+/// Load routines with their argument identities and aggregate metadata.
 pub(super) fn load_routines(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,

@@ -46,12 +46,6 @@ enum RoutineResult {
     Record(Vec<(Option<String>, String)>),
 }
 
-/// The identity constraints `CREATE OR REPLACE` places on an existing routine.
-///
-/// PostgreSQL keeps the routine's identity and lets only the body change. The
-/// checks below mirror `ProcedureCreate` in order: the return type and the
-/// `SETOF` flag, the `RECORD` row descriptor the OUT parameters imply, the
-/// names of already-named input parameters, and the parameter defaults.
 /// The drop command PostgreSQL names in the hint of a replacement error.
 fn drop_command_for(kind: RoutineKind) -> &'static str {
     match kind {
@@ -367,6 +361,7 @@ impl AnalysisState {
         Ok(())
     }
 
+    /// Create or replace a function, enforcing replacement identity rules.
     pub(super) fn apply_create_function(
         &mut self,
         function: &CreateFunctionMutation,
@@ -514,6 +509,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Apply ALTER FUNCTION changes while keeping the routine's identity.
     pub(super) fn apply_alter_function(
         &mut self,
         function: &AlterFunctionMutation,
@@ -651,6 +647,7 @@ impl AnalysisState {
             .collect()
     }
 
+    /// Drop routines by identity, honoring dependencies and CASCADE.
     pub(super) fn apply_drop_function(
         &mut self,
         function: &DropFunctionMutation,
@@ -833,6 +830,7 @@ impl AnalysisState {
         }
     }
 
+    /// Create or replace a procedure, recording its parameter identity and attributes.
     pub(super) fn apply_create_procedure(
         &mut self,
         procedure: &CreateProcedureMutation,
@@ -1380,6 +1378,7 @@ impl AnalysisState {
         let _ = self.apply_drop_relation_family(&seeds, true, "view");
     }
 
+    /// Drop aggregates after preflighting targets and cascading dependent views.
     pub(super) fn apply_drop_aggregate(
         &mut self,
         aggregate: &DropAggregateMutation,

@@ -31,6 +31,7 @@ impl AnalysisState {
         }
     }
 
+    /// Create a publication, tainting scope it cannot verify.
     pub(super) fn apply_create_publication(
         &mut self,
         p: &CreatePublicationMutation,
@@ -160,6 +161,7 @@ impl AnalysisState {
         params
     }
 
+    /// Apply publication membership, option, owner, and rename changes.
     pub(super) fn apply_alter_publication(
         &mut self,
         p: &AlterPublicationMutation,
@@ -450,6 +452,7 @@ impl AnalysisState {
         }
     }
 
+    /// Create a subscription, tainting an unverifiable name.
     pub(super) fn apply_create_subscription(
         &mut self,
         s: &CreateSubscriptionMutation,
@@ -548,6 +551,9 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Apply ALTER SUBSCRIPTION changes. Publication refreshes cannot run in a
+    /// transaction, and slot, failover, or two-phase changes require the
+    /// subscription to be disabled first.
     pub(super) fn apply_alter_subscription(
         &mut self,
         s: &AlterSubscriptionMutation,
@@ -612,6 +618,7 @@ impl AnalysisState {
                 publications,
                 params,
             } => {
+                // A publication refresh defaults on; only an explicit false skips it.
                 if in_transaction
                     && Self::subscription_boolean_option(Some(params), "refresh") != Some(false)
                 {

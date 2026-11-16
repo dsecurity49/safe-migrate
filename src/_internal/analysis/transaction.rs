@@ -7,6 +7,8 @@ use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::types::TypeOverlay;
 use std::collections::{HashMap, HashSet};
 
+/// A full state snapshot, used when a change touches too many families to
+/// record individually.
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceSnapshot {
@@ -43,6 +45,8 @@ pub(crate) enum BaselineSet {
     Sequences,
 }
 
+/// One reversible edit, replayed in reverse to undo a statement, savepoint, or
+/// transaction.
 #[allow(clippy::large_enum_variant)] // Undo entries stay allocation-free in the hot state path.
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
@@ -177,6 +181,7 @@ pub(crate) enum TransactionFrameKind {
     Savepoint(String),
 }
 
+/// A transaction or savepoint with the undo entries needed to roll it back.
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) struct TransactionFrame {

@@ -1,5 +1,7 @@
 use super::*;
 
+/// Load role identities and effective membership capabilities. PostgreSQL 16+
+/// stores one membership row per grantor, so options are unioned per edge.
 pub(super) fn load_roles(
     client: &mut impl GenericClient,
     pg_version_num: u32,
@@ -129,6 +131,8 @@ pub(super) struct ProvenanceCatalog {
     pub(super) search_path: Vec<String>,
 }
 
+/// Read the server version, effective search path, and source settings, then
+/// pin catalog queries to `pg_catalog` so user schemas cannot shadow them.
 pub(super) fn load_provenance(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,

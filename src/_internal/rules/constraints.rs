@@ -371,6 +371,8 @@ impl Rule for BlockingConstraintRule {
 }
 
 impl BlockingConstraintRule {
+    /// Check a domain constraint change against every live relation using the
+    /// domain; lock cost is sized by the largest affected table.
     fn evaluate_domain(
         &self,
         context: &RuleContext<'_>,

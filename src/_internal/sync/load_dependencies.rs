@@ -1,5 +1,6 @@
 use super::*;
 
+/// Load view dependencies on routines and types across the scope boundary.
 pub(super) fn load_view_object_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,

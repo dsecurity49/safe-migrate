@@ -277,6 +277,7 @@ impl DbCache {
         self.relations.iter()
     }
 
+    /// Returns a role that participates in a membership cycle, if any.
     fn role_membership_cycle(&self) -> Option<ObjectId> {
         fn visit(
             role_id: &ObjectId,

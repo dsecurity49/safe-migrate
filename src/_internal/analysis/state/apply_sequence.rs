@@ -402,6 +402,7 @@ impl AnalysisState {
                 .contains(&qualified.to_ascii_lowercase())
     }
 
+    /// Clear column defaults that reference a sequence removed by CASCADE.
     pub(super) fn clear_sequence_defaults_on_cascade(
         &mut self,
         sequence: &ObjectId,
@@ -510,6 +511,7 @@ impl AnalysisState {
         }
     }
 
+    /// Create a sequence, validating ownership and runtime parameters.
     pub(super) fn apply_create_sequence(
         &mut self,
         create: &CreateSequenceMutation,
@@ -623,6 +625,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Apply ALTER SEQUENCE options together, then run post-merge checks.
     pub(super) fn apply_alter_sequence(&mut self, alter: &AlterSequenceMutation) -> MutationResult {
         match self.sequence_lookup(&alter.id) {
             SequenceLookup::Present => {}
@@ -877,6 +880,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Drop sequences after checking ownership and default dependencies.
     pub(super) fn apply_drop_sequence(&mut self, drop: &DropSequenceMutation) -> MutationResult {
         for id in &drop.ids {
             if let Some(result) = self.extension_member_drop_conflict(

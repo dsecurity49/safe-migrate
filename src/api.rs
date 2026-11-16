@@ -8,7 +8,6 @@
 //! # fn main() -> Result<(), safe_migrate::api::Error> {
 //! use safe_migrate::api::{self, Baseline, Config};
 //! use std::path::Path;
-//!
 //! let config = Config::load_from_file(Path::new("safe-migrate.toml"))?;
 //! let baseline = Baseline::load_optional(Path::new(".safe-migrate.cache"), &config)?;
 //! let outcome = api::analyze(&config, "001.sql", "CREATE TABLE users (id bigint);", &baseline)?;
@@ -1000,6 +999,8 @@ fn decode_cache(
     decode_cache_payload(path, decrypted, encrypted)
 }
 
+/// Decode a compressed cache payload, enforcing the magic header, format
+/// version, decoded-size limit, and absence of trailing data.
 fn decode_cache_payload(
     path: &Path,
     decrypted: Vec<u8>,

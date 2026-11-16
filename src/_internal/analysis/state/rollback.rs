@@ -32,6 +32,7 @@ impl AnalysisState {
         self.rollback_undo_log(std::mem::take(&mut frame.undo_log));
     }
 
+    /// Undo a statement, savepoint, or transaction by replaying its log in reverse.
     pub(super) fn rollback_undo_log(&mut self, mut undo_log: Vec<StateChange>) {
         while let Some(change) = undo_log.pop() {
             match change {
@@ -280,6 +281,8 @@ impl AnalysisState {
                     self.local.evidence.truncate(len);
                 }
                 StateChange::NotEvaluatedLength { len } => {
+                    // A rollback cannot make an earlier aborted transaction
+                    // evaluatable again, so keep those entries and taint below.
                     let preserved: Vec<_> = self
                         .not_evaluated
                         .iter()

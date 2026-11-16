@@ -23,6 +23,8 @@ impl AnalysisState {
         if !self.local.records_undo() {
             return;
         }
+        // Keep the first snapshot per statement: later changes in the same
+        // statement must roll back to its pre-statement value.
         if !self.local.statement_snapshot_ids.insert(id.clone()) {
             return;
         }
@@ -33,6 +35,8 @@ impl AnalysisState {
         });
     }
 
+    /// A rename only snapshots the destination: rollback moves the renamed
+    /// overlay back and restores whatever occupied the destination beforehand.
     pub(super) fn snapshot_relation_rename(&mut self, old: &ObjectId, new: &ObjectId) {
         if !self.local.records_undo() || old == new {
             return;

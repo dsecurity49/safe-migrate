@@ -1,5 +1,6 @@
 use super::*;
 
+/// Load relations and columns in scope, plus foreign-key endpoints.
 pub(super) fn load_relations_and_columns(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,
@@ -416,6 +417,7 @@ pub(super) struct RelationGrant {
     pub(super) is_grantable: bool,
 }
 
+/// Load relation triggers, policies, rules, and grants.
 pub(super) fn load_relation_decorations(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -554,6 +556,8 @@ pub(super) fn load_relation_decorations(
     Ok((decorations, grants))
 }
 
+/// Load visible triggers, including their enabled mode and the parent trigger
+/// identity PostgreSQL records for partitioned-table clones.
 pub(super) fn load_triggers(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -640,6 +644,7 @@ pub(super) fn load_triggers(
         .collect()
 }
 
+/// Loads inheritance and partition-parent edges, including detach-pending state.
 pub(super) fn load_inheritances(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,

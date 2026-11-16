@@ -43,6 +43,8 @@ impl TypeKindRemap {
             && !self.base_element
     }
 
+    /// Applies a cached rename remap to a type definition, rewriting references
+    /// and schema-qualified spellings.
     fn apply(self, kind: &mut TypeKind, rename: &Rename) {
         let schema_changed = rename.old_id.schema != rename.new_id.schema;
         match kind {
@@ -154,6 +156,8 @@ impl AnalysisState {
             .then(|| Self::array_type_id(&rename.new_id))
     }
 
+    /// Precomputes references to the renamed type inside a type definition,
+    /// including its array form.
     fn type_kind_remap(kind: &TypeKind, rename: &Rename) -> TypeKindRemap {
         let mut remap = TypeKindRemap::default();
         match kind {
@@ -202,6 +206,7 @@ impl AnalysisState {
         !Self::type_kind_remap(kind, rename).is_empty()
     }
 
+    /// Create a type, completing a shell and adding its companions.
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
         if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
@@ -474,6 +479,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Rename a type, its array form, and every reference that names it.
     pub(super) fn apply_rename_type(&mut self, rename: &Rename) -> MutationResult {
         match self.type_lookup(&rename.old_id, |_| true) {
             TypeLookup::Present => {}
@@ -822,6 +828,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Apply an ALTER TYPE action after checking the type kind.
     pub(super) fn apply_alter_type(&mut self, alter: &AlterTypeMutation) -> MutationResult {
         match self.type_lookup(&alter.id, |_| true) {
             TypeLookup::Present => {}
@@ -1313,6 +1320,8 @@ impl AnalysisState {
         })
     }
 
+    /// Repoint range canonical/subtype-diff IDs and base-type routine text
+    /// after the routine they name has moved or been renamed.
     pub(super) fn remap_range_routine_reference(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         let affected: Vec<ObjectId> = self
             .local
@@ -1383,6 +1392,7 @@ impl AnalysisState {
         }
     }
 
+    /// Create a domain, folding its constraints and default into state.
     pub(super) fn apply_create_domain(&mut self, create: &CreateDomainMutation) -> MutationResult {
         if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
@@ -1610,6 +1620,8 @@ impl AnalysisState {
             })
     }
 
+    /// Resolves a type's effective collation through arrays and user types.
+    /// `Some((None, None))` means non-collatable; `None` means unknown.
     fn effective_type_collation(&self, raw: &str) -> Option<(Option<String>, Option<ObjectId>)> {
         let mut element = raw.trim();
         while let Some(stripped) = element.strip_suffix("[]") {
@@ -1652,6 +1664,8 @@ impl AnalysisState {
         })
     }
 
+    /// Validates an explicit composite-field collation or inherits the data
+    /// type's collation; unknown inheritance taints the statement.
     fn resolve_composite_field_collation(
         &mut self,
         data_type: &str,
@@ -1709,6 +1723,7 @@ impl AnalysisState {
         }
     }
 
+    /// Apply an ALTER DOMAIN action after checking the target is a domain.
     pub(super) fn apply_alter_domain(&mut self, alter: &AlterDomainMutation) -> MutationResult {
         match self.type_lookup(&alter.id, |kind| matches!(kind, TypeKind::Domain { .. })) {
             TypeLookup::Present => {}
@@ -1856,6 +1871,7 @@ impl AnalysisState {
                     "not_null",
                     &mut reserved,
                 );
+                // PG18 records domain NOT NULL in pg_constraint; older versions keep only the flag.
                 let records_constraint = self.pg_version().satisfies(|version| version >= 180_000);
                 self.snapshot_type(&alter.id);
                 if let Some(TypeOverlay::Present(TypeState {
@@ -1885,6 +1901,7 @@ impl AnalysisState {
         }
     }
 
+    /// Add a domain constraint, allocating a name when omitted.
     fn apply_add_domain_constraint(
         &mut self,
         alter: &AlterDomainMutation,
@@ -1957,6 +1974,7 @@ impl AnalysisState {
                     return MutationResult::conflict(message);
                 }
                 self.taint_domain_validation_if_data_scanned(&alter.id);
+                // PG18 stores NOT NULL as a domain constraint, as with SET NOT NULL.
                 let records_constraint = self.pg_version().satisfies(|version| version >= 180_000);
                 self.snapshot_type(&alter.id);
                 if let Some(TypeOverlay::Present(TypeState {
@@ -1978,6 +1996,8 @@ impl AnalysisState {
         }
     }
 
+    /// Drops a domain check constraint or the synthetic NOT NULL constraint,
+    /// honoring `IF EXISTS`.
     fn apply_drop_domain_constraint(
         &mut self,
         alter: &AlterDomainMutation,
@@ -2029,6 +2049,8 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Renames a check constraint or the synthetic NOT NULL constraint,
+    /// rejecting collisions.
     fn apply_rename_domain_constraint(
         &mut self,
         alter: &AlterDomainMutation,
@@ -2094,6 +2116,8 @@ impl AnalysisState {
         }
     }
 
+    /// Sets or clears a domain default, snapshotting only on change and
+    /// tainting when coercion cannot be proven.
     fn apply_set_domain_default(
         &mut self,
         alter: &AlterDomainMutation,
@@ -2156,6 +2180,8 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Marks a check constraint validated; the synthetic NOT NULL constraint
+    /// cannot be validated this way.
     fn apply_validate_domain_constraint(
         &mut self,
         alter: &AlterDomainMutation,
@@ -2357,6 +2383,8 @@ impl AnalysisState {
         ids
     }
 
+    /// Whether any local relation, routine, or type still references `id`.
+    /// Objects scheduled for the same drop do not count as external dependents.
     pub(super) fn has_type_dependents(&self, id: &ObjectId) -> bool {
         // Extension drops call this after seeding co_dropped_objects, so a
         // dependent member scheduled in the same statement is not external.
@@ -2523,6 +2551,8 @@ fn domain_default_is_provably_coercible(
     }
 }
 
+/// Conservative literal-to-builtin assignability check; `false` means not
+/// proven, not necessarily invalid.
 fn literal_is_provably_assignable(
     base_type: &str,
     literal: &str,

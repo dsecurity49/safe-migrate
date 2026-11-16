@@ -14,6 +14,8 @@ fn remap_endpoint(endpoint: &mut ObjectId, mappings: &HashMap<ObjectId, ObjectId
     true
 }
 
+/// Why one object depends on another. The kind decides which operations must
+/// respect the dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DependencyKind {
     ForeignKey {
@@ -110,6 +112,8 @@ pub(crate) struct ForeignKeyOperatorEvidence {
     pub fk_fk: Vec<String>,
 }
 
+/// A directed dependency: the `dependent` object needs the `referenced` one to
+/// stay valid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DependencyEdge {
     pub dependent: ObjectId,
@@ -127,6 +131,7 @@ impl DependencyEdge {
     }
 }
 
+/// Dependency edges between modeled objects, with lookup indexes built on first use.
 #[derive(Debug, Default)]
 pub(crate) struct DependencyGraph {
     edges: Vec<DependencyEdge>,
@@ -1015,13 +1020,6 @@ impl DependencyGraph {
         self.invalidate_indexes();
     }
 
-    /// Propagate a relation rename through relation-to-relation edges.
-    ///
-    /// Dependency endpoints are intentionally updated by edge kind rather than
-    /// by blindly comparing `ObjectId`s.  `ObjectId` carries no catalog kind,
-    /// and publications are represented by a synthetic `public/<name>` ID, so
-    /// a generic endpoint rewrite can otherwise corrupt an unrelated edge when
-    /// two namespaces happen to share a name.
     /// Apply every identity move in one pass.
     ///
     /// The typed match preserves the per-kind endpoint rules that a blind
