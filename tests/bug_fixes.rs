@@ -1490,6 +1490,39 @@ mod phase10_bug_fixes_and_sorting_tests {
         );
     }
 
+    #[test]
+    fn inline_suppression_disabled_is_reported_once_with_a_location() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "-- safe-migrate: ignore-file(drop-database)\n\
+                   DROP DATABASE first_db;\n\
+                   DROP DATABASE second_db;\n\
+                   DROP DATABASE third_db;";
+        let findings = engine
+            .analyze(sql, &mut state)
+            .expect("the directives and statements must parse");
+
+        let inline_suppression: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.rule_id == "inline-suppression-disabled")
+            .collect();
+        assert_eq!(
+            inline_suppression.len(),
+            1,
+            "one directive must produce one configuration finding, not one per mutation: {findings:#?}"
+        );
+        assert!(
+            inline_suppression[0].source_range.is_some(),
+            "the configuration finding must point at the directive"
+        );
+        assert_eq!(
+            inline_suppression[0].sql.as_deref(),
+            Some("DROP DATABASE first_db;"),
+            "the finding should retain the statement it applies to"
+        );
+    }
+
     // ─────────────────────────────────────────────
     // Bug 15 — stmt_text strips leading comments
     // ─────────────────────────────────────────────
@@ -1735,10 +1768,12 @@ mod audit_regressions {
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, RelationOverlay};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::db::cache::DbCache;
+    use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::constraint::{ConstraintKind, ConstraintState};
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::model::role::{RoleOverlay, RoleState};
+    use safe_migrate::api::Config;
 
     fn existing_table_cache() -> safe_migrate::_internal::db::cache::DbCache {
         let mut cache = synced_cache();
@@ -1887,6 +1922,102 @@ mod audit_regressions {
             state.confidence(),
             &Confidence::Exact,
             "an aborted transaction cannot leave the report at exact confidence"
+        );
+    }
+
+    #[test]
+    fn aborted_transaction_omits_disabled_rules_from_not_evaluated() {
+        let engine = SafeMigrateEngine::new(Config::default().disable_rule("drop-database"));
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "BEGIN; \
+                 ALTER TABLE missing_t ADD COLUMN c int; \
+                 DROP TABLE orders; \
+                 COMMIT;",
+                &mut state,
+            )
+            .expect("Squawk should parse the transaction");
+
+        let not_evaluated = state.not_evaluated();
+        assert!(
+            not_evaluated
+                .iter()
+                .any(|entry| entry.rule_id == "table-lock"),
+            "active rules must still be reported as not evaluated"
+        );
+        assert!(
+            !not_evaluated
+                .iter()
+                .any(|entry| entry.rule_id == "drop-database"),
+            "a disabled rule must not be reported as not evaluated"
+        );
+    }
+
+    #[test]
+    fn aborted_transaction_omits_allowed_inline_suppressions_from_not_evaluated() {
+        let engine = SafeMigrateEngine::new(Config::default().with_allow_inline_suppressions(true));
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "-- safe-migrate: ignore-file(missing-idempotency)\n\
+                 BEGIN; \
+                 ALTER TABLE missing_t ADD COLUMN c int; \
+                 DROP TABLE orders; \
+                 COMMIT;",
+                &mut state,
+            )
+            .expect("Squawk should parse the transaction");
+
+        assert!(
+            !state
+                .not_evaluated()
+                .iter()
+                .any(|entry| entry.rule_id == "missing-idempotency"),
+            "an allowed inline suppression must not be reported as not evaluated"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "inline-suppression-disabled"),
+            "an allowed inline suppression must not produce a configuration finding"
+        );
+    }
+
+    #[test]
+    fn aborted_transaction_reports_disallowed_inline_suppression_once() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "-- safe-migrate: ignore-file(missing-idempotency)\n\
+                 BEGIN; \
+                 ALTER TABLE missing_t ADD COLUMN c int; \
+                 DROP TABLE orders; \
+                 COMMIT;",
+                &mut state,
+            )
+            .expect("Squawk should parse the transaction");
+
+        let inline_suppression: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.rule_id == "inline-suppression-disabled")
+            .collect();
+        assert_eq!(
+            inline_suppression.len(),
+            1,
+            "the disallowed directive must produce exactly one configuration finding: {findings:#?}"
+        );
+        assert!(
+            inline_suppression[0].source_range.is_some(),
+            "the configuration finding must point at the directive"
+        );
+        assert!(
+            !state
+                .not_evaluated()
+                .iter()
+                .any(|entry| entry.rule_id == "missing-idempotency"),
+            "a disallowed inline suppression must not also be reported as not evaluated"
         );
     }
 

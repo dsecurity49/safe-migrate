@@ -291,6 +291,22 @@ fn column_compression_from_pg(code: Option<&str>) -> Result<Option<String>> {
     }
 }
 
+fn is_internal_column_option(key: &str) -> bool {
+    key.starts_with("pg_")
+}
+
+/// Removes PostgreSQL-internal attribute options before schema comparison.
+#[cfg(test)]
+pub(crate) fn visible_column_options(
+    options: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    options
+        .iter()
+        .filter(|(key, _)| !is_internal_column_option(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 pub(crate) fn catalog_options(
     values: Option<Vec<String>>,
     object: &str,
@@ -302,6 +318,11 @@ pub(crate) fn catalog_options(
         };
         if key.is_empty() || value.is_empty() {
             anyhow::bail!("PostgreSQL returned malformed {object} option '{option}'");
+        }
+        // `attoptions` also carries internal attribute-version metadata, such
+        // as PostgreSQL 18.7's `pg_attver`; it is not user schema state.
+        if object == "column" && is_internal_column_option(key) {
+            continue;
         }
         if options.insert(key.to_string(), value.to_string()).is_some() {
             anyhow::bail!("PostgreSQL returned duplicate {object} option '{key}'");

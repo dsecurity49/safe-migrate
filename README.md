@@ -182,7 +182,7 @@ Inline suppressions are **disabled by default**. To enable them, add to
 allow_inline_suppressions = true
 ```
 
-Without this setting, an inline directive produces a Tier 1
+Without this setting, each inline directive produces one located Tier 1
 `inline-suppression-disabled` finding instead of suppressing the rule.
 This is intentional: keeping suppressions in the TOML file makes them
 visible in pull request diffs and subject to review. Use per-rule

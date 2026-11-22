@@ -11,7 +11,7 @@ mod tests {
     use crate::_internal::sync::{
         cache_search_path, catalog_options, database_config_is_local,
         ensure_supported_postgres_version, is_local_host, is_system_schema,
-        parse_search_path_setting, relation_owner_id, sync_cache,
+        parse_search_path_setting, relation_owner_id, sync_cache, visible_column_options,
     };
     use crate::_internal::test_support::EnvironmentValueGuard;
     use serde::Serialize;
@@ -94,6 +94,36 @@ mod tests {
         assert_eq!(options.get("n_distinct"), Some(&"-0.25".to_string()));
         assert!(catalog_options(Some(vec!["broken".into()]), "column").is_err());
         assert!(catalog_options(Some(vec!["x=1".into(), "x=2".into()]), "column").is_err());
+    }
+
+    #[test]
+    fn catalog_options_ignore_internal_postgres_attribute_versioning() {
+        let options = catalog_options(
+            Some(vec!["fillfactor=80".into(), "pg_attver=103135856".into()]),
+            "column",
+        )
+        .expect("valid PostgreSQL options");
+
+        assert_eq!(options.get("fillfactor"), Some(&"80".to_string()));
+        assert!(
+            !options.contains_key("pg_attver"),
+            "PostgreSQL's internal attribute version is not schema state"
+        );
+    }
+
+    #[test]
+    fn visible_column_options_ignore_internal_postgres_attribute_versioning() {
+        let options = std::collections::BTreeMap::from([
+            ("fillfactor".to_string(), "80".to_string()),
+            ("pg_attver".to_string(), "103135856".to_string()),
+        ]);
+        let visible = visible_column_options(&options);
+
+        assert_eq!(visible.get("fillfactor"), Some(&"80".to_string()));
+        assert!(
+            !visible.contains_key("pg_attver"),
+            "cached PostgreSQL internals must not participate in schema comparison"
+        );
     }
 
     #[test]

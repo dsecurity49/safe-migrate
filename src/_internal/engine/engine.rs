@@ -16,7 +16,7 @@ use squawk_syntax::{
     Parse, SyntaxKind,
     ast::{AstNode, SourceFile},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Byte-offset to line/column lookup built once per source file.
 struct LineIndex<'a> {
@@ -421,7 +421,7 @@ impl SafeMigrateEngine {
         let mut warned_keys = HashSet::new();
         let mut pre_state = PreState::default();
 
-        let mut file_ignores = HashSet::new();
+        let mut file_ignores = HashMap::new();
         for token in parsed
             .tree()
             .syntax()
@@ -429,8 +429,13 @@ impl SafeMigrateEngine {
             .filter_map(|it| it.into_token())
             .filter(|token| token.kind() == SyntaxKind::COMMENT)
         {
-            let mut dummy = HashSet::new();
-            Self::parse_directives(token.text(), &mut file_ignores, &mut dummy);
+            let mut dummy = HashMap::new();
+            Self::parse_directives(
+                token.text(),
+                token.text_range(),
+                &mut file_ignores,
+                &mut dummy,
+            );
         }
 
         for (statement_offset, stmt) in parsed.tree().stmts().enumerate() {
@@ -438,7 +443,7 @@ impl SafeMigrateEngine {
                 file: filename.to_string(),
                 statement_index: statement_offset + 1,
             }));
-            let mut stmt_ignores = HashSet::new();
+            let mut stmt_ignores = HashMap::new();
 
             let mut prev = stmt.syntax().prev_sibling_or_token();
             while let Some(element) = prev {
@@ -448,8 +453,13 @@ impl SafeMigrateEngine {
                 if let Some(token) = element.as_token()
                     && token.kind() == SyntaxKind::COMMENT
                 {
-                    let mut dummy = HashSet::new();
-                    Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
+                    let mut dummy = HashMap::new();
+                    Self::parse_directives(
+                        token.text(),
+                        token.text_range(),
+                        &mut dummy,
+                        &mut stmt_ignores,
+                    );
                 }
                 prev = element.prev_sibling_or_token();
             }
@@ -460,8 +470,13 @@ impl SafeMigrateEngine {
                 .filter_map(|it| it.into_token())
                 .filter(|token| token.kind() == SyntaxKind::COMMENT)
             {
-                let mut dummy = HashSet::new();
-                Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
+                let mut dummy = HashMap::new();
+                Self::parse_directives(
+                    token.text(),
+                    token.text_range(),
+                    &mut dummy,
+                    &mut stmt_ignores,
+                );
             }
 
             // Capture raw statement text for sql field on violations (strip leading comments)
@@ -547,6 +562,26 @@ impl SafeMigrateEngine {
                     if state.transaction_is_aborted() {
                         state.taint(EvidenceCode::TransactionAborted, EvidenceScope::Chain);
                         for rule in &self.rules {
+                            let inline_range = stmt_ignores
+                                .get(rule.id())
+                                .or_else(|| file_ignores.get(rule.id()))
+                                .copied();
+                            if let Some(directive_range) = inline_range {
+                                if !self.config.allow_inline_suppressions {
+                                    Self::record_inline_suppression_disabled(
+                                        rule.id(),
+                                        directive_range,
+                                        stmt_text,
+                                        &warned_keys,
+                                        &mut statement_warned_keys,
+                                        &mut statement_violations,
+                                    );
+                                }
+                                continue;
+                            }
+                            if self.config.is_rule_disabled(rule.id()) {
+                                continue;
+                            }
                             state.record_not_evaluated(
                                 crate::_internal::report::violations::NotEvaluated {
                                     rule_id: rule.id(),
@@ -572,28 +607,29 @@ impl SafeMigrateEngine {
                 let mut unresolved_context: Option<(Vec<String>, String)> = None;
 
                 for rule in &self.rules {
-                    let is_inline_ignored =
-                        file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
+                    let inline_range = stmt_ignores
+                        .get(rule.id())
+                        .or_else(|| file_ignores.get(rule.id()))
+                        .copied();
 
-                    if is_inline_ignored && !self.config.allow_inline_suppressions {
-                        statement_violations.push(crate::_internal::report::violations::Violation {
-                            source_range: None,
-                            rule_id: "inline-suppression-disabled",
-                            object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
-                            object_name: "".to_string(),
-                            tier: crate::_internal::report::violations::ViolationTier::Tier1,
-                            reason: format!("Inline suppression of rule '{}' is not allowed by configuration", rule.id()),
-                            recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
-                            dedup_key: Some(format!("inline-suppression-disabled:{}", rule.id())),
-                            sql: None,
-
-                        });
-                        // Skip evaluating the rule since it was requested to be ignored,
-                        // but the build will fail anyway due to the Tier1 config violation.
+                    if let Some(directive_range) = inline_range {
+                        if !self.config.allow_inline_suppressions {
+                            Self::record_inline_suppression_disabled(
+                                rule.id(),
+                                directive_range,
+                                stmt_text,
+                                &warned_keys,
+                                &mut statement_warned_keys,
+                                &mut statement_violations,
+                            );
+                        }
+                        // The rule was suppressed, so it must not run. With
+                        // enforcement enabled the configuration finding still
+                        // fails the build.
                         continue;
                     }
 
-                    if self.config.is_rule_disabled(rule.id()) || is_inline_ignored {
+                    if self.config.is_rule_disabled(rule.id()) {
                         continue;
                     }
 
@@ -838,12 +874,43 @@ impl SafeMigrateEngine {
         )
     }
 
+    fn record_inline_suppression_disabled(
+        rule_id: &str,
+        directive_range: rowan::TextRange,
+        stmt_text: &str,
+        warned_keys: &HashSet<String>,
+        statement_warned_keys: &mut HashSet<String>,
+        statement_violations: &mut Vec<Violation>,
+    ) {
+        let key = format!(
+            "inline-suppression-disabled:{rule_id}:{}",
+            usize::from(directive_range.start())
+        );
+        if warned_keys.contains(&key) || !statement_warned_keys.insert(key.clone()) {
+            return;
+        }
+        statement_violations.push(Violation {
+            source_range: Some(directive_range),
+            rule_id: "inline-suppression-disabled",
+            object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
+            object_name: String::new(),
+            tier: crate::_internal::report::violations::ViolationTier::Tier1,
+            reason: format!(
+                "Inline suppression of rule '{rule_id}' is not allowed by configuration"
+            ),
+            recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
+            dedup_key: Some(key),
+            sql: Some(stmt_text.trim().to_string()),
+        });
+    }
+
     /// Scans a comment for `safe-migrate: ignore-file(...)` and
     /// `safe-migrate: ignore(...)` directives.
     fn parse_directives(
         text: &str,
-        file_ignores: &mut HashSet<String>,
-        stmt_ignores: &mut HashSet<String>,
+        range: rowan::TextRange,
+        file_ignores: &mut HashMap<String, rowan::TextRange>,
+        stmt_ignores: &mut HashMap<String, rowan::TextRange>,
     ) {
         let marker = "safe-migrate:";
         let mut pos = 0;
@@ -857,7 +924,9 @@ impl SafeMigrateEngine {
                     .strip_prefix('(')
                     .and_then(|s| s.find(')').map(|e| &s[..e]))
                 {
-                    file_ignores.insert(inner.trim().to_string());
+                    file_ignores
+                        .entry(inner.trim().to_string())
+                        .or_insert(range);
                 }
             } else if let Some(rest) = after.strip_prefix("ignore") {
                 let rest = rest.trim_start();
@@ -865,7 +934,9 @@ impl SafeMigrateEngine {
                     .strip_prefix('(')
                     .and_then(|s| s.find(')').map(|e| &s[..e]))
                 {
-                    stmt_ignores.insert(inner.trim().to_string());
+                    stmt_ignores
+                        .entry(inner.trim().to_string())
+                        .or_insert(range);
                 }
             }
 

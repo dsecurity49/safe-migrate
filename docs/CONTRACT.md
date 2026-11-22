@@ -108,7 +108,7 @@ Additional top-level objects are:
 | --- | --- |
 | `summary` | `total`, `tier1`, `tier2`, and `tier3` counts. |
 | `evidence` | Ordered, deduplicated reasons for conservative analysis. Each has a stable snake-case `code`, `statement` or `chain` scope, summary, and optional file/index. It contains no SQL or credentials. |
-| `not_evaluated` | Checks that did not run, either for want of evidence or because the operation is outside the rule's modeled scope. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. |
+| `not_evaluated` | Checks that did not run, either for want of evidence or because the operation is outside the rule's modeled scope. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. Disabled rules and rules suppressed by an inline directive are not listed. |
 | `baseline` | Cache status, provenance, observed settings, and automatic-sync result. |
 
 The `baseline` shape is:
