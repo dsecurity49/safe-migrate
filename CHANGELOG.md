@@ -5,6 +5,36 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.13.0 — 2026-11-22
+
+- Added `lock-risk`, a size-independent Tier 3 advisory for lock modes on
+  constraints, indexes, partitions, `REINDEX`, materialized-view refreshes,
+  `TRUNCATE`, and domain changes; `set-storage-lock` covers storage parameters.
+  `blocking-partition-mutation` now estimates `ATTACH PARTITION` from partition
+  leaves, and operations outside the predictor are reported under
+  `not_evaluated` as `lock_prediction_unavailable`.
+- Expanded PostgreSQL modeling and state tracking for `ALTER TABLE IF EXISTS`
+  on absent relations, role renames, abort-skipped statements, validated
+  `SET NOT NULL`, and partition, foreign-key, identity, view, trigger,
+  composite, and constraint dependencies. This includes `VALIDATE CONSTRAINT`,
+  `EXECUTE` normalization, and failed compound-statement reporting;
+  `type-change-rewrite` no longer fires on an already-conflicted change.
+- Catalog sync and analysis are faster through scoped dependency lookups,
+  batched sequence reads, single-pass multi-action `ALTER TABLE` snapshots,
+  indexed cache validation, and typed journals with targeted snapshots. Cache
+  format 12 adds parsed index predicates and expression keys, range-type
+  identities, and search-path whitespace preservation; re-run
+  `safe-migrate sync`.
+- `lint` and `lint-chain --report-dir` write both reports in one pass;
+  unevaluated checks use a compact tiered summary; `init github-actions`
+  improves branch, authentication, and secret setup; PostgreSQL 14–18 bounds
+  are shared across the public API, cache validation, and sync; the unused
+  `OperationKind` is removed.
+- Inline suppressions now produce one located Tier 1
+  `inline-suppression-disabled` finding per directive, and aborted transactions
+  omit disabled or suppressed rules from `not_evaluated`. Sync ignores internal
+  PostgreSQL column metadata such as `pg_attver`.
+
 ## v0.12.0 — 2026-10-31
 
 - Domains, extensions, sequences, and PostgreSQL type lifecycles are modeled

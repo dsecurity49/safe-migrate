@@ -41,6 +41,31 @@ fn generated_expression_text_tracks_create_add_change_and_rollback() {
 }
 
 #[test]
+fn aborted_compound_statement_does_not_leak_not_evaluated_records() {
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(cache_with_table("public", "t", None));
+
+    engine.analyze("BEGIN;", &mut state).unwrap();
+    let findings = engine
+        .analyze(
+            "ALTER TABLE t DROP COLUMN missing, ADD COLUMN a integer, ADD COLUMN a integer;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "the duplicate column should abort the statement: {findings:?}"
+    );
+    assert!(
+        state.not_evaluated().is_empty(),
+        "the aborted statement leaked not-evaluated records: {:?}",
+        state.not_evaluated()
+    );
+}
+
+#[test]
 fn create_if_not_exists_skips_when_another_relation_kind_uses_the_name() {
     let engine = setup_engine();
     let mut state = setup_state();

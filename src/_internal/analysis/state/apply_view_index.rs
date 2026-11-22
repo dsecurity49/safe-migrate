@@ -543,6 +543,7 @@ impl AnalysisState {
         })
     }
 
+    /// Drop a relation family, applying CASCADE and tainting incomplete scope.
     pub(super) fn apply_drop_relation_family(
         &mut self,
         present: &[ObjectId],
@@ -665,6 +666,7 @@ impl AnalysisState {
         }
     }
 
+    /// Create or replace a view and rebuild its dependency edges.
     pub(super) fn apply_create_view(&mut self, create: &CreateView) -> MutationResult {
         if let Some(message) = &create.invalid_aggregate {
             return MutationResult::conflict(message.clone());
@@ -791,6 +793,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Create a materialized view and record whether it has data.
     pub(super) fn apply_create_materialized_view(
         &mut self,
         create: &CreateMaterializedView,
@@ -868,6 +871,8 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Refresh a materialized view, enforcing `CONCURRENTLY`'s transaction,
+    /// populated-state, and usable-unique-index preconditions.
     pub(super) fn apply_refresh_materialized_view(
         &mut self,
         refresh: &RefreshMaterializedViewMutation,
@@ -954,9 +959,6 @@ impl AnalysisState {
         RefreshIndexState::Missing
     }
 
-    /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
-    /// statement. `IF EXISTS` guards the relation lookup, and an action the
-    /// model does not represent makes the statement opaque.
     /// Record the routines a view calls as dependency edges.
     ///
     /// A call PostgreSQL could have resolved in a schema the model cannot see
@@ -1038,6 +1040,9 @@ impl AnalysisState {
         Ok(())
     }
 
+    /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
+    /// statement. `IF EXISTS` guards the relation lookup, and an action the
+    /// model does not represent makes the statement opaque.
     pub(super) fn apply_alter_view_family(&mut self, alter: &AlterViewFamily) -> MutationResult {
         match self.relation_lookup(&alter.id, |kind| *kind == alter.kind) {
             RelationLookup::WrongKind => {
@@ -1070,6 +1075,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Create an index, validating keys and ensuring child indexes on partitions.
     pub(super) fn apply_create_index(&mut self, create: &CreateIndex) -> MutationResult {
         if create.concurrently && self.in_transaction() {
             return MutationResult::Conflict(ConflictKind::ConcurrentInTransaction);
@@ -1299,6 +1305,7 @@ impl AnalysisState {
         self.apply_drop_relation_family(&present, drop.cascade, "materialized view")
     }
 
+    /// Drop indexes after preflighting targets, constraints, and partition attachments.
     pub(super) fn apply_drop_index(&mut self, drop: &DropIndex) -> MutationResult {
         if drop.concurrently && self.in_transaction() {
             return MutationResult::Conflict(ConflictKind::ConcurrentInTransaction);

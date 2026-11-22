@@ -159,6 +159,8 @@ impl AnalysisState {
         }
     }
 
+    /// Drop one or more schemas, including their dependent objects under CASCADE.
+    /// `IF EXISTS` cannot excuse a schema the scoped baseline cannot see.
     pub(super) fn apply_drop_schema(&mut self, drop_schema: &DropSchemaMutation) -> MutationResult {
         for name in &drop_schema.names {
             if let Some(result) = self.extension_schema_drop_conflict(name) {

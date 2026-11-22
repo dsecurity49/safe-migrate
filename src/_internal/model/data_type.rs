@@ -219,6 +219,8 @@ pub(crate) struct ParsedDataType {
 pub(crate) const WIDENED_NUMERIC_SCALE_VERSION: u32 = 150_000;
 
 impl ParsedDataType {
+    /// Parse a declared type into its built-in identity, modifier, and array
+    /// depth, preserving the written spelling for unresolved names.
     pub(crate) fn parse(raw: &str, catalogue: &BuiltinTypeCatalogue) -> Self {
         let mut text = Self::fold_unquoted_identifier_case(raw.trim());
 
@@ -357,7 +359,8 @@ impl ParsedDataType {
             .unwrap_or(name)
     }
 
-    // Anything the server would reject becomes OutOfRange rather than a value.
+    /// Maps a written modifier to parsed character/numeric bounds; unparseable
+    /// or unsupported modifiers fail closed.
     fn classify_typmod(
         builtin: Option<&ResolvedBuiltinType>,
         written: &str,
@@ -415,10 +418,8 @@ impl ParsedDataType {
                 TypeTypmod::Numeric { precision, scale }
             }
             // Fractional-second precision and interval fields take a bare
-            // integer or a field list, neither of which narrows a value.
-            // Fractional-second precision and interval fields take a bare
-            // integer or a field list; neither constrains a stored value, so the
-            // modifier is recorded without being interpreted.
+            // integer or a field list; neither constrains a stored value, so
+            // the modifier is recorded without being interpreted.
             TypmodKind::FractionalSeconds | TypmodKind::IntervalFields => match raw {
                 None => TypeTypmod::NotApplicable,
                 Some(_) => TypeTypmod::Unbounded,
@@ -533,6 +534,8 @@ impl ParsedDataType {
         }
     }
 
+    /// Reports whether converting to the new type can drop or overflow values,
+    /// based on array depth, numeric bounds, fixed widths, and text limits.
     pub(crate) fn is_lossy_narrowing_to(&self, new_type: &ParsedDataType) -> bool {
         // Two spellings of one built-in (`int` and `integer`) are the same
         // type; two unresolved names are never assumed to be.

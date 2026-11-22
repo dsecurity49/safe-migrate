@@ -250,6 +250,9 @@ impl Resolver {
         TypeIdentity::from_syntax(&ParsedDataType::parse(raw, catalogue))
     }
 
+    /// Turn a statement fact into the mutations the state machine applies.
+    /// Unresolved or unsupported references become opaque mutations so rules can
+    /// report them.
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
         let mut mutations = Vec::new();
         match fact {
@@ -605,9 +608,12 @@ impl Resolver {
             StatementFact::AlterTable {
                 name,
                 only,
+                if_exists,
                 actions,
             } => {
-                mutations.extend(Self::resolve_alter_table(name, *only, actions, state));
+                mutations.extend(Self::resolve_alter_table(
+                    name, *only, *if_exists, actions, state,
+                ));
             }
             StatementFact::DropTable {
                 names,

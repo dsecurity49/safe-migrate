@@ -1,4 +1,5 @@
 use super::*;
+use crate::_internal::sync::visible_column_options;
 
 /// Plant a real interrupted-concurrent-detach catalog state: create a parent
 /// and child partition, block a `DETACH PARTITION ... CONCURRENTLY` behind a
@@ -534,7 +535,7 @@ pub(super) fn snapshot_live_state(
                             statistics_target: normalize_statistics_target(
                                 column.statistics_target,
                             ),
-                            options: column.options.clone(),
+                            options: visible_column_options(&column.options),
                         },
                     );
                 }
@@ -1052,7 +1053,7 @@ pub(super) fn snapshot_simulator_state(
                             statistics_target: normalize_statistics_target(
                                 column.statistics_target,
                             ),
-                            options: column.options.clone(),
+                            options: visible_column_options(&column.options),
                         },
                     );
                 }

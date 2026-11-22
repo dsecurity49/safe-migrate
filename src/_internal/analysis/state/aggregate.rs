@@ -147,6 +147,8 @@ impl<'a> CallTypeResolver<'a> {
         }
     }
 
+    /// Resolves a catalog type id for aggregate matching, reducing domains to
+    /// their base category.
     fn resolve_id(&self, id: &ObjectId, spelling: Option<&str>) -> Option<KnownCallType> {
         use crate::_internal::model::builtin_type::TypeCategory;
 
@@ -183,6 +185,8 @@ impl<'a> CallTypeResolver<'a> {
         })
     }
 
+    /// Resolves a written type name for aggregate matching; builtins use the
+    /// catalogue, pseudotypes are explicit, and unknown names stay unresolved.
     fn resolve_name(&self, raw: &str) -> CallType {
         use crate::_internal::model::builtin_type::TypeCategory;
         use crate::_internal::model::data_type::TypeIdentity;
@@ -278,6 +282,8 @@ pub(crate) struct AggregateCallArgument {
     pub(crate) variadic: bool,
 }
 
+/// Scores a candidate argument against a declared type: exact, implicit-cast,
+/// or preferred-type tiebreak; `None` means no implicit cast.
 fn argument_match(
     argument: &CandidateArg,
     declared: &CallType,

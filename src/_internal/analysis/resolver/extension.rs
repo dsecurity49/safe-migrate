@@ -59,6 +59,8 @@ impl Resolver {
         })
     }
 
+    /// Resolves named members by kind, routines by signature, and schema or
+    /// unmodeled members as opaque identifiers.
     fn resolve_extension_member(
         member: &ExtensionMemberFact,
         state: &AnalysisState,

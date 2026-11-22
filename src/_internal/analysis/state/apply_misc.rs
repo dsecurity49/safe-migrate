@@ -132,6 +132,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Validate a REINDEX target and mark a rebuilt leaf index valid.
     pub(super) fn apply_reindex(
         &mut self,
         target: &Option<ReindexTargetMutation>,
@@ -280,6 +281,7 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Apply ALTER INDEX actions and validate reloptions and partition attachments.
     pub(super) fn apply_alter_index(&mut self, alter: &AlterIndexMutation) -> MutationResult {
         // Validate the index exists before applying any actions.
         if !self.index_is_present(&alter.index_id) {
@@ -465,14 +467,9 @@ impl AnalysisState {
         &mut self,
         _all: &AlterIndexAllInTablespaceMutation,
     ) -> MutationResult {
-        // `ALTER INDEX ALL IN TABLESPACE src SET TABLESPACE dst` bulk-relocates
-        // every index currently residing in tablespace `src` to tablespace `dst`.
-        // Index tablespace is advisory planner metadata (pg_class.reltablespace);
-        // this engine does not model tablespace placement in its relation state,
-        // so this operation never drifts the catalog model and requires no
-        // state mutation. The source/target tablespace names are preserved in
-        // the mutation for rule authors and future diagnostics, but the apply
-        // layer correctly treats this as a no-op against the schema model.
+        // Tablespace placement (`pg_class.reltablespace`) is not modeled, so
+        // this bulk relocation never changes modeled state. The names stay on
+        // the mutation for diagnostics.
         MutationResult::Applied
     }
 }

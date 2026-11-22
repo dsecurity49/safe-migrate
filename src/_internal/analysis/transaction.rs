@@ -1,4 +1,4 @@
-use crate::_internal::analysis::graph::DependencyEdge;
+use crate::_internal::analysis::graph::{DependencyEdge, GraphEdgeDelta};
 use crate::_internal::analysis::namespace::SearchPathEntry;
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationOverlay;
@@ -7,6 +7,9 @@ use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::types::TypeOverlay;
 use std::collections::{HashMap, HashSet};
 
+/// A full state snapshot, used when a change touches too many families to
+/// record individually.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceSnapshot {
     pub schemas: HashMap<String, SchemaOverlay>,
@@ -34,7 +37,18 @@ pub(crate) struct NamespaceSnapshot {
     pub session_search_path_template: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaselineSet {
+    Relations,
+    Indexes,
+    FkDependencies,
+    Sequences,
+}
+
+/// One reversible edit, replayed in reverse to undo a statement, savepoint, or
+/// transaction.
 #[allow(clippy::large_enum_variant)] // Undo entries stay allocation-free in the hot state path.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) enum StateChange {
     SchemaSnapshot {
@@ -46,6 +60,11 @@ pub(crate) enum StateChange {
         id: ObjectId,
         previous: Box<Option<RelationOverlay>>,
     },
+    RelationRename {
+        old_id: ObjectId,
+        new_id: ObjectId,
+        previous_new: Box<Option<RelationOverlay>>,
+    },
     TypeSnapshot {
         id: ObjectId,
         previous: Option<TypeOverlay>,
@@ -53,6 +72,11 @@ pub(crate) enum StateChange {
     SequenceSnapshot {
         id: ObjectId,
         previous: Option<SequenceOverlay>,
+    },
+    SequenceRename {
+        old_id: ObjectId,
+        new_id: ObjectId,
+        previous_new: Box<Option<SequenceOverlay>>,
     },
     ExtensionSnapshot {
         name: String,
@@ -62,6 +86,10 @@ pub(crate) enum StateChange {
         previous: Vec<SearchPathEntry>,
         previous_template: Vec<String>,
         previous_session_template: Vec<String>,
+    },
+    TempNamespaceSnapshot {
+        previous: bool,
+        previous_search_path: Vec<SearchPathEntry>,
     },
     TimeoutSettingsSnapshot {
         lock_timeout: crate::_internal::analysis::settings::ScopedSetting<Option<u64>>,
@@ -78,6 +106,9 @@ pub(crate) enum StateChange {
     },
     GraphSnapshot {
         previous: Vec<DependencyEdge>,
+    },
+    GraphEdgeDelta {
+        delta: GraphEdgeDelta,
     },
     FunctionSnapshot {
         id: ObjectId,
@@ -111,6 +142,13 @@ pub(crate) enum StateChange {
     BaselineForeignKeysSnapshot {
         previous: HashSet<(ObjectId, String)>,
     },
+    BaselineSetRenameSnapshot {
+        set: BaselineSet,
+        old: ObjectId,
+        new: ObjectId,
+        old_present: bool,
+        new_present: bool,
+    },
     RoleContextSnapshot {
         current_role: String,
         current_role_known: bool,
@@ -120,12 +158,20 @@ pub(crate) enum StateChange {
         session_role_known: bool,
         persistent_session_role: String,
         persistent_session_role_known: bool,
+        authenticated_role: String,
+        authenticated_role_known: bool,
     },
     ConfidenceSnapshot {
         previous: crate::_internal::analysis::state::Confidence,
     },
-    EvidenceSnapshot {
-        previous: crate::_internal::analysis::evidence::EvidenceLog,
+    EvidenceLengthMarker {
+        len: usize,
+    },
+    NotEvaluatedLength {
+        len: usize,
+    },
+    CoDroppedObjectsSnapshot {
+        previous: HashSet<ObjectId>,
     },
 }
 
@@ -135,6 +181,8 @@ pub(crate) enum TransactionFrameKind {
     Savepoint(String),
 }
 
+/// A transaction or savepoint with the undo entries needed to roll it back.
+#[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug, Clone)]
 pub(crate) struct TransactionFrame {
     pub kind: TransactionFrameKind,

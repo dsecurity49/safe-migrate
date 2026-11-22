@@ -11,7 +11,7 @@ mod tests {
     use crate::_internal::sync::{
         cache_search_path, catalog_options, database_config_is_local,
         ensure_supported_postgres_version, is_local_host, is_system_schema,
-        parse_search_path_setting, relation_owner_id, sync_cache,
+        parse_search_path_setting, relation_owner_id, sync_cache, visible_column_options,
     };
     use crate::_internal::test_support::EnvironmentValueGuard;
     use serde::Serialize;
@@ -97,6 +97,36 @@ mod tests {
     }
 
     #[test]
+    fn catalog_options_ignore_internal_postgres_attribute_versioning() {
+        let options = catalog_options(
+            Some(vec!["fillfactor=80".into(), "pg_attver=103135856".into()]),
+            "column",
+        )
+        .expect("valid PostgreSQL options");
+
+        assert_eq!(options.get("fillfactor"), Some(&"80".to_string()));
+        assert!(
+            !options.contains_key("pg_attver"),
+            "PostgreSQL's internal attribute version is not schema state"
+        );
+    }
+
+    #[test]
+    fn visible_column_options_ignore_internal_postgres_attribute_versioning() {
+        let options = std::collections::BTreeMap::from([
+            ("fillfactor".to_string(), "80".to_string()),
+            ("pg_attver".to_string(), "103135856".to_string()),
+        ]);
+        let visible = visible_column_options(&options);
+
+        assert_eq!(visible.get("fillfactor"), Some(&"80".to_string()));
+        assert!(
+            !visible.contains_key("pg_attver"),
+            "cached PostgreSQL internals must not participate in schema comparison"
+        );
+    }
+
+    #[test]
     fn test_database_config_rejects_remote_hostaddr() {
         let local: postgres::Config = "host=localhost hostaddr=127.0.0.1 dbname=safe_migrate"
             .parse()
@@ -125,14 +155,22 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_requires_postgresql_14_or_newer() {
-        let error = ensure_supported_postgres_version(130_012).unwrap_err();
+    fn test_sync_requires_postgresql_14_through_18() {
+        let low_error = ensure_supported_postgres_version(130_012).unwrap_err();
         assert!(
-            error
+            low_error
                 .to_string()
-                .contains("requires PostgreSQL 14 or newer")
+                .contains("requires PostgreSQL 14 through 18")
+        );
+        let high_error = ensure_supported_postgres_version(190_000).unwrap_err();
+        assert!(
+            high_error
+                .to_string()
+                .contains("requires PostgreSQL 14 through 18")
         );
         assert!(ensure_supported_postgres_version(140_000).is_ok());
+        assert!(ensure_supported_postgres_version(180_006).is_ok());
+        assert!(ensure_supported_postgres_version(189_999).is_ok());
     }
 
     #[test]
@@ -172,6 +210,39 @@ mod tests {
         assert_eq!(
             parse_search_path_setting("\"$user\", public, \"Mixed,Schema\", \"a\"\"b\""),
             ["$user", "public", "Mixed,Schema", "a\"b"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" leading\", \"trailing \", \" both \",  normal  , public"),
+            [" leading", "trailing ", " both ", "normal", "public"]
+        );
+    }
+
+    #[test]
+    fn test_search_path_setting_parser_discards_whitespace_outside_quotes() {
+        assert_eq!(
+            parse_search_path_setting("\"billing schema\" , public"),
+            ["billing schema", "public"]
+        );
+        assert_eq!(
+            parse_search_path_setting("  public  ,  \"tenant schema\"  "),
+            ["public", "tenant schema"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" both \"   , normal"),
+            [" both ", "normal"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" leading\"  ,  \"trailing \"  ,  public"),
+            [" leading", "trailing ", "public"]
+        );
+        // Canonical PostgreSQL 18 output for the same settings.
+        assert_eq!(
+            parse_search_path_setting("\"billing schema\", public"),
+            ["billing schema", "public"]
+        );
+        assert_eq!(
+            parse_search_path_setting("\" leading\", \"trailing \", \" both \""),
+            [" leading", "trailing ", " both "]
         );
     }
 
@@ -340,7 +411,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V11(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V12(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
@@ -446,7 +517,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V11(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V12(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         let rel = deserialized.relations.get(&id).unwrap();

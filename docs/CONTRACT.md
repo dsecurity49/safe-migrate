@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.12.0's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.13.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -20,12 +20,13 @@ database.
 | `sync` | Read PostgreSQL metadata and settings into a local cache. Requires `DATABASE_URL` and a local, Unix-socket, or tunneled connection. |
 | `cache inspect` | Show cache provenance and redacted counts without a database connection. Supports `--json`. |
 | `rules` | List primary rules; `--rule <id>` selects one and `--json` emits the discovery schema. |
-| `init github-actions --path <dir>` | Generate separate PR-analysis and trusted-refresh workflows. With `--configure-secrets`, warn before secret setup when the baseline environment is missing, unverifiable, or lacks an access-protection rule. |
+| `init github-actions --path <dir>` | Generate separate PR-analysis and trusted-refresh workflows. With `--configure-secrets`, verify GitHub CLI authentication before writing files, warn before secret setup when the baseline environment is missing, unverifiable, or lacks an access-protection rule, and report when the database URL was configured but the cache key was not. |
 | `init cache-key` | Generate a random 32-byte key as 64 lowercase hexadecimal characters. |
 
 `init github-actions --configure-secrets` sends the database URL and generated
 key through authenticated GitHub CLI without printing them. It detects the
-default branch from `origin/HEAD`, falls back to `main`, and accepts `--branch`.
+default branch from `origin/HEAD` and accepts `--branch`; it fails with
+recovery guidance when detection is unavailable.
 `init cache-key --set-github-secret` sends the key instead of printing it.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
@@ -47,9 +48,11 @@ object counts. Treat that output as infrastructure metadata.
 | Human | The human-readable report. |
 | `--json` | Exactly one JSON document, without progress text, ANSI escapes, or a preamble. |
 | `--markdown` | One deterministic Markdown report, with source locations when available. |
+| `--report-dir <dir>` | Writes `safe-migrate-report.json` and `safe-migrate-report.md` from one analysis pass; standard output stays empty. |
 
-Diagnostics always use standard error. JSON, Markdown, and interactive output
-are mutually exclusive; conflicts exit `2`. Both lint commands support JSON.
+Diagnostics always use standard error. JSON, Markdown, interactive, and
+report-directory output are mutually exclusive; conflicts exit `2`. Both lint
+commands support JSON and report-directory output.
 
 ## JSON report
 
@@ -105,7 +108,7 @@ Additional top-level objects are:
 | --- | --- |
 | `summary` | `total`, `tier1`, `tier2`, and `tier3` counts. |
 | `evidence` | Ordered, deduplicated reasons for conservative analysis. Each has a stable snake-case `code`, `statement` or `chain` scope, summary, and optional file/index. It contains no SQL or credentials. |
-| `not_evaluated` | Checks that did not run for want of evidence. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. |
+| `not_evaluated` | Checks that did not run, either for want of evidence or because the operation is outside the rule's modeled scope. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. Disabled rules and rules suppressed by an inline directive are not listed. |
 | `baseline` | Cache status, provenance, observed settings, and automatic-sync result. |
 
 The `baseline` shape is:
@@ -171,8 +174,8 @@ Human, JSON, and Markdown modes must use the same exit-status policy. An
 unevaluated Tier 1-capable check caps the verdict at `CAUTIOUS`; it does not
 change the exit status, because degraded analysis (no cache, or a baseline
 scoped away from the target) is a supported mode. The report lists every
-skipped check in `not_evaluated`, with the cause and what would make it
-evaluable, in each output mode.
+skipped check in `not_evaluated`, with the cause and either what would make it
+evaluable or what to review manually, in each output mode.
 
 ## Confidence
 
@@ -194,7 +197,7 @@ PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V11 supplies typed evidence for:
+Cache V12 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
@@ -207,9 +210,10 @@ Cache V11 supplies typed evidence for:
 - every `pg_proc.prokind` with the columns that make a routine's identity
   (`proretset`, parameter names and modes, and `pronargdefaults`), plus
   publications and redacted subscriptions;
-- every `pg_type.typtype` a user can name, including range types and the
-  multirange PostgreSQL creates beside them, plus the range constructors it
-  records as internally owned by that type.
+- every `pg_type.typtype` a user can name, including composite-type attributes
+  and data-loss dependencies, range types and the multirange companion types
+  PostgreSQL creates beside them, plus the range constructors it records as
+  internally owned by that type.
 
 Catalog coverage is recorded by the loader that produced it, so a family is
 claimed only once its catalog query has completed. Missing required evidence
@@ -236,7 +240,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V11, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V12, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -254,15 +258,15 @@ report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V11 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V12 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V11 carries an explicit header, coverage and scope-completion markers,
+`sync`. V12 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V10 and unheadered caches are rejected with resync guidance. V11 remains
+V1–V11 and unheadered caches are rejected with resync guidance. V12 remains
 pre-1.0: a cache written by an earlier release may be rejected after a layout
 change, so rerun `sync`.
 

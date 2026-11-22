@@ -95,6 +95,7 @@ impl AstVisitor {
         })
     }
 
+    /// Extract index identity (synthetic when unnamed), keys, predicate, and options.
     pub(super) fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
         let table_relation = node.table_relation_name()?;
         let relation = table_relation.table_name_ref()?.path_ref()?;
@@ -208,6 +209,7 @@ impl AstVisitor {
         })
     }
 
+    /// Extract ALTER INDEX actions and the bulk tablespace form.
     pub(super) fn extract_alter_index(node: &AlterIndex) -> Option<StatementFact> {
         // Two grammar shapes: a per-index action list (IndexRef child), and the
         // bulk relocation form `ALL IN TABLESPACE src SET TABLESPACE dst`

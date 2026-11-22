@@ -70,6 +70,8 @@ impl ReindexTargetMutation {
     }
 }
 
+/// A state change with names resolved to concrete object identities. A compound
+/// statement may produce several, applied in order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Mutation {
     CreateSchema(CreateSchemaMutation),
@@ -654,6 +656,7 @@ pub(crate) struct CreateIndex {
 pub(crate) struct AlterTable {
     pub id: ObjectId,
     pub only: bool,
+    pub if_exists: bool,
     pub action: AlterTableActionMutation,
 }
 
@@ -825,6 +828,7 @@ pub(crate) struct CreateRoleMutation {
 pub(crate) struct AlterRoleMutation {
     pub name: crate::_internal::analysis::facts::RoleFact,
     pub inherits: Option<bool>,
+    pub rename_to: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -977,6 +981,11 @@ pub(crate) enum AlterTableActionMutation {
     SetDefault {
         column: String,
         default: Option<ExprIr>,
+    },
+    AddIdentity {
+        column: String,
+        generation: crate::_internal::analysis::facts::ColumnGeneration,
+        identity_sequence: IdentitySequenceOptionsMutation,
     },
     SetGeneratedExpression {
         column: String,

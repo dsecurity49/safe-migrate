@@ -53,7 +53,6 @@ mod tests {
     use crate::_internal::analysis::mutations::Mutation;
     use crate::_internal::analysis::state::MutationResult;
     use crate::api::config::Config;
-    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_conflict_rule_emits_tier1_on_conflict() {
@@ -64,18 +63,7 @@ mod tests {
         );
         let mutation =
             Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DoBlock);
-        let pre_state = crate::_internal::analysis::state::PreState {
-            relations: HashMap::new(),
-            functions: HashMap::new(),
-            roles: HashMap::new(),
-            publications: HashMap::new(),
-            subscriptions: HashMap::new(),
-            sequences: HashMap::new(),
-            extensions: HashMap::new(),
-            types: HashMap::new(),
-            indexes: Vec::new(),
-            baseline_foreign_keys: HashSet::new(),
-        };
+        let pre_state = crate::_internal::analysis::state::PreState::default();
         let state = crate::_internal::analysis::state::AnalysisState::new(
             crate::_internal::db::cache::DbCache::new(),
         );
@@ -98,18 +86,7 @@ mod tests {
         let result = MutationResult::Applied;
         let mutation =
             Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DoBlock);
-        let pre_state = crate::_internal::analysis::state::PreState {
-            relations: HashMap::new(),
-            functions: HashMap::new(),
-            roles: HashMap::new(),
-            publications: HashMap::new(),
-            subscriptions: HashMap::new(),
-            sequences: HashMap::new(),
-            extensions: HashMap::new(),
-            types: HashMap::new(),
-            indexes: Vec::new(),
-            baseline_foreign_keys: HashSet::new(),
-        };
+        let pre_state = crate::_internal::analysis::state::PreState::default();
         let state = crate::_internal::analysis::state::AnalysisState::new(
             crate::_internal::db::cache::DbCache::new(),
         );

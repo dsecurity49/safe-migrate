@@ -1,9 +1,13 @@
-use crate::_internal::analysis::evidence::EvidenceLocation;
+use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceLocation, EvidenceScope};
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::outcome::AnalysisOutcome;
 use crate::_internal::analysis::resolver::Resolver;
+#[cfg(test)]
+use crate::_internal::analysis::state::PreStateReadSet;
 use crate::_internal::analysis::state::{AnalysisState, PreState};
+use crate::_internal::analysis::transaction::TransactionFrameKind;
 use crate::_internal::ast::visitor::AstVisitor;
+use crate::_internal::engine::pre_state_footprint;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::_internal::rules::registry;
 use crate::_internal::rules::{Rule, RuleContext, TransitionRecord};
@@ -12,7 +16,34 @@ use squawk_syntax::{
     Parse, SyntaxKind,
     ast::{AstNode, SourceFile},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Byte-offset to line/column lookup built once per source file.
+struct LineIndex<'a> {
+    sql: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    fn new(sql: &'a str) -> Self {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            sql.bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        Self { sql, line_starts }
+    }
+
+    fn location(&self, start: usize) -> Option<(usize, usize)> {
+        if start > self.sql.len() || !self.sql.is_char_boundary(start) {
+            return None;
+        }
+        let line = self.line_starts.partition_point(|offset| *offset <= start);
+        let line_start = self.line_starts[line.saturating_sub(1)];
+        Some((line, self.sql[line_start..start].chars().count() + 1))
+    }
+}
 
 enum StatementCheckpoint {
     Full(Option<Box<AnalysisState>>),
@@ -20,33 +51,71 @@ enum StatementCheckpoint {
         transaction_depth: usize,
         undo_len: usize,
     },
+    StatementUndo,
+    TransactionControl {
+        shape: Vec<(TransactionFrameKind, usize)>,
+    },
+}
+
+fn is_transaction_control(mutation: &Mutation) -> bool {
+    matches!(
+        mutation,
+        Mutation::BeginTransaction
+            | Mutation::CommitTransaction
+            | Mutation::CommitAndChain
+            | Mutation::RollbackTransaction
+            | Mutation::RollbackAndChain
+            | Mutation::RollbackToSavepoint(_)
+            | Mutation::Savepoint(_)
+            | Mutation::ReleaseSavepoint(_)
+    )
+}
+
+fn is_pure_transaction_control(mutations: &[Mutation]) -> bool {
+    let mut control = false;
+    for mutation in mutations {
+        if is_transaction_control(mutation) {
+            if control {
+                return false;
+            }
+            control = true;
+        } else if !matches!(mutation, Mutation::CheckTimeouts { .. }) {
+            return false;
+        }
+    }
+    control
 }
 
 impl StatementCheckpoint {
-    fn capture(state: &AnalysisState, mutations: &[Mutation]) -> Self {
-        let changes_transaction_structure = mutations.iter().any(|mutation| {
-            matches!(
-                mutation,
-                Mutation::BeginTransaction
-                    | Mutation::CommitTransaction
-                    | Mutation::CommitAndChain
-                    | Mutation::RollbackTransaction
-                    | Mutation::RollbackAndChain
-                    | Mutation::RollbackToSavepoint(_)
-                    | Mutation::Savepoint(_)
-                    | Mutation::ReleaseSavepoint(_)
-            )
-        });
-        if !changes_transaction_structure
-            && let Some((transaction_depth, undo_len)) = state.transaction_undo_checkpoint()
-        {
-            Self::TransactionUndo {
-                transaction_depth,
-                undo_len,
+    fn capture(
+        state: &mut AnalysisState,
+        mutations: &[Mutation],
+        force_full: bool,
+        transaction_control: bool,
+    ) -> Self {
+        debug_assert!(
+            state.local.statement_undo_log.is_none(),
+            "the previous statement's undo journal must be closed before the next checkpoint"
+        );
+        state.local.statement_snapshot_ids.clear();
+        if !force_full {
+            if is_pure_transaction_control(mutations) {
+                let shape = state.transaction_shape();
+                state.begin_statement_undo();
+                return Self::TransactionControl { shape };
             }
-        } else {
-            Self::Full(Some(Box::new(state.clone())))
+            if !transaction_control {
+                if let Some((transaction_depth, undo_len)) = state.transaction_undo_checkpoint() {
+                    return Self::TransactionUndo {
+                        transaction_depth,
+                        undo_len,
+                    };
+                }
+                state.begin_statement_undo();
+                return Self::StatementUndo;
+            }
         }
+        Self::Full(Some(Box::new(state.clone())))
     }
 
     fn restore(&mut self, state: &mut AnalysisState) -> Result<(), String> {
@@ -64,13 +133,47 @@ impl StatementCheckpoint {
             } => state
                 .rollback_to_transaction_undo_checkpoint(*transaction_depth, *undo_len)
                 .map_err(str::to_string),
+            Self::StatementUndo => state.rollback_statement_undo().map_err(str::to_string),
+            Self::TransactionControl { shape } => {
+                if state.transaction_shape() != *shape {
+                    return Err(
+                        "transaction-control statement changed transaction structure before failing"
+                            .to_string(),
+                    );
+                }
+                state.rollback_statement_undo().map_err(str::to_string)
+            }
         }
     }
+
+    fn finish(self, state: &mut AnalysisState) {
+        if matches!(self, Self::StatementUndo | Self::TransactionControl { .. }) {
+            state.commit_statement_undo();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatementCheckpointMode {
+    Journal,
+    Full,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum PreStateCaptureMode {
+    Selective,
+    Full,
 }
 
 pub(crate) struct SafeMigrateEngine {
     config: Config,
     rules: Vec<Box<dyn Rule>>,
+    #[cfg(test)]
+    pre_state_mode: PreStateCaptureMode,
+    #[cfg(test)]
+    statement_checkpoint_mode: StatementCheckpointMode,
 }
 
 impl SafeMigrateEngine {
@@ -78,6 +181,35 @@ impl SafeMigrateEngine {
         Self {
             config,
             rules: registry::build_primary_rules(),
+            #[cfg(test)]
+            pre_state_mode: PreStateCaptureMode::Selective,
+            #[cfg(test)]
+            statement_checkpoint_mode: StatementCheckpointMode::Journal,
+        }
+    }
+
+    /// Verifies selective capture against the full snapshot in tests.
+    #[cfg(test)]
+    pub(crate) fn with_full_pre_state_for_tests(mut self) -> Self {
+        self.pre_state_mode = PreStateCaptureMode::Full;
+        self
+    }
+
+    /// Verifies the statement undo journal against the full checkpoint in tests.
+    #[cfg(test)]
+    pub(crate) fn with_full_statement_checkpoint_for_tests(mut self) -> Self {
+        self.statement_checkpoint_mode = StatementCheckpointMode::Full;
+        self
+    }
+
+    fn force_full_statement_checkpoint(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.statement_checkpoint_mode == StatementCheckpointMode::Full
+        }
+        #[cfg(not(test))]
+        {
+            false
         }
     }
 
@@ -147,15 +279,19 @@ impl SafeMigrateEngine {
                 .collect();
             let violations =
                 self.analyze_parsed_file(filename, &normalized_sql, sql, &parsed, state)?;
+            let line_index = LineIndex::new(&normalized_sql);
             findings.extend(
                 violations
                     .into_iter()
                     .map(|violation| {
                         let statement_index = violation.source_range.and_then(|range| {
-                            statement_ranges
-                                .iter()
-                                .position(|statement| statement.contains_range(range))
-                                .map(|index| index + 1)
+                            // Statement ranges are sorted and non-overlapping; use
+                            // partition_point to find the candidate in O(log n).
+                            let i =
+                                statement_ranges.partition_point(|s| s.start() <= range.start());
+                            i.checked_sub(1)
+                                .filter(|&i| statement_ranges[i].contains_range(range))
+                                .map(|i| i + 1)
                         });
                         let certainty =
                             crate::_internal::report::violations::certainty_for_statement(
@@ -168,7 +304,7 @@ impl SafeMigrateEngine {
                         ReportFinding {
                             location: Self::source_location(
                                 filename,
-                                &normalized_sql,
+                                &line_index,
                                 violation.source_range,
                             ),
                             statement_index,
@@ -260,6 +396,9 @@ impl SafeMigrateEngine {
         self.analyze_parsed_file(filename, sql, sql, &parsed, state)
     }
 
+    /// Analyze one file statement by statement. Each statement is atomic: its
+    /// state, findings, and deduplication keys are kept only if every action
+    /// succeeds.
     fn analyze_parsed_file(
         &self,
         filename: &str,
@@ -282,7 +421,7 @@ impl SafeMigrateEngine {
         let mut warned_keys = HashSet::new();
         let mut pre_state = PreState::default();
 
-        let mut file_ignores = HashSet::new();
+        let mut file_ignores = HashMap::new();
         for token in parsed
             .tree()
             .syntax()
@@ -290,8 +429,13 @@ impl SafeMigrateEngine {
             .filter_map(|it| it.into_token())
             .filter(|token| token.kind() == SyntaxKind::COMMENT)
         {
-            let mut dummy = HashSet::new();
-            Self::parse_directives(token.text(), &mut file_ignores, &mut dummy);
+            let mut dummy = HashMap::new();
+            Self::parse_directives(
+                token.text(),
+                token.text_range(),
+                &mut file_ignores,
+                &mut dummy,
+            );
         }
 
         for (statement_offset, stmt) in parsed.tree().stmts().enumerate() {
@@ -299,7 +443,7 @@ impl SafeMigrateEngine {
                 file: filename.to_string(),
                 statement_index: statement_offset + 1,
             }));
-            let mut stmt_ignores = HashSet::new();
+            let mut stmt_ignores = HashMap::new();
 
             let mut prev = stmt.syntax().prev_sibling_or_token();
             while let Some(element) = prev {
@@ -309,8 +453,13 @@ impl SafeMigrateEngine {
                 if let Some(token) = element.as_token()
                     && token.kind() == SyntaxKind::COMMENT
                 {
-                    let mut dummy = HashSet::new();
-                    Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
+                    let mut dummy = HashMap::new();
+                    Self::parse_directives(
+                        token.text(),
+                        token.text_range(),
+                        &mut dummy,
+                        &mut stmt_ignores,
+                    );
                 }
                 prev = element.prev_sibling_or_token();
             }
@@ -321,8 +470,13 @@ impl SafeMigrateEngine {
                 .filter_map(|it| it.into_token())
                 .filter(|token| token.kind() == SyntaxKind::COMMENT)
             {
-                let mut dummy = HashSet::new();
-                Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
+                let mut dummy = HashMap::new();
+                Self::parse_directives(
+                    token.text(),
+                    token.text_range(),
+                    &mut dummy,
+                    &mut stmt_ignores,
+                );
             }
 
             // Capture raw statement text for sql field on violations (strip leading comments)
@@ -345,6 +499,7 @@ impl SafeMigrateEngine {
             // ignoring it would claim exact confidence for later SQL.
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
+            let mut fallback_source_range: Option<rowan::TextRange> = None;
             let mut mutations = match AstVisitor::extract(&stmt) {
                 Some(fact) => Resolver::resolve(&fact, state),
                 None => vec![Mutation::Opaque(
@@ -358,20 +513,10 @@ impl SafeMigrateEngine {
                 mutations.push(Mutation::CheckTimeouts { subject });
             }
             let started_in_transaction = state.in_transaction();
-            let transaction_control = mutations.iter().any(|mutation| {
-                matches!(
-                    mutation,
-                    Mutation::BeginTransaction
-                        | Mutation::CommitTransaction
-                        | Mutation::CommitAndChain
-                        | Mutation::RollbackTransaction
-                        | Mutation::RollbackAndChain
-                        | Mutation::RollbackToSavepoint(_)
-                        | Mutation::Savepoint(_)
-                        | Mutation::ReleaseSavepoint(_)
-                )
-            });
-            let mut statement_checkpoint = StatementCheckpoint::capture(state, &mutations);
+            let transaction_control = mutations.iter().any(is_transaction_control);
+            let force_full = self.force_full_statement_checkpoint();
+            let mut statement_checkpoint =
+                StatementCheckpoint::capture(state, &mutations, force_full, transaction_control);
             let mut statement_failed = false;
 
             for mutation in mutations {
@@ -382,7 +527,17 @@ impl SafeMigrateEngine {
                     _ => None,
                 };
 
-                state.capture_pre_state_into(&mut pre_state);
+                #[cfg(not(test))]
+                let reads =
+                    pre_state_footprint::for_mutation(state, &mutation, pre_cascade.as_ref());
+                #[cfg(test)]
+                let reads = match self.pre_state_mode {
+                    PreStateCaptureMode::Selective => {
+                        pre_state_footprint::for_mutation(state, &mutation, pre_cascade.as_ref())
+                    }
+                    PreStateCaptureMode::Full => PreStateReadSet::full(),
+                };
+                state.capture_pre_state_into(&mut pre_state, &reads);
                 let result = state.apply(&mutation, pre_cascade.as_ref());
 
                 statement_failed = matches!(
@@ -404,66 +559,128 @@ impl SafeMigrateEngine {
                 }
 
                 if result == crate::_internal::analysis::state::MutationResult::NotExecuted {
+                    if state.transaction_is_aborted() {
+                        state.taint(EvidenceCode::TransactionAborted, EvidenceScope::Chain);
+                        for rule in &self.rules {
+                            let inline_range = stmt_ignores
+                                .get(rule.id())
+                                .or_else(|| file_ignores.get(rule.id()))
+                                .copied();
+                            if let Some(directive_range) = inline_range {
+                                if !self.config.allow_inline_suppressions {
+                                    Self::record_inline_suppression_disabled(
+                                        rule.id(),
+                                        directive_range,
+                                        stmt_text,
+                                        &warned_keys,
+                                        &mut statement_warned_keys,
+                                        &mut statement_violations,
+                                    );
+                                }
+                                continue;
+                            }
+                            if self.config.is_rule_disabled(rule.id()) {
+                                continue;
+                            }
+                            state.record_not_evaluated(
+                                crate::_internal::report::violations::NotEvaluated {
+                                    rule_id: rule.id(),
+                                    tier: rule.default_tier(),
+                                    cause: EvidenceCode::TransactionAborted,
+                                    sql: Some(stmt_text.trim().to_string()),
+                                    recipe:
+                                        crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                            EvidenceCode::TransactionAborted,
+                                            &[],
+                                            None,
+                                        ),
+                                    missing_schemas: Vec::new(),
+                                },
+                            );
+                        }
+                    }
                     continue;
                 }
 
+                let transition =
+                    TransitionRecord::new(&mutation, &result, &pre_state, pre_cascade.as_ref());
+                let mut unresolved_context: Option<(Vec<String>, String)> = None;
+
                 for rule in &self.rules {
-                    let is_inline_ignored =
-                        file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
+                    let inline_range = stmt_ignores
+                        .get(rule.id())
+                        .or_else(|| file_ignores.get(rule.id()))
+                        .copied();
 
-                    if is_inline_ignored && !self.config.allow_inline_suppressions {
-                        statement_violations.push(crate::_internal::report::violations::Violation {
-                            source_range: None,
-                            rule_id: "inline-suppression-disabled",
-                            object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
-                            object_name: "".to_string(),
-                            tier: crate::_internal::report::violations::ViolationTier::Tier1,
-                            reason: format!("Inline suppression of rule '{}' is not allowed by configuration", rule.id()),
-                            recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
-                            dedup_key: Some(format!("inline-suppression-disabled:{}", rule.id())),
-                            sql: None,
-
-                        });
-                        // Skip evaluating the rule since it was requested to be ignored,
-                        // but the build will fail anyway due to the Tier1 config violation.
+                    if let Some(directive_range) = inline_range {
+                        if !self.config.allow_inline_suppressions {
+                            Self::record_inline_suppression_disabled(
+                                rule.id(),
+                                directive_range,
+                                stmt_text,
+                                &warned_keys,
+                                &mut statement_warned_keys,
+                                &mut statement_violations,
+                            );
+                        }
+                        // The rule was suppressed, so it must not run. With
+                        // enforcement enabled the configuration finding still
+                        // fails the build.
                         continue;
                     }
 
-                    if self.config.is_rule_disabled(rule.id()) || is_inline_ignored {
+                    if self.config.is_rule_disabled(rule.id()) {
                         continue;
                     }
 
-                    let transition =
-                        TransitionRecord::new(&mutation, &result, &pre_state, pre_cascade.as_ref());
                     if let Some(cause) = result.unresolved_cause()
                         && !rule.evaluates_when_unresolved(&transition)
                     {
+                        let (missing_schemas, recipe) =
+                            unresolved_context.get_or_insert_with(|| {
+                                let mut missing_schemas = state.external_referenced_schemas();
+                                if let Some((_, obj_name)) = mutation.primary_object()
+                                    && let Some(schema) =
+                                        state.baseline_scope_omits_displayed_object(&obj_name)
+                                    && !missing_schemas.iter().any(|s| s == schema)
+                                {
+                                    missing_schemas.push(schema.to_string());
+                                }
+
+                                let configured_or_synced_scope =
+                                    self.config.schema_scope().map(|s| s.to_vec()).or_else(|| {
+                                        state
+                                            .baseline_schemas
+                                            .as_ref()
+                                            .map(|s| s.iter().cloned().collect::<Vec<_>>())
+                                    });
+
+                                let recipe =
+                                    crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                        cause,
+                                        &missing_schemas,
+                                        configured_or_synced_scope.as_deref(),
+                                    );
+                                (missing_schemas, recipe)
+                            });
+
                         state.record_not_evaluated(
                             crate::_internal::report::violations::NotEvaluated {
                                 rule_id: rule.id(),
                                 tier: rule.default_tier(),
                                 cause,
                                 sql: Some(stmt_text.trim().to_string()),
-                                recipe:
-                                    crate::_internal::report::violations::NotEvaluated::recipe_for(
-                                        cause,
-                                        &state.external_referenced_schemas(),
-                                    ),
-                                missing_schemas: state.external_referenced_schemas(),
+                                recipe: recipe.clone(),
+                                missing_schemas: missing_schemas.clone(),
                             },
                         );
                         continue;
                     }
 
-                    let rule_context = RuleContext::new(
-                        &mutation,
-                        &result,
-                        &pre_state,
-                        state,
-                        &self.config,
-                        pre_cascade.as_ref(),
-                    );
+                    let rule_context =
+                        RuleContext::from_transition(transition, state, &self.config);
                     let violations = rule.evaluate(&rule_context);
+                    let coverage_gap = rule.not_evaluated_cause(&rule_context);
 
                     // A capability is relevant only when this rule actually
                     // produces a finding for the current mutation. Recording
@@ -495,20 +712,23 @@ impl SafeMigrateEngine {
                         }
                         let mut v = v;
                         if v.source_range.is_none() {
-                            let start = stmt
-                                .syntax()
-                                .descendants_with_tokens()
-                                .filter_map(|element| element.into_token())
-                                .find(|token| {
-                                    let text = token.text().trim();
-                                    !text.is_empty()
-                                        && !text.starts_with("--")
-                                        && !text.starts_with("/*")
-                                })
-                                .map(|token| token.text_range().start())
-                                .unwrap_or_else(|| stmt.syntax().text_range().start());
-                            let end = stmt.syntax().text_range().end();
-                            v.source_range = Some(rowan::TextRange::new(start, end));
+                            let fallback = *fallback_source_range.get_or_insert_with(|| {
+                                let start = stmt
+                                    .syntax()
+                                    .descendants_with_tokens()
+                                    .filter_map(|element| element.into_token())
+                                    .find(|token| {
+                                        let text = token.text().trim();
+                                        !text.is_empty()
+                                            && !text.starts_with("--")
+                                            && !text.starts_with("/*")
+                                    })
+                                    .map(|token| token.text_range().start())
+                                    .unwrap_or_else(|| stmt.syntax().text_range().start());
+                                let end = stmt.syntax().text_range().end();
+                                rowan::TextRange::new(start, end)
+                            });
+                            v.source_range = Some(fallback);
                         }
                         if v.sql.is_none() {
                             if let Some(range) = v.source_range {
@@ -527,12 +747,31 @@ impl SafeMigrateEngine {
                         // derived per finding from the evidence log.
                         statement_violations.push(v);
                     }
+
+                    if let Some(cause) = coverage_gap {
+                        state.record_not_evaluated(
+                            crate::_internal::report::violations::NotEvaluated {
+                                rule_id: rule.id(),
+                                tier: rule.default_tier(),
+                                cause,
+                                sql: Some(stmt_text.trim().to_string()),
+                                recipe: crate::_internal::report::violations::NotEvaluated::recipe_with_scope(
+                                    cause,
+                                    &[],
+                                    None,
+                                ),
+                                missing_schemas: Vec::new(),
+                            },
+                        );
+                    }
                 }
 
                 if statement_failed {
                     break;
                 }
             }
+
+            statement_checkpoint.finish(state);
 
             if !statement_failed
                 && !started_in_transaction
@@ -552,22 +791,10 @@ impl SafeMigrateEngine {
 
     fn source_location(
         filename: &str,
-        sql: &str,
+        line_index: &LineIndex<'_>,
         source_range: Option<rowan::TextRange>,
     ) -> Option<SourceLocation> {
-        let start = usize::from(source_range?.start());
-        if start > sql.len() || !sql.is_char_boundary(start) {
-            return None;
-        }
-
-        let before = &sql[..start];
-        let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let column = before
-            .rsplit_once('\n')
-            .map_or(before, |(_, final_line)| final_line)
-            .chars()
-            .count()
-            + 1;
+        let (line, column) = line_index.location(usize::from(source_range?.start()))?;
         Some(SourceLocation {
             file: filename.to_string(),
             line,
@@ -580,32 +807,110 @@ impl SafeMigrateEngine {
     /// string literal). Rewriting to DO lets the parser produce a proper
     /// DoBlock node. Keep the replacement byte-for-byte the same length so
     /// source ranges still point into the original migration text.
-    fn normalize_execute(sql: &str) -> String {
-        let mut out = String::with_capacity(sql.len());
-        for line in sql.split_inclusive('\n') {
-            let trimmed = line.trim_start();
-            let bytes = trimmed.as_bytes();
-            if bytes.len() > 9 && bytes[..9].eq_ignore_ascii_case(b"EXECUTE '") {
-                let indent = &line[..line.len() - trimmed.len()];
-                out.push_str(indent);
-                out.push_str("DO      '");
-                out.push_str(&trimmed[9..]);
-            } else if bytes.len() > 10 && bytes[..10].eq_ignore_ascii_case(b"EXECUTE $$") {
-                let indent = &line[..line.len() - trimmed.len()];
-                out.push_str(indent);
-                out.push_str("DO      $$");
-                out.push_str(&trimmed[10..]);
-            } else {
-                out.push_str(line);
+    ///
+    /// The scan is lexical rather than line-based so string literals, quoted
+    /// identifiers, dollar-quoted bodies, and comments cannot be mistaken for
+    /// statement starts.
+    fn normalize_execute<'a>(sql: &'a str) -> std::borrow::Cow<'a, str> {
+        let bytes = sql.as_bytes();
+        let mut index = 0;
+        let mut at_statement_start = true;
+        let mut rewrite_offsets = Vec::new();
+
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\'' => {
+                    index = skip_quoted_string(bytes, index);
+                    at_statement_start = false;
+                }
+                b'"' => {
+                    index = skip_quoted_identifier(bytes, index);
+                    at_statement_start = false;
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    index = skip_line_comment(bytes, index);
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index = skip_block_comment(bytes, index);
+                }
+                b'$' if !preceded_by_identifier(bytes, index) => {
+                    if let Some(end) = dollar_quote_end(bytes, index) {
+                        index = end;
+                        at_statement_start = false;
+                    } else {
+                        index += 1;
+                        at_statement_start = false;
+                    }
+                }
+                b';' => {
+                    index += 1;
+                    at_statement_start = true;
+                }
+                byte if byte.is_ascii_whitespace() => index += 1,
+                _ => {
+                    if at_statement_start
+                        && starts_with_keyword(bytes, index, b"EXECUTE")
+                        && next_token_is_string(bytes, index + b"EXECUTE".len())
+                    {
+                        rewrite_offsets.push(index);
+                    }
+                    index += 1;
+                    at_statement_start = false;
+                }
             }
         }
-        out
+
+        if rewrite_offsets.is_empty() {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+
+        let mut mutated = bytes.to_vec();
+        for offset in rewrite_offsets {
+            mutated[offset..offset + b"EXECUTE".len()].copy_from_slice(b"DO     ");
+        }
+        std::borrow::Cow::Owned(
+            String::from_utf8(mutated)
+                .expect("normalization replaces ASCII bytes with ASCII bytes"),
+        )
     }
 
+    fn record_inline_suppression_disabled(
+        rule_id: &str,
+        directive_range: rowan::TextRange,
+        stmt_text: &str,
+        warned_keys: &HashSet<String>,
+        statement_warned_keys: &mut HashSet<String>,
+        statement_violations: &mut Vec<Violation>,
+    ) {
+        let key = format!(
+            "inline-suppression-disabled:{rule_id}:{}",
+            usize::from(directive_range.start())
+        );
+        if warned_keys.contains(&key) || !statement_warned_keys.insert(key.clone()) {
+            return;
+        }
+        statement_violations.push(Violation {
+            source_range: Some(directive_range),
+            rule_id: "inline-suppression-disabled",
+            object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
+            object_name: String::new(),
+            tier: crate::_internal::report::violations::ViolationTier::Tier1,
+            reason: format!(
+                "Inline suppression of rule '{rule_id}' is not allowed by configuration"
+            ),
+            recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
+            dedup_key: Some(key),
+            sql: Some(stmt_text.trim().to_string()),
+        });
+    }
+
+    /// Scans a comment for `safe-migrate: ignore-file(...)` and
+    /// `safe-migrate: ignore(...)` directives.
     fn parse_directives(
         text: &str,
-        file_ignores: &mut HashSet<String>,
-        stmt_ignores: &mut HashSet<String>,
+        range: rowan::TextRange,
+        file_ignores: &mut HashMap<String, rowan::TextRange>,
+        stmt_ignores: &mut HashMap<String, rowan::TextRange>,
     ) {
         let marker = "safe-migrate:";
         let mut pos = 0;
@@ -619,7 +924,9 @@ impl SafeMigrateEngine {
                     .strip_prefix('(')
                     .and_then(|s| s.find(')').map(|e| &s[..e]))
                 {
-                    file_ignores.insert(inner.trim().to_string());
+                    file_ignores
+                        .entry(inner.trim().to_string())
+                        .or_insert(range);
                 }
             } else if let Some(rest) = after.strip_prefix("ignore") {
                 let rest = rest.trim_start();
@@ -627,7 +934,9 @@ impl SafeMigrateEngine {
                     .strip_prefix('(')
                     .and_then(|s| s.find(')').map(|e| &s[..e]))
                 {
-                    stmt_ignores.insert(inner.trim().to_string());
+                    stmt_ignores
+                        .entry(inner.trim().to_string())
+                        .or_insert(range);
                 }
             }
 
@@ -635,7 +944,9 @@ impl SafeMigrateEngine {
         }
     }
 
-    fn strip_sql_leading_comments(s: &str) -> String {
+    /// Returns the first token after leading whitespace, line comments, and
+    /// block comments.
+    fn strip_sql_leading_comments(s: &str) -> &str {
         let mut pos = 0;
         let bytes = s.as_bytes();
         while pos < bytes.len() {
@@ -660,6 +971,224 @@ impl SafeMigrateEngine {
             }
             break;
         }
-        s[pos..].to_string()
+        &s[pos..]
+    }
+}
+
+fn starts_with_keyword(bytes: &[u8], start: usize, word: &[u8]) -> bool {
+    let end = start + word.len();
+    end <= bytes.len()
+        && bytes[start..end].eq_ignore_ascii_case(word)
+        && bytes.get(end).is_none_or(|byte| !is_identifier_byte(*byte))
+}
+
+/// Reports whether the next SQL token is a string or dollar-quoted literal,
+/// skipping whitespace and comments.
+fn next_token_is_string(bytes: &[u8], mut index: usize) -> bool {
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
+            index = skip_line_comment(bytes, index);
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_block_comment(bytes, index);
+            continue;
+        }
+        break;
+    }
+
+    match bytes.get(index) {
+        Some(b'\'') => true,
+        Some(b'$') => dollar_quote_end(bytes, index).is_some(),
+        _ => false,
+    }
+}
+
+fn skip_quoted_string(bytes: &[u8], start: usize) -> usize {
+    let backslash_escapes = is_escape_string_quote(bytes, start);
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if backslash_escapes => index += 2,
+            b'\'' if bytes.get(index + 1) == Some(&b'\'') => index += 2,
+            b'\'' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn is_escape_string_quote(bytes: &[u8], quote: usize) -> bool {
+    if quote == 0 {
+        return false;
+    }
+    quote > 0
+        && bytes[quote - 1].eq_ignore_ascii_case(&b'E')
+        && (quote < 2 || !is_identifier_byte(bytes[quote - 2]))
+}
+
+fn skip_quoted_identifier(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            if bytes.get(index + 1) == Some(&b'"') {
+                index += 2;
+            } else {
+                return index + 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'/' && bytes[index + 1] == b'*' {
+            depth += 1;
+            index += 2;
+        } else if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+            depth = depth.saturating_sub(1);
+            index += 2;
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+/// Validates a dollar-quote tag and returns the offset just past its closing
+/// delimiter, or the end of input if unterminated.
+fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut tag_end = start + 1;
+    if bytes.get(tag_end).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    while tag_end < bytes.len() && is_dollar_tag_byte(bytes[tag_end]) {
+        tag_end += 1;
+    }
+    if bytes.get(tag_end) != Some(&b'$') {
+        return None;
+    }
+    let tag = &bytes[start..=tag_end];
+    let mut index = tag_end + 1;
+    while index + tag.len() <= bytes.len() {
+        if &bytes[index..index + tag.len()] == tag {
+            return Some(index + tag.len());
+        }
+        index += 1;
+    }
+    Some(bytes.len())
+}
+
+fn is_dollar_tag_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+fn preceded_by_identifier(bytes: &[u8], index: usize) -> bool {
+    index > 0 && is_identifier_byte(bytes[index - 1])
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || !byte.is_ascii()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SafeMigrateEngine;
+
+    #[test]
+    fn normalize_execute_rewrites_statement_after_same_line_statement() {
+        let sql = "SELECT 1; EXECUTE 'DROP TABLE x';";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "SELECT 1; DO      'DROP TABLE x';"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_leaves_execute_text_inside_multiline_literal() {
+        let sql = "INSERT INTO logs (msg) VALUES ('first line\nEXECUTE ''second line'');";
+        assert_eq!(SafeMigrateEngine::normalize_execute(sql), sql);
+    }
+
+    #[test]
+    fn normalize_execute_leaves_execute_text_inside_comments() {
+        let sql = "/*\nEXECUTE 'DROP TABLE x';\n-- EXECUTE 'DROP TABLE y';\n*/\nSELECT 1;";
+        assert_eq!(SafeMigrateEngine::normalize_execute(sql), sql);
+    }
+
+    #[test]
+    fn normalize_execute_rewrites_after_preceding_comment() {
+        let sql = "-- leading comment\nEXECUTE 'DROP TABLE x';";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "-- leading comment\nDO      'DROP TABLE x';"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_rewrites_dollar_quoted_body_with_tag() {
+        let sql = "EXECUTE $body$SELECT 'EXECUTE ''x'';'$body$;";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "DO      $body$SELECT 'EXECUTE ''x'';'$body$;"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_leaves_prepared_statement_and_identifier_dollars() {
+        let sql = "EXECUTE my_plan; SELECT a$b$ FROM t; EXECUTE format('SELECT 1');";
+        assert_eq!(SafeMigrateEngine::normalize_execute(sql), sql);
+    }
+
+    #[test]
+    fn normalize_execute_respects_escape_string_quotes() {
+        let sql = "SELECT E'it\\'s; EXECUTE ''x'''; EXECUTE 'DROP TABLE t';";
+        assert_eq!(
+            SafeMigrateEngine::normalize_execute(sql),
+            "SELECT E'it\\'s; EXECUTE ''x'''; DO      'DROP TABLE t';"
+        );
+    }
+
+    #[test]
+    fn normalize_execute_preserves_byte_length_and_non_ascii_text() {
+        let sql = "SELECT 'é'; EXECUTE 'DROP TABLE x';";
+        let normalized = SafeMigrateEngine::normalize_execute(sql);
+        assert_eq!(normalized.len(), sql.len());
+        assert_eq!(normalized, "SELECT 'é'; DO      'DROP TABLE x';");
+    }
+
+    #[test]
+    fn normalize_execute_borrows_when_no_rewrite_needed() {
+        let sql = "SELECT 1; INSERT INTO t VALUES ('EXECUTE');";
+        let res = SafeMigrateEngine::normalize_execute(sql);
+        assert!(matches!(res, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn normalize_execute_owns_when_rewrite_performed() {
+        let sql = "EXECUTE 'DROP TABLE x';";
+        let res = SafeMigrateEngine::normalize_execute(sql);
+        assert!(matches!(res, std::borrow::Cow::Owned(_)));
     }
 }

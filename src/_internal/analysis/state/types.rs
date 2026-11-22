@@ -2,6 +2,8 @@ use super::*;
 use crate::_internal::model::relation::RelationState;
 
 impl AnalysisState {
+    /// Resolve a type spelling against local overlays, row types, and the
+    /// search path, preserving array element identity.
     pub(super) fn resolve_type_reference_from_catalog(
         raw: &str,
         types: &HashMap<ObjectId, TypeOverlay>,
@@ -95,7 +97,7 @@ impl AnalysisState {
             || self.resolve_type_reference(declared).is_some()
     }
 
-    fn strip_array_type_id(id: &ObjectId) -> (ObjectId, bool) {
+    pub(crate) fn strip_array_type_id(id: &ObjectId) -> (ObjectId, bool) {
         let mut name = id.name.as_str();
         let mut is_array = false;
         while let Some(stripped) = name.strip_suffix("[]") {
@@ -105,34 +107,41 @@ impl AnalysisState {
         (ObjectId::new(&id.schema, name), is_array)
     }
 
+    /// Collect a domain and every domain derived from it through local
+    /// base-type links; baseline-only derivations are not followed.
     pub(crate) fn domain_closure(&self, domain: &ObjectId) -> HashSet<ObjectId> {
+        let mut derived_by_base: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for (id, overlay) in &self.local.types {
+            let TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Domain {
+                        base_type_id: Some(base),
+                        ..
+                    },
+                ..
+            }) = overlay
+            else {
+                continue;
+            };
+            derived_by_base
+                .entry(base.clone())
+                .or_default()
+                .push(id.clone());
+        }
+
         let mut domains = HashSet::from([domain.clone()]);
-        loop {
-            let mut changed = false;
-            for (id, overlay) in &self.local.types {
-                if domains.contains(id) {
-                    continue;
+        let mut pending = vec![domain.clone()];
+        while let Some(base) = pending.pop() {
+            let Some(derived) = derived_by_base.get(&base) else {
+                continue;
+            };
+            for id in derived {
+                if domains.insert(id.clone()) {
+                    pending.push(id.clone());
                 }
-                let TypeOverlay::Present(TypeState {
-                    kind:
-                        TypeKind::Domain {
-                            base_type_id: Some(base),
-                            ..
-                        },
-                    ..
-                }) = overlay
-                else {
-                    continue;
-                };
-                if domains.contains(base) {
-                    domains.insert(id.clone());
-                    changed = true;
-                }
-            }
-            if !changed {
-                return domains;
             }
         }
+        domains
     }
 
     /// Relations whose columns use the domain or a domain derived from it.

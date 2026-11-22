@@ -1,6 +1,8 @@
 use super::*;
 
 impl AnalysisState {
+    /// Collect everything a cascading drop removes from `target_oid`, following
+    /// current dependency edges through the whole closure.
     pub(crate) fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
         let mut result = CascadeResult::default();
         let mut visited = HashSet::new();
@@ -47,78 +49,83 @@ impl AnalysisState {
         }
     }
 
+    /// Walk the dependency graph depth-first from `current`, resolving renames
+    /// and skipping edges from an older relation incarnation. Views, partitions,
+    /// and inheriting tables join the traversal; indexes and foreign keys are
+    /// recorded as removed objects.
     pub(super) fn walk_cascade(
         &self,
         current: &ObjectId,
         visited: &mut HashSet<ObjectId>,
         result: &mut CascadeResult,
     ) {
-        let resolved_current = self.local.graph.resolve_rename(current).clone();
+        let mut queue = vec![current.clone()];
 
-        if !visited.insert(resolved_current.clone()) {
-            return;
-        }
+        while let Some(node) = queue.pop() {
+            let resolved_current = self.local.graph.resolve_rename(&node).clone();
 
-        result.dropped_relations.insert(resolved_current.clone());
-
-        if self.local.graph.cascade_index_is_worthwhile() {
-            for edge in self.local.graph.cascade_edges(&resolved_current) {
-                self.walk_cascade_edge(edge, &resolved_current, visited, result);
+            if !visited.insert(resolved_current.clone()) {
+                continue;
             }
-        } else {
-            for edge in self.local.graph.edges() {
-                self.walk_cascade_edge(edge, &resolved_current, visited, result);
-            }
-        }
-    }
 
-    pub(super) fn walk_cascade_edge(
-        &self,
-        edge: &DependencyEdge,
-        resolved_current: &ObjectId,
-        visited: &mut HashSet<ObjectId>,
-        result: &mut CascadeResult,
-    ) {
-        if !self.dependency_edge_is_current(edge) {
-            return;
-        }
-        match &edge.kind {
-            DependencyKind::ViewDependency { .. } => {
-                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current {
-                    let resolved_view_id = self.local.graph.resolve_rename(&edge.dependent).clone();
-                    if !visited.contains(&resolved_view_id) {
-                        self.walk_cascade(&resolved_view_id, visited, result);
+            result.dropped_relations.insert(resolved_current.clone());
+
+            let mut process_edge = |edge: &DependencyEdge| {
+                if !self.dependency_edge_is_current(edge) {
+                    return;
+                }
+                match &edge.kind {
+                    DependencyKind::ViewDependency { .. } => {
+                        if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current {
+                            let resolved_view_id =
+                                self.local.graph.resolve_rename(&edge.dependent).clone();
+                            if !visited.contains(&resolved_view_id) {
+                                queue.push(resolved_view_id);
+                            }
+                        }
                     }
+                    DependencyKind::IndexOnRelation { .. } => {
+                        if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current {
+                            result
+                                .dropped_indexes
+                                .insert(self.local.graph.resolve_rename(&edge.dependent).clone());
+                        }
+                    }
+                    DependencyKind::ForeignKey {
+                        constraint_name, ..
+                    } => {
+                        if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current
+                            && let Some(cname) = constraint_name
+                        {
+                            result.dropped_constraints.insert((
+                                self.local.graph.resolve_rename(&edge.dependent).clone(),
+                                cname.clone(),
+                            ));
+                        }
+                    }
+                    DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                        if self.local.graph.resolve_rename(&edge.referenced)
+                            == &resolved_current =>
+                    {
+                        let resolved_child =
+                            self.local.graph.resolve_rename(&edge.dependent).clone();
+                        if !visited.contains(&resolved_child) {
+                            queue.push(resolved_child);
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            if self.local.graph.cascade_index_is_worthwhile() {
+                for edge in self.local.graph.cascade_edges(&resolved_current) {
+                    process_edge(edge);
+                }
+            } else {
+                for edge in self.local.graph.edges() {
+                    process_edge(edge);
                 }
             }
-            DependencyKind::IndexOnRelation { .. } => {
-                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current {
-                    result
-                        .dropped_indexes
-                        .insert(self.local.graph.resolve_rename(&edge.dependent).clone());
-                }
-            }
-            DependencyKind::ForeignKey {
-                constraint_name, ..
-            } => {
-                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current
-                    && let Some(cname) = constraint_name
-                {
-                    result.dropped_constraints.insert((
-                        self.local.graph.resolve_rename(&edge.dependent).clone(),
-                        cname.clone(),
-                    ));
-                }
-            }
-            DependencyKind::InheritanceOf | DependencyKind::PartitionOf
-                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current =>
-            {
-                let resolved_child = self.local.graph.resolve_rename(&edge.dependent).clone();
-                if !visited.contains(&resolved_child) {
-                    self.walk_cascade(&resolved_child, visited, result);
-                }
-            }
-            _ => {}
         }
     }
 }

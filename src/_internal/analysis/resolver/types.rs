@@ -11,6 +11,7 @@ use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::types::TypeKind;
 
 impl Resolver {
+    /// Resolve a CREATE TYPE fact, including its multirange name.
     pub(super) fn resolve_create_type(fact: &CreateTypeFact, state: &AnalysisState) -> Mutation {
         let mut multirange_name = None;
         let kind = match &fact.kind {
@@ -130,6 +131,7 @@ impl Resolver {
         })
     }
 
+    /// Resolve ALTER TYPE actions into renames and alter mutations.
     pub(super) fn resolve_alter_type(fact: &AlterTypeFact, state: &AnalysisState) -> Vec<Mutation> {
         let id = Self::resolve_type_lookup_name(&fact.name, state);
         fact.actions

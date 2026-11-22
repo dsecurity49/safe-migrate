@@ -41,6 +41,7 @@ impl Resolver {
         Mutation::AlterRole(AlterRoleMutation {
             name: fact.name.clone(),
             inherits: fact.inherits,
+            rename_to: fact.rename_to.clone(),
         })
     }
 

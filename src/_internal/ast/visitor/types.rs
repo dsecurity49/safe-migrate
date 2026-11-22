@@ -382,6 +382,7 @@ impl AstVisitor {
             .and_then(|attribute| attribute.value)
     }
 
+    /// Extract ALTER TYPE actions in written order.
     pub(super) fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
         let path = node.type_name_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;

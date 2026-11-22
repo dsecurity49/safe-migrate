@@ -31,7 +31,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.12.0'
+VERSION='v0.13.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
@@ -56,8 +56,10 @@ The simulator models tables, indexes, constraints, partitions, views,
 materialized views, sequences, routines, domains, extensions, and PostgreSQL
 type lifecycles. The built-in rules cover:
 
-- blocking locks, table rewrites, constraints, indexes, partitions, and
-  materialized-view refreshes;
+- size-independent lock-mode advisories (`lock-risk`) kept separate from
+  row-count-based scan and rewrite warnings;
+- table rewrites, constraints, indexes, partitions, and materialized-view
+  refreshes;
 - destructive changes, cascades, schema drift, dependency breakage, and
   migration ordering conflicts;
 - grants, policies, disabled triggers, roles, and privilege-sensitive changes;
@@ -180,7 +182,7 @@ Inline suppressions are **disabled by default**. To enable them, add to
 allow_inline_suppressions = true
 ```
 
-Without this setting, an inline directive produces a Tier 1
+Without this setting, each inline directive produces one located Tier 1
 `inline-suppression-disabled` finding instead of suppressing the rule.
 This is intentional: keeping suppressions in the TOML file makes them
 visible in pull request diffs and subject to review. Use per-rule
@@ -188,6 +190,35 @@ visible in pull request diffs and subject to review. Use per-rule
 as the standard suppression path.
 
 Keep suppressions narrow and explain the reason in the migration review.
+
+## DDL lock modes
+
+| Operation | Lock mode |
+| --- | --- |
+| Add a `CHECK` constraint (valid or `NOT VALID`) | `ACCESS EXCLUSIVE`; only the valid form scans |
+| Add a `FOREIGN KEY` (valid or `NOT VALID`) | `SHARE ROW EXCLUSIVE` on both tables |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE`; a foreign key also takes `ROW SHARE` on the referenced table |
+| `SET STORAGE`, `SET NOT NULL`, `SET DATA TYPE`, `SET ACCESS METHOD` | `ACCESS EXCLUSIVE` |
+| Add `UNIQUE`, `PRIMARY KEY`, or `EXCLUDE` without `USING INDEX` | `ACCESS EXCLUSIVE` plus `SHARE` while the index is built |
+| Add `UNIQUE` or `PRIMARY KEY` with `USING INDEX` | `ACCESS EXCLUSIVE`; a primary key may also scan |
+| `ATTACH PARTITION` | `ACCESS EXCLUSIVE` on the partition, `SHARE UPDATE EXCLUSIVE` on the parent |
+| `DETACH PARTITION` | `ACCESS EXCLUSIVE` on parent and partition; `CONCURRENTLY` uses `SHARE UPDATE EXCLUSIVE` on the parent |
+| `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` | `SHARE` / `ACCESS EXCLUSIVE` |
+| `REINDEX` without `CONCURRENTLY` | `SHARE` on each table, `ACCESS EXCLUSIVE` on each index |
+| `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` | `ACCESS EXCLUSIVE` |
+| `TRUNCATE` | `ACCESS EXCLUSIVE` |
+| Add a domain constraint | `SHARE` on each table using the domain |
+
+These are reported by `lock-risk` (and `set-storage-lock` for storage
+parameters) regardless of table size. Scan and rewrite cost remains a separate,
+row-count-based finding. Dedicated Tier 1/2 rules such as
+`require-concurrent-index`, `require-concurrent-reindex`,
+`blocking-mat-view-refresh`, and `vacuum-full` still provide the actionable
+warning; `lock-risk` adds the exact mode without replacing them. Brief
+metadata-only operations such as `ADD`/`DROP`/`RENAME COLUMN`, `SET DEFAULT`,
+and `ALTER TYPE` are not separately flagged. Operations outside the curated
+predictor are listed under `not_evaluated` as `lock_prediction_unavailable`;
+that is a coverage gap, not evidence of safety.
 
 ## Migration timeouts
 
