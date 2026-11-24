@@ -21,24 +21,24 @@ keywords = ["postgres", "migration", "linter", "ast", "database"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
-squawk-syntax = "=2.70.0"
-squawk-lexer  = "=2.70.0"
-squawk-parser = "=2.70.0"
-squawk-linter = "=2.70.0"
+squawk-syntax = "=2.72.0"
+squawk-lexer  = "=2.72.0"
+squawk-parser = "=2.72.0"
+squawk-linter = "=2.72.0"
+squawk-rowan  = "=2.72.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-thiserror = "1.0"
+toml = "1.2"
+thiserror = "2.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 postgres = "0.19"
-rowan = "0.15.18"
 owo-colors = "4"
-terminal_size = "0.3"
-comfy-table = "7"
+terminal_size = "0.4"
+comfy-table = "8"
 bincode = { package = "bincode-next", version = "2.1", features = ["serde"] }
 zstd = "0.14"
-crossterm = "0.27.0"
+crossterm = "0.29.0"
 tempfile = "3.10"
 chacha20poly1305 = { version = "0.11", features = ["getrandom", "zeroize"] }
 zeroize = "1.8"

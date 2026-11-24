@@ -66,7 +66,7 @@ fn certainty_is_exact(&c: &Certainty) -> bool {
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Violation {
     #[serde(skip)]
-    pub source_range: Option<rowan::TextRange>,
+    pub source_range: Option<squawk_rowan::TextRange>,
     pub rule_id: &'static str,
     pub object_kind: ObjectKind,
     pub object_name: String,
