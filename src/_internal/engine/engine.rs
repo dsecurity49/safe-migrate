@@ -499,7 +499,7 @@ impl SafeMigrateEngine {
             // ignoring it would claim exact confidence for later SQL.
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
-            let mut fallback_source_range: Option<rowan::TextRange> = None;
+            let mut fallback_source_range: Option<squawk_rowan::TextRange> = None;
             let mut mutations = match AstVisitor::extract(&stmt) {
                 Some(fact) => Resolver::resolve(&fact, state),
                 None => vec![Mutation::Opaque(
@@ -726,7 +726,7 @@ impl SafeMigrateEngine {
                                     .map(|token| token.text_range().start())
                                     .unwrap_or_else(|| stmt.syntax().text_range().start());
                                 let end = stmt.syntax().text_range().end();
-                                rowan::TextRange::new(start, end)
+                                squawk_rowan::TextRange::new(start, end)
                             });
                             v.source_range = Some(fallback);
                         }
@@ -792,7 +792,7 @@ impl SafeMigrateEngine {
     fn source_location(
         filename: &str,
         line_index: &LineIndex<'_>,
-        source_range: Option<rowan::TextRange>,
+        source_range: Option<squawk_rowan::TextRange>,
     ) -> Option<SourceLocation> {
         let (line, column) = line_index.location(usize::from(source_range?.start()))?;
         Some(SourceLocation {
@@ -876,7 +876,7 @@ impl SafeMigrateEngine {
 
     fn record_inline_suppression_disabled(
         rule_id: &str,
-        directive_range: rowan::TextRange,
+        directive_range: squawk_rowan::TextRange,
         stmt_text: &str,
         warned_keys: &HashSet<String>,
         statement_warned_keys: &mut HashSet<String>,
@@ -908,9 +908,9 @@ impl SafeMigrateEngine {
     /// `safe-migrate: ignore(...)` directives.
     fn parse_directives(
         text: &str,
-        range: rowan::TextRange,
-        file_ignores: &mut HashMap<String, rowan::TextRange>,
-        stmt_ignores: &mut HashMap<String, rowan::TextRange>,
+        range: squawk_rowan::TextRange,
+        file_ignores: &mut HashMap<String, squawk_rowan::TextRange>,
+        stmt_ignores: &mut HashMap<String, squawk_rowan::TextRange>,
     ) {
         let marker = "safe-migrate:";
         let mut pos = 0;

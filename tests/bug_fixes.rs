@@ -335,7 +335,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[allow(clippy::useless_vec)]
     fn test_manual_violation_sorting() {
         let v_tier3 = Violation {
-            source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
+            source_range: Some(squawk_rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_a",
             object_kind: ObjectKind::Table,
             object_name: "a".to_string(),
@@ -346,7 +346,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             sql: None,
         };
         let v_tier1 = Violation {
-            source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
+            source_range: Some(squawk_rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_b",
             object_kind: ObjectKind::Table,
             object_name: "b".to_string(),
@@ -357,7 +357,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             sql: None,
         };
         let v_range_later = Violation {
-            source_range: Some(rowan::TextRange::new(20.into(), 30.into())),
+            source_range: Some(squawk_rowan::TextRange::new(20.into(), 30.into())),
             rule_id: "rule_c",
             object_kind: ObjectKind::Table,
             object_name: "c".to_string(),
@@ -368,7 +368,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             sql: None,
         };
         let v_name_later = Violation {
-            source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
+            source_range: Some(squawk_rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_b",
             object_kind: ObjectKind::Table,
             object_name: "z".to_string(),

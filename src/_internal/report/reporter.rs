@@ -415,7 +415,7 @@ impl Reporter {
         // Three borderless columns so the fields spread evenly instead of
         // bunching left; UTF8_BORDERS_ONLY keeps the edges clean.
         let mut header_table = Table::new();
-        header_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+        header_table.load_style(comfy_table::presets::UTF8_BORDERS_ONLY);
         header_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
         header_table.set_width(width as u16);
         header_table.set_header(vec!["safe-migrate lint", "", ""]);
@@ -542,7 +542,7 @@ impl Reporter {
         }
 
         let mut summary_table = Table::new();
-        summary_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+        summary_table.load_style(comfy_table::presets::UTF8_BORDERS_ONLY);
         summary_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
         summary_table.set_width(width as u16);
         summary_table.set_header(vec!["SUMMARY", ""]);

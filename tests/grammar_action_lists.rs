@@ -55,11 +55,19 @@ const CLASSIFIED: &[(&str, Handling)] = &[
 /// The `squawk-syntax` version this build is locked to. The census describes
 /// the grammar that this build actually compiles, so the resolved package —
 /// not a copy found on disk — is the source of truth.
-const PINNED_SQUAWK_VERSION: &str = "2.70.0";
+const PINNED_SQUAWK_VERSION: &str = "2.72.0";
 
-/// The pinned `squawk-syntax` grammar, whose list-bearing productions this
-/// build must classify.
-fn pinned_grammar() -> String {
+/// The direct Squawk crates that share a release version. `squawk-rowan` is
+/// the syntax tree layer; a split here mixes incompatible node and range types.
+const PINNED_SQUAWK_CRATES: [&str; 5] = [
+    "squawk-syntax",
+    "squawk-lexer",
+    "squawk-parser",
+    "squawk-linter",
+    "squawk-rowan",
+];
+
+fn cargo_metadata() -> serde_json::Value {
     let output = std::process::Command::new(env!("CARGO"))
         .args(["metadata", "--format-version", "1", "--locked"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -70,20 +78,23 @@ fn pinned_grammar() -> String {
         "cargo metadata failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
-    let package = metadata["packages"]
+    serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON")
+}
+
+fn resolved_package<'a>(metadata: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    metadata["packages"]
         .as_array()
         .expect("metadata lists packages")
         .iter()
-        .find(|package| package["name"] == "squawk-syntax")
-        .expect("squawk-syntax is a resolved dependency");
-    assert_eq!(
-        package["version"].as_str(),
-        Some(PINNED_SQUAWK_VERSION),
-        "squawk-syntax moved. Update PINNED_SQUAWK_VERSION and re-audit every \
-         production the new grammar gives a list."
-    );
+        .find(|package| package["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is a resolved dependency"))
+}
+
+/// The pinned `squawk-syntax` grammar, whose list-bearing productions this
+/// build must classify.
+fn pinned_grammar() -> String {
+    let metadata = cargo_metadata();
+    let package = resolved_package(&metadata, "squawk-syntax");
     let manifest = package["manifest_path"]
         .as_str()
         .expect("a resolved package has a manifest path");
@@ -93,6 +104,20 @@ fn pinned_grammar() -> String {
         .join("src/postgresql.ungram");
     std::fs::read_to_string(&grammar)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", grammar.display()))
+}
+
+#[test]
+fn pinned_squawk_crates_share_one_version() {
+    let metadata = cargo_metadata();
+    for name in PINNED_SQUAWK_CRATES {
+        let package = resolved_package(&metadata, name);
+        assert_eq!(
+            package["version"].as_str(),
+            Some(PINNED_SQUAWK_VERSION),
+            "{name} moved independently. Update every pinned Squawk crate and \
+             re-audit the extraction surface."
+        );
+    }
 }
 
 /// Whether a production body carries a repeatable list, in either spelling:
