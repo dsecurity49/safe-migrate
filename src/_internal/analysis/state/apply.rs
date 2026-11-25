@@ -127,6 +127,8 @@ impl AnalysisState {
             Mutation::CreateAggregate(aggregate) => self.apply_create_aggregate(aggregate),
             Mutation::AlterAggregate(aggregate) => self.apply_alter_aggregate(aggregate),
             Mutation::DropAggregate(aggregate) => self.apply_drop_aggregate(aggregate),
+            Mutation::AlterRoutine(routine) => self.apply_alter_routine(routine),
+            Mutation::DropRoutine(routine) => self.apply_drop_routine(routine),
             Mutation::CreatePublication(publication) => self.apply_create_publication(publication),
             Mutation::AlterPublication(publication) => self.apply_alter_publication(publication),
             Mutation::DropPublication(publication) => self.apply_drop_publication(publication),

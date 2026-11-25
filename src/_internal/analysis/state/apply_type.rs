@@ -2456,10 +2456,7 @@ impl AnalysisState {
             }
             let implicit_set: HashSet<ObjectId> = implicit.iter().cloned().collect();
             for routine in self.routine_cascade_victims(&implicit_set) {
-                self.snapshot_function(&routine);
-                self.local
-                    .functions
-                    .insert(routine, FunctionOverlay::Dropped);
+                self.drop_routine_with_edges(&routine);
             }
             for id in implicit {
                 self.snapshot_type(&id);
@@ -2547,6 +2544,12 @@ impl AnalysisState {
                             && matches!(
                                 self.local.relations.get(&edge.dependent),
                                 Some(RelationOverlay::Present(_))
+                            )
+                    }) || self.local.graph.routines_for_type(probe).iter().any(|edge| {
+                        !self.co_dropped_objects.contains(&edge.dependent)
+                            && matches!(
+                                self.local.functions.get(&edge.dependent),
+                                Some(FunctionOverlay::Present(_))
                             )
                     })
                 })

@@ -690,6 +690,9 @@ impl Rule for GeneralCascadeRule {
             Mutation::DropAggregate(d) if d.cascade => {
                 Some((ObjectKind::Function, "aggregate".to_string()))
             }
+            Mutation::DropRoutine(d) if d.cascade => {
+                Some((ObjectKind::Function, "routine".to_string()))
+            }
             Mutation::DropPublication(d) if d.cascade => {
                 Some((ObjectKind::Publication, d.names.join(", ")))
             }

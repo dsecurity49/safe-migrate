@@ -50,6 +50,17 @@ pub(crate) enum DependencyKind {
     /// PostgreSQL records this from the cast alone: a view that selects a
     /// column of a type creates no such dependency. The endpoint is the type.
     ViewUsesType,
+    /// A routine or aggregate that depends on another routine.
+    RoutineUsesRoutine {
+        unresolved_name: Option<ObjectId>,
+    },
+    /// A routine whose parsed body depends on a relation (and optionally a column).
+    #[allow(dead_code)]
+    RoutineUsesRelation {
+        referenced_column: Option<String>,
+    },
+    /// A routine or aggregate that depends on a user-defined type.
+    RoutineUsesType,
     IndexOnRelation {
         definition: IndexDefinition,
         dependency_columns: Vec<String>,
@@ -1005,6 +1016,9 @@ impl DependencyGraph {
                 // leaves it stale makes a later drop miss this view.
                 DependencyKind::ViewUsesRoutine {
                     unresolved_name: Some(name),
+                }
+                | DependencyKind::RoutineUsesRoutine {
+                    unresolved_name: Some(name),
                 } => {
                     remap(&mut edge.dependent);
                     remap(&mut edge.referenced);
@@ -1121,6 +1135,20 @@ impl DependencyGraph {
             }
             DependencyKind::ViewUsesType => {
                 changed |= remap_endpoint(&mut edge.dependent, &plan.relations);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.types);
+            }
+            DependencyKind::RoutineUsesRoutine { unresolved_name } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.routines);
+                if unresolved_name.is_none() {
+                    changed |= remap_endpoint(&mut edge.referenced, &plan.routines);
+                }
+            }
+            DependencyKind::RoutineUsesRelation { .. } => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.routines);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.relations);
+            }
+            DependencyKind::RoutineUsesType => {
+                changed |= remap_endpoint(&mut edge.dependent, &plan.routines);
                 changed |= remap_endpoint(&mut edge.referenced, &plan.types);
             }
             DependencyKind::ColumnDefaultOnSequence { .. } => {
@@ -1263,6 +1291,9 @@ impl DependencyGraph {
                 &edge.kind,
                 DependencyKind::ViewUsesRoutine {
                     unresolved_name: Some(reference),
+                }
+                | DependencyKind::RoutineUsesRoutine {
+                    unresolved_name: Some(reference),
                 } if reference == name
             )
         })
@@ -1276,13 +1307,17 @@ impl DependencyGraph {
         new_name: &ObjectId,
     ) {
         for edge in &mut self.edges {
-            if let DependencyKind::ViewUsesRoutine {
-                unresolved_name: Some(reference),
-            } = &mut edge.kind
-                && reference == old_name
-            {
-                *reference = new_name.clone();
-                edge.referenced = new_name.clone();
+            match &mut edge.kind {
+                DependencyKind::ViewUsesRoutine {
+                    unresolved_name: Some(reference),
+                }
+                | DependencyKind::RoutineUsesRoutine {
+                    unresolved_name: Some(reference),
+                } if reference == old_name => {
+                    *reference = new_name.clone();
+                    edge.referenced = new_name.clone();
+                }
+                _ => {}
             }
         }
         self.deduplicate_edges();
@@ -1431,6 +1466,9 @@ impl DependencyGraph {
                 DependencyKind::ViewDependency {
                     referenced_column: Some(column),
                     ..
+                }
+                | DependencyKind::RoutineUsesRelation {
+                    referenced_column: Some(column),
                 } => table_ids.contains(&edge.referenced) && column == old_name,
                 _ => false,
             };
@@ -1517,6 +1555,9 @@ impl DependencyGraph {
                 DependencyKind::ViewDependency {
                     referenced_column: Some(column),
                     ..
+                }
+                | DependencyKind::RoutineUsesRelation {
+                    referenced_column: Some(column),
                 } => {
                     *column = new_name.to_string();
                 }
@@ -1726,6 +1767,31 @@ impl DependencyGraph {
             .iter()
             .filter(|edge| {
                 matches!(edge.kind, DependencyKind::ViewUsesType)
+                    && (self.resolve_rename(&edge.referenced) == target || &edge.referenced == ty)
+            })
+            .collect()
+    }
+
+    pub(crate) fn routines_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
+        let (schema, signature) = Self::split_routine_signature(function_id);
+        self.edges
+            .iter()
+            .filter(|edge| match &edge.kind {
+                DependencyKind::RoutineUsesRoutine { unresolved_name } => match unresolved_name {
+                    None => &edge.referenced == function_id,
+                    Some(name) => name.schema == schema && name.name == signature,
+                },
+                _ => false,
+            })
+            .collect()
+    }
+
+    pub(crate) fn routines_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        let target = self.resolve_rename(ty);
+        self.edges
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::RoutineUsesType)
                     && (self.resolve_rename(&edge.referenced) == target || &edge.referenced == ty)
             })
             .collect()

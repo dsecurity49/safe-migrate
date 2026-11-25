@@ -1,5 +1,6 @@
 use super::*;
 use crate::_internal::analysis::mutations::AlterTable;
+use crate::_internal::model::relation::Persistence;
 
 mod finish;
 
@@ -158,6 +159,16 @@ impl AnalysisState {
         {
             return MutationResult::conflict(format!(
                 "SET ACCESS METHOD requires PostgreSQL 15 or later, but the baseline reports {version}"
+            ));
+        }
+        if matches!(
+            alter.action,
+            AlterTableActionMutation::SetGeneratedExpression { .. }
+        ) && let Some(version) = self.pg_version().num()
+            && version < 170_000
+        {
+            return MutationResult::conflict(format!(
+                "SET EXPRESSION requires PostgreSQL 17 or later, but the baseline reports {version}"
             ));
         }
 
@@ -424,11 +435,31 @@ impl AnalysisState {
                 return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
             }
             AlterTableActionMutation::SetGeneratedExpression { column, expr, .. } => {
-                if !relation.generated_columns.contains_key(column) {
+                let Some(generated) = relation.generated_columns.get(column) else {
                     return MutationResult::conflict(format!(
                         "column '{}.{}' is not a generated column",
                         alter.id, column
                     ));
+                };
+                if generated.kind == crate::_internal::model::relation::GeneratedColumnKind::Virtual
+                {
+                    if self
+                        .local
+                        .constraints
+                        .iter()
+                        .any(|((table_id, _), constraint)| {
+                            table_id == &alter.id && constraint.kind == ConstraintKind::Check
+                        })
+                    {
+                        return MutationResult::conflict(
+                            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables with check constraints",
+                        );
+                    }
+                    if self.relation_is_in_any_publication(&alter.id) {
+                        return MutationResult::conflict(
+                            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables that are part of a publication",
+                        );
+                    }
                 }
                 let Some(references) = expr.referenced_columns() else {
                     return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
@@ -441,6 +472,59 @@ impl AnalysisState {
                         "generated expression for '{}.{}' references invalid column '{}'",
                         alter.id, column, reference
                     ));
+                }
+            }
+            AlterTableActionMutation::SetPersistence { persistence } => {
+                if relation.persistence == Persistence::Temporary {
+                    return MutationResult::conflict(format!(
+                        "cannot change logged status of table \"{}\" because it is temporary",
+                        alter.id
+                    ));
+                }
+                if relation.persistence == *persistence {
+                    return MutationResult::NoOp;
+                }
+                if *persistence == Persistence::Unlogged
+                    && self.relation_is_in_any_publication(&alter.id)
+                {
+                    return MutationResult::conflict(format!(
+                        "cannot change table \"{}\" to unlogged because it is part of a publication",
+                        alter.id
+                    ));
+                }
+                let resolved_self = self.local.graph.resolve_rename(&alter.id);
+                for edge in self.local.graph.edges() {
+                    if !self.dependency_edge_is_current(edge)
+                        || !matches!(edge.kind, DependencyKind::ForeignKey { .. })
+                    {
+                        continue;
+                    }
+                    let dependent = self.local.graph.resolve_rename(&edge.dependent);
+                    let referenced = self.local.graph.resolve_rename(&edge.referenced);
+                    if dependent == referenced {
+                        continue;
+                    }
+                    if *persistence == Persistence::Unlogged && referenced == resolved_self {
+                        if let Some(RelationOverlay::Present(other)) =
+                            self.local.relations.get(dependent)
+                            && other.persistence == Persistence::Permanent
+                        {
+                            return MutationResult::conflict(format!(
+                                "could not change table \"{}\" to unlogged because it references logged table \"{}\"",
+                                alter.id, dependent
+                            ));
+                        }
+                    } else if *persistence == Persistence::Permanent
+                        && dependent == resolved_self
+                        && let Some(RelationOverlay::Present(other)) =
+                            self.local.relations.get(referenced)
+                        && other.persistence == Persistence::Unlogged
+                    {
+                        return MutationResult::conflict(format!(
+                            "could not change table \"{}\" to logged because it references unlogged table \"{}\"",
+                            alter.id, referenced
+                        ));
+                    }
                 }
             }
             AlterTableActionMutation::DropGeneratedExpression { column, if_exists }

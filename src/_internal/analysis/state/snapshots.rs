@@ -215,6 +215,35 @@ impl AnalysisState {
         }
     }
 
+    pub(super) fn drop_routine_with_edges(&mut self, id: &ObjectId) {
+        self.snapshot_function(id);
+        self.local.functions.insert(
+            id.clone(),
+            crate::_internal::model::function::FunctionOverlay::Dropped,
+        );
+        let has_routine_edges = self.local.graph.edges().iter().any(|edge| {
+            edge.dependent == *id
+                && matches!(
+                    edge.kind,
+                    DependencyKind::RoutineUsesRoutine { .. }
+                        | DependencyKind::RoutineUsesRelation { .. }
+                        | DependencyKind::RoutineUsesType
+                )
+        });
+        if has_routine_edges {
+            self.snapshot_graph_full();
+            self.local.graph.retain_edges(|edge| {
+                !(edge.dependent == *id
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::RoutineUsesRoutine { .. }
+                            | DependencyKind::RoutineUsesRelation { .. }
+                            | DependencyKind::RoutineUsesType
+                    ))
+            });
+        }
+    }
+
     pub(super) fn snapshot_function(&mut self, id: &ObjectId) {
         if !self.local.records_undo() {
             return;

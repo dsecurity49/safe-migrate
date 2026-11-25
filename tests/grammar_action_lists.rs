@@ -27,7 +27,7 @@ const CLASSIFIED: &[(&str, Handling)] = &[
     ("AlterMaterializedView", Handling::AllActionsApplied),
     ("AlterSequence", Handling::AllActionsApplied),
     ("AlterServer", Handling::Unmodelled),
-    ("AlterTypeAttributeActionList", Handling::Unmodelled),
+    ("AlterTypeAttributeActionList", Handling::AllActionsApplied),
     // PL/pgSQL bodies are opaque, so their internal statements are never read.
     ("PlpgsqlExpr", Handling::Unmodelled),
     ("PlpgsqlForCursorStmt", Handling::Unmodelled),

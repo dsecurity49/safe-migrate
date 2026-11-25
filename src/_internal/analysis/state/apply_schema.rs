@@ -309,9 +309,7 @@ impl AnalysisState {
                 .cloned()
                 .collect();
             for id in &functions_to_drop {
-                self.local
-                    .functions
-                    .insert(id.clone(), FunctionOverlay::Dropped);
+                self.drop_routine_with_edges(id);
             }
 
             let triggers_to_drop: Vec<ObjectId> = self

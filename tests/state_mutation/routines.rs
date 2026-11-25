@@ -1540,3 +1540,134 @@ fn create_aggregate_validates_moving_aggregate_options_and_modifier_flags() {
         "mstype without minvfunc must conflict: {missing_minv:?}"
     );
 }
+
+#[test]
+fn alter_and_drop_routine_dispatch_across_functions_procedures_and_aggregates() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+
+    let findings = engine
+        .analyze(
+            "CREATE FUNCTION public.r_fn(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             ALTER ROUTINE public.r_fn(int) IMMUTABLE;
+             ALTER ROUTINE public.r_fn(int) RENAME TO r_fn2;
+             CREATE PROCEDURE public.r_proc(int) LANGUAGE sql AS 'SELECT $1';
+             ALTER ROUTINE public.r_proc(int) RENAME TO r_proc2;
+             CREATE AGGREGATE public.r_agg(int) (sfunc = r_fn2, stype = int);
+             ALTER ROUTINE public.r_agg(int) RENAME TO r_agg2;
+             DROP ROUTINE public.r_agg2(int);
+             DROP ROUTINE public.r_fn2(int), public.r_proc2(int);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid ALTER/DROP ROUTINE statements must not conflict: {findings:?}"
+    );
+
+    let mut agg_opt_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let agg_opt_findings = engine
+        .analyze(
+            "CREATE FUNCTION public.agg_sf(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+             CREATE AGGREGATE public.agg_test(int) (sfunc = agg_sf, stype = int);
+             ALTER ROUTINE public.agg_test(int) IMMUTABLE;",
+            &mut agg_opt_state,
+        )
+        .unwrap();
+    assert!(
+        agg_opt_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict" && v.reason.contains("is an aggregate function")
+        }),
+        "ALTER ROUTINE option changes on aggregates must conflict: {agg_opt_findings:?}"
+    );
+}
+
+#[test]
+fn create_aggregate_tracks_dependencies_and_validates_or_replace_and_hypothetical_args() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+
+    let dep_block = engine
+        .analyze(
+            "CREATE TYPE public.agg_state_t AS (total int);
+             CREATE FUNCTION public.agg_step(public.agg_state_t, int) RETURNS public.agg_state_t LANGUAGE sql AS 'SELECT $1';
+             CREATE AGGREGATE public.custom_agg(int) (sfunc = agg_step, stype = public.agg_state_t);
+             DROP FUNCTION public.agg_step(public.agg_state_t, int);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        dep_block.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("is required by routine 'public.custom_agg(integer)'")
+        }),
+        "dropping support function of an active aggregate without CASCADE must conflict: {dep_block:?}"
+    );
+
+    let mut type_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let type_block = engine
+        .analyze(
+            "CREATE TYPE public.agg_state_t AS (total int);
+             CREATE FUNCTION public.agg_step(public.agg_state_t, int) RETURNS public.agg_state_t LANGUAGE sql AS 'SELECT $1';
+             CREATE AGGREGATE public.custom_agg(int) (sfunc = agg_step, stype = public.agg_state_t);
+             DROP TYPE public.agg_state_t;",
+            &mut type_state,
+        )
+        .unwrap();
+    assert!(
+        type_block.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping state type of an active aggregate without CASCADE must conflict: {type_block:?}"
+    );
+
+    let mut hyp_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let hyp_conflict = engine
+        .analyze(
+            "CREATE FUNCTION public.hyp_sf(internal, int, text) RETURNS internal LANGUAGE internal AS ' ordered_set_transition_multi ';
+             CREATE FUNCTION public.hyp_ff(internal, VARIADIC \"any\") RETURNS bigint LANGUAGE internal AS ' rank_final ';
+             CREATE AGGREGATE public.bad_hyp(int ORDER BY text) (
+                 sfunc = hyp_sf,
+                 stype = internal,
+                 finalfunc = hyp_ff,
+                 hypothetical
+             );",
+            &mut hyp_state,
+        )
+        .unwrap();
+    assert!(
+        hyp_conflict.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains(
+                    "a hypothetical-set aggregate must have direct arguments matching its aggregated arguments"
+                )
+        }),
+        "mismatched hypothetical direct arguments must conflict: {hyp_conflict:?}"
+    );
+
+    let mut replace_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let replace_conflict = engine
+        .analyze(
+            "CREATE FUNCTION public.rep_os_sf1(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             CREATE FUNCTION public.rep_os_ff1(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE AGGREGATE public.rep_agg(int ORDER BY int, int) (
+                 sfunc = rep_os_sf1,
+                 stype = int,
+                 finalfunc = rep_os_ff1
+             );
+             CREATE OR REPLACE AGGREGATE public.rep_agg(int, int ORDER BY int) (
+                 sfunc = rep_os_sf1,
+                 stype = int,
+                 finalfunc = rep_os_ff1
+             );",
+            &mut replace_state,
+        )
+        .unwrap();
+    assert!(
+        replace_conflict.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("cannot change number of direct arguments of an aggregate function")
+        }),
+        "changing direct argument count in CREATE OR REPLACE AGGREGATE must conflict: {replace_conflict:?}"
+    );
+}

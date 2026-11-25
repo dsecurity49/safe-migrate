@@ -643,4 +643,83 @@ impl AstVisitor {
             },
         ))
     }
+
+    pub(super) fn extract_alter_routine(node: &ast::AlterRoutine) -> Option<StatementFact> {
+        let sig = node.routine_sig()?;
+        let path = sig.routine_name_ref()?.path_ref()?;
+        let name = Self::path_ref_to_qualified_name(&path)?;
+        let params = Self::extract_signature_params(sig.param_list());
+
+        let action = node.action().and_then(|a| match a {
+            ast::AlterRoutineAction::RoutineRenameTo(rt) => {
+                let new_name = Self::resolve_name(rt.routine_name()?.path()?.segment()?);
+                Some(
+                    crate::_internal::analysis::facts::AlterFunctionAction::Rename {
+                        from: name.name.resolve(),
+                        to: new_name,
+                    },
+                )
+            }
+            ast::AlterRoutineAction::OwnerTo(ot) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
+                    Self::extract_role(&ot.role_ref()?),
+                ),
+            ),
+            ast::AlterRoutineAction::SetSchema(ss) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
+                    new_schema: Self::resolve_ast_identifier(&ss.schema_ref()?),
+                },
+            ),
+            ast::AlterRoutineAction::DependsOnExtension(de) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&de.extension_ref()?),
+                },
+            ),
+            ast::AlterRoutineAction::NoDependsOnExtension(nde) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&nde.extension_ref()?),
+                },
+            ),
+            ast::AlterRoutineAction::FuncOptionList(ol) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    ol.options()
+                        .map(|o| Self::extract_func_option(&o))
+                        .collect(),
+                ),
+            ),
+        });
+
+        Some(StatementFact::AlterRoutine(
+            crate::_internal::analysis::facts::AlterRoutineFact {
+                name,
+                params,
+                action: action?,
+            },
+        ))
+    }
+
+    pub(super) fn extract_drop_routine(node: &ast::DropRoutine) -> Option<StatementFact> {
+        let signatures = node
+            .routine_sig_list()
+            .map(|sl| {
+                sl.routine_sigs()
+                    .filter_map(|sig| {
+                        let path = sig.routine_name_ref()?.path_ref()?;
+                        Some(crate::_internal::analysis::facts::FunctionSigFact {
+                            name: Self::path_ref_to_qualified_name(&path)?,
+                            params: Self::extract_signature_params(sig.param_list()),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Some(StatementFact::DropRoutine(
+            crate::_internal::analysis::facts::DropRoutineFact {
+                signatures,
+                if_exists: node.if_exists().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
+            },
+        ))
+    }
 }

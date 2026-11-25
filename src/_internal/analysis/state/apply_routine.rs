@@ -3,11 +3,11 @@ use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{
     AlterFunctionAction, FuncOptionFact, ParamModeFact, RetTypeFact, SecurityKind, VolatilityKind,
 };
-use crate::_internal::analysis::graph::{DependencyGraph, DependencyKind};
+use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::{
-    AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, CreateAggregateMutation,
-    CreateFunctionMutation, CreateProcedureMutation, DropAggregateMutation, DropFunctionMutation,
-    DropProcedureMutation,
+    AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, AlterRoutineMutation,
+    CreateAggregateMutation, CreateFunctionMutation, CreateProcedureMutation,
+    DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, DropRoutineMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::function::{
@@ -769,6 +769,26 @@ impl AnalysisState {
                         }
                         return self.unresolved(EvidenceCode::UnresolvedReference);
                     }
+                    let dependent_routines: Vec<ObjectId> = self
+                        .local
+                        .graph
+                        .routines_for_function(&id)
+                        .into_iter()
+                        .filter(|edge| {
+                            !self.co_dropped_objects.contains(&edge.dependent)
+                                && matches!(
+                                    self.local.functions.get(&edge.dependent),
+                                    Some(FunctionOverlay::Present(_))
+                                )
+                        })
+                        .map(|edge| edge.dependent.clone())
+                        .collect();
+                    if !dependent_routines.is_empty() && !function.cascade {
+                        return MutationResult::conflict(format!(
+                            "function '{}' is required by routine '{}'; use CASCADE",
+                            id, dependent_routines[0]
+                        ));
+                    }
                     if !targets.iter().any(|(existing, _, _)| existing == &id) {
                         targets.push((id, dependent_triggers, dependent_views));
                     }
@@ -804,10 +824,7 @@ impl AnalysisState {
                     surviving_reference = true;
                 }
             } else {
-                self.snapshot_function(id);
-                self.local
-                    .functions
-                    .insert(id.clone(), FunctionOverlay::Dropped);
+                self.drop_routine_with_edges(id);
             }
         }
         if !cascade_types.is_empty() {
@@ -1083,10 +1100,7 @@ impl AnalysisState {
         // allowed in atomic bodies and string bodies are untracked), so
         // CASCADE behaves like RESTRICT here.
         for id in &targets {
-            self.snapshot_function(id);
-            self.local
-                .functions
-                .insert(id.clone(), FunctionOverlay::Dropped);
+            self.drop_routine_with_edges(id);
         }
         if !targets.is_empty() {
             MutationResult::Applied
@@ -1283,8 +1297,110 @@ impl AnalysisState {
                 }
             }
         }
+        if aggregate.kind == crate::_internal::model::aggregate::AggregateKind::Hypothetical
+            && aggregate.direct_count < aggregate.params.len()
+        {
+            let num_aggregated = aggregate.params.len() - aggregate.direct_count;
+            let has_variadic = aggregate
+                .params
+                .iter()
+                .any(|p| matches!(p.mode, ParamModeFact::Variadic));
+            let canonical = |raw: &str| {
+                if let Some(id) = self.resolve_type_reference(raw) {
+                    return id.to_string();
+                }
+                crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                    raw,
+                    self.builtin_types(),
+                )
+                .render()
+            };
+            let direct_slice = &aggregate.params[..aggregate.direct_count];
+            let aggregated_slice = &aggregate.params[aggregate.direct_count..];
+            let matches_tail = aggregate.direct_count >= num_aggregated
+                && direct_slice[aggregate.direct_count - num_aggregated..]
+                    .iter()
+                    .zip(aggregated_slice.iter())
+                    .all(|(d, a)| canonical(&d.ty) == canonical(&a.ty));
+            if has_variadic || !matches_tail {
+                return MutationResult::conflict(
+                    "a hypothetical-set aggregate must have direct arguments matching its aggregated arguments"
+                        .to_string(),
+                );
+            }
+        }
         for attribute in &aggregate.definition {
             if let Some(result) = self.check_aggregate_attribute(attribute) {
+                return result;
+            }
+        }
+        let stype_raw = aggregate
+            .definition
+            .iter()
+            .find(|attr| {
+                attr.name.eq_ignore_ascii_case("stype") || attr.name.eq_ignore_ascii_case("stype1")
+            })
+            .map(|attr| attr.value.trim().to_string());
+        let finalfunc_raw = aggregate
+            .definition
+            .iter()
+            .find(|attr| attr.name.eq_ignore_ascii_case("finalfunc"))
+            .map(|attr| attr.value.trim().to_string());
+        let (derived_return_type, derived_return_type_id) = match finalfunc_raw.as_deref() {
+            Some(ff_name) => {
+                if let Some(routine_id) = self.resolve_unique_routine_by_name(ff_name)
+                    && let Some(FunctionOverlay::Present(ff_state)) =
+                        self.local.functions.get(&routine_id)
+                {
+                    (
+                        ff_state.return_type.clone(),
+                        ff_state.return_type_id.clone(),
+                    )
+                } else {
+                    (
+                        stype_raw.clone().unwrap_or_default(),
+                        stype_raw
+                            .as_deref()
+                            .and_then(|ty| self.resolve_type_reference(ty)),
+                    )
+                }
+            }
+            None => (
+                stype_raw.clone().unwrap_or_default(),
+                stype_raw
+                    .as_deref()
+                    .and_then(|ty| self.resolve_type_reference(ty)),
+            ),
+        };
+        if aggregate.or_replace
+            && let Some(existing) = self.existing_routine(&aggregate.id)
+        {
+            if let Some(existing_agg) = existing.aggregate {
+                if existing_agg.kind != aggregate.kind {
+                    return MutationResult::conflict(format!(
+                        "cannot change routine kind for '{}'",
+                        aggregate.id
+                    ));
+                }
+                if existing_agg.direct_count != aggregate.direct_count {
+                    return MutationResult::conflict(
+                        "cannot change number of direct arguments of an aggregate function"
+                            .to_string(),
+                    );
+                }
+            }
+            if !existing.return_type.is_empty()
+                && !derived_return_type.is_empty()
+                && let Err(result) = self.check_routine_replacement(
+                    &existing,
+                    &aggregate.id,
+                    &aggregate.params,
+                    Some(&RetTypeFact::Scalar {
+                        ty: derived_return_type.clone(),
+                        setof: false,
+                    }),
+                )
+            {
                 return result;
             }
         }
@@ -1311,14 +1427,12 @@ impl AnalysisState {
                     .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| self.resolve_type_reference(&parameter.ty))
                     .collect(),
-                // `pg_proc.prorettype` of an aggregate is its state type, which
-                // the definition records rather than the parameter list.
-                return_type: String::new(),
-                return_type_id: None,
+                return_type: derived_return_type,
+                return_type_id: derived_return_type_id,
                 returns_set: false,
                 parameters: aggregate_parameters,
                 default_count: Self::routine_default_count(&aggregate.params, None),
-                volatility: Volatility::Volatile,
+                volatility: Volatility::Immutable,
                 language: "internal".to_string(),
                 security: SecurityMode::Invoker,
                 aggregate: Some(crate::_internal::model::aggregate::AggregateMetadata::new(
@@ -1327,6 +1441,7 @@ impl AnalysisState {
                 )),
             }),
         );
+        self.record_aggregate_dependencies(aggregate);
         MutationResult::Applied
     }
 
@@ -1391,10 +1506,7 @@ impl AnalysisState {
         dependent_views: &[(ObjectId, Option<ObjectId>)],
         dropped: &HashSet<ObjectId>,
     ) -> bool {
-        self.snapshot_function(id);
-        self.local
-            .functions
-            .insert(id.clone(), FunctionOverlay::Dropped);
+        self.drop_routine_with_edges(id);
 
         // A name-only view reference is definitely cleared by this statement
         // only when every overload of its written name is being dropped.
@@ -1443,6 +1555,54 @@ impl AnalysisState {
                     .iter()
                     .any(|(trigger_id, _)| edge.dependent == *trigger_id)
             });
+        }
+        let dependent_routines: Vec<ObjectId> = self
+            .local
+            .graph
+            .routines_for_function(id)
+            .into_iter()
+            .filter(|edge| {
+                !dropped.contains(&edge.dependent)
+                    && matches!(
+                        self.local.functions.get(&edge.dependent),
+                        Some(FunctionOverlay::Present(_))
+                    )
+            })
+            .map(|edge| edge.dependent.clone())
+            .collect();
+        if !dependent_routines.is_empty() {
+            let mut next_dropped = dropped.clone();
+            next_dropped.extend(dependent_routines.iter().cloned());
+            for routine_id in dependent_routines {
+                let triggers: Vec<(ObjectId, ObjectId)> = self
+                    .local
+                    .graph
+                    .edges()
+                    .iter()
+                    .filter_map(|edge| {
+                        let DependencyKind::TriggerOnTable { function_id, .. } = &edge.kind else {
+                            return None;
+                        };
+                        (function_id == &routine_id)
+                            .then(|| (edge.dependent.clone(), edge.referenced.clone()))
+                    })
+                    .collect();
+                let views: Vec<(ObjectId, Option<ObjectId>)> = self
+                    .local
+                    .graph
+                    .views_for_function(&routine_id)
+                    .into_iter()
+                    .filter_map(|edge| {
+                        let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind else {
+                            return None;
+                        };
+                        Some((edge.dependent.clone(), unresolved_name.clone()))
+                    })
+                    .collect();
+                if self.apply_routine_cascade_drop(&routine_id, &triggers, &views, &next_dropped) {
+                    surviving_reference = true;
+                }
+            }
         }
         surviving_reference
     }
@@ -1560,13 +1720,316 @@ impl AnalysisState {
             }
         }
         for id in &targets {
-            self.snapshot_function(id);
-            self.local
-                .functions
-                .insert(id.clone(), FunctionOverlay::Dropped);
+            self.drop_routine_with_edges(id);
         }
         if aggregate.cascade {
             self.drop_cascaded_views(&dropped_views);
+        }
+        if surviving_reference {
+            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
+        }
+        MutationResult::Applied
+    }
+
+    fn normalize_sql_identifier(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+            trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
+        } else {
+            trimmed.to_ascii_lowercase()
+        }
+    }
+
+    fn resolve_unique_routine_by_name(&self, raw_name: &str) -> Option<ObjectId> {
+        let trimmed = raw_name.trim();
+        let (schema_filter, bare_name) = match trimmed.split_once('.') {
+            Some((schema, name)) => (
+                Some(Self::normalize_sql_identifier(schema)),
+                Self::normalize_sql_identifier(name),
+            ),
+            None => (None, Self::normalize_sql_identifier(trimmed)),
+        };
+        let matches: Vec<ObjectId> = self
+            .local
+            .functions
+            .iter()
+            .filter_map(|(id, overlay)| {
+                if !matches!(overlay, FunctionOverlay::Present(_)) {
+                    return None;
+                }
+                let (id_schema, id_bare) = DependencyGraph::split_routine_signature(id);
+                if id_bare != bare_name {
+                    return None;
+                }
+                if let Some(ref schema) = schema_filter
+                    && id_schema != schema
+                {
+                    return None;
+                }
+                Some(id.clone())
+            })
+            .collect();
+        (matches.len() == 1).then(|| matches[0].clone())
+    }
+
+    fn record_aggregate_dependencies(&mut self, aggregate: &CreateAggregateMutation) {
+        self.snapshot_graph_full();
+        self.local.graph.retain_edges(|edge| {
+            !(edge.dependent == aggregate.id
+                && matches!(
+                    edge.kind,
+                    DependencyKind::RoutineUsesRoutine { .. }
+                        | DependencyKind::RoutineUsesType
+                        | DependencyKind::RoutineUsesRelation { .. }
+                ))
+        });
+        for attr in &aggregate.definition {
+            let key = attr.name.to_ascii_lowercase();
+            if matches!(key.as_str(), "stype" | "stype1" | "mstype") {
+                if let Some(type_id) = self.resolve_type_reference(attr.value.trim()) {
+                    self.local.graph.add_edge(DependencyEdge::new(
+                        aggregate.id.clone(),
+                        type_id,
+                        DependencyKind::RoutineUsesType,
+                    ));
+                }
+            } else if matches!(
+                key.as_str(),
+                "sfunc"
+                    | "sfunc1"
+                    | "finalfunc"
+                    | "combinefunc"
+                    | "serialfunc"
+                    | "deserialfunc"
+                    | "msfunc"
+                    | "mfunc"
+                    | "minvfunc"
+                    | "mfinalfunc"
+            ) && let Some(routine_id) =
+                self.resolve_unique_routine_by_name(attr.value.trim())
+            {
+                self.local.graph.add_edge(DependencyEdge::new(
+                    aggregate.id.clone(),
+                    routine_id,
+                    DependencyKind::RoutineUsesRoutine {
+                        unresolved_name: None,
+                    },
+                ));
+            }
+        }
+    }
+
+    pub(super) fn apply_alter_routine(&mut self, routine: &AlterRoutineMutation) -> MutationResult {
+        match self.routine_lookup(&routine.id, |_| true) {
+            RoutineLookup::Present => {}
+            RoutineLookup::WrongKind => {
+                return MutationResult::conflict(format!(
+                    "routine '{}' does not exist",
+                    routine.id
+                ));
+            }
+            RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
+                return MutationResult::conflict(format!(
+                    "routine '{}' does not exist",
+                    routine.id
+                ));
+            }
+            RoutineLookup::Unknown => {
+                return self.unresolved(EvidenceCode::UnknownObjectState);
+            }
+        }
+        let Some(FunctionOverlay::Present(existing)) = self.local.functions.get(&routine.id) else {
+            return self.unresolved(EvidenceCode::UnknownObjectState);
+        };
+        match existing.routine_kind {
+            RoutineKind::Function | RoutineKind::Window => {
+                self.apply_alter_function(&AlterFunctionMutation {
+                    id: routine.id.clone(),
+                    action: routine.action.clone(),
+                })
+            }
+            RoutineKind::Procedure => self.apply_alter_procedure(&AlterProcedureMutation {
+                id: routine.id.clone(),
+                action: routine.action.clone(),
+            }),
+            RoutineKind::Aggregate => match &routine.action {
+                AlterFunctionAction::OptionsChange(_) => {
+                    MutationResult::conflict(format!("'{}' is an aggregate function", routine.id))
+                }
+                AlterFunctionAction::DependsOnExtension { .. }
+                | AlterFunctionAction::NoDependsOnExtension { .. } => {
+                    self.unresolved(EvidenceCode::UnmodeledState)
+                }
+                _ => self.apply_alter_aggregate(&AlterAggregateMutation {
+                    id: routine.id.clone(),
+                    action: routine.action.clone(),
+                }),
+            },
+        }
+    }
+
+    pub(super) fn apply_drop_routine(&mut self, routine: &DropRoutineMutation) -> MutationResult {
+        let mut targets: Vec<DropTarget> = Vec::new();
+        let mut cascade_types: Vec<ObjectId> = Vec::new();
+        for signature in &routine.signatures {
+            let signature_name = format!(
+                "{}({})",
+                signature.name.name.resolve(),
+                signature.params.join(",")
+            );
+            let schema = self.resolve_function_schema(&signature.name, &signature_name);
+            let id = ObjectId::new(schema, signature_name);
+            if let Some(result) = self.extension_member_drop_conflict(
+                crate::_internal::model::extension::ExtensionMemberKind::Routine,
+                &id,
+                "routine",
+            ) {
+                return result;
+            }
+            match self.routine_lookup(&id, |_| true) {
+                RoutineLookup::WrongKind => {
+                    return MutationResult::conflict(format!("routine '{}' does not exist", id));
+                }
+                RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent
+                    if routine.if_exists => {}
+                RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
+                    return MutationResult::conflict(format!("routine '{}' does not exist", id));
+                }
+                RoutineLookup::Unknown => {
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
+                }
+                RoutineLookup::Present => {
+                    if let Some(owner) = self.routine_internal_type_owner(&id)
+                        && self.type_is_present(owner)
+                        && !self.co_dropped_objects.contains(owner)
+                    {
+                        return MutationResult::conflict(format!(
+                            "function '{}' cannot be dropped because type '{}' requires it",
+                            id, owner
+                        ));
+                    }
+                    let dependent_types = self.types_requiring_routine(&id);
+                    if !dependent_types.is_empty() {
+                        if !routine.cascade {
+                            return MutationResult::conflict(format!(
+                                "function '{}' is required by {} '{}'; use CASCADE",
+                                id, dependent_types[0].1, dependent_types[0].0
+                            ));
+                        }
+                        cascade_types
+                            .extend(dependent_types.into_iter().map(|(type_id, _)| type_id));
+                    }
+                    let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
+                        .local
+                        .graph
+                        .edges()
+                        .iter()
+                        .filter_map(|edge| {
+                            let DependencyKind::TriggerOnTable { function_id, .. } = &edge.kind
+                            else {
+                                return None;
+                            };
+                            (function_id == &id
+                                && !self.co_dropped_objects.contains(&edge.dependent))
+                            .then(|| (edge.dependent.clone(), edge.referenced.clone()))
+                        })
+                        .collect();
+                    if !dependent_triggers.is_empty() && !routine.cascade {
+                        return MutationResult::conflict(format!(
+                            "function '{}' still has dependent triggers; use CASCADE",
+                            id
+                        ));
+                    }
+                    let dependent_views: Vec<(ObjectId, Option<ObjectId>)> = self
+                        .local
+                        .graph
+                        .views_for_function(&id)
+                        .into_iter()
+                        .filter_map(|edge| {
+                            let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind
+                            else {
+                                return None;
+                            };
+                            (!self.co_dropped_objects.contains(&edge.dependent))
+                                .then(|| (edge.dependent.clone(), unresolved_name.clone()))
+                        })
+                        .collect();
+                    if !dependent_views.is_empty() && !routine.cascade {
+                        let definite = dependent_views.iter().find(|(_, unresolved_name)| {
+                            unresolved_name
+                                .as_ref()
+                                .is_none_or(|name| self.routine_overloads_under(name).count() <= 1)
+                        });
+                        if let Some((view, _)) = definite {
+                            return MutationResult::conflict(format!(
+                                "routine '{}' is required by view '{}'; use CASCADE",
+                                id, view
+                            ));
+                        }
+                        return self.unresolved(EvidenceCode::UnresolvedReference);
+                    }
+                    let dependent_routines: Vec<ObjectId> = self
+                        .local
+                        .graph
+                        .routines_for_function(&id)
+                        .into_iter()
+                        .filter(|edge| {
+                            !self.co_dropped_objects.contains(&edge.dependent)
+                                && matches!(
+                                    self.local.functions.get(&edge.dependent),
+                                    Some(FunctionOverlay::Present(_))
+                                )
+                        })
+                        .map(|edge| edge.dependent.clone())
+                        .collect();
+                    if !dependent_routines.is_empty() && !routine.cascade {
+                        return MutationResult::conflict(format!(
+                            "routine '{}' is required by routine '{}'; use CASCADE",
+                            id, dependent_routines[0]
+                        ));
+                    }
+                    if !targets.iter().any(|(existing, _, _)| existing == &id) {
+                        targets.push((id, dependent_triggers, dependent_views));
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return MutationResult::NoOp;
+        }
+        if targets.iter().any(|(id, _, _)| {
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Routines,
+            )
+        }) {
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+        }
+        let dropped_ids: HashSet<ObjectId> = targets.iter().map(|(id, _, _)| id.clone()).collect();
+        let mut surviving_reference = false;
+        for (id, dependent_triggers, dependent_views) in &targets {
+            if routine.cascade {
+                if self.apply_routine_cascade_drop(
+                    id,
+                    dependent_triggers,
+                    dependent_views,
+                    &dropped_ids,
+                ) {
+                    surviving_reference = true;
+                }
+            } else {
+                self.drop_routine_with_edges(id);
+            }
+        }
+        if !cascade_types.is_empty() {
+            cascade_types.sort();
+            cascade_types.dedup();
+            if !self.apply_type_cascade(&cascade_types) {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+            }
         }
         if surviving_reference {
             self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);

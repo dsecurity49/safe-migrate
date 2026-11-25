@@ -379,6 +379,12 @@ impl AstVisitor {
         if let Some(node) = ast::DropAggregate::cast(syntax.clone()) {
             return Self::extract_drop_aggregate(&node);
         }
+        if let Some(node) = ast::AlterRoutine::cast(syntax.clone()) {
+            return Self::extract_alter_routine(&node);
+        }
+        if let Some(node) = ast::DropRoutine::cast(syntax.clone()) {
+            return Self::extract_drop_routine(&node);
+        }
         if let Some(node) = ast::CreatePublication::cast(syntax.clone()) {
             return Self::extract_create_publication(&node);
         }

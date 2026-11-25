@@ -1,13 +1,14 @@
 use super::Resolver;
 use crate::_internal::analysis::facts::{
-    AlterAggregateFact, AlterFunctionFact, AlterProcedureFact, CreateAggregateFact,
-    CreateFunctionFact, CreateProcedureFact, DropAggregateFact, DropFunctionFact,
-    DropProcedureFact, FunctionSigFact,
+    AlterAggregateFact, AlterFunctionFact, AlterProcedureFact, AlterRoutineFact,
+    CreateAggregateFact, CreateFunctionFact, CreateProcedureFact, DropAggregateFact,
+    DropFunctionFact, DropProcedureFact, DropRoutineFact, FunctionSigFact,
 };
 use crate::_internal::analysis::mutations::{
-    AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, CreateAggregateMutation,
-    CreateFunctionMutation, CreateProcedureMutation, DropAggregateMutation, DropFunctionMutation,
-    DropProcedureMutation, Mutation,
+    AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, AlterRoutineMutation,
+    CreateAggregateMutation, CreateFunctionMutation, CreateProcedureMutation,
+    DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, DropRoutineMutation,
+    Mutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 
@@ -108,6 +109,24 @@ impl Resolver {
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::DropAggregate(DropAggregateMutation {
+            signatures: Self::normalize_signatures(&fact.signatures, state),
+            if_exists: fact.if_exists,
+            cascade: fact.cascade,
+        })
+    }
+
+    pub(super) fn resolve_alter_routine(
+        fact: &AlterRoutineFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::AlterRoutine(AlterRoutineMutation {
+            id: Self::resolve_routine_lookup_name(&fact.name, &fact.params, state),
+            action: fact.action.clone(),
+        })
+    }
+
+    pub(super) fn resolve_drop_routine(fact: &DropRoutineFact, state: &AnalysisState) -> Mutation {
+        Mutation::DropRoutine(DropRoutineMutation {
             signatures: Self::normalize_signatures(&fact.signatures, state),
             if_exists: fact.if_exists,
             cascade: fact.cascade,

@@ -166,6 +166,8 @@ pub(crate) enum Mutation {
     CreateAggregate(CreateAggregateMutation),
     AlterAggregate(AlterAggregateMutation),
     DropAggregate(DropAggregateMutation),
+    AlterRoutine(AlterRoutineMutation),
+    DropRoutine(DropRoutineMutation),
     CreatePublication(CreatePublicationMutation),
     AlterPublication(AlterPublicationMutation),
     DropPublication(DropPublicationMutation),
@@ -772,6 +774,19 @@ pub(crate) struct AlterAggregateMutation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DropAggregateMutation {
+    pub signatures: Vec<crate::_internal::analysis::facts::FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterRoutineMutation {
+    pub id: ObjectId,
+    pub action: crate::_internal::analysis::facts::AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropRoutineMutation {
     pub signatures: Vec<crate::_internal::analysis::facts::FunctionSigFact>,
     pub if_exists: bool,
     pub cascade: bool,

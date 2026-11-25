@@ -473,6 +473,8 @@ pub(crate) enum StatementFact {
     CreateAggregate(CreateAggregateFact),
     AlterAggregate(AlterAggregateFact),
     DropAggregate(DropAggregateFact),
+    AlterRoutine(AlterRoutineFact),
+    DropRoutine(DropRoutineFact),
     CreatePublication(CreatePublicationFact),
     AlterPublication(AlterPublicationFact),
     DropPublication(DropPublicationFact),
@@ -954,6 +956,20 @@ pub(crate) struct AlterAggregateFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DropAggregateFact {
+    pub signatures: Vec<FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterRoutineFact {
+    pub name: QualifiedName,
+    pub params: Vec<String>,
+    pub action: AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropRoutineFact {
     pub signatures: Vec<FunctionSigFact>,
     pub if_exists: bool,
     pub cascade: bool,

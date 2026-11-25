@@ -36,6 +36,16 @@ impl Rule for FunctionVolatilityRule {
                     return violations;
                 }
             }
+            Mutation::AlterRoutine(alter) => {
+                if let crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    new_opts,
+                ) = &alter.action
+                {
+                    (&alter.id, new_opts)
+                } else {
+                    return violations;
+                }
+            }
             Mutation::CreateFunction(create) if create.or_replace => (&create.id, &create.options),
             _ => return violations,
         };
@@ -103,10 +113,13 @@ impl Rule for BrokenComputeRule {
         if !matches!(context.result(), MutationResult::Conflict(_)) {
             return vec![];
         }
-        if let Mutation::DropFunction(drop) = context.mutation()
-            && !drop.cascade
-        {
-            for sig in &drop.signatures {
+        let signatures = match context.mutation() {
+            Mutation::DropFunction(drop) if !drop.cascade => Some(&drop.signatures),
+            Mutation::DropRoutine(drop) if !drop.cascade => Some(&drop.signatures),
+            _ => None,
+        };
+        if let Some(signatures) = signatures {
+            for sig in signatures {
                 let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                 let schema = context.state().resolve_function_schema(&sig.name, &sig_str);
                 let function_id =

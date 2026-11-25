@@ -219,6 +219,12 @@ pub(crate) fn for_mutation(
         Mutation::DropProcedure(_) => {
             reads.functions.require_all();
         }
+        Mutation::AlterRoutine(alter) => {
+            reads.functions.insert(alter.id.clone());
+        }
+        Mutation::DropRoutine(_) => {
+            reads.functions.require_all();
+        }
         Mutation::CreateSchema(_)
         | Mutation::AlterSchema(_)
         | Mutation::DropSchema(_)

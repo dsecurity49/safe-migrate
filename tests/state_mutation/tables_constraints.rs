@@ -1921,3 +1921,87 @@ fn set_access_method_is_rejected_on_postgresql_14_and_accepted_on_15_plus() {
         "PG 15 must accept SET ACCESS METHOD: {pg15_findings:?}"
     );
 }
+
+#[test]
+fn set_generated_expression_validates_version_gate_and_virtual_constraints() {
+    let engine = setup_engine();
+    let mut pg16_cache = synced_cache();
+    pg16_cache.pg_version_num = Some(160_000);
+    let mut pg16_state = crate::_internal::analysis::state::AnalysisState::new(pg16_cache);
+    let pg16_findings = engine
+        .analyze(
+            "CREATE TABLE public.gen_t (a int, b int GENERATED ALWAYS AS (a + 1) STORED);
+             ALTER TABLE public.gen_t ALTER COLUMN b SET EXPRESSION AS (a + 2);",
+            &mut pg16_state,
+        )
+        .unwrap();
+    assert!(
+        pg16_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("SET EXPRESSION requires PostgreSQL 17 or later")
+        }),
+        "PG 16 must reject SET EXPRESSION: {pg16_findings:?}"
+    );
+
+    let mut pg18_cache = synced_cache();
+    pg18_cache.pg_version_num = Some(180_000);
+    let mut pg18_state = crate::_internal::analysis::state::AnalysisState::new(pg18_cache);
+    let virtual_check_findings = engine
+        .analyze(
+            "CREATE TABLE public.v_gen_t (
+                 a int,
+                 b int GENERATED ALWAYS AS (a + 1) VIRTUAL,
+                 CONSTRAINT b_pos CHECK (b > 0)
+             );
+             ALTER TABLE public.v_gen_t ALTER COLUMN b SET EXPRESSION AS (a + 2);",
+            &mut pg18_state,
+        )
+        .unwrap();
+    assert!(
+        virtual_check_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables with check constraints")
+        }),
+        "SET EXPRESSION on virtual generated column with CHECK constraint must conflict: {virtual_check_findings:?}"
+    );
+}
+
+#[test]
+fn set_persistence_enforces_foreign_key_and_publication_invariants() {
+    let engine = setup_engine();
+    let mut pub_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let pub_findings = engine
+        .analyze(
+            "CREATE TABLE public.pub_t (id int PRIMARY KEY);
+             CREATE PUBLICATION p1 FOR TABLE public.pub_t;
+             ALTER TABLE public.pub_t SET UNLOGGED;",
+            &mut pub_state,
+        )
+        .unwrap();
+    assert!(
+        pub_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("cannot change table \"public.pub_t\" to unlogged because it is part of a publication")
+        }),
+        "SET UNLOGGED on a published table must conflict: {pub_findings:?}"
+    );
+
+    let mut fk_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let fk_findings = engine
+        .analyze(
+            "CREATE TABLE public.parent_logged (id int PRIMARY KEY);
+             CREATE TABLE public.child_logged (id int REFERENCES public.parent_logged(id));
+             ALTER TABLE public.parent_logged SET UNLOGGED;",
+            &mut fk_state,
+        )
+        .unwrap();
+    assert!(
+        fk_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("could not change table \"public.parent_logged\" to unlogged")
+        }),
+        "SET UNLOGGED on a table referenced by a permanent foreign key must conflict: {fk_findings:?}"
+    );
+}

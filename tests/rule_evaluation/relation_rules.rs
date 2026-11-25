@@ -2087,3 +2087,44 @@ fn alter_index_if_exists_missing_is_safe() {
         .unwrap();
     assert!(!state.index_is_present(&object_id("public", "idx_also_missing")));
 }
+
+#[test]
+fn set_persistence_and_stored_set_expression_predict_table_rewrite() {
+    let engine = setup_engine();
+    let mut cache = crate::common::synced_cache();
+    cache.pg_version_num = Some(180_000);
+    let mut state = AnalysisState::new(cache);
+    engine
+        .analyze(
+            "CREATE TABLE public.big_rewrite_t (
+                 id int,
+                 computed int GENERATED ALWAYS AS (id + 1) STORED
+             );",
+            &mut state,
+        )
+        .unwrap();
+    if let Some(RelationOverlay::Present(rel)) = state
+        .local
+        .relations
+        .get_mut(&object_id("public", "big_rewrite_t"))
+    {
+        rel.estimated_rows = Some(1_000_000);
+        rel.relpages = Some(200_000);
+    }
+    let violations = engine
+        .analyze(
+            "ALTER TABLE public.big_rewrite_t SET UNLOGGED;
+             ALTER TABLE public.big_rewrite_t ALTER COLUMN computed SET EXPRESSION AS (id + 2);",
+            &mut state,
+        )
+        .unwrap();
+    let rewrites: Vec<_> = violations
+        .iter()
+        .filter(|v| v.rule_id == "lock-risk" && v.reason.contains("rewriting the table"))
+        .collect();
+    assert_eq!(
+        rewrites.len(),
+        2,
+        "both SET UNLOGGED and stored SET EXPRESSION on large table must emit lock-risk table rewrite findings: {violations:?}"
+    );
+}

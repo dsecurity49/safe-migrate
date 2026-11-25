@@ -731,6 +731,12 @@ impl Resolver {
             StatementFact::DropAggregate(a) => {
                 mutations.push(Self::resolve_drop_aggregate(a, state));
             }
+            StatementFact::AlterRoutine(r) => {
+                mutations.push(Self::resolve_alter_routine(r, state));
+            }
+            StatementFact::DropRoutine(r) => {
+                mutations.push(Self::resolve_drop_routine(r, state));
+            }
             StatementFact::CreatePublication(p) => {
                 mutations.push(Self::resolve_create_publication(p, state));
             }

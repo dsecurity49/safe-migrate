@@ -295,7 +295,14 @@ impl AnalysisState {
                 }) || Self::type_reference_matches_victims(
                     function.return_type_id.as_ref(),
                     dropped_types,
-                );
+                ) || self.local.graph.edges().iter().any(|edge| {
+                    edge.dependent == *id
+                        && matches!(edge.kind, DependencyKind::RoutineUsesType)
+                        && Self::type_reference_matches_victims(
+                            Some(&edge.referenced),
+                            dropped_types,
+                        )
+                });
                 (owner_dropped || signature_references).then(|| id.clone())
             })
             .collect()
