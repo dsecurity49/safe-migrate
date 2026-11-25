@@ -846,4 +846,190 @@ impl AstVisitor {
             },
         ))
     }
+
+    fn extract_cast_sig_types(sig: &ast::CastSig) -> Option<(String, String)> {
+        let mut types = sig.syntax().children().filter_map(ast::Type::cast);
+        let source = types.next()?.syntax().text().to_string();
+        let target = types.next()?.syntax().text().to_string();
+        Some((source, target))
+    }
+
+    pub(super) fn extract_create_cast(node: &ast::CreateCast) -> Option<StatementFact> {
+        let (source_type, target_type) = Self::extract_cast_sig_types(&node.cast_sig()?)?;
+        let method = match node.cast_method()? {
+            ast::CastMethod::WithoutFunction(_) => {
+                crate::_internal::analysis::facts::CastMethodFact::WithoutFunction
+            }
+            ast::CastMethod::WithInout(_) => {
+                crate::_internal::analysis::facts::CastMethodFact::WithInout
+            }
+            ast::CastMethod::WithFunction(wf) => {
+                let sig = wf.function_sig()?;
+                let path = sig.function_name_ref()?.path_ref()?;
+                let name = Self::path_ref_to_qualified_name(&path)?;
+                let params = Self::extract_signature_params(sig.param_list());
+                crate::_internal::analysis::facts::CastMethodFact::WithFunction(
+                    crate::_internal::analysis::facts::FunctionSigFact { name, params },
+                )
+            }
+        };
+        let context = match node.cast_context() {
+            Some(ast::CastContext::AsImplicit(_)) => {
+                crate::_internal::analysis::facts::CastContextFact::Implicit
+            }
+            Some(ast::CastContext::AsAssignment(_)) => {
+                crate::_internal::analysis::facts::CastContextFact::Assignment
+            }
+            None => crate::_internal::analysis::facts::CastContextFact::Explicit,
+        };
+        Some(StatementFact::CreateCast(
+            crate::_internal::analysis::facts::CreateCastFact {
+                source_type,
+                target_type,
+                method,
+                context,
+            },
+        ))
+    }
+
+    pub(super) fn extract_drop_cast(node: &ast::DropCast) -> Option<StatementFact> {
+        let (source_type, target_type) = Self::extract_cast_sig_types(&node.cast_sig()?)?;
+        Some(StatementFact::DropCast(
+            crate::_internal::analysis::facts::DropCastFact {
+                source_type,
+                target_type,
+                if_exists: node.if_exists().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
+            },
+        ))
+    }
+
+    pub(super) fn extract_create_statistics(node: &ast::CreateStatistics) -> Option<StatementFact> {
+        let name = node
+            .statistics()
+            .and_then(|s| s.path())
+            .and_then(|p| Self::path_to_qualified_name(&p));
+        let if_not_exists = node.if_not_exists().is_some();
+        let kinds = node
+            .stat_types()
+            .map(|st| {
+                st.statistics_kinds()
+                    .filter_map(|k| {
+                        k.ident_token()
+                            .map(|t| Self::resolve_identifier_token(t.text()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let on_clause = node.statistics_on_clause()?;
+        let mut columns = Vec::new();
+        let mut expr_texts = Vec::new();
+        for expr in on_clause.exprs() {
+            match &expr {
+                ast::Expr::NameRef(nr) => {
+                    columns.push(Self::resolve_name_ref(nr));
+                }
+                _ => {
+                    expr_texts.push(expr.syntax().text().to_string().trim().to_string());
+                }
+            }
+        }
+        let expression_count = expr_texts.len();
+        let expressions_sql = (!expr_texts.is_empty()).then(|| expr_texts.join(", "));
+        let table_path = node.from_table()?.table_name_ref()?.path_ref()?;
+        let table = Self::path_ref_to_qualified_name(&table_path)?;
+        Some(StatementFact::CreateStatistics(
+            crate::_internal::analysis::facts::CreateStatisticsFact {
+                name,
+                if_not_exists,
+                kinds,
+                columns,
+                expression_count,
+                expressions_sql,
+                table,
+            },
+        ))
+    }
+
+    pub(super) fn extract_alter_statistics(node: &ast::AlterStatistics) -> Option<StatementFact> {
+        let path = node.statistics_ref()?.path_ref()?;
+        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action = match node.action()? {
+            ast::AlterStatisticsAction::StatisticsRenameTo(rt) => {
+                let seg = rt.statistics()?.path()?.segment()?;
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::RenameTo(
+                    Self::resolve_name(seg),
+                )
+            }
+            ast::AlterStatisticsAction::OwnerTo(ot) => {
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::OwnerTo(
+                    Self::extract_role(&ot.role_ref()?),
+                )
+            }
+            ast::AlterStatisticsAction::SetSchema(ss) => {
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::SetSchema(
+                    Self::resolve_ast_identifier(&ss.schema_ref()?),
+                )
+            }
+            ast::AlterStatisticsAction::SetStatistics(ss) => {
+                let target = if ss.default_token().is_some() {
+                    crate::_internal::analysis::facts::StatisticsTarget::Default
+                } else {
+                    let raw = ss.expr()?.syntax().text().to_string();
+                    let val = raw.trim().parse::<i32>().ok()?;
+                    crate::_internal::analysis::facts::StatisticsTarget::Value(val)
+                };
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::SetStatistics(target)
+            }
+        };
+        Some(StatementFact::AlterStatistics(
+            crate::_internal::analysis::facts::AlterStatisticsFact { name, action },
+        ))
+    }
+
+    pub(super) fn extract_drop_statistics(node: &ast::DropStatistics) -> Option<StatementFact> {
+        let names: Vec<QualifiedName> = node
+            .statistics_refs()
+            .filter_map(|r| r.path_ref())
+            .filter_map(|p| Self::path_ref_to_qualified_name(&p))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(StatementFact::DropStatistics(
+            crate::_internal::analysis::facts::DropStatisticsFact {
+                names,
+                if_exists: node.if_exists().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
+            },
+        ))
+    }
+
+    pub(super) fn extract_analyze(node: &ast::Analyze) -> Option<StatementFact> {
+        let mut targets = Vec::new();
+        if let Some(list) = node.table_and_columns_list() {
+            for tc in list.table_and_columnss() {
+                let path = tc.table_relation_name()?.table_name_ref()?.path_ref()?;
+                let relation = Self::path_ref_to_qualified_name(&path)?;
+                let columns = tc
+                    .column_ref_list()
+                    .map(|cl| {
+                        cl.column_name_refs()
+                            .filter_map(|c| {
+                                c.ident_token()
+                                    .map(|t| Self::resolve_identifier_token(t.text()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                targets.push(crate::_internal::analysis::facts::AnalyzeTargetFact {
+                    relation,
+                    columns,
+                });
+            }
+        }
+        Some(StatementFact::Analyze(
+            crate::_internal::analysis::facts::AnalyzeFact { targets },
+        ))
+    }
 }

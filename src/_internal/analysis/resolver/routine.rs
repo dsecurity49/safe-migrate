@@ -1,15 +1,18 @@
 use super::Resolver;
 use crate::_internal::analysis::facts::{
     AlterAggregateFact, AlterFunctionFact, AlterProcedureFact, AlterRoutineFact,
-    CreateAggregateFact, CreateFunctionFact, CreateProcedureFact, DropAggregateFact,
-    DropFunctionFact, DropProcedureFact, DropRoutineFact, FunctionSigFact,
+    AlterStatisticsFact, AnalyzeFact, CastMethodFact, CreateAggregateFact, CreateCastFact,
+    CreateFunctionFact, CreateProcedureFact, CreateStatisticsFact, DropAggregateFact, DropCastFact,
+    DropFunctionFact, DropProcedureFact, DropRoutineFact, DropStatisticsFact, FunctionSigFact,
     RoutineBodyDependenciesFact,
 };
 use crate::_internal::analysis::mutations::{
     AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, AlterRoutineMutation,
-    CreateAggregateMutation, CreateFunctionMutation, CreateProcedureMutation,
-    DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, DropRoutineMutation,
-    Mutation, RoutineBodyDependencies, RoutineRelationDependency,
+    AlterStatisticsMutation, AnalyzeMutation, AnalyzeTargetMutation, CastMethodMutation,
+    CreateAggregateMutation, CreateCastMutation, CreateFunctionMutation, CreateProcedureMutation,
+    CreateStatisticsMutation, DropAggregateMutation, DropCastMutation, DropFunctionMutation,
+    DropProcedureMutation, DropRoutineMutation, DropStatisticsMutation, Mutation,
+    RoutineBodyDependencies, RoutineRelationDependency,
 };
 use crate::_internal::analysis::state::AnalysisState;
 
@@ -188,5 +191,85 @@ impl Resolver {
                 signature
             })
             .collect()
+    }
+    pub(super) fn resolve_create_cast(fact: &CreateCastFact, state: &AnalysisState) -> Mutation {
+        let method = match &fact.method {
+            CastMethodFact::WithoutFunction => CastMethodMutation::WithoutFunction,
+            CastMethodFact::WithInout => CastMethodMutation::WithInout,
+            CastMethodFact::WithFunction(sig) => CastMethodMutation::WithFunction(
+                Self::resolve_routine_lookup_name(&sig.name, &sig.params, state),
+            ),
+        };
+        Mutation::CreateCast(CreateCastMutation {
+            source_type: Self::resolve_cast_type_identity(&fact.source_type, state),
+            target_type: Self::resolve_cast_type_identity(&fact.target_type, state),
+            method,
+            context: fact.context,
+        })
+    }
+
+    pub(super) fn resolve_drop_cast(fact: &DropCastFact, state: &AnalysisState) -> Mutation {
+        Mutation::DropCast(DropCastMutation {
+            source_type: Self::resolve_cast_type_identity(&fact.source_type, state),
+            target_type: Self::resolve_cast_type_identity(&fact.target_type, state),
+            if_exists: fact.if_exists,
+            cascade: fact.cascade,
+        })
+    }
+
+    pub(super) fn resolve_create_statistics(
+        fact: &CreateStatisticsFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::CreateStatistics(CreateStatisticsMutation {
+            id: fact
+                .name
+                .as_ref()
+                .map(|name| Self::resolve_creation_name(name, state)),
+            if_not_exists: fact.if_not_exists,
+            kinds: fact.kinds.clone(),
+            columns: fact.columns.clone(),
+            expression_count: fact.expression_count,
+            expressions_sql: fact.expressions_sql.clone(),
+            table: Self::resolve_relation_lookup_name(&fact.table, state),
+        })
+    }
+
+    pub(super) fn resolve_alter_statistics(
+        fact: &AlterStatisticsFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::AlterStatistics(AlterStatisticsMutation {
+            id: Self::resolve_statistics_lookup_name(&fact.name, state),
+            action: fact.action.clone(),
+        })
+    }
+
+    pub(super) fn resolve_drop_statistics(
+        fact: &DropStatisticsFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::DropStatistics(DropStatisticsMutation {
+            ids: fact
+                .names
+                .iter()
+                .map(|name| Self::resolve_statistics_lookup_name(name, state))
+                .collect(),
+            if_exists: fact.if_exists,
+            cascade: fact.cascade,
+        })
+    }
+
+    pub(super) fn resolve_analyze(fact: &AnalyzeFact, state: &AnalysisState) -> Mutation {
+        Mutation::Analyze(AnalyzeMutation {
+            targets: fact
+                .targets
+                .iter()
+                .map(|t| AnalyzeTargetMutation {
+                    table_id: Self::resolve_relation_lookup_name(&t.relation, state),
+                    columns: t.columns.clone(),
+                })
+                .collect(),
+        })
     }
 }

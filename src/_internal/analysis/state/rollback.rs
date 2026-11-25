@@ -51,6 +51,7 @@ impl AnalysisState {
                     self.local.functions = snapshot.functions;
                     self.local.sequences = snapshot.sequences;
                     self.local.collations = snapshot.collations;
+                    self.local.casts = snapshot.casts;
                     self.local.extensions = snapshot.extensions;
                     self.local.publications = snapshot.publications;
                     self.local.triggers = snapshot.triggers;
@@ -298,6 +299,9 @@ impl AnalysisState {
                 }
                 StateChange::CoDroppedObjectsSnapshot { previous } => {
                     self.co_dropped_objects = previous;
+                }
+                StateChange::CastsSnapshot { previous } => {
+                    self.local.casts = previous;
                 }
             }
         }

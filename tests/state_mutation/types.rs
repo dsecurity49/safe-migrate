@@ -3423,3 +3423,65 @@ fn schema_rename_remaps_typed_table_of_type_and_column_type_ids() {
         "orders.st.type_id must be remapped to app_v2.status so DROP TYPE CASCADE drops column st: {findings:?}"
     );
 }
+
+#[test]
+fn create_and_drop_cast_update_implicit_coercion_catalogue_and_rollback() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let findings = engine
+        .analyze(
+            "CREATE TYPE public.cast_src AS ENUM ('a');
+             CREATE TYPE public.cast_dst AS ENUM ('a');
+             CREATE FUNCTION public.cast_fn(public.cast_src) RETURNS public.cast_dst
+                 LANGUAGE sql IMMUTABLE AS 'SELECT ''a''::public.cast_dst';
+             CREATE CAST (public.cast_src AS public.cast_dst)
+                 WITH FUNCTION public.cast_fn(public.cast_src) AS IMPLICIT;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid CREATE CAST AS IMPLICIT must not conflict: {findings:?}"
+    );
+    assert!(
+        state
+            .casts()
+            .coerces_implicitly("public.cast_src", "public.cast_dst"),
+        "CREATE CAST AS IMPLICIT must register implicit cast in CastCatalogue"
+    );
+
+    let mut dup_state = state.clone();
+    let dup = engine
+        .analyze(
+            "CREATE CAST (public.cast_src AS public.cast_dst) WITH INOUT AS IMPLICIT;",
+            &mut dup_state,
+        )
+        .unwrap();
+    assert!(
+        dup.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains(
+                    "cast from type public.cast_src to type public.cast_dst already exists",
+                )
+        }),
+        "duplicate implicit cast must conflict: {dup:?}"
+    );
+
+    let mut drop_state = state.clone();
+    let drop_findings = engine
+        .analyze(
+            "DROP CAST (public.cast_src AS public.cast_dst);",
+            &mut drop_state,
+        )
+        .unwrap();
+    assert!(
+        !drop_findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP CAST must succeed: {drop_findings:?}"
+    );
+    assert!(
+        !drop_state
+            .casts()
+            .coerces_implicitly("public.cast_src", "public.cast_dst"),
+        "DROP CAST must remove implicit cast from CastCatalogue"
+    );
+}

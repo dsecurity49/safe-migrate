@@ -2005,3 +2005,54 @@ fn set_persistence_enforces_foreign_key_and_publication_invariants() {
         "SET UNLOGGED on a table referenced by a permanent foreign key must conflict: {fk_findings:?}"
     );
 }
+
+#[test]
+fn create_alter_drop_statistics_and_analyze_update_relation_state() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let findings = engine
+        .analyze(
+            "CREATE TABLE public.stats_t (a int, b int, c text);
+             CREATE STATISTICS public.s_ab (dependencies, ndistinct) ON a, b FROM public.stats_t;
+             CREATE STATISTICS IF NOT EXISTS public.s_ab (dependencies) ON a, b FROM public.stats_t;
+             ALTER STATISTICS public.s_ab SET STATISTICS 250;
+             ALTER STATISTICS public.s_ab RENAME TO s_ab_renamed;
+             ANALYZE public.stats_t(a, b);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid CREATE/ALTER STATISTICS and ANALYZE must not conflict: {findings:?}"
+    );
+    let Some(RelationOverlay::Present(rel)) =
+        state.local.relations.get(&object_id("public", "stats_t"))
+    else {
+        panic!("stats_t must exist");
+    };
+    let stat = rel
+        .extended_statistics
+        .get(&object_id("public", "s_ab_renamed"))
+        .expect("s_ab_renamed must be present on stats_t");
+    assert_eq!(stat.kinds, vec!["f".to_string(), "d".to_string()]);
+    assert_eq!(stat.columns, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(stat.target, Some(250));
+    assert!(
+        !rel.is_stale(),
+        "ANALYZE public.stats_t must clear stale statistics state"
+    );
+
+    let drop_findings = engine
+        .analyze("DROP STATISTICS public.s_ab_renamed;", &mut state)
+        .unwrap();
+    assert!(
+        !drop_findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP STATISTICS must succeed: {drop_findings:?}"
+    );
+    let Some(RelationOverlay::Present(rel_after)) =
+        state.local.relations.get(&object_id("public", "stats_t"))
+    else {
+        panic!("stats_t must exist");
+    };
+    assert!(rel_after.extended_statistics.is_empty());
+}

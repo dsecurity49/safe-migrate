@@ -421,6 +421,24 @@ impl AstVisitor {
         if let Some(node) = ast::DropDatabase::cast(syntax.clone()) {
             return Self::extract_drop_database(&node);
         }
+        if let Some(node) = ast::CreateCast::cast(syntax.clone()) {
+            return Self::extract_create_cast(&node);
+        }
+        if let Some(node) = ast::DropCast::cast(syntax.clone()) {
+            return Self::extract_drop_cast(&node);
+        }
+        if let Some(node) = ast::CreateStatistics::cast(syntax.clone()) {
+            return Self::extract_create_statistics(&node);
+        }
+        if let Some(node) = ast::AlterStatistics::cast(syntax.clone()) {
+            return Self::extract_alter_statistics(&node);
+        }
+        if let Some(node) = ast::DropStatistics::cast(syntax.clone()) {
+            return Self::extract_drop_statistics(&node);
+        }
+        if let Some(node) = ast::Analyze::cast(syntax.clone()) {
+            return Self::extract_analyze(&node);
+        }
 
         None
     }

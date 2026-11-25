@@ -1,12 +1,16 @@
 use super::index_topology::AttachRefusal;
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
-use crate::_internal::analysis::facts::{IndexStatisticsColumn, StatisticsTarget};
+use crate::_internal::analysis::facts::{
+    AlterStatisticsActionFact, CastContextFact, IndexStatisticsColumn, StatisticsTarget,
+};
 use crate::_internal::analysis::graph::DependencyKind;
 use crate::_internal::analysis::mutations::{
     AlterDatabaseMutation, AlterIndexActionMutation, AlterIndexAllInTablespaceMutation,
-    AlterIndexMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
-    ReindexTargetMutation, Rename, TruncateMutation,
+    AlterIndexMutation, AlterStatisticsMutation, AnalyzeMutation, CastMethodMutation,
+    CreateCastMutation, CreateDatabaseMutation, CreateStatisticsMutation, DropCastMutation,
+    DropDatabaseMutation, DropStatisticsMutation, LockTableMutation, ReindexTargetMutation, Rename,
+    TruncateMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationKind;
@@ -470,6 +474,444 @@ impl AnalysisState {
         // Tablespace placement (`pg_class.reltablespace`) is not modeled, so
         // this bulk relocation never changes modeled state. The names stay on
         // the mutation for diagnostics.
+        MutationResult::Applied
+    }
+
+    fn validate_cast_type(&mut self, type_name: &str) -> Result<(), MutationResult> {
+        if self.declared_type_resolves(type_name) {
+            return Ok(());
+        }
+        if self.baseline_schemas.is_none()
+            && self
+                .baseline_coverage
+                .has(crate::_internal::db::cache::CatalogFamily::Types)
+        {
+            return Err(MutationResult::conflict(format!(
+                "type \"{type_name}\" does not exist"
+            )));
+        }
+        Err(self.unresolved(EvidenceCode::UnknownObjectState))
+    }
+
+    pub(super) fn apply_create_cast(&mut self, cast: &CreateCastMutation) -> MutationResult {
+        if let Err(result) = self.validate_cast_type(&cast.source_type) {
+            return result;
+        }
+        if let Err(result) = self.validate_cast_type(&cast.target_type) {
+            return result;
+        }
+        if cast.source_type == cast.target_type {
+            return MutationResult::conflict(
+                "source data type and target data type are the same".to_string(),
+            );
+        }
+        if let CastMethodMutation::WithFunction(func_id) = &cast.method {
+            match self.local.functions.get(func_id) {
+                Some(crate::_internal::model::function::FunctionOverlay::Present(fn_state)) => {
+                    if !matches!(
+                        fn_state.routine_kind,
+                        crate::_internal::model::function::RoutineKind::Function
+                    ) {
+                        return MutationResult::conflict(format!(
+                            "function '{}' does not exist",
+                            func_id
+                        ));
+                    }
+                }
+                Some(crate::_internal::model::function::FunctionOverlay::Dropped) => {
+                    return MutationResult::conflict(format!(
+                        "function '{}' does not exist",
+                        func_id
+                    ));
+                }
+                None if self.baseline_covers_family_object(
+                    func_id,
+                    crate::_internal::db::cache::CatalogFamily::Routines,
+                ) =>
+                {
+                    return MutationResult::conflict(format!(
+                        "function '{}' does not exist",
+                        func_id
+                    ));
+                }
+                None => {
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                }
+            }
+        }
+        if self
+            .local
+            .casts
+            .coerces_implicitly(&cast.source_type, &cast.target_type)
+        {
+            return MutationResult::conflict(format!(
+                "cast from type {} to type {} already exists",
+                cast.source_type, cast.target_type
+            ));
+        }
+        if cast.context == CastContextFact::Implicit {
+            self.snapshot_casts();
+            self.local
+                .casts
+                .insert_implicit(cast.source_type.clone(), cast.target_type.clone());
+        } else {
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        }
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_drop_cast(&mut self, cast: &DropCastMutation) -> MutationResult {
+        if !cast.if_exists {
+            if let Err(result) = self.validate_cast_type(&cast.source_type) {
+                return result;
+            }
+            if let Err(result) = self.validate_cast_type(&cast.target_type) {
+                return result;
+            }
+        }
+        if self
+            .local
+            .casts
+            .coerces_implicitly(&cast.source_type, &cast.target_type)
+            && cast.source_type != cast.target_type
+        {
+            self.snapshot_casts();
+            self.local
+                .casts
+                .remove_implicit(&cast.source_type, &cast.target_type);
+            return MutationResult::Applied;
+        }
+        if cast.if_exists {
+            return MutationResult::NoOp;
+        }
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_create_statistics(
+        &mut self,
+        create: &CreateStatisticsMutation,
+    ) -> MutationResult {
+        if let Err(result) = self.ensure_relation_target(
+            &create.table,
+            |kind| {
+                matches!(
+                    kind,
+                    RelationKind::Table
+                        | RelationKind::ForeignTable
+                        | RelationKind::MaterializedView
+                )
+            },
+            format!("relation '{}' does not exist", create.table),
+            format!("cannot define statistics for relation '{}'", create.table),
+        ) {
+            return result;
+        }
+        let stats_id = match &create.id {
+            Some(id) => {
+                if let Err(result) = self.ensure_creation_target(id) {
+                    return result;
+                }
+                id.clone()
+            }
+            None => self.next_generated_statistics_name_avoiding(
+                &create.table.schema,
+                &create.table.name,
+                &create.columns,
+                &HashSet::new(),
+            ),
+        };
+        if self.extended_statistics_is_present(&stats_id) {
+            if create.if_not_exists {
+                return MutationResult::NoOp;
+            }
+            return MutationResult::conflict(format!(
+                "statistics object \"{}\" already exists",
+                stats_id
+            ));
+        }
+        let mut normalized_kinds = Vec::new();
+        if create.kinds.is_empty() {
+            for k in ["d", "f", "m"] {
+                normalized_kinds.push(k.to_string());
+            }
+        } else {
+            for k in &create.kinds {
+                let code = match k.to_ascii_lowercase().as_str() {
+                    "ndistinct" => "d",
+                    "dependencies" => "f",
+                    "mcv" => "m",
+                    other => {
+                        return MutationResult::conflict(format!(
+                            "unrecognized statistics kind \"{other}\""
+                        ));
+                    }
+                };
+                if !normalized_kinds.iter().any(|existing| existing == code) {
+                    normalized_kinds.push(code.to_string());
+                }
+            }
+        }
+        if create.columns.len() + create.expression_count < 2
+            && !(create.columns.is_empty()
+                && create.expression_count == 1
+                && create.kinds.is_empty())
+        {
+            return MutationResult::conflict(
+                "extended statistics require at least 2 columns".to_string(),
+            );
+        }
+        let mut seen_cols = HashSet::new();
+        for col in &create.columns {
+            if !seen_cols.insert(col) {
+                return MutationResult::conflict(
+                    "duplicate column name in statistics definition".to_string(),
+                );
+            }
+        }
+        if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+            self.local.relations.get(&create.table)
+            && rel.columns_complete
+        {
+            for col in &create.columns {
+                if !rel.has_column(col) {
+                    return MutationResult::conflict(format!("column \"{col}\" does not exist"));
+                }
+            }
+        }
+        self.snapshot_relation(&create.table);
+        if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+            self.local.relations.get_mut(&create.table)
+        {
+            rel.extended_statistics.insert(
+                stats_id.clone(),
+                crate::_internal::model::relation::ExtendedStatisticsState {
+                    id: stats_id,
+                    kinds: normalized_kinds,
+                    columns: create.columns.clone(),
+                    expressions: create.expressions_sql.clone(),
+                    target: None,
+                },
+            );
+        }
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_alter_statistics(
+        &mut self,
+        alter: &AlterStatisticsMutation,
+    ) -> MutationResult {
+        let owner_table = self.local.relations.iter().find_map(|(table_id, overlay)| {
+            let crate::_internal::model::relation::RelationOverlay::Present(rel) = overlay else {
+                return None;
+            };
+            rel.extended_statistics
+                .contains_key(&alter.id)
+                .then(|| table_id.clone())
+        });
+        let Some(table_id) = owner_table else {
+            if self.baseline_covers_family_object(
+                &alter.id,
+                crate::_internal::db::cache::CatalogFamily::Relations,
+            ) {
+                return MutationResult::conflict(format!(
+                    "statistics object \"{}\" does not exist",
+                    alter.id
+                ));
+            }
+            return self.unresolved(EvidenceCode::UnknownObjectState);
+        };
+        match &alter.action {
+            AlterStatisticsActionFact::RenameTo(new_name) => {
+                let new_id = ObjectId::new(&alter.id.schema, new_name);
+                if new_id != alter.id && self.extended_statistics_is_present(&new_id) {
+                    return MutationResult::conflict(format!(
+                        "statistics object \"{}\" already exists",
+                        new_id
+                    ));
+                }
+                self.snapshot_relation(&table_id);
+                if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                    self.local.relations.get_mut(&table_id)
+                    && let Some(mut stat) = rel.extended_statistics.remove(&alter.id)
+                {
+                    stat.id = new_id.clone();
+                    rel.extended_statistics.insert(new_id, stat);
+                }
+            }
+            AlterStatisticsActionFact::SetSchema(new_schema) => {
+                if let Err(result) = self.ensure_schema_target(new_schema) {
+                    return result;
+                }
+                let new_id = ObjectId::new(new_schema, &alter.id.name);
+                if new_id != alter.id && self.extended_statistics_is_present(&new_id) {
+                    return MutationResult::conflict(format!(
+                        "statistics object \"{}\" already exists",
+                        new_id
+                    ));
+                }
+                self.snapshot_relation(&table_id);
+                if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                    self.local.relations.get_mut(&table_id)
+                    && let Some(mut stat) = rel.extended_statistics.remove(&alter.id)
+                {
+                    stat.id = new_id.clone();
+                    rel.extended_statistics.insert(new_id, stat);
+                }
+            }
+            AlterStatisticsActionFact::SetStatistics(target) => {
+                let next_target = match target {
+                    StatisticsTarget::Default => None,
+                    StatisticsTarget::Value(val) => {
+                        if *val < SET_STATISTICS_MIN {
+                            return MutationResult::conflict(format!(
+                                "statistics target {val} is too low"
+                            ));
+                        }
+                        if *val > SET_STATISTICS_MAX {
+                            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                            Some(SET_STATISTICS_MAX)
+                        } else if *val == -1 {
+                            None
+                        } else {
+                            Some(*val)
+                        }
+                    }
+                };
+                self.snapshot_relation(&table_id);
+                if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                    self.local.relations.get_mut(&table_id)
+                    && let Some(stat) = rel.extended_statistics.get_mut(&alter.id)
+                {
+                    stat.target = next_target;
+                }
+            }
+            AlterStatisticsActionFact::OwnerTo(_) => {
+                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+            }
+        }
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_drop_statistics(
+        &mut self,
+        drop: &DropStatisticsMutation,
+    ) -> MutationResult {
+        let mut targets: Vec<(ObjectId, ObjectId)> = Vec::new();
+        for stats_id in &drop.ids {
+            let owner_table = self.local.relations.iter().find_map(|(table_id, overlay)| {
+                let crate::_internal::model::relation::RelationOverlay::Present(rel) = overlay
+                else {
+                    return None;
+                };
+                rel.extended_statistics
+                    .contains_key(stats_id)
+                    .then(|| table_id.clone())
+            });
+            match owner_table {
+                Some(table_id) => {
+                    if !targets.iter().any(|(_, s)| s == stats_id) {
+                        targets.push((table_id, stats_id.clone()));
+                    }
+                }
+                None if drop.if_exists => {}
+                None if self.baseline_covers_family_object(
+                    stats_id,
+                    crate::_internal::db::cache::CatalogFamily::Relations,
+                ) =>
+                {
+                    return MutationResult::conflict(format!(
+                        "statistics object \"{}\" does not exist",
+                        stats_id
+                    ));
+                }
+                None => {
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return MutationResult::NoOp;
+        }
+        for (table_id, stats_id) in targets {
+            self.snapshot_relation(&table_id);
+            if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                self.local.relations.get_mut(&table_id)
+            {
+                rel.extended_statistics.remove(&stats_id);
+            }
+        }
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_analyze(&mut self, analyze: &AnalyzeMutation) -> MutationResult {
+        if analyze.targets.is_empty() {
+            let all_tables: Vec<ObjectId> = self
+                .local
+                .relations
+                .iter()
+                .filter_map(|(id, overlay)| match overlay {
+                    crate::_internal::model::relation::RelationOverlay::Present(rel)
+                        if matches!(
+                            rel.kind,
+                            RelationKind::Table
+                                | RelationKind::MaterializedView
+                                | RelationKind::ForeignTable
+                        ) =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for table_id in all_tables {
+                self.snapshot_relation(&table_id);
+                if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                    self.local.relations.get_mut(&table_id)
+                {
+                    rel.last_analyze = Some("in-migration".to_string());
+                }
+            }
+            return MutationResult::Applied;
+        }
+        for target in &analyze.targets {
+            if let Err(result) = self.ensure_relation_target(
+                &target.table_id,
+                |kind| {
+                    matches!(
+                        kind,
+                        RelationKind::Table
+                            | RelationKind::MaterializedView
+                            | RelationKind::ForeignTable
+                    )
+                },
+                format!("relation '{}' does not exist", target.table_id),
+                format!("cannot analyze relation '{}'", target.table_id),
+            ) {
+                return result;
+            }
+            if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                self.local.relations.get(&target.table_id)
+                && rel.columns_complete
+            {
+                for col in &target.columns {
+                    if !rel.has_column(col) {
+                        return MutationResult::conflict(format!(
+                            "column \"{col}\" of relation \"{}\" does not exist",
+                            target.table_id
+                        ));
+                    }
+                }
+            }
+        }
+        for target in &analyze.targets {
+            self.snapshot_relation(&target.table_id);
+            if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                self.local.relations.get_mut(&target.table_id)
+            {
+                rel.last_analyze = Some("in-migration".to_string());
+            }
+        }
         MutationResult::Applied
     }
 }

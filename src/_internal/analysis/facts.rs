@@ -475,6 +475,12 @@ pub(crate) enum StatementFact {
     DropAggregate(DropAggregateFact),
     AlterRoutine(AlterRoutineFact),
     DropRoutine(DropRoutineFact),
+    CreateCast(CreateCastFact),
+    DropCast(DropCastFact),
+    CreateStatistics(CreateStatisticsFact),
+    AlterStatistics(AlterStatisticsFact),
+    DropStatistics(DropStatisticsFact),
+    Analyze(AnalyzeFact),
     CreatePublication(CreatePublicationFact),
     AlterPublication(AlterPublicationFact),
     DropPublication(DropPublicationFact),
@@ -1735,4 +1741,77 @@ pub(crate) enum AlterTableActionFact {
         rule_name: Option<String>,
         mode: RuleEnableModeFact,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CastContextFact {
+    Explicit,
+    Assignment,
+    Implicit,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CastMethodFact {
+    WithFunction(FunctionSigFact),
+    WithoutFunction,
+    WithInout,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateCastFact {
+    pub source_type: String,
+    pub target_type: String,
+    pub method: CastMethodFact,
+    pub context: CastContextFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropCastFact {
+    pub source_type: String,
+    pub target_type: String,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreateStatisticsFact {
+    pub name: Option<QualifiedName>,
+    pub if_not_exists: bool,
+    pub kinds: Vec<String>,
+    pub columns: Vec<String>,
+    pub expression_count: usize,
+    pub expressions_sql: Option<String>,
+    pub table: QualifiedName,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterStatisticsActionFact {
+    RenameTo(String),
+    OwnerTo(RoleFact),
+    SetSchema(String),
+    SetStatistics(StatisticsTarget),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterStatisticsFact {
+    pub name: QualifiedName,
+    pub action: AlterStatisticsActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropStatisticsFact {
+    pub names: Vec<QualifiedName>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeTargetFact {
+    pub relation: QualifiedName,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeFact {
+    pub targets: Vec<AnalyzeTargetFact>,
 }

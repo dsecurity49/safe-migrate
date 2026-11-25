@@ -32,6 +32,19 @@ impl CastCatalogue {
                 .get(from)
                 .is_some_and(|targets| targets.contains(to))
     }
+
+    pub(crate) fn insert_implicit(&mut self, from: String, to: String) {
+        self.implicit.entry(from).or_default().insert(to);
+    }
+
+    pub(crate) fn remove_implicit(&mut self, from: &str, to: &str) {
+        if let Some(targets) = self.implicit.get_mut(from) {
+            targets.remove(to);
+            if targets.is_empty() {
+                self.implicit.remove(from);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

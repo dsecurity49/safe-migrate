@@ -94,6 +94,26 @@ impl Resolver {
         id
     }
 
+    pub(super) fn resolve_statistics_lookup_name(
+        name: &QualifiedName,
+        state: &AnalysisState,
+    ) -> ObjectId {
+        Self::resolve_in_namespace(
+            name,
+            name.name.resolve(),
+            state,
+            AnalysisState::extended_statistics_is_present,
+            AnalysisState::relation_search_path,
+        )
+    }
+
+    pub(super) fn resolve_cast_type_identity(raw: &str, state: &AnalysisState) -> String {
+        if let Some(id) = state.resolve_type_reference(raw) {
+            return id.to_string();
+        }
+        Self::normalize_function_arg_type(raw, state.builtin_types()).render()
+    }
+
     fn resolve_relation_lookup_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
         Self::resolve_in_namespace(
             name,
@@ -736,6 +756,24 @@ impl Resolver {
             }
             StatementFact::DropRoutine(r) => {
                 mutations.push(Self::resolve_drop_routine(r, state));
+            }
+            StatementFact::CreateCast(c) => {
+                mutations.push(Self::resolve_create_cast(c, state));
+            }
+            StatementFact::DropCast(c) => {
+                mutations.push(Self::resolve_drop_cast(c, state));
+            }
+            StatementFact::CreateStatistics(s) => {
+                mutations.push(Self::resolve_create_statistics(s, state));
+            }
+            StatementFact::AlterStatistics(s) => {
+                mutations.push(Self::resolve_alter_statistics(s, state));
+            }
+            StatementFact::DropStatistics(s) => {
+                mutations.push(Self::resolve_drop_statistics(s, state));
+            }
+            StatementFact::Analyze(a) => {
+                mutations.push(Self::resolve_analyze(a, state));
             }
             StatementFact::CreatePublication(p) => {
                 mutations.push(Self::resolve_create_publication(p, state));

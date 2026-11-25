@@ -168,6 +168,12 @@ pub(crate) enum Mutation {
     DropAggregate(DropAggregateMutation),
     AlterRoutine(AlterRoutineMutation),
     DropRoutine(DropRoutineMutation),
+    CreateCast(CreateCastMutation),
+    DropCast(DropCastMutation),
+    CreateStatistics(CreateStatisticsMutation),
+    AlterStatistics(AlterStatisticsMutation),
+    DropStatistics(DropStatisticsMutation),
+    Analyze(AnalyzeMutation),
     CreatePublication(CreatePublicationMutation),
     AlterPublication(AlterPublicationMutation),
     DropPublication(DropPublicationMutation),
@@ -1156,4 +1162,62 @@ pub(crate) enum AlterIndexActionMutation {
     ResetOptions {
         options: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CastMethodMutation {
+    WithFunction(ObjectId),
+    WithoutFunction,
+    WithInout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreateCastMutation {
+    pub source_type: String,
+    pub target_type: String,
+    pub method: CastMethodMutation,
+    pub context: crate::_internal::analysis::facts::CastContextFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropCastMutation {
+    pub source_type: String,
+    pub target_type: String,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreateStatisticsMutation {
+    pub id: Option<ObjectId>,
+    pub if_not_exists: bool,
+    pub kinds: Vec<String>,
+    pub columns: Vec<String>,
+    pub expression_count: usize,
+    pub expressions_sql: Option<String>,
+    pub table: ObjectId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterStatisticsMutation {
+    pub id: ObjectId,
+    pub action: crate::_internal::analysis::facts::AlterStatisticsActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropStatisticsMutation {
+    pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeTargetMutation {
+    pub table_id: ObjectId,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeMutation {
+    pub targets: Vec<AnalyzeTargetMutation>,
 }

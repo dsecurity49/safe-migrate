@@ -18,6 +18,7 @@ pub(crate) struct NamespaceSnapshot {
     pub functions: HashMap<ObjectId, crate::_internal::model::function::FunctionOverlay>,
     pub sequences: HashMap<ObjectId, SequenceOverlay>,
     pub collations: crate::_internal::model::collation::CollationCatalogue,
+    pub casts: crate::_internal::model::cast::CastCatalogue,
     pub extensions: HashMap<String, crate::_internal::model::extension::ExtensionOverlay>,
     pub publications: HashMap<String, crate::_internal::model::replication::PublicationOverlay>,
     pub triggers: HashMap<ObjectId, crate::_internal::model::trigger::TriggerOverlay>,
@@ -172,6 +173,9 @@ pub(crate) enum StateChange {
     },
     CoDroppedObjectsSnapshot {
         previous: HashSet<ObjectId>,
+    },
+    CastsSnapshot {
+        previous: crate::_internal::model::cast::CastCatalogue,
     },
 }
 

@@ -572,3 +572,12 @@ impl AnalysisState {
         self.local.transaction_aborted = true;
     }
 }
+
+impl AnalysisState {
+    pub(crate) fn extended_statistics_is_present(&self, id: &ObjectId) -> bool {
+        self.local.relations.values().any(|overlay| match overlay {
+            RelationOverlay::Present(rel) => rel.extended_statistics.contains_key(id),
+            RelationOverlay::Dropped => false,
+        })
+    }
+}

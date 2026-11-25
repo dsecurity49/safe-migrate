@@ -78,6 +78,7 @@ impl AnalysisState {
             functions: self.local.functions.clone(),
             sequences: self.local.sequences.clone(),
             collations: self.local.collations.clone(),
+            casts: self.local.casts.clone(),
             extensions: self.local.extensions.clone(),
             publications: self.local.publications.clone(),
             triggers: self.local.triggers.clone(),
@@ -97,6 +98,15 @@ impl AnalysisState {
         };
         self.local
             .push_undo(StateChange::NamespaceSnapshot(Box::new(snapshot)));
+    }
+
+    pub(super) fn snapshot_casts(&mut self) {
+        if !self.local.records_undo() {
+            return;
+        }
+        self.local.push_undo(StateChange::CastsSnapshot {
+            previous: self.local.casts.clone(),
+        });
     }
 
     pub(super) fn snapshot_type(&mut self, id: &ObjectId) {
