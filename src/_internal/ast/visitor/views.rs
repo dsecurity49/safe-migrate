@@ -636,7 +636,7 @@ impl AstVisitor {
 
     /// Collects relation aliases from one `FROM` item, recursing through joins
     /// and marking subqueries or unknown items unresolved.
-    fn collect_scope_item(item: &ast::FromListItem, scope: &mut AggregateScopeFact) {
+    pub(super) fn collect_scope_item(item: &ast::FromListItem, scope: &mut AggregateScopeFact) {
         match item {
             ast::FromListItem::JoinExpr(join) => {
                 if let Some(item) = join.from_list_item() {

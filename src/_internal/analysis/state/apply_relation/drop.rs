@@ -158,6 +158,29 @@ impl AnalysisState {
                     .relations
                     .insert(dropped_rel_id.clone(), RelationOverlay::Dropped);
             }
+            let routines_to_drop: Vec<ObjectId> = self
+                .local
+                .graph
+                .edges()
+                .iter()
+                .filter(|e| {
+                    matches!(e.kind, DependencyKind::RoutineUsesRelation { .. })
+                        && closure.dropped_relations.contains(&resolve(&e.referenced))
+                        && matches!(
+                            self.local.functions.get(&e.dependent),
+                            Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                _
+                            ))
+                        )
+                })
+                .map(|e| e.dependent.clone())
+                .collect();
+            if !routines_to_drop.is_empty() {
+                let dropped_set: HashSet<ObjectId> = routines_to_drop.iter().cloned().collect();
+                for routine_id in routines_to_drop {
+                    let _ = self.apply_routine_cascade_drop(&routine_id, &[], &[], &dropped_set);
+                }
+            }
 
             self.snapshot_graph_full();
             self.local.graph.retain_edges(|e| match &e.kind {
@@ -212,7 +235,19 @@ impl AnalysisState {
                     && !self.co_dropped_objects.contains(&resolve(&e.dependent))
             });
 
-            if has_view_deps || has_fk_deps || has_inheritance_deps {
+            let has_routine_deps = self.local.graph.edges().iter().any(|e| {
+                matches!(e.kind, DependencyKind::RoutineUsesRelation { .. })
+                    && roots.contains(&resolve(&e.referenced))
+                    && !self.co_dropped_objects.contains(&e.dependent)
+                    && matches!(
+                        self.local.functions.get(&e.dependent),
+                        Some(crate::_internal::model::function::FunctionOverlay::Present(
+                            _
+                        ))
+                    )
+            });
+
+            if has_view_deps || has_fk_deps || has_inheritance_deps || has_routine_deps {
                 let relation_word = if present_targets.len() == 1 {
                     "relation"
                 } else {

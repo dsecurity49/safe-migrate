@@ -1671,3 +1671,100 @@ fn create_aggregate_tracks_dependencies_and_validates_or_replace_and_hypothetica
         "changing direct argument count in CREATE OR REPLACE AGGREGATE must conflict: {replace_conflict:?}"
     );
 }
+
+#[test]
+fn atomic_routine_bodies_track_relation_column_routine_and_type_dependencies() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    engine
+        .analyze(
+            "CREATE TYPE public.atomic_status AS ENUM ('active', 'closed');
+             CREATE TABLE public.atomic_users (id int PRIMARY KEY, email text, phone text);
+             CREATE FUNCTION public.atomic_helper(int) RETURNS int
+                 BEGIN ATOMIC RETURN $1 + 1; END;
+             CREATE FUNCTION public.atomic_lookup(uid int) RETURNS text
+                 BEGIN ATOMIC
+                     SELECT u.email
+                     FROM public.atomic_users u
+                     WHERE u.id = public.atomic_helper(uid)
+                       AND 'active'::public.atomic_status = 'active'::public.atomic_status;
+                 END;",
+            &mut state,
+        )
+        .unwrap();
+
+    let mut drop_tbl_state = state.clone();
+    let drop_tbl = engine
+        .analyze("DROP TABLE public.atomic_users;", &mut drop_tbl_state)
+        .unwrap();
+    assert!(
+        drop_tbl.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping table referenced by atomic function without CASCADE must conflict: {drop_tbl:?}"
+    );
+
+    let mut drop_col_state = state.clone();
+    let drop_col = engine
+        .analyze(
+            "ALTER TABLE public.atomic_users DROP COLUMN email;",
+            &mut drop_col_state,
+        )
+        .unwrap();
+    assert!(
+        drop_col.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping column referenced by atomic function without CASCADE must conflict: {drop_col:?}"
+    );
+
+    let mut drop_unreferenced_col_state = state.clone();
+    let drop_unreferenced_col = engine
+        .analyze(
+            "ALTER TABLE public.atomic_users DROP COLUMN phone;",
+            &mut drop_unreferenced_col_state,
+        )
+        .unwrap();
+    assert!(
+        !drop_unreferenced_col
+            .iter()
+            .any(|v| v.rule_id == "chain-conflict"),
+        "dropping unreferenced column must succeed: {drop_unreferenced_col:?}"
+    );
+
+    let mut drop_fn_state = state.clone();
+    let drop_fn = engine
+        .analyze(
+            "DROP FUNCTION public.atomic_helper(int);",
+            &mut drop_fn_state,
+        )
+        .unwrap();
+    assert!(
+        drop_fn.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping routine referenced by atomic function without CASCADE must conflict: {drop_fn:?}"
+    );
+
+    let mut drop_type_state = state.clone();
+    let drop_type = engine
+        .analyze("DROP TYPE public.atomic_status;", &mut drop_type_state)
+        .unwrap();
+    assert!(
+        drop_type.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping type cast inside atomic function without CASCADE must conflict: {drop_type:?}"
+    );
+
+    let mut cascade_col_state = state.clone();
+    let cascade_col = engine
+        .analyze(
+            "ALTER TABLE public.atomic_users DROP COLUMN email CASCADE;",
+            &mut cascade_col_state,
+        )
+        .unwrap();
+    assert!(
+        !cascade_col.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP COLUMN CASCADE must drop dependent atomic function: {cascade_col:?}"
+    );
+    assert!(matches!(
+        cascade_col_state
+            .local
+            .functions
+            .get(&object_id("public", "atomic_lookup(integer)")),
+        Some(safe_migrate::_internal::model::function::FunctionOverlay::Dropped)
+    ));
+}

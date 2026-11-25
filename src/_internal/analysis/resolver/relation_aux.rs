@@ -428,7 +428,7 @@ impl Resolver {
     /// resolves to the exact routine identity. Any other call falls back to the
     /// lone routine of that name when the modeled universe holds one; only a
     /// call that is still ambiguous keeps just the qualified name.
-    fn resolve_view_routines(
+    pub(super) fn resolve_view_routines(
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         source: Option<&ObjectId>,
         state: &AnalysisState,
@@ -488,7 +488,7 @@ impl Resolver {
     }
 
     /// The types a view body casts to, as identities the drop path can match.
-    fn resolve_cast_types(
+    pub(super) fn resolve_cast_types(
         cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
     ) -> Vec<ObjectId> {

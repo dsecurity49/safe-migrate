@@ -3,12 +3,13 @@ use crate::_internal::analysis::facts::{
     AlterAggregateFact, AlterFunctionFact, AlterProcedureFact, AlterRoutineFact,
     CreateAggregateFact, CreateFunctionFact, CreateProcedureFact, DropAggregateFact,
     DropFunctionFact, DropProcedureFact, DropRoutineFact, FunctionSigFact,
+    RoutineBodyDependenciesFact,
 };
 use crate::_internal::analysis::mutations::{
     AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, AlterRoutineMutation,
     CreateAggregateMutation, CreateFunctionMutation, CreateProcedureMutation,
     DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, DropRoutineMutation,
-    Mutation,
+    Mutation, RoutineBodyDependencies, RoutineRelationDependency,
 };
 use crate::_internal::analysis::state::AnalysisState;
 
@@ -23,6 +24,10 @@ impl Resolver {
             params: fact.params.clone(),
             return_type: fact.return_type.clone(),
             options: fact.options.clone(),
+            body_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.body_dependencies,
+                state,
+            ),
         })
     }
 
@@ -56,6 +61,10 @@ impl Resolver {
             or_replace: fact.or_replace,
             params: fact.params.clone(),
             options: fact.options.clone(),
+            body_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.body_dependencies,
+                state,
+            ),
         })
     }
 
@@ -131,6 +140,36 @@ impl Resolver {
             if_exists: fact.if_exists,
             cascade: fact.cascade,
         })
+    }
+
+    fn resolve_routine_body_dependencies(
+        deps: &RoutineBodyDependenciesFact,
+        state: &AnalysisState,
+    ) -> RoutineBodyDependencies {
+        let mut relations: Vec<RoutineRelationDependency> = Vec::new();
+        for rel in &deps.relations {
+            let resolved = RoutineRelationDependency {
+                relation: Self::resolve_relation_lookup_name(&rel.relation, state),
+                column: rel.column.clone(),
+            };
+            if !relations.contains(&resolved) {
+                relations.push(resolved);
+            }
+        }
+        let single_source = {
+            let mut distinct_rels: Vec<&crate::_internal::ast::identifiers::ObjectId> = Vec::new();
+            for r in &relations {
+                if !distinct_rels.contains(&&r.relation) {
+                    distinct_rels.push(&r.relation);
+                }
+            }
+            (distinct_rels.len() == 1).then(|| distinct_rels[0].clone())
+        };
+        RoutineBodyDependencies {
+            relations,
+            routines: Self::resolve_view_routines(&deps.routines, single_source.as_ref(), state),
+            types: Self::resolve_cast_types(&deps.types, state),
+        }
     }
 
     fn normalize_signatures(

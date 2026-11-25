@@ -19,6 +19,7 @@ impl AnalysisState {
             drop_column_statistics,
             cascade_generated_columns,
             cascade_view_roots,
+            cascade_routine_roots,
         } = context;
         let action_type_id = match &alter.action {
             AlterTableActionMutation::AddColumn { ty, .. } => ty
@@ -1343,6 +1344,12 @@ impl AnalysisState {
             // Preflight established a column-level dependency and CASCADE;
             // this applies the recursive view/index closure PostgreSQL drops.
             let _ = self.apply_drop_relation_family(&views, true, "view");
+        }
+        if !cascade_routine_roots.is_empty() {
+            for routine_id in &cascade_routine_roots {
+                let _ =
+                    self.apply_routine_cascade_drop(routine_id, &[], &[], &cascade_routine_roots);
+            }
         }
         if let AlterTableActionMutation::DropColumn { name, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();

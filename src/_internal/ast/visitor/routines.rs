@@ -205,6 +205,126 @@ impl AstVisitor {
         }
     }
 
+    pub(super) fn extract_routine_body_dependencies(
+        body: Option<squawk_syntax::ast::RoutineBody>,
+    ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+        let Some(body) = body else {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        };
+        let syntax = body.syntax();
+        let mut relations: Vec<crate::_internal::analysis::facts::RoutineRelationReferenceFact> =
+            Vec::new();
+        for qname in Self::extract_view_dependencies(syntax) {
+            let rel_fact = crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                relation: qname,
+                column: None,
+            };
+            if !relations.contains(&rel_fact) {
+                relations.push(rel_fact);
+            }
+        }
+        for select in syntax.descendants().filter_map(ast::Select::cast) {
+            let mut scope = AggregateScopeFact {
+                bindings: Vec::new(),
+                unknown: false,
+            };
+            if let Some(from) = select.from_clause() {
+                for item in from.items() {
+                    Self::collect_scope_item(&item, &mut scope);
+                }
+            }
+            let single_binding = if !scope.unknown && scope.bindings.len() == 1 {
+                scope.bindings[0].relation.clone()
+            } else {
+                None
+            };
+            for field in select
+                .syntax()
+                .descendants()
+                .filter_map(ast::FieldExpr::cast)
+            {
+                if field.star_token().is_some() {
+                    continue;
+                }
+                let Some(field_name) = field
+                    .field()
+                    .and_then(|f| f.syntax().first_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                let Some(ast::Expr::NameRef(base_name)) = field.base() else {
+                    continue;
+                };
+                let Some(qualifier) = base_name
+                    .syntax()
+                    .first_token()
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                if let Some(binding) = scope.bindings.iter().find(|b| b.alias == qualifier)
+                    && let Some(ref rel_qname) = binding.relation
+                {
+                    let rel_fact =
+                        crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                            relation: rel_qname.clone(),
+                            column: Some(field_name),
+                        };
+                    if !relations.contains(&rel_fact) {
+                        relations.push(rel_fact);
+                    }
+                }
+            }
+            if let Some(rel_qname) = single_binding {
+                let mut field_children = std::collections::HashSet::new();
+                let mut callees = std::collections::HashSet::new();
+                for node in select.syntax().descendants() {
+                    if let Some(call) = ast::CallExpr::cast(node.clone())
+                        && let Some(callee) = call.expr()
+                    {
+                        callees.insert(callee.syntax().clone());
+                    }
+                    if let Some(field) = ast::FieldExpr::cast(node) {
+                        if let Some(b) = field.base() {
+                            field_children.insert(b.syntax().clone());
+                        }
+                        if let Some(f) = field.field() {
+                            field_children.insert(f.syntax().clone());
+                        }
+                    }
+                }
+                for name_ref in select.syntax().descendants().filter_map(ast::NameRef::cast) {
+                    if field_children.contains(name_ref.syntax())
+                        || callees.contains(name_ref.syntax())
+                    {
+                        continue;
+                    }
+                    let Some(col_name) = name_ref
+                        .syntax()
+                        .first_token()
+                        .map(|t| Self::resolve_identifier_token(t.text()))
+                    else {
+                        continue;
+                    };
+                    let rel_fact =
+                        crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                            relation: rel_qname.clone(),
+                            column: Some(col_name),
+                        };
+                    if !relations.contains(&rel_fact) {
+                        relations.push(rel_fact);
+                    }
+                }
+            }
+        }
+        crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+            relations,
+            routines: Self::extract_view_routines(syntax),
+            types: Self::extract_view_cast_types(syntax),
+        }
+    }
+
     pub(super) fn extract_create_function(
         node: &squawk_syntax::ast::CreateFunction,
     ) -> Option<StatementFact> {
@@ -225,6 +345,7 @@ impl AstVisitor {
             })
             .unwrap_or_default();
 
+        let body_dependencies = Self::extract_routine_body_dependencies(node.body());
         Some(StatementFact::CreateFunction(
             crate::_internal::analysis::facts::CreateFunctionFact {
                 name,
@@ -232,6 +353,7 @@ impl AstVisitor {
                 params,
                 return_type,
                 options,
+                body_dependencies,
             },
         ))
     }
@@ -338,12 +460,14 @@ impl AstVisitor {
             })
             .unwrap_or_default();
 
+        let body_dependencies = Self::extract_routine_body_dependencies(node.body());
         Some(StatementFact::CreateProcedure(
             crate::_internal::analysis::facts::CreateProcedureFact {
                 name,
                 or_replace,
                 params,
                 options,
+                body_dependencies,
             },
         ))
     }

@@ -506,6 +506,7 @@ impl AnalysisState {
                 aggregate: None,
             }),
         );
+        self.record_routine_body_dependencies(&function.id, &function.body_dependencies);
         MutationResult::Applied
     }
 
@@ -962,6 +963,7 @@ impl AnalysisState {
                 aggregate: None,
             }),
         );
+        self.record_routine_body_dependencies(&procedure.id, &procedure.body_dependencies);
         MutationResult::Applied
     }
 
@@ -1100,7 +1102,35 @@ impl AnalysisState {
         // allowed in atomic bodies and string bodies are untracked), so
         // CASCADE behaves like RESTRICT here.
         for id in &targets {
-            self.drop_routine_with_edges(id);
+            let dependent_routines: Vec<ObjectId> = self
+                .local
+                .graph
+                .routines_for_function(id)
+                .into_iter()
+                .filter(|edge| {
+                    !self.co_dropped_objects.contains(&edge.dependent)
+                        && !targets.contains(&edge.dependent)
+                        && matches!(
+                            self.local.functions.get(&edge.dependent),
+                            Some(FunctionOverlay::Present(_))
+                        )
+                })
+                .map(|edge| edge.dependent.clone())
+                .collect();
+            if !dependent_routines.is_empty() && !procedure.cascade {
+                return MutationResult::conflict(format!(
+                    "procedure '{}' is required by routine '{}'; use CASCADE",
+                    id, dependent_routines[0]
+                ));
+            }
+        }
+        let dropped_ids: HashSet<ObjectId> = targets.iter().cloned().collect();
+        for id in &targets {
+            if procedure.cascade {
+                let _ = self.apply_routine_cascade_drop(id, &[], &[], &dropped_ids);
+            } else {
+                self.drop_routine_with_edges(id);
+            }
         }
         if !targets.is_empty() {
             MutationResult::Applied
@@ -1770,6 +1800,61 @@ impl AnalysisState {
             })
             .collect();
         (matches.len() == 1).then(|| matches[0].clone())
+    }
+
+    fn record_routine_body_dependencies(
+        &mut self,
+        routine_id: &ObjectId,
+        deps: &crate::_internal::analysis::mutations::RoutineBodyDependencies,
+    ) {
+        self.snapshot_graph_full();
+        self.local.graph.retain_edges(|edge| {
+            !(edge.dependent == *routine_id
+                && matches!(
+                    edge.kind,
+                    DependencyKind::RoutineUsesRoutine { .. }
+                        | DependencyKind::RoutineUsesType
+                        | DependencyKind::RoutineUsesRelation { .. }
+                ))
+        });
+        for rel_dep in &deps.relations {
+            if let Some(ref col) = rel_dep.column
+                && let Some(RelationOverlay::Present(rel)) =
+                    self.local.relations.get(&rel_dep.relation)
+                && rel.columns_complete
+                && !rel.has_column(col)
+            {
+                continue;
+            }
+            self.local.graph.add_edge(DependencyEdge::new(
+                routine_id.clone(),
+                rel_dep.relation.clone(),
+                DependencyKind::RoutineUsesRelation {
+                    referenced_column: rel_dep.column.clone(),
+                },
+            ));
+        }
+        for routine in &deps.routines {
+            if routine.name.inferred_schema && self.path_shadows(&routine.name.schema) {
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+            }
+            let (referenced, unresolved_name) = match &routine.signature {
+                Some(signature) => (signature.clone(), None),
+                None => (routine.name.clone(), Some(routine.name.clone())),
+            };
+            self.local.graph.add_edge(DependencyEdge::new(
+                routine_id.clone(),
+                referenced,
+                DependencyKind::RoutineUsesRoutine { unresolved_name },
+            ));
+        }
+        for ty in &deps.types {
+            self.local.graph.add_edge(DependencyEdge::new(
+                routine_id.clone(),
+                ty.clone(),
+                DependencyKind::RoutineUsesType,
+            ));
+        }
     }
 
     fn record_aggregate_dependencies(&mut self, aggregate: &CreateAggregateMutation) {

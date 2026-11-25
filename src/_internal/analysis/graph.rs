@@ -55,7 +55,6 @@ pub(crate) enum DependencyKind {
         unresolved_name: Option<ObjectId>,
     },
     /// A routine whose parsed body depends on a relation (and optionally a column).
-    #[allow(dead_code)]
     RoutineUsesRelation {
         referenced_column: Option<String>,
     },

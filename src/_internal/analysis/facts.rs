@@ -793,6 +793,19 @@ pub(crate) struct DropRoleFact {
     pub if_exists: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutineRelationReferenceFact {
+    pub relation: QualifiedName,
+    pub column: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RoutineBodyDependenciesFact {
+    pub relations: Vec<RoutineRelationReferenceFact>,
+    pub routines: Vec<RoutineReferenceFact>,
+    pub types: Vec<CastTypeReferenceFact>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateFunctionFact {
     pub name: QualifiedName,
@@ -800,6 +813,7 @@ pub(crate) struct CreateFunctionFact {
     pub params: Vec<ParamFact>,
     pub return_type: Option<RetTypeFact>,
     pub options: Vec<FuncOptionFact>,
+    pub body_dependencies: RoutineBodyDependenciesFact,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -906,6 +920,7 @@ pub(crate) struct CreateProcedureFact {
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
     pub options: Vec<FuncOptionFact>,
+    pub body_dependencies: RoutineBodyDependenciesFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]

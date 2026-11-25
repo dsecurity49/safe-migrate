@@ -683,6 +683,7 @@ impl AnalysisState {
                 && matches!(
                     edge.kind,
                     DependencyKind::ViewDependency { .. }
+                        | DependencyKind::RoutineUsesRelation { .. }
                         | DependencyKind::ForeignKey { .. }
                         | DependencyKind::InheritanceOf
                         | DependencyKind::PartitionOf
@@ -719,6 +720,18 @@ impl AnalysisState {
                         Some(RelationOverlay::Present(_))
                     )
             })
+            || self
+                .local
+                .graph
+                .routines_for_function(routine)
+                .iter()
+                .any(|edge| {
+                    !co_dropped.contains(&edge.dependent)
+                        && matches!(
+                            self.local.functions.get(&edge.dependent),
+                            Some(FunctionOverlay::Present(_))
+                        )
+                })
     }
 
     fn sequence_has_external_dependents(

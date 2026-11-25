@@ -711,6 +711,19 @@ pub(crate) struct RollbackToSavepointMutation {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutineRelationDependency {
+    pub relation: ObjectId,
+    pub column: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RoutineBodyDependencies {
+    pub relations: Vec<RoutineRelationDependency>,
+    pub routines: Vec<ViewRoutine>,
+    pub types: Vec<ObjectId>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateFunctionMutation {
     pub id: ObjectId,
@@ -718,6 +731,7 @@ pub(crate) struct CreateFunctionMutation {
     pub params: Vec<crate::_internal::analysis::facts::ParamFact>,
     pub return_type: Option<crate::_internal::analysis::facts::RetTypeFact>,
     pub options: Vec<crate::_internal::analysis::facts::FuncOptionFact>,
+    pub body_dependencies: RoutineBodyDependencies,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -739,6 +753,7 @@ pub(crate) struct CreateProcedureMutation {
     pub or_replace: bool,
     pub params: Vec<crate::_internal::analysis::facts::ParamFact>,
     pub options: Vec<crate::_internal::analysis::facts::FuncOptionFact>,
+    pub body_dependencies: RoutineBodyDependencies,
 }
 
 #[derive(Clone, Debug, PartialEq)]

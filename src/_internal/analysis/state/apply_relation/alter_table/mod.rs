@@ -20,6 +20,7 @@ struct AlterTableContext {
     drop_column_statistics: HashSet<ObjectId>,
     cascade_generated_columns: HashSet<String>,
     cascade_view_roots: HashSet<ObjectId>,
+    cascade_routine_roots: HashSet<ObjectId>,
 }
 
 impl AnalysisState {
@@ -1602,6 +1603,7 @@ impl AnalysisState {
         let mut drop_column_statistics: HashSet<ObjectId> = HashSet::new();
         let mut cascade_generated_columns: HashSet<String> = HashSet::new();
         let mut cascade_view_roots: HashSet<ObjectId> = HashSet::new();
+        let mut cascade_routine_roots: HashSet<ObjectId> = HashSet::new();
         if let AlterTableActionMutation::DropColumn { name, cascade, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
             // The same rule as DROP TABLE: an unproven dependency set widens what the
@@ -1744,6 +1746,21 @@ impl AnalysisState {
                         Some(_) => {}
                         None => unknown_dependency = true,
                     },
+                    DependencyKind::RoutineUsesRelation {
+                        referenced_column: Some(column),
+                    } if referenced == &resolved_table && column == name => {
+                        if matches!(
+                            self.local.functions.get(dependent),
+                            Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                _
+                            ))
+                        ) {
+                            known_dependency = true;
+                            if *cascade {
+                                cascade_routine_roots.insert(dependent.clone());
+                            }
+                        }
+                    }
                     DependencyKind::ConstraintDependency {
                         constraint_name,
                         columns,
@@ -1959,6 +1976,7 @@ impl AnalysisState {
             drop_column_statistics,
             cascade_generated_columns,
             cascade_view_roots,
+            cascade_routine_roots,
         };
         self.alter_table_finish(alter, context)
     }
