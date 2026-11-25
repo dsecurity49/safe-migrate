@@ -61,6 +61,29 @@ impl AnalysisState {
         // Every column source must be complete for the result to be.
         let mut sources_complete = true;
         let mut inherited_names = HashSet::new();
+        if let Some(type_id) = &create.of_type
+            && let Some(crate::_internal::model::types::TypeOverlay::Present(
+                crate::_internal::model::types::TypeState {
+                    kind: crate::_internal::model::types::TypeKind::Composite { fields },
+                    ..
+                },
+            )) = self.local.types.get(type_id)
+        {
+            for field in fields {
+                inherited_names.insert(field.name.clone());
+                let mut column = crate::_internal::model::column::Column::migration_created(
+                    field.name.clone(),
+                    Some(field.data_type.clone()),
+                    true,
+                    None,
+                );
+                column.type_id = field
+                    .data_type_id
+                    .clone()
+                    .or_else(|| self.resolve_type_reference(&field.data_type));
+                inherited_columns.push(column);
+            }
+        }
         let mut inherited_generated_columns = std::collections::HashMap::new();
         let mut inherited_check_constraints: std::collections::HashMap<
             String,
@@ -603,19 +626,103 @@ impl AnalysisState {
         }
 
         let mut column_names = inherited_names;
+        let mut explicit_names = HashSet::new();
         for column in &create.columns {
+            if !explicit_names.insert(column.name.clone()) {
+                return MutationResult::conflict(format!(
+                    "column \"{}\" specified more than once",
+                    column.name
+                ));
+            }
+            if create.of_type.is_some() {
+                if matches!(
+                    column.generation,
+                    crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored
+                        | crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual
+                ) {
+                    return MutationResult::conflict(
+                        "generated columns are not supported on typed tables".to_string(),
+                    );
+                }
+                if matches!(
+                    column.generation,
+                    crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
+                        | crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+                ) {
+                    return MutationResult::conflict(
+                        "identity columns are not supported on typed tables".to_string(),
+                    );
+                }
+            }
+            if (create.of_type.is_some() || create.partition_of.is_some() || column.ty.is_none())
+                && !inherited_columns
+                    .iter()
+                    .any(|candidate| candidate.name == column.name)
+            {
+                return MutationResult::conflict(format!(
+                    "column \"{}\" does not exist",
+                    column.name
+                ));
+            }
             if !column_names.insert(column.name.clone()) {
-                let inherited = inherited_columns
+                let Some(inherited) = inherited_columns
                     .iter()
                     .find(|candidate| candidate.name == column.name)
-                    .expect("an inherited name always has a column");
+                else {
+                    return MutationResult::conflict(format!(
+                        "column \"{}\" specified more than once",
+                        column.name
+                    ));
+                };
                 let compatible = match (inherited.data_type.as_deref(), column.ty.as_deref()) {
+                    (_, None) => create.of_type.is_some() || create.partition_of.is_some(),
                     (Some(left), Some(right)) => left.trim().eq_ignore_ascii_case(right.trim()),
                     _ => false,
                 };
                 if !compatible {
                     return MutationResult::conflict(format!(
                         "column '{}' conflicts with an inherited column type",
+                        column.name
+                    ));
+                }
+                let parent_generated = inherited_generated_columns.get(&column.name);
+                let child_generated = match column.generation {
+                    crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored => {
+                        Some(crate::_internal::model::relation::GeneratedColumnKind::Stored)
+                    }
+                    crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual => {
+                        Some(crate::_internal::model::relation::GeneratedColumnKind::Virtual)
+                    }
+                    _ => None,
+                };
+                if let Some(parent_gen) = parent_generated {
+                    if column.default.is_some() && child_generated.is_none() {
+                        return MutationResult::conflict(format!(
+                            "column \"{}\" inherits from generated column but specifies default",
+                            column.name
+                        ));
+                    }
+                    if matches!(
+                        column.generation,
+                        crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
+                            | crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+                    ) {
+                        return MutationResult::conflict(format!(
+                            "column \"{}\" inherits from generated column but specifies identity",
+                            column.name
+                        ));
+                    }
+                    if let Some(child_kind) = child_generated
+                        && child_kind != parent_gen.kind
+                    {
+                        return MutationResult::conflict(format!(
+                            "column \"{}\" inherits from generated column of different kind",
+                            column.name
+                        ));
+                    }
+                } else if child_generated.is_some() {
+                    return MutationResult::conflict(format!(
+                        "child column \"{}\" specifies generation expression",
                         column.name
                     ));
                 }
@@ -1384,7 +1491,12 @@ impl AnalysisState {
             .flatten()
             .collect();
 
-        let mut not_null_columns = Vec::new();
+        let mut not_null_columns: Vec<String> = rel_state
+            .columns
+            .iter()
+            .filter(|column| !column.is_nullable)
+            .map(|column| column.name.clone())
+            .collect();
         for col in &create.columns {
             if let Some(ty) = &col.ty
                 && let Some(conflict) = self.check_declared_type(ty)
@@ -1392,7 +1504,7 @@ impl AnalysisState {
                 return conflict;
             }
             let is_pk = col.is_primary_key || pk_columns.contains(col.name.as_str());
-            if col.not_null || is_pk {
+            if (col.not_null || is_pk) && !not_null_columns.contains(&col.name) {
                 not_null_columns.push(col.name.clone());
             }
             rel_state.apply_column_action(&ColumnAction::Add {
@@ -1482,6 +1594,7 @@ impl AnalysisState {
                 })
                 .count() as u32;
             let is_local = create.partition_of.is_none()
+                && create.of_type.is_none()
                 && (parent_count == 0
                     || create
                         .columns

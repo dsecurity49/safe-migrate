@@ -1472,3 +1472,71 @@ fn distinct_custom_types_are_not_collapsed_into_one_signature() {
         "distinct argument types are distinct routines: {findings:?}"
     );
 }
+
+#[test]
+fn create_aggregate_validates_moving_aggregate_options_and_modifier_flags() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let valid = engine
+        .analyze(
+            "CREATE FUNCTION public.my_sfunc(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+             CREATE FUNCTION public.my_minv(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 - $2';
+             CREATE AGGREGATE public.moving_sum(int) (
+                 sfunc = my_sfunc,
+                 stype = int,
+                 msfunc = my_sfunc,
+                 minvfunc = my_minv,
+                 mstype = int,
+                 mfinalfunc_modify = read_only,
+                 parallel = safe
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !valid.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid moving aggregate with mfinalfunc_modify = read_only must not conflict: {valid:?}"
+    );
+
+    let bad_mstype = engine
+        .analyze(
+            "CREATE AGGREGATE public.bad_moving(int) (
+                 sfunc = my_sfunc,
+                 stype = int,
+                 msfunc = my_sfunc,
+                 minvfunc = my_minv,
+                 mstype = no_such_moving_type
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        bad_mstype.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("type \"no_such_moving_type\" does not exist")
+        }),
+        "nonexistent mstype must conflict: {bad_mstype:?}"
+    );
+
+    let missing_minv = engine
+        .analyze(
+            "CREATE AGGREGATE public.missing_minv(int) (
+                 sfunc = my_sfunc,
+                 stype = int,
+                 msfunc = my_sfunc,
+                 mstype = int
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        missing_minv.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("aggregate minvfunc must be specified when mstype is specified")
+        }),
+        "mstype without minvfunc must conflict: {missing_minv:?}"
+    );
+}

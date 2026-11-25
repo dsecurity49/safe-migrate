@@ -1806,3 +1806,118 @@ fn drop_table_still_rejects_a_foreign_table() {
         "the server answers DROP TABLE with 'is not a table'"
     );
 }
+
+#[test]
+fn create_table_rejects_duplicate_columns_and_merges_typed_and_partition_options() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let duplicate = engine
+        .analyze("CREATE TABLE public.dup_t (x int, x int);", &mut state)
+        .unwrap();
+    assert!(
+        duplicate.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("column \"x\" specified more than once")
+        }),
+        "duplicate columns must report a chain conflict without panicking: {duplicate:?}"
+    );
+
+    let typed = engine
+        .analyze(
+            "CREATE TYPE public.comp_opts AS (x int, y text);
+             CREATE TABLE public.typed_opts OF public.comp_opts (x WITH OPTIONS NOT NULL DEFAULT 1);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !typed.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid typed table WITH OPTIONS must succeed: {typed:?}"
+    );
+    let Some(RelationOverlay::Present(typed_rel)) = state
+        .local
+        .relations
+        .get(&object_id("public", "typed_opts"))
+    else {
+        panic!("typed_opts relation must exist");
+    };
+    let x_col = typed_rel.get_column("x").expect("column x must exist");
+    assert!(!x_col.is_nullable, "WITH OPTIONS NOT NULL must apply to x");
+    assert!(
+        x_col.default.is_some(),
+        "WITH OPTIONS DEFAULT must apply to x"
+    );
+
+    let missing_typed = engine
+        .analyze(
+            "CREATE TABLE public.typed_bad OF public.comp_opts (missing_col WITH OPTIONS NOT NULL);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        missing_typed.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("column \"missing_col\" does not exist")
+        }),
+        "WITH OPTIONS on a nonexistent composite attribute must conflict: {missing_typed:?}"
+    );
+
+    let partition_opts = engine
+        .analyze(
+            "CREATE TABLE public.p_opts (x int, y text) PARTITION BY LIST (x);
+             CREATE TABLE public.c_opts PARTITION OF public.p_opts (y WITH OPTIONS NOT NULL) FOR VALUES IN (1);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !partition_opts.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid partition WITH OPTIONS must succeed: {partition_opts:?}"
+    );
+    let Some(RelationOverlay::Present(part_rel)) =
+        state.local.relations.get(&object_id("public", "c_opts"))
+    else {
+        panic!("c_opts relation must exist");
+    };
+    assert!(
+        !part_rel.get_column("y").expect("column y").is_nullable,
+        "partition WITH OPTIONS NOT NULL must mark column y non-null"
+    );
+}
+
+#[test]
+fn set_access_method_is_rejected_on_postgresql_14_and_accepted_on_15_plus() {
+    let engine = setup_engine();
+    let mut pg14_cache = synced_cache();
+    pg14_cache.pg_version_num = Some(140_000);
+    let mut pg14_state = crate::_internal::analysis::state::AnalysisState::new(pg14_cache);
+    let pg14_findings = engine
+        .analyze(
+            "CREATE TABLE public.am_t (id int);
+             ALTER TABLE public.am_t SET ACCESS METHOD heap;",
+            &mut pg14_state,
+        )
+        .unwrap();
+    assert!(
+        pg14_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("SET ACCESS METHOD requires PostgreSQL 15 or later")
+        }),
+        "PG 14 must reject SET ACCESS METHOD: {pg14_findings:?}"
+    );
+
+    let mut pg15_cache = synced_cache();
+    pg15_cache.pg_version_num = Some(150_000);
+    let mut pg15_state = crate::_internal::analysis::state::AnalysisState::new(pg15_cache);
+    let pg15_findings = engine
+        .analyze(
+            "CREATE TABLE public.am_t (id int);
+             ALTER TABLE public.am_t SET ACCESS METHOD heap;",
+            &mut pg15_state,
+        )
+        .unwrap();
+    assert!(
+        !pg15_findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "PG 15 must accept SET ACCESS METHOD: {pg15_findings:?}"
+    );
+}

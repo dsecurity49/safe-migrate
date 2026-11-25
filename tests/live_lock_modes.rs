@@ -253,21 +253,27 @@ fn table_ddl_lock_modes_match_postgresql() {
     );
     transaction.rollback().expect("rollback SET STORAGE probe");
 
-    let mut transaction = client
-        .transaction()
-        .expect("begin SET ACCESS METHOD lock probe");
-    transaction
-        .batch_execute(&format!("ALTER TABLE {schema}.t SET ACCESS METHOD heap;"))
-        .expect("set access method");
-    assert_lock_mode(
-        &mut transaction,
-        &format!("{schema}.t"),
-        "AccessExclusiveLock",
-        "SET ACCESS METHOD",
-    );
-    transaction
-        .rollback()
-        .expect("rollback SET ACCESS METHOD probe");
+    let version_num: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .expect("query server_version_num")
+        .get(0);
+    if version_num >= 150_000 {
+        let mut transaction = client
+            .transaction()
+            .expect("begin SET ACCESS METHOD lock probe");
+        transaction
+            .batch_execute(&format!("ALTER TABLE {schema}.t SET ACCESS METHOD heap;"))
+            .expect("set access method");
+        assert_lock_mode(
+            &mut transaction,
+            &format!("{schema}.t"),
+            "AccessExclusiveLock",
+            "SET ACCESS METHOD",
+        );
+        transaction
+            .rollback()
+            .expect("rollback SET ACCESS METHOD probe");
+    }
 
     let mut transaction = client.transaction().expect("begin SET NOT NULL lock probe");
     transaction

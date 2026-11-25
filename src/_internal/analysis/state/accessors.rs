@@ -115,6 +115,10 @@ impl AnalysisState {
     /// Record a configured version, used only when the cache carries none.
     pub(crate) fn with_asserted_pg_version(mut self, version: Option<u32>) -> Self {
         self.asserted_pg_version_num = version;
+        if self.pg_version_num.is_none() && !self.baseline_available {
+            self.local.aggregates =
+                AggregateCatalogue::fallback_for_version(self.asserted_pg_version_num);
+        }
         self
     }
 

@@ -3304,3 +3304,122 @@ fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
         "subtype_diff_id must be hydrated from baseline cache"
     );
 }
+
+#[test]
+fn alter_composite_attribute_type_rejects_direct_and_transitive_table_column_dependencies() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let direct = engine
+        .analyze(
+            "CREATE TYPE public.comp_in_use AS (x int, y text);
+             CREATE TABLE public.holder (id int, payload public.comp_in_use);
+             ALTER TYPE public.comp_in_use ALTER ATTRIBUTE x TYPE bigint;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        direct.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains(
+                    "cannot alter type \"comp_in_use\" because column \"holder.payload\" uses it",
+                )
+        }),
+        "direct composite column dependency must reject ALTER ATTRIBUTE TYPE: {direct:?}"
+    );
+
+    let mut state2 = setup_state();
+    let transitive = engine
+        .analyze(
+            "CREATE TYPE public.inner_c AS (x int);
+             CREATE TYPE public.outer_c AS (inner_val public.inner_c);
+             CREATE TABLE public.outer_holder (id int, payload public.outer_c[]);
+             ALTER TYPE public.inner_c ALTER ATTRIBUTE x TYPE bigint CASCADE;",
+            &mut state2,
+        )
+        .unwrap();
+    assert!(
+        transitive.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains(
+                    "cannot alter type \"inner_c\" because column \"outer_holder.payload\" uses it",
+                )
+        }),
+        "transitive composite/array column dependency must reject ALTER ATTRIBUTE TYPE even with CASCADE: {transitive:?}"
+    );
+}
+
+#[test]
+fn drop_attribute_if_exists_missing_is_a_noop_and_cascade_propagates_to_typed_table_dependents() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let noop_findings = engine
+        .analyze(
+            "CREATE TYPE public.comp_noop AS (x int, y text);
+             CREATE TABLE public.comp_noop_holder (id int, payload public.comp_noop);
+             ALTER TYPE public.comp_noop DROP ATTRIBUTE IF EXISTS missing_attr;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !noop_findings
+            .iter()
+            .any(|v| v.rule_id == "irreversible-migration"),
+        "DROP ATTRIBUTE IF EXISTS on a missing attribute must be a NoOp and not fire irreversible-migration: {noop_findings:?}"
+    );
+
+    let mut state2 = setup_state();
+    let cascade_findings = engine
+        .analyze(
+            "CREATE TYPE public.comp_casc AS (x int, y text);
+             CREATE TABLE public.typed_casc OF public.comp_casc;
+             CREATE INDEX typed_casc_x_idx ON public.typed_casc (x);
+             ALTER TYPE public.comp_casc DROP ATTRIBUTE x CASCADE;
+             DROP INDEX public.typed_casc_x_idx;",
+            &mut state2,
+        )
+        .unwrap();
+    assert!(
+        cascade_findings
+            .iter()
+            .any(|v| { v.rule_id == "chain-conflict" && v.reason.contains("typed_casc_x_idx") }),
+        "ALTER TYPE DROP ATTRIBUTE CASCADE must drop indexes depending on the typed-table column: {cascade_findings:?}"
+    );
+}
+
+#[test]
+fn schema_rename_remaps_typed_table_of_type_and_column_type_ids() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let findings = engine
+        .analyze(
+            "CREATE SCHEMA app;
+             CREATE TYPE app.my_comp AS (x int, y text);
+             CREATE TABLE app.typed_orders OF app.my_comp;
+             CREATE TYPE app.status AS ENUM ('open', 'closed');
+             CREATE TABLE app.orders (id int PRIMARY KEY, st app.status NOT NULL);
+             ALTER SCHEMA app RENAME TO app_v2;
+             ALTER TYPE app_v2.my_comp ADD ATTRIBUTE z int CASCADE;
+             ALTER TABLE app_v2.typed_orders ALTER COLUMN z SET NOT NULL;
+             DROP TYPE app_v2.status CASCADE;
+             ALTER TABLE app_v2.orders DROP COLUMN st;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| {
+            v.rule_id == "chain-conflict" && v.reason.contains("column 'z' does not exist")
+        }),
+        "typed_orders.of_type must be remapped to app_v2.my_comp so ADD ATTRIBUTE z CASCADE reaches typed_orders: {findings:?}"
+    );
+    assert!(
+        findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("column 'st' does not exist on relation 'app_v2.orders'")
+        }),
+        "orders.st.type_id must be remapped to app_v2.status so DROP TYPE CASCADE drops column st: {findings:?}"
+    );
+}

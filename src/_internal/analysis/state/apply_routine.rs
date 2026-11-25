@@ -1117,22 +1117,57 @@ impl AnalysisState {
         &mut self,
         attribute: &crate::_internal::analysis::facts::AggregateOptionFact,
     ) -> Option<MutationResult> {
+        let key = attribute.name.to_ascii_lowercase();
+        if matches!(key.as_str(), "finalfunc_modify" | "mfinalfunc_modify") {
+            let val = attribute
+                .value
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_ascii_lowercase();
+            if !matches!(val.as_str(), "read_only" | "shareable" | "read_write") {
+                return Some(MutationResult::conflict(format!(
+                    "parameter \"{}\" must be READ_ONLY, SHAREABLE, or READ_WRITE",
+                    attribute.name
+                )));
+            }
+            return None;
+        }
+        if key == "parallel" {
+            let val = attribute
+                .value
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_ascii_lowercase();
+            if !matches!(val.as_str(), "safe" | "restricted" | "unsafe") {
+                return Some(MutationResult::conflict(
+                    "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE".to_string(),
+                ));
+            }
+            return None;
+        }
         let routine_option = matches!(
-            attribute.name.as_str(),
+            key.as_str(),
             "sfunc"
+                | "sfunc1"
                 | "finalfunc"
                 | "combinefunc"
                 | "serialfunc"
                 | "deserialfunc"
+                | "msfunc"
                 | "mfunc"
                 | "minvfunc"
                 | "mfinalfunc"
         );
-        let type_option = matches!(attribute.name.as_str(), "stype" | "mfinalfunc_modify");
+        let type_option = matches!(key.as_str(), "stype" | "stype1" | "mstype" | "basetype");
         if !routine_option && !type_option {
             return None;
         }
         let name = attribute.value.trim();
+        if key == "basetype" && matches!(name.to_ascii_lowercase().as_str(), "any" | "*") {
+            return None;
+        }
         // A qualified name is resolved against schemas this build may not hold.
         if name.contains('.') {
             self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -1199,6 +1234,55 @@ impl AnalysisState {
         // signature a transition function has to match, the state type it has
         // to return, and the aggregate's own operator set — cannot be decided
         // from a name alone and is left to the evidence below.
+        if !aggregate.definition.is_empty() {
+            let has_option = |names: &[&str]| {
+                aggregate.definition.iter().any(|attr| {
+                    names
+                        .iter()
+                        .any(|candidate| attr.name.eq_ignore_ascii_case(candidate))
+                })
+            };
+            let hypothetical_enabled = aggregate.definition.iter().any(|attr| {
+                attr.name.eq_ignore_ascii_case("hypothetical")
+                    && !matches!(
+                        attr.value.trim().to_ascii_lowercase().as_str(),
+                        "false" | "f" | "0"
+                    )
+            });
+            if hypothetical_enabled
+                && aggregate.kind == crate::_internal::model::aggregate::AggregateKind::Normal
+            {
+                return MutationResult::conflict(
+                    "only ordered-set aggregates can be hypothetical".to_string(),
+                );
+            }
+            if !has_option(&["stype", "stype1"]) {
+                return MutationResult::conflict("aggregate stype must be specified".to_string());
+            }
+            if !has_option(&["sfunc", "sfunc1"]) {
+                return MutationResult::conflict("aggregate sfunc must be specified".to_string());
+            }
+            if has_option(&["mstype"]) {
+                if !has_option(&["msfunc"]) {
+                    return MutationResult::conflict(
+                        "aggregate msfunc must be specified when mstype is specified".to_string(),
+                    );
+                }
+                if !has_option(&["minvfunc"]) {
+                    return MutationResult::conflict(
+                        "aggregate minvfunc must be specified when mstype is specified".to_string(),
+                    );
+                }
+            } else {
+                for disallowed in ["msfunc", "minvfunc", "mfinalfunc", "msspace", "minitcond"] {
+                    if has_option(&[disallowed]) {
+                        return MutationResult::conflict(format!(
+                            "aggregate {disallowed} must not be specified without mstype"
+                        ));
+                    }
+                }
+            }
+        }
         for attribute in &aggregate.definition {
             if let Some(result) = self.check_aggregate_attribute(attribute) {
                 return result;

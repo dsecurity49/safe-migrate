@@ -257,31 +257,21 @@ impl AstVisitor {
                     Self::extract_role(&ot.role_ref()?),
                 ),
             ),
-            ast::AlterFunctionAction::SetSchema(ss) => {
-                let token = ss.schema_ref()?.ident_token()?;
-                Some(
-                    crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
-                        new_schema: Self::resolve_identifier_token(token.text()),
-                    },
-                )
-            }
-            ast::AlterFunctionAction::DependsOnExtension(de) => {
-                let ext = Self::resolve_identifier_token(de.extension_ref()?.ident_token()?.text());
-                Some(
-                    crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
-                        extension: ext,
-                    },
-                )
-            }
-            ast::AlterFunctionAction::NoDependsOnExtension(nde) => {
-                let ext =
-                    Self::resolve_identifier_token(nde.extension_ref()?.ident_token()?.text());
-                Some(
-                    crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
-                        extension: ext,
-                    },
-                )
-            }
+            ast::AlterFunctionAction::SetSchema(ss) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
+                    new_schema: Self::resolve_ast_identifier(&ss.schema_ref()?),
+                },
+            ),
+            ast::AlterFunctionAction::DependsOnExtension(de) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&de.extension_ref()?),
+                },
+            ),
+            ast::AlterFunctionAction::NoDependsOnExtension(nde) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&nde.extension_ref()?),
+                },
+            ),
             ast::AlterFunctionAction::FuncOptionList(ol) => Some(
                 crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
                     ol.options()
@@ -381,9 +371,17 @@ impl AstVisitor {
             ),
             ast::AlterProcedureAction::SetSchema(ss) => Some(
                 crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
-                    new_schema: Self::resolve_identifier_token(
-                        ss.schema_ref()?.ident_token()?.text(),
-                    ),
+                    new_schema: Self::resolve_ast_identifier(&ss.schema_ref()?),
+                },
+            ),
+            ast::AlterProcedureAction::DependsOnExtension(de) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&de.extension_ref()?),
+                },
+            ),
+            ast::AlterProcedureAction::NoDependsOnExtension(nde) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&nde.extension_ref()?),
                 },
             ),
             // A procedure takes the same option list a function does, so
@@ -396,7 +394,6 @@ impl AstVisitor {
                         .collect(),
                 ),
             ),
-            _ => None,
         });
 
         Some(StatementFact::AlterProcedure(

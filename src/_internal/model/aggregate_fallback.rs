@@ -324,11 +324,28 @@ const SIGNATURES: &[(&str, AggregateKind, usize, &[&str])] = &[
     ("min", AggregateKind::Normal, 1, &["bytea"]),
 ];
 
+fn signature_min_pg_version(index: usize) -> u32 {
+    match index {
+        141 | 142 | 147 => 150_000,
+        148..=156 => 160_000,
+        157..=160 => 180_000,
+        _ => 140_000,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn catalogue() -> AggregateCatalogue {
+    catalogue_for_version(None)
+}
+
+pub(crate) fn catalogue_for_version(pg_version_num: Option<u32>) -> AggregateCatalogue {
+    let version = pg_version_num.unwrap_or(180_000);
     AggregateCatalogue::new(
         SIGNATURES
             .iter()
-            .map(|(name, kind, direct_count, parameters)| {
+            .enumerate()
+            .filter(|(index, _)| version >= signature_min_pg_version(*index))
+            .map(|(_, (name, kind, direct_count, parameters))| {
                 let arguments = parameters
                     .iter()
                     .map(|parameter| {

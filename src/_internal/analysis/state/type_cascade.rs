@@ -175,7 +175,7 @@ impl AnalysisState {
     /// A domain or range built on a dropped type goes, a range takes its
     /// multirange companion, and a composite survives with the offending
     /// field removed rather than being dropped.
-    fn type_cascade_closure(
+    pub(super) fn type_cascade_closure(
         &self,
         victims: &[ObjectId],
     ) -> (HashSet<ObjectId>, HashSet<(ObjectId, String)>) {

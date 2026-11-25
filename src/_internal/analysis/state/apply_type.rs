@@ -940,6 +940,75 @@ impl AnalysisState {
             _ => {}
         }
 
+        if let AlterTypeActionMutation::AlterAttributeType { name, .. } = &alter.action {
+            let (dependent_types, _) = self.type_cascade_closure(std::slice::from_ref(&alter.id));
+            let mut transitive_types = dependent_types;
+            loop {
+                let mut grew = false;
+                for (id, overlay) in &self.local.types {
+                    if transitive_types.contains(id) {
+                        continue;
+                    }
+                    let TypeOverlay::Present(state) = overlay else {
+                        continue;
+                    };
+                    if let TypeKind::Composite { fields } = &state.kind
+                        && fields.iter().any(|field| {
+                            Self::type_reference_matches_victims(
+                                field.data_type_id.as_ref(),
+                                &transitive_types,
+                            )
+                        })
+                    {
+                        transitive_types.insert(id.clone());
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            for overlay in self.local.relations.values() {
+                let RelationOverlay::Present(relation) = overlay else {
+                    continue;
+                };
+                if !matches!(
+                    relation.kind,
+                    crate::_internal::model::relation::RelationKind::Table
+                        | crate::_internal::model::relation::RelationKind::MaterializedView
+                        | crate::_internal::model::relation::RelationKind::ForeignTable
+                ) {
+                    continue;
+                }
+                if let Some(column) = relation.columns.iter().find(|column| {
+                    Self::type_reference_matches_victims(column.type_id.as_ref(), &transitive_types)
+                }) {
+                    return MutationResult::conflict(format!(
+                        "cannot alter type \"{}\" because column \"{}.{}\" uses it",
+                        alter.id.name, relation.id.name, column.name
+                    ));
+                }
+            }
+            for tbl_id in &typed_tables {
+                let resolved_table = self.local.graph.resolve_rename(tbl_id);
+                if self.local.graph.edges().iter().any(|edge| {
+                    self.dependency_edge_is_current(edge)
+                        && self.local.graph.resolve_rename(&edge.referenced) == resolved_table
+                        && matches!(
+                            &edge.kind,
+                            DependencyKind::ViewDependency {
+                                referenced_column: Some(col),
+                                ..
+                            } if col == name
+                        )
+                }) {
+                    return MutationResult::conflict(
+                        "cannot alter type of a column used by a view or rule".to_string(),
+                    );
+                }
+            }
+        }
+
         let resolved_attr_type_id = match &alter.action {
             AlterTypeActionMutation::AddAttribute { data_type, .. }
             | AlterTypeActionMutation::AlterAttributeType { data_type, .. } => {
@@ -1043,7 +1112,9 @@ impl AnalysisState {
                     if let TypeKind::Composite { fields } = &mut existing.kind {
                         if let Some(idx) = fields.iter().position(|f| f.name == *name) {
                             fields.remove(idx);
-                        } else if !if_exists {
+                        } else if *if_exists {
+                            return MutationResult::NoOp;
+                        } else {
                             return MutationResult::conflict(format!(
                                 "column \"{}\" of relation \"{}\" does not exist",
                                 name, alter.id.name
@@ -1141,14 +1212,17 @@ impl AnalysisState {
         }
 
         // Synchronize typed tables with composite alterations
-        for tbl_id in typed_tables {
-            self.snapshot_relation(&tbl_id);
-            if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&tbl_id) {
-                match &alter.action {
-                    AlterTypeActionMutation::AddAttribute {
-                        name, data_type, ..
-                    } => {
-                        if !rel.columns.iter().any(|c| c.name == *name) {
+        if !typed_tables.is_empty() {
+            match &alter.action {
+                AlterTypeActionMutation::AddAttribute {
+                    name, data_type, ..
+                } => {
+                    for tbl_id in &typed_tables {
+                        self.snapshot_relation(tbl_id);
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(tbl_id)
+                            && !rel.columns.iter().any(|c| c.name == *name)
+                        {
                             rel.columns.push(crate::_internal::model::column::Column {
                                 name: name.clone(),
                                 data_type: Some(data_type.clone()),
@@ -1164,28 +1238,57 @@ impl AnalysisState {
                                 options: Default::default(),
                                 generated: None,
                             });
+                            rel.column_inheritance.insert(
+                                name.clone(),
+                                crate::_internal::model::relation::ColumnInheritance {
+                                    parent_count: 0,
+                                    is_local: false,
+                                },
+                            );
                         }
                     }
-                    AlterTypeActionMutation::DropAttribute { name, .. } => {
-                        rel.columns.retain(|c| c.name != *name);
+                }
+                AlterTypeActionMutation::DropAttribute { name, cascade, .. } => {
+                    for tbl_id in &typed_tables {
+                        let alter_tbl = crate::_internal::analysis::mutations::AlterTable {
+                            id: tbl_id.clone(),
+                            only: false,
+                            if_exists: false,
+                            action:
+                                crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
+                                    name: name.clone(),
+                                    if_exists: true,
+                                    cascade: *cascade,
+                                },
+                        };
+                        match self.apply_alter_table(&alter_tbl) {
+                            MutationResult::Applied | MutationResult::NoOp => {}
+                            result => return result,
+                        }
                     }
-                    AlterTypeActionMutation::AlterAttributeType {
-                        name, data_type, ..
-                    } => {
-                        if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *name) {
+                }
+                AlterTypeActionMutation::AlterAttributeType {
+                    name, data_type, ..
+                } => {
+                    let typmod = ParsedDataType::parse(data_type, self.builtin_types()).atttypmod();
+                    for tbl_id in &typed_tables {
+                        self.snapshot_relation(tbl_id);
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(tbl_id)
+                            && let Some(col) = rel.columns.iter_mut().find(|c| c.name == *name)
+                        {
                             col.data_type = Some(data_type.clone());
                             col.type_id = resolved_attr_type_id.clone();
+                            col.type_modifier = typmod;
                         }
                     }
-                    AlterTypeActionMutation::RenameAttribute {
-                        old_name, new_name, ..
-                    } => {
-                        if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *old_name) {
-                            col.name = new_name.clone();
-                        }
-                    }
-                    _ => {}
                 }
+                AlterTypeActionMutation::RenameAttribute {
+                    old_name, new_name, ..
+                } => {
+                    self.rename_relations_column_metadata_batch(&typed_tables, old_name, new_name);
+                }
+                _ => {}
             }
         }
 

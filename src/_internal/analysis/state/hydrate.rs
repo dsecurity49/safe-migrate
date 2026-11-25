@@ -698,10 +698,9 @@ impl AnalysisState {
                 opclasses: cache.opclasses.clone().unwrap_or_default(),
                 collations: cache.collations.clone().unwrap_or_default(),
                 casts: cache.casts.clone().unwrap_or_else(CastCatalogue::fallback),
-                aggregates: cache
-                    .aggregates
-                    .clone()
-                    .unwrap_or_else(AggregateCatalogue::fallback),
+                aggregates: cache.aggregates.clone().unwrap_or_else(|| {
+                    AggregateCatalogue::fallback_for_version(cache.pg_version_num)
+                }),
                 temp_namespace_created: false,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),

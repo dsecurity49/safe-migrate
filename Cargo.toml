@@ -7,7 +7,6 @@ rust-version = "1.99"
 description = "Check PostgreSQL migrations against a synchronized database baseline"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dsecurity49/safe-migrate"
-homepage = "https://github.com/dsecurity49/safe-migrate"
 documentation = "https://docs.rs/safe-migrate"
 readme = "README.md"
 exclude = [
@@ -29,7 +28,6 @@ squawk-rowan  = "=2.72.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.2"
-thiserror = "2.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 postgres = "0.19"

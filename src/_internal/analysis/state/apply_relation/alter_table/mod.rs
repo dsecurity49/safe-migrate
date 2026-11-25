@@ -150,6 +150,16 @@ impl AnalysisState {
                 alter.id
             ));
         }
+        if matches!(
+            alter.action,
+            AlterTableActionMutation::SetAccessMethod { .. }
+        ) && let Some(version) = self.pg_version().num()
+            && version < 150_000
+        {
+            return MutationResult::conflict(format!(
+                "SET ACCESS METHOD requires PostgreSQL 15 or later, but the baseline reports {version}"
+            ));
+        }
 
         if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
             let Some((owner, known)) = self.role_fact_identity(new_owner) else {
