@@ -361,6 +361,149 @@ impl AnalysisState {
         Ok(())
     }
 
+    fn apply_routine_owner_change(
+        &mut self,
+        owner: &crate::_internal::analysis::facts::RoleFact,
+    ) -> MutationResult {
+        let Some((owner_name, known)) = self.role_fact_identity(owner) else {
+            return self.unresolved(EvidenceCode::UnresolvedReference);
+        };
+        if known && self.local.roles_known && self.present_role(&owner_name).is_none() {
+            return MutationResult::conflict(format!("role '{owner_name}' does not exist"));
+        }
+        if known && !self.local.roles_known {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+        }
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        MutationResult::Applied
+    }
+
+    fn apply_routine_depends_on_extension(&mut self, extension: &str) -> MutationResult {
+        match self.local.extensions.get(extension) {
+            Some(crate::_internal::model::extension::ExtensionOverlay::Present(_)) => {}
+            Some(crate::_internal::model::extension::ExtensionOverlay::Dropped) => {
+                return MutationResult::conflict(format!(
+                    "extension \"{extension}\" does not exist"
+                ));
+            }
+            None if self.baseline_is_available()
+                && self.baseline_has_coverage(
+                    crate::_internal::db::cache::CatalogFamily::Extensions,
+                ) =>
+            {
+                return MutationResult::conflict(format!(
+                    "extension \"{extension}\" does not exist"
+                ));
+            }
+            None => {
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+            }
+        }
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        MutationResult::Applied
+    }
+
+    fn validate_routine_options(
+        &mut self,
+        is_procedure: bool,
+        returns_set: bool,
+        options: &[FuncOptionFact],
+    ) -> Result<Vec<ObjectId>, MutationResult> {
+        let mut support_functions = Vec::new();
+        for option in options {
+            if is_procedure
+                && matches!(
+                    option,
+                    FuncOptionFact::Volatility(_)
+                        | FuncOptionFact::Strict(_)
+                        | FuncOptionFact::Leakproof(_)
+                        | FuncOptionFact::Cost(_)
+                        | FuncOptionFact::Rows(_)
+                        | FuncOptionFact::Support(_)
+                        | FuncOptionFact::Parallel(_)
+                        | FuncOptionFact::Window
+                )
+            {
+                return Err(MutationResult::conflict(
+                    "invalid attribute in procedure definition".to_string(),
+                ));
+            }
+            match option {
+                FuncOptionFact::Cost(Some(cost)) if *cost <= 0.0 => {
+                    return Err(MutationResult::conflict(
+                        "COST must be positive".to_string(),
+                    ));
+                }
+                FuncOptionFact::Rows(rows) => {
+                    if let Some(r) = rows
+                        && *r <= 0.0
+                    {
+                        return Err(MutationResult::conflict(
+                            "ROWS must be positive".to_string(),
+                        ));
+                    }
+                    if !returns_set {
+                        return Err(MutationResult::conflict(
+                            "ROWS is not applicable when function does not return a set"
+                                .to_string(),
+                        ));
+                    }
+                }
+                FuncOptionFact::Parallel(mode) => {
+                    if !matches!(
+                        mode.to_ascii_lowercase().as_str(),
+                        "safe" | "restricted" | "unsafe"
+                    ) {
+                        return Err(MutationResult::conflict(
+                            "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE"
+                                .to_string(),
+                        ));
+                    }
+                }
+                FuncOptionFact::Support(Some(qname)) => {
+                    let sig_name = format!("{}(internal)", qname.name.resolve());
+                    let schema = self.resolve_function_schema(qname, &sig_name);
+                    let support_id = ObjectId::new(schema, sig_name);
+                    match self.routine_lookup(&support_id, |kind| kind == RoutineKind::Function) {
+                        RoutineLookup::Present => {
+                            if let Some(FunctionOverlay::Present(support_fn)) =
+                                self.local.functions.get(&support_id)
+                                && !support_fn.return_type.is_empty()
+                                && !support_fn.return_type.eq_ignore_ascii_case("internal")
+                            {
+                                return Err(MutationResult::conflict(format!(
+                                    "support function {} must return type internal",
+                                    qname.name.resolve()
+                                )));
+                            }
+                            support_functions.push(support_id);
+                        }
+                        RoutineLookup::WrongKind | RoutineLookup::Tombstone => {
+                            return Err(MutationResult::conflict(format!(
+                                "function '{}' does not exist",
+                                support_id
+                            )));
+                        }
+                        RoutineLookup::AuthoritativelyAbsent if qname.schema.is_some() => {
+                            return Err(MutationResult::conflict(format!(
+                                "function '{}' does not exist",
+                                support_id
+                            )));
+                        }
+                        RoutineLookup::AuthoritativelyAbsent | RoutineLookup::Unknown => {
+                            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(support_functions)
+    }
+
     /// Create or replace a function, enforcing replacement identity rules.
     pub(super) fn apply_create_function(
         &mut self,
@@ -416,6 +559,12 @@ impl AnalysisState {
         {
             return result;
         }
+        let returns_set = Self::routine_declares_setof(function.return_type.as_ref());
+        let support_functions =
+            match self.validate_routine_options(false, returns_set, &function.options) {
+                Ok(support) => support,
+                Err(result) => return result,
+            };
         self.snapshot_function(&function.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -507,6 +656,15 @@ impl AnalysisState {
             }),
         );
         self.record_routine_body_dependencies(&function.id, &function.body_dependencies);
+        for support_id in support_functions {
+            self.local.graph.add_edge(DependencyEdge::new(
+                function.id.clone(),
+                support_id,
+                DependencyKind::RoutineUsesRoutine {
+                    unresolved_name: None,
+                },
+            ));
+        }
         MutationResult::Applied
     }
 
@@ -535,6 +693,14 @@ impl AnalysisState {
 
         match &function.action {
             AlterFunctionAction::OptionsChange(options) => {
+                let returns_set = self
+                    .existing_routine(&function.id)
+                    .is_some_and(|existing| existing.returns_set);
+                let support_functions =
+                    match self.validate_routine_options(false, returns_set, options) {
+                        Ok(support) => support,
+                        Err(result) => return result,
+                    };
                 self.snapshot_function(&function.id);
                 if let Some(FunctionOverlay::Present(existing)) =
                     self.local.functions.get_mut(&function.id)
@@ -566,6 +732,18 @@ impl AnalysisState {
                         }
                     }
                 }
+                if !support_functions.is_empty() {
+                    self.snapshot_graph_full();
+                    for support_id in support_functions {
+                        self.local.graph.add_edge(DependencyEdge::new(
+                            function.id.clone(),
+                            support_id,
+                            DependencyKind::RoutineUsesRoutine {
+                                unresolved_name: None,
+                            },
+                        ));
+                    }
+                }
                 if options.iter().any(Self::function_option_unmodeled) {
                     self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 }
@@ -590,13 +768,12 @@ impl AnalysisState {
                 }
                 self.move_function(&function.id, &new_id);
             }
-            AlterFunctionAction::OwnerChange(_)
-            | AlterFunctionAction::DependsOnExtension { .. }
-            | AlterFunctionAction::NoDependsOnExtension { .. } => {
-                // Ownership and extension dependencies are not represented
-                // by FunctionState, so retaining Applied would overstate the
-                // precision of subsequent dependency checks.
-                return self.unresolved(EvidenceCode::UnmodeledState);
+            AlterFunctionAction::OwnerChange(owner) => {
+                return self.apply_routine_owner_change(owner);
+            }
+            AlterFunctionAction::DependsOnExtension { extension }
+            | AlterFunctionAction::NoDependsOnExtension { extension } => {
+                return self.apply_routine_depends_on_extension(extension);
             }
         }
         MutationResult::Applied
@@ -876,6 +1053,9 @@ impl AnalysisState {
         {
             return result;
         }
+        if let Err(result) = self.validate_routine_options(true, false, &procedure.options) {
+            return result;
+        }
         self.snapshot_function(&procedure.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -1009,22 +1189,15 @@ impl AnalysisState {
                 self.move_function(&procedure.id, &new_id);
             }
             AlterFunctionAction::OptionsChange(options) => {
-                // A procedure takes the same options a function does, so they
-                // apply to the same state fields rather than degrading to an
-                // unmodeled statement.
+                if let Err(result) = self.validate_routine_options(true, false, options) {
+                    return result;
+                }
                 self.snapshot_function(&procedure.id);
                 if let Some(FunctionOverlay::Present(existing)) =
                     self.local.functions.get_mut(&procedure.id)
                 {
                     for option in options {
                         match option {
-                            FuncOptionFact::Volatility(volatility) => {
-                                existing.volatility = match volatility {
-                                    VolatilityKind::Volatile => Volatility::Volatile,
-                                    VolatilityKind::Stable => Volatility::Stable,
-                                    VolatilityKind::Immutable => Volatility::Immutable,
-                                };
-                            }
                             FuncOptionFact::Security(security) => {
                                 existing.security = match security {
                                     SecurityKind::Invoker => SecurityMode::Invoker,
@@ -1034,15 +1207,20 @@ impl AnalysisState {
                             FuncOptionFact::Language(language) => {
                                 existing.language = language.clone();
                             }
-                            _ => {
-                                return self.unresolved(EvidenceCode::UnmodeledState);
-                            }
+                            _ => {}
                         }
                     }
                 }
+                if options.iter().any(Self::function_option_unmodeled) {
+                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
+                }
             }
-            _ => {
-                return self.unresolved(EvidenceCode::UnsupportedSemantics);
+            AlterFunctionAction::OwnerChange(owner) => {
+                return self.apply_routine_owner_change(owner);
+            }
+            AlterFunctionAction::DependsOnExtension { extension }
+            | AlterFunctionAction::NoDependsOnExtension { extension } => {
+                return self.apply_routine_depends_on_extension(extension);
             }
         }
         MutationResult::Applied
@@ -1515,8 +1693,8 @@ impl AnalysisState {
                 }
                 self.move_function(&aggregate.id, &new_id);
             }
-            AlterFunctionAction::OwnerChange(_) => {
-                return self.unresolved(EvidenceCode::UnmodeledState);
+            AlterFunctionAction::OwnerChange(owner) => {
+                return self.apply_routine_owner_change(owner);
             }
             _ => unreachable!("aggregate extraction only emits rename, owner, or schema"),
         }
@@ -1733,27 +1911,52 @@ impl AnalysisState {
             }
             return self.unresolved(EvidenceCode::UnresolvedReference);
         }
-        let dropped_ids: HashSet<&ObjectId> = targets.iter().collect();
-        let mut surviving_reference = false;
-        let mut dropped_views: Vec<ObjectId> = Vec::new();
-        for (view_id, unresolved_name) in &dependent_views {
-            let covered = match unresolved_name {
-                None => true,
-                Some(name) => self
-                    .routine_overloads_under(name)
-                    .all(|overload| dropped_ids.contains(overload)),
-            };
-            if covered {
-                dropped_views.push(view_id.clone());
-            } else {
-                surviving_reference = true;
+        for id in &targets {
+            let dependent_routines: Vec<ObjectId> = self
+                .local
+                .graph
+                .routines_for_function(id)
+                .into_iter()
+                .filter(|edge| {
+                    !self.co_dropped_objects.contains(&edge.dependent)
+                        && !targets.contains(&edge.dependent)
+                        && matches!(
+                            self.local.functions.get(&edge.dependent),
+                            Some(FunctionOverlay::Present(_))
+                        )
+                })
+                .map(|edge| edge.dependent.clone())
+                .collect();
+            if !dependent_routines.is_empty() && !aggregate.cascade {
+                return MutationResult::conflict(format!(
+                    "aggregate '{}' is required by routine '{}'; use CASCADE",
+                    id, dependent_routines[0]
+                ));
             }
         }
+        let dropped_ids: HashSet<ObjectId> = targets.iter().cloned().collect();
+        let mut surviving_reference = false;
         for id in &targets {
-            self.drop_routine_with_edges(id);
-        }
-        if aggregate.cascade {
-            self.drop_cascaded_views(&dropped_views);
+            if aggregate.cascade {
+                let views_for_id: Vec<(ObjectId, Option<ObjectId>)> = self
+                    .local
+                    .graph
+                    .views_for_function(id)
+                    .into_iter()
+                    .filter_map(|edge| {
+                        let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind else {
+                            return None;
+                        };
+                        (!self.co_dropped_objects.contains(&edge.dependent))
+                            .then(|| (edge.dependent.clone(), unresolved_name.clone()))
+                    })
+                    .collect();
+                if self.apply_routine_cascade_drop(id, &[], &views_for_id, &dropped_ids) {
+                    surviving_reference = true;
+                }
+            } else {
+                self.drop_routine_with_edges(id);
+            }
         }
         if surviving_reference {
             self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
@@ -1941,9 +2144,9 @@ impl AnalysisState {
                 AlterFunctionAction::OptionsChange(_) => {
                     MutationResult::conflict(format!("'{}' is an aggregate function", routine.id))
                 }
-                AlterFunctionAction::DependsOnExtension { .. }
-                | AlterFunctionAction::NoDependsOnExtension { .. } => {
-                    self.unresolved(EvidenceCode::UnmodeledState)
+                AlterFunctionAction::DependsOnExtension { extension }
+                | AlterFunctionAction::NoDependsOnExtension { extension } => {
+                    self.apply_routine_depends_on_extension(extension)
                 }
                 _ => self.apply_alter_aggregate(&AlterAggregateMutation {
                     id: routine.id.clone(),

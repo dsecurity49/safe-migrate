@@ -5,6 +5,31 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.14.0 — 2026-11-25
+
+- Added `ALTER ROUTINE` and `DROP ROUTINE` simulation across functions,
+  procedures, and aggregates, along with routine option validation (`COST`,
+  `ROWS`, `PARALLEL`, `SUPPORT`, `SET`, `RESET`, `RESET ALL`), `[NO] DEPENDS ON
+  EXTENSION`, and `OWNER TO` checks.
+- Modeled SQL-standard routine body dependencies (`BEGIN ATOMIC ... END` and
+  `RETURN expr`) across tables, columns, routines, and types (`RoutineUsesTable`,
+  `RoutineUsesColumn`, `RoutineUsesRoutine`, `RoutineUsesType`), and expanded
+  `CREATE AGGREGATE` / `DROP AGGREGATE` dependency tracking and `CREATE OR
+  REPLACE AGGREGATE` identity checks.
+- Added user-defined cast simulation (`CREATE CAST`, `DROP CAST`), extended
+  statistics (`CREATE STATISTICS`, `ALTER STATISTICS`, `DROP STATISTICS`), and
+  `ANALYZE`, including `missing-idempotency`, `destructive-cascade`, and lock
+  predictions (`ShareUpdateExclusive`).
+- Completed table-rewrite and lock-prediction coverage for `ALTER COLUMN ...
+  SET EXPRESSION` (PostgreSQL 17+ gate, virtual column `CHECK` and publication
+  restrictions, and `TableRewrite` / `MetadataOnly` lock classification),
+  `ALTER TABLE ... SET LOGGED` / `SET UNLOGGED` persistence checks, and
+  `ALTER COLUMN ... ADD GENERATED ... AS IDENTITY`.
+- Resolved composite-type attribute dependency tracking for views and routines,
+  `DROP SCHEMA` composite/foreign-table handling, `ALTER TABLE ... RENAME
+  CONSTRAINT` index renaming, foreign-key column type-change rewrite barriers,
+  and PostgreSQL 14–18 catalog parity gaps.
+
 ## v0.13.0 — 2026-11-22
 
 - Added `lock-risk`, a size-independent Tier 3 advisory for lock modes on

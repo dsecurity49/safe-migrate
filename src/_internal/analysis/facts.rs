@@ -858,8 +858,9 @@ pub(crate) enum FuncOptionFact {
     Strict(StrictKind),
     Leakproof(bool),
     Parallel(String),
-    Cost,
-    Rows,
+    Cost(Option<f64>),
+    Rows(Option<f64>),
+    Set(String),
     Reset(String),
     As {
         definition: Option<String>,
@@ -868,7 +869,7 @@ pub(crate) enum FuncOptionFact {
     },
     Transform,
     Window,
-    Support,
+    Support(Option<QualifiedName>),
     Unknown,
 }
 

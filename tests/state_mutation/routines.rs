@@ -1768,3 +1768,150 @@ fn atomic_routine_bodies_track_relation_column_routine_and_type_dependencies() {
         Some(safe_migrate::_internal::model::function::FunctionOverlay::Dropped)
     ));
 }
+
+#[test]
+fn routine_options_owner_extension_and_support_dependencies_match_postgresql() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    state.local.roles_known = true;
+    state.local.roles.insert(
+        object_id("", "app_owner"),
+        safe_migrate::_internal::model::role::RoleOverlay::Present(
+            safe_migrate::_internal::model::role::RoleState {
+                id: object_id("", "app_owner"),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        ),
+    );
+    state.local.extensions.insert(
+        "pg_trgm".to_string(),
+        safe_migrate::_internal::model::extension::ExtensionOverlay::Present(
+            safe_migrate::_internal::model::extension::ExtensionState {
+                name: "pg_trgm".to_string(),
+                schema: Some("public".to_string()),
+                version: Some("1.6".to_string()),
+                relocatable: Some(true),
+                owner: object_id("", "postgres"),
+                members: Default::default(),
+                members_complete: true,
+                config_tables: Vec::new(),
+                generation: 0,
+            },
+        ),
+    );
+
+    let violations = engine
+        .analyze(
+            "CREATE FUNCTION public.my_support(internal) RETURNS internal LANGUAGE internal AS 'int4_support';
+             CREATE FUNCTION public.set_fn() RETURNS SETOF int LANGUAGE sql
+                 COST 50 ROWS 25 PARALLEL SAFE SUPPORT public.my_support
+                 SET search_path = public RESET search_path RESET ALL
+                 AS 'SELECT 1';
+             ALTER FUNCTION public.set_fn() OWNER TO app_owner;
+             ALTER FUNCTION public.set_fn() DEPENDS ON EXTENSION pg_trgm;
+             ALTER FUNCTION public.set_fn() NO DEPENDS ON EXTENSION pg_trgm;
+             CREATE PROCEDURE public.cfg_proc() LANGUAGE sql
+                 SET work_mem = '4MB' RESET work_mem RESET ALL
+                 AS 'SELECT 1';
+             ALTER PROCEDURE public.cfg_proc() OWNER TO app_owner;
+             ALTER PROCEDURE public.cfg_proc() DEPENDS ON EXTENSION pg_trgm;
+             ALTER PROCEDURE public.cfg_proc() NO DEPENDS ON EXTENSION pg_trgm;
+             CREATE AGGREGATE public.owned_agg(int) (sfunc = int4pl, stype = int);
+             ALTER AGGREGATE public.owned_agg(int) OWNER TO app_owner;
+             ALTER ROUTINE public.owned_agg(int) DEPENDS ON EXTENSION pg_trgm;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid routine options, owners, and extension deps must apply cleanly: {violations:?}"
+    );
+
+    let mut drop_support_state = state.clone();
+    let drop_support = engine
+        .analyze(
+            "DROP FUNCTION public.my_support(internal);",
+            &mut drop_support_state,
+        )
+        .unwrap();
+    assert!(
+        drop_support.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping support function without CASCADE must conflict: {drop_support:?}"
+    );
+
+    for invalid_sql in [
+        "CREATE PROCEDURE public.bad_proc() LANGUAGE sql IMMUTABLE AS 'SELECT 1';",
+        "ALTER PROCEDURE public.cfg_proc() STRICT;",
+        "CREATE FUNCTION public.bad_cost() RETURNS int LANGUAGE sql COST 0 AS 'SELECT 1';",
+        "CREATE FUNCTION public.neg_cost() RETURNS int LANGUAGE sql COST -5 AS 'SELECT 1';",
+        "CREATE FUNCTION public.bad_rows() RETURNS int LANGUAGE sql ROWS 10 AS 'SELECT 1';",
+        "ALTER FUNCTION public.set_fn() ROWS 0;",
+        "CREATE FUNCTION public.bad_par() RETURNS int LANGUAGE sql PARALLEL bogus AS 'SELECT 1';",
+        "ALTER FUNCTION public.set_fn() OWNER TO missing_role;",
+        "ALTER PROCEDURE public.cfg_proc() OWNER TO missing_role;",
+        "ALTER AGGREGATE public.owned_agg(int) OWNER TO missing_role;",
+        "ALTER FUNCTION public.set_fn() DEPENDS ON EXTENSION missing_ext;",
+    ] {
+        let mut s = state.clone();
+        let v = engine.analyze(invalid_sql, &mut s).unwrap();
+        assert!(
+            v.iter().any(|finding| finding.rule_id == "chain-conflict"),
+            "expected chain-conflict for `{invalid_sql}`, got: {v:?}"
+        );
+    }
+}
+
+#[test]
+fn drop_aggregate_enforces_and_cascades_dependent_atomic_routines() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let violations = engine
+        .analyze(
+            "CREATE FUNCTION public.agg_add(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+             CREATE AGGREGATE public.agg_sum(int) (sfunc = agg_add, stype = int);
+             CREATE FUNCTION public.uses_agg(v int) RETURNS int
+                 BEGIN ATOMIC
+                     SELECT public.agg_sum(v);
+                 END;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+        "setup should not conflict: {violations:?}"
+    );
+
+    let mut restrict_state = state.clone();
+    let restrict_v = engine
+        .analyze("DROP AGGREGATE public.agg_sum(int);", &mut restrict_state)
+        .unwrap();
+    assert!(
+        restrict_v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP AGGREGATE without CASCADE must conflict when an atomic routine depends on it: {restrict_v:?}"
+    );
+
+    let mut cascade_state = state.clone();
+    let cascade_v = engine
+        .analyze(
+            "DROP AGGREGATE public.agg_sum(int) CASCADE;",
+            &mut cascade_state,
+        )
+        .unwrap();
+    assert!(
+        !cascade_v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP AGGREGATE CASCADE must drop dependent routine cleanly: {cascade_v:?}"
+    );
+    assert!(matches!(
+        cascade_state
+            .local
+            .functions
+            .get(&object_id("public", "uses_agg(integer)")),
+        Some(safe_migrate::_internal::model::function::FunctionOverlay::Dropped)
+    ));
+}

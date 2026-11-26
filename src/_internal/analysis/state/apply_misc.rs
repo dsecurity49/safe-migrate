@@ -786,7 +786,19 @@ impl AnalysisState {
                     stat.target = next_target;
                 }
             }
-            AlterStatisticsActionFact::OwnerTo(_) => {
+            AlterStatisticsActionFact::OwnerTo(owner) => {
+                let Some((owner_name, known)) = self.role_fact_identity(owner) else {
+                    return self.unresolved(EvidenceCode::UnresolvedReference);
+                };
+                if known && self.local.roles_known && self.present_role(&owner_name).is_none() {
+                    return MutationResult::conflict(format!("role '{owner_name}' does not exist"));
+                }
+                if known && !self.local.roles_known {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                }
                 self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
             }
         }

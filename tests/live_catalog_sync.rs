@@ -1020,9 +1020,15 @@ fn live_routine_and_replication_mutations_match_postgresql() {
 
     let alter_sql = format!(
         "ALTER FUNCTION {SCHEMA}.with_out(integer) STABLE;
+         ALTER ROUTINE {SCHEMA}.with_out(integer) COST 50 PARALLEL SAFE SET search_path = public RESET search_path;
          ALTER PROCEDURE {SCHEMA}.record_value(integer) RENAME TO record_value_renamed;
+         ALTER PROCEDURE {SCHEMA}.record_value_renamed(integer) SET work_mem = '4MB' RESET ALL;
          ALTER AGGREGATE {SCHEMA}.total(integer) RENAME TO total_renamed;
          ALTER FUNCTION {SCHEMA}.win_rank() STABLE;
+         CREATE STATISTICS {SCHEMA}.view_source_stats (dependencies, ndistinct) ON id, note FROM {SCHEMA}.view_source;
+         ALTER STATISTICS {SCHEMA}.view_source_stats SET STATISTICS 150;
+         ANALYZE {SCHEMA}.view_source (id, note);
+         DROP STATISTICS {SCHEMA}.view_source_stats;
          ALTER TABLE {SCHEMA}.entries
            ADD CONSTRAINT entries_score_check CHECK (score >= 0),
            ADD CONSTRAINT entries_period_excl EXCLUDE USING gist (period WITH &&);

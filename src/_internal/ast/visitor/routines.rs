@@ -151,20 +151,59 @@ impl AstVisitor {
                         .unwrap_or_default(),
                 )
             }
-            ast::FuncOption::CostFuncOption(_) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Cost
+            ast::FuncOption::CostFuncOption(f) => {
+                let value = f
+                    .literal()
+                    .map(|l| l.syntax().text().to_string())
+                    .or_else(|| {
+                        f.syntax()
+                            .children()
+                            .find_map(ast::PrefixExpr::cast)
+                            .map(|pe| pe.syntax().text().to_string())
+                    })
+                    .and_then(|raw| raw.replace([' ', '\t', '\n'], "").parse::<f64>().ok());
+                crate::_internal::analysis::facts::FuncOptionFact::Cost(value)
             }
-            ast::FuncOption::RowsFuncOption(_) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Rows
+            ast::FuncOption::RowsFuncOption(f) => {
+                let value = f
+                    .literal()
+                    .map(|l| l.syntax().text().to_string())
+                    .or_else(|| {
+                        f.syntax()
+                            .children()
+                            .find_map(ast::PrefixExpr::cast)
+                            .map(|pe| pe.syntax().text().to_string())
+                    })
+                    .and_then(|raw| raw.replace([' ', '\t', '\n'], "").parse::<f64>().ok());
+                crate::_internal::analysis::facts::FuncOptionFact::Rows(value)
+            }
+            ast::FuncOption::SetFuncOption(f) => {
+                crate::_internal::analysis::facts::FuncOptionFact::Set(
+                    f.set_config_param()
+                        .and_then(|scp| scp.config_parameter_ref())
+                        .and_then(|cpr| cpr.path_ref())
+                        .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
+                        .map(|qn| match qn.schema {
+                            Some(schema) => format!("{}.{}", schema.resolve(), qn.name.resolve()),
+                            None => qn.name.resolve(),
+                        })
+                        .unwrap_or_default(),
+                )
             }
             ast::FuncOption::ResetFuncOption(f) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Reset(
+                let target = if f.all_token().is_some() {
+                    "all".to_string()
+                } else {
                     f.config_parameter_ref()
                         .and_then(|cpr| cpr.path_ref())
                         .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                        .map(|qn| qn.name.resolve())
-                        .unwrap_or_default(),
-                )
+                        .map(|qn| match qn.schema {
+                            Some(schema) => format!("{}.{}", schema.resolve(), qn.name.resolve()),
+                            None => qn.name.resolve(),
+                        })
+                        .unwrap_or_default()
+                };
+                crate::_internal::analysis::facts::FuncOptionFact::Reset(target)
             }
             ast::FuncOption::AsFuncOption(f) => {
                 let (definition, obj_file, link_symbol) = match f.as_func_target() {
@@ -198,10 +237,13 @@ impl AstVisitor {
             ast::FuncOption::WindowFuncOption(_) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Window
             }
-            ast::FuncOption::SupportFuncOption(_) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Support
+            ast::FuncOption::SupportFuncOption(f) => {
+                let support_fn = f
+                    .function_name_ref()
+                    .and_then(|fnr| fnr.path_ref())
+                    .and_then(|pr| Self::path_ref_to_qualified_name(&pr));
+                crate::_internal::analysis::facts::FuncOptionFact::Support(support_fn)
             }
-            _ => crate::_internal::analysis::facts::FuncOptionFact::Unknown,
         }
     }
 
