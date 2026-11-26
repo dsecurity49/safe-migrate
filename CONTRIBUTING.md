@@ -1,64 +1,40 @@
 # Contributing to safe-migrate
 
-## Start with an issue
+Before opening an issue or pull request, search
+[existing issues](https://github.com/dsecurity49/safe-migrate/issues). For bug
+reports, include minimal SQL, expected vs. actual output, safe-migrate version,
+PostgreSQL version (14–18), and whether a baseline cache was used (with
+credentials removed).
 
-Before submitting a new issue, [search existing issues](https://github.com/dsecurity49/safe-migrate/issues),
-including closed ones, for similar reports or proposals. If one already covers
-your topic, add any new information there rather than opening a duplicate.
+## Architecture and module map
 
-Otherwise, [open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose).
-For substantial changes, discuss the approach before starting implementation.
-For bug reports, include:
-
-- minimal SQL;
-- expected and actual output;
-- safe-migrate version;
-- PostgreSQL version or assumed version;
-- whether a cache was used;
-- relevant configuration, with credentials and other secrets removed.
-
-## How analysis works
-
-Thanks for contributing. safe-migrate is a Rust PostgreSQL migration analyzer
-with typed AST extraction, stateful schema simulation, and safety rules.
-
-The analysis pipeline is:
+safe-migrate is a deterministic five-stage pipeline:
 
 ```text
-SQL -> Squawk parser -> typed facts -> simulated database state -> rules -> report
+SQL -> Squawk 2.72.0 AST (src/_internal/ast/visitor/)
+    -> Typed StatementFacts (src/_internal/analysis/facts.rs)
+    -> Namespace-resolved Mutations (src/_internal/analysis/resolver/)
+    -> Transactional State & DependencyGraph (src/_internal/analysis/state/, src/_internal/model/)
+    -> Safety Rules & Reporters (src/_internal/rules/, src/_internal/report/)
 ```
 
-Most changes touch one or two stages. Start with a focused test at that stage,
-then add an integration test when behavior crosses into the next stage.
+| Path | Responsibility |
+| --- | --- |
+| `src/_internal/ast/visitor/` | Extracts typed facts from pinned Squawk AST nodes (`tables.rs`, `alter_table.rs`, `views.rs`, `indexes.rs`, `routines.rs`, `types.rs`, `publications.rs`). |
+| `src/_internal/analysis/expr_visitor.rs` | Converts Squawk `ast::Expr` nodes into `ExprIr` for column reference extraction, literal evaluation, and column-rename rewriting. |
+| `src/_internal/analysis/resolver/` | Resolves `QualifiedName`s against the effective `search_path` (`pg_temp`, `pg_catalog`, user schemas) into canonical `ObjectId` mutations. |
+| `src/_internal/analysis/state/` | Applies mutations to `AnalysisState` with statement/savepoint/transaction undo journals (`apply_relation/`, `apply_routine/`, `apply_type/`, `apply_view_index.rs`, `apply_extension.rs`, `apply_misc.rs`, `snapshots.rs`, `rollback.rs`). |
+| `src/_internal/analysis/graph.rs` | Tracks typed `DependencyEdge`s (`ForeignKey`, `ViewDependency`, `ViewUsesRoutine`, `RoutineUsesRoutine`, `RoutineUsesRelation`, `IndexOnRelation`, `PartitionOf`, etc.) with incremental index lookups and delta rollback. |
+| `src/_internal/db/cache/` | Versioned `SMCACHE12` cache (`DbCacheVersioned::V12` for `12.0`, `DbCacheVersioned::V12_1(Box<DbCache>, CacheExtensionV12_1)` for `12.1`) and semantic validator. |
+| `src/_internal/sync/` | Read-only PostgreSQL 14–18 catalog loaders (`load_relations.rs`, `load_indexes.rs`, `load_constraints.rs`, `load_types.rs`, `load_routines.rs`, `load_dependencies.rs`). |
+| `src/_internal/rules/` | Primary safety rules and lock-mode predictor (`lock_risk.rs`, `table_circulation.rs`, `destructive.rs`, `functions.rs`, `timeout_settings.rs`, etc.). |
+| `src/api.rs`, `src/api/` | Public Rust library API (`Config`, `Baseline`, `Outcome`). |
+| `tests/` | Unit, state-mutation (`tests/state_mutation/`), rule-evaluation (`tests/rule_evaluation/`), CLI, and live differential harnesses (`tests/live_differential_harness/`). |
+| `live_tests/` | End-to-end SQL fixtures, `differential_baseline.sql`, `differential_manifest.json`, and the frozen V12.1 `.safe-migrate.cache`. |
 
-## Start here
+## Build and test commands
 
-- [README and user guide](README.md)
-- [GitHub Action guide](docs/GITHUB_ACTIONS.md)
-- [CLI and report contract](docs/CONTRACT.md)
-- [Live fixtures and sourced cases](live_tests/README.md)
-
-## Project structure
-
-```text
-src/_internal/analysis/   facts, resolution, mutations, dependency graph, state, transactions
-src/_internal/ast/        extraction from the pinned Squawk typed AST
-src/_internal/db/         versioned database cache
-src/_internal/engine/     configuration, orchestration, and rule dispatch
-src/_internal/model/      modeled PostgreSQL objects
-src/_internal/report/     human, JSON, and interactive reporting
-src/_internal/rules/      safety rule implementations
-src/api.rs, src/api/      supported Rust integration API
-tests/          integration, state-machine, rule, CLI, and regression tests
-live_tests/     end-to-end SQL fixtures and frozen database cache
-docs/           Action guide and CLI/report contract
-```
-
-`rg --files src tests live_tests` lists the current files.
-
-## Development commands
-
-Use locked dependencies:
+Always use `--locked`:
 
 ```bash
 cargo build --locked
@@ -67,157 +43,66 @@ cargo fmt -- --check
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Focused examples:
+- Internal test modules under `tests/` are compiled into the library test target
+  (`cargo test --locked --lib <filter>`), while the public API facade and
+  grammar checks run via `cargo test --locked --test api_facade` and
+  `cargo test --locked --test grammar_action_lists`.
+- Run the offline fixture suite and contract checks:
+  ```bash
+  cd live_tests && ./run.sh
+  sh scripts/test-action-contract
+  sh scripts/test-install-dry-run
+  scripts/fuzz
+  ```
+
+### Live PostgreSQL 14–18 differential verification
+
+Live tests require a disposable local database named `safe_migrate` (never point
+them at a shared or production database):
 
 ```bash
-cargo test rule_evaluation
-cargo test architectural_gap
-cargo test expression_parsing
-```
-
-Implementation tests are registered under the library target (`--lib`), not
-individual `--test` targets. The independent public API suite uses
-`cargo test --locked --test api_facade`.
-
-End-to-end fixtures:
-
-```bash
-cd live_tests
-./run.sh
-./run.sh -d rule_25_schema-drift
-```
-
-The fixture runner invokes the compiled binary. Most rule directories lint each
-file independently; chain-conflict fixtures use `lint-chain`.
-
-Repository checks:
-
-```bash
-sh scripts/test-install-dry-run
-sh scripts/test-action-contract
-scripts/fuzz
-```
-
-The installer test covers pinned offline installation and checksum failures.
-The Action test covers installation, cache handling, gates, summaries, and
-annotations. The fuzz script generates SQL inputs and rejects crashes,
-timeouts, operational errors, invalid JSON, and inconsistent exit statuses.
-
-Live checks require a disposable local PostgreSQL database:
-
-```bash
-export DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/safe_migrate'
-scripts/live-differential
-scripts/live-auto-sync
-scripts/live-cache-encryption
+export DATABASE_URL='postgres://postgres@127.0.0.1:5432/safe_migrate'
+scripts/live-differential -v
 scripts/live-catalog-sync
 scripts/live-catalog-differential
+scripts/live-auto-sync
+scripts/live-cache-encryption
 ```
 
-The differential harness requires a local database named `safe_migrate` and
-mutates and resets its test schemas and fixture objects. Never point it at a
-shared or production database. CI runs the enabled differential manifest
-against PostgreSQL 14 through 18; excluded fixtures and their reasons live in
-`live_tests/differential_manifest.json`.
+### Regenerating `live_tests/.safe-migrate.cache`
 
-## Adding or changing a rule
+When baseline fixtures or cache extensions change, rebuild the frozen V12.1
+cache from a clean local PostgreSQL 18 `safe_migrate` database:
 
-1. Implement one safety concept under `src/_internal/rules/`.
-2. Register the rule in the primary rule registry.
-3. Add configuration only when the rule needs a user-controlled policy.
-4. Add focused regression tests.
-5. Add or update end-to-end fixtures.
-6. Update the rule-registry metadata.
-7. Add a `CHANGELOG.md` entry for user-visible behavior.
+```bash
+psql "$DATABASE_URL" -f live_tests/differential_baseline.sql
+psql "$DATABASE_URL" -c "ANALYZE;"
+cargo run --locked -- sync --out live_tests/.safe-migrate.cache
+```
 
-Rules must:
+Running `ANALYZE;` before `sync` is required so `pg_class.reltuples` records
+`0` (analyzed empty) rather than `-1` (unanalyzed unknown) on empty baseline
+tables.
 
-- define behavior for `MutationResult::NoOp`, `NotExecuted`, and `Unresolved`,
-  not only `Applied`;
-- distinguish conflicts from applied mutations;
-- infer operation and object kinds from the mutation;
-- avoid mutating analysis state;
-- explain the mechanism and a safer next step;
-- document PostgreSQL-version assumptions;
-- avoid using row count for lock behavior unless table size actually changes
-  the rule's conclusion.
+## Engineering standards
 
-## Extending AST extraction
-
-Use the pinned Squawk source and grammar when changing AST extraction:
-
-1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
-2. inspect the resolved dependency source and grammar;
-3. add an exact fact assertion in the matching `src/_internal/ast/visitor_tests/*.rs` module;
-4. implement extraction in the matching module under
-   `src/_internal/ast/visitor/` or expression conversion in
-   `src/_internal/analysis/expr_visitor.rs`;
-5. test resolver, state, and rule effects when behavior crosses layers;
-6. represent unsupported parser behavior explicitly.
-
-A Squawk version upgrade is an AST migration. Update all four pinned Squawk
-crates and the matching `squawk-rowan` together, then validate the full
-extraction surface through compilation and tests.
-
-## State-machine changes
-
-When adding modeled state:
-
-1. define the state or overlay in the appropriate model module;
-2. add explicit mutations and resolution;
-3. preserve baseline-versus-local identity;
-4. add transaction undo state for every mutable component;
-5. test apply, skip, conflict, rollback, rename, drop, and recreate behavior;
-6. update dependency edges and generation metadata where applicable.
-
-## CLI and report changes
-
-User-visible output is an interface. Changes to JSON fields, confidence meaning,
-verdicts, exit statuses, output channels, or ordering must:
-
-1. follow [the CLI and report contract](docs/CONTRACT.md);
-2. include integration or golden tests;
-3. preserve machine-only JSON standard output;
-4. update `CHANGELOG.md`;
-5. include a migration note when scripts may break.
-
-## Testing expectations
-
-Add regression coverage with every behavior change:
-
-- AST changes: assert exact extracted facts.
-- Resolver/state changes: assert the resulting state and undo behavior.
-- Rule changes: assert rule ID, tier, object, reason, and relevant recipe.
-- Reporter changes: assert structured output and deterministic ordering.
-- CLI changes: assert standard output, standard error, and exit status.
-- Database metadata changes: use existing cache and live-test helpers.
-
-`safe_*.sql` fixtures must not emit the target rule. Numbered fixtures must emit
-the target rule. Use Rust tests for exact object, tier, reason, and source
-assertions. Fixture counts only check suite coverage.
-
-## Database synchronization
-
-`safe-migrate sync`, and `lint` or `lint-chain` only when configured with
-`auto_sync = true`, read `DATABASE_URL`. Do not commit credentials, connection
-strings, or private database dumps. Use a least-privilege PostgreSQL role and
-treat cache changes as reviewable schema-state changes.
-
-The frozen cache under `live_tests/` belongs to the test corpus. Update it only
-when a fixture requires a changed baseline, and explain the assumption in the
-pull request.
-
-Cache V12 synchronizes every PostgreSQL routine kind, publications, redacted
-subscription metadata, domain and sequence state, extension membership, and
-explicit catalog coverage. Never query or store `pg_subscription.subconninfo`.
-Changes to the cache model require serialization and inspection regressions,
-an updated frozen cache, and live catalog coverage across supported PostgreSQL
-versions.
-
-## Code style
-
-- Format with `rustfmt`.
-- Treat Clippy warnings as errors.
-- Use idiomatic Rust naming and four-space indentation.
-- Keep one rule concept per file or focused module.
-- Document non-obvious undo-log and dependency-graph behavior inline.
+- **Verify against PostgreSQL and Squawk**: verify catalog and error semantics
+  against PostgreSQL 14–18 (and PostgreSQL C source such as `tablecmds.c`,
+  `functioncmds.c`, `statscmds.c`, `analyze.c`) and the pinned Squawk `2.72.0`
+  grammar before coding.
+- **State & undo completeness**: every mutable field on `AnalysisState` must be
+  covered by statement undo and transaction/savepoint rollback, and tested for
+  apply, no-op, conflict, rename, drop, cascade, and rollback.
+- **Rules**: rules must be pure readers of `AnalysisState` and `PreState`,
+  explicitly handling `MutationResult::Applied`, `NoOp`, `NotExecuted`, and
+  `Unresolved`.
+- **Module cohesion and size**: keep production modules under 2,000 lines and
+  test modules under 2,500 lines by splitting distinct responsibilities into
+  cohesive submodules (`apply_routine/aggregate.rs`, `apply_type/domain.rs`,
+  `apply_relation/create_table/finish.rs`, `graph_tests.rs`,
+  `tests/state_mutation/types_advanced.rs`). Keep inline comments concise (1–3
+  lines) and only where the invariant is non-obvious.
+- **Commits**: group each complete feature or fix with its tests into one atomic
+  commit using a concise single-line imperative subject (`feat: ...`,
+  `fix: ...`, `docs: ...`) and no commit body. Update `CHANGELOG.md` and
+  `docs/CONTRACT.md` for user-visible changes.

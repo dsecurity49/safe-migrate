@@ -10,25 +10,20 @@
   <a href="https://docs.rs/safe-migrate"><img src="https://docs.rs/safe-migrate/badge.svg" alt="docs.rs"></a>
 </p>
 
-safe-migrate finds risky PostgreSQL migrations before they reach production.
-It parses SQL, simulates schema changes, and checks the result against a
-synchronized database snapshot. It never executes migration SQL.
+safe-migrate catches dangerous PostgreSQL migrations before they reach production.
+It parses your `.sql` files, simulates schema transitions step by step, and checks them against a synchronized snapshot of your database—without ever executing migration SQL.
 
-PostgreSQL 14–18 are supported.
+Supports **PostgreSQL 14–18**.
 
 ## Install
 
-Requires Rust 1.99 or newer.
-
-With Rust installed:
+With Rust 1.99 or newer:
 
 ```bash
 cargo install safe-migrate --locked
 ```
 
-Prebuilt binaries are available from
-[GitHub Releases](https://github.com/dsecurity49/safe-migrate/releases). The
-installer verifies release checksums:
+Or install a checksum-verified release binary from [GitHub Releases](https://github.com/dsecurity49/safe-migrate/releases):
 
 ```bash
 VERSION='v0.14.0'
@@ -36,206 +31,129 @@ curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION
   bash -s -- --version "${VERSION}"
 ```
 
-Download `install.sh` first and run `sh install.sh --help` to review destination
-and target options.
-
 ## Quick start
 
-```bash
-export DATABASE_URL='postgres://readonly_user@localhost:5432/app'
-safe-migrate sync
-safe-migrate lint-chain --dir migrations
-```
+1. **Sync a read-only baseline snapshot** from your database (via localhost, Unix socket, or SSH tunnel):
+   ```bash
+   export DATABASE_URL='postgres://readonly_user@localhost:5432/app'
+   safe-migrate sync
+   ```
+2. **Lint a single migration or an ordered migration directory offline**:
+   ```bash
+   safe-migrate lint --file migrations/20261126_add_index.sql
+   safe-migrate lint-chain --dir migrations/
+   ```
 
-`sync` writes `.safe-migrate.cache`. Later checks use that snapshot offline.
-Run `safe-migrate cache inspect` to view its provenance and redacted contents.
+When safe-migrate finds a risk, it tells you what blocks, why, and how to rewrite it safely:
+
+```text
+[HALT] Require concurrent index (require-concurrent-index)
+  object : public.users_email_idx (index)
+  file   : migrations/20261126_add_index.sql:4:1
+  reason : CREATE INDEX on table 'public.users' (250,000 rows) takes a SHARE lock that blocks writes while the index builds.
+  recipe : Use CREATE INDEX CONCURRENTLY outside a transaction block.
+```
 
 ## What it checks
 
-The simulator models tables, indexes, constraints, partitions, views,
-materialized views, sequences, routines, domains, extensions, and PostgreSQL
-type lifecycles. The built-in rules cover:
+safe-migrate models tables, columns, indexes, constraints, partitions, views, materialized views, sequences, routines (functions, procedures, aggregates, and SQL-standard `BEGIN ATOMIC` / `RETURN` bodies), user-defined casts, extended statistics, domains, extensions, roles, and logical replication:
 
-- size-independent lock-mode advisories (`lock-risk`) kept separate from
-  row-count-based scan and rewrite warnings;
-- table rewrites, constraints, indexes, partitions, and materialized-view
-  refreshes;
-- destructive changes, cascades, schema drift, dependency breakage, and
-  migration ordering conflicts;
-- grants, policies, disabled triggers, roles, and privilege-sensitive changes;
-- missing timeouts, transaction-incompatible operations, dynamic SQL,
-  volatile defaults, and rerun safety.
-
-Run `safe-migrate rules` for the catalog or inspect one rule directly:
-
-```bash
-safe-migrate rules --rule require-concurrent-index
-```
+- **Lock & rewrite hazards**: table rewrites (`SET DATA TYPE`, `SET EXPRESSION`, `SET LOGGED`/`UNLOGGED`), blocking constraint scans (`ADD CONSTRAINT` without `NOT VALID`), non-concurrent `CREATE INDEX` / `REINDEX` / `REFRESH MATERIALIZED VIEW`, and size-independent lock-mode advisories (`lock-risk`, `set-storage-lock`).
+- **Schema & dependency safety**: destructive drops, cascades (`DROP ... CASCADE`), schema drift against the baseline, broken views or routines after column/type changes, and statement ordering conflicts (`chain-conflict`).
+- **Access & operational guardrails**: overbroad grants, restrictive RLS policies, disabled triggers, missing `lock_timeout` / `statement_timeout`, transaction-incompatible DDL, dynamic SQL, volatile defaults, and missing `IF EXISTS` / `IF NOT EXISTS` guards.
 
 ## GitHub Actions
 
-Create and protect the `safe-migrate-baseline` GitHub environment, then run:
+safe-migrate keeps database credentials out of pull requests. A protected workflow refreshes and encrypts the baseline cache (`SAFE_MIGRATE_DATABASE_URL`), while pull requests only restore the encrypted cache (`SAFE_MIGRATE_CACHE_KEY`) and run offline.
+
+### 1. Generate the workflows
+
+Create a protected GitHub environment named `safe-migrate-baseline` (restricted to your default branch), then run:
 
 ```bash
 safe-migrate init github-actions --path migrations --configure-secrets
 ```
 
-This generates a trusted baseline refresh and an offline PR check. Follow the
-[GitHub Action guide](docs/GITHUB_ACTIONS.md) to connect the runner and create
-the first baseline.
+This creates `.github/workflows/safe-migrate-baseline.yml` (scheduled/manual baseline refresh) and `.github/workflows/safe-migrate.yml` (offline PR check) and uploads both secrets via GitHub CLI.
 
-## Results
+### 2. Minimal PR workflow example
 
-| Tier | Meaning | Default command result |
-| --- | --- | --- |
-| `Tier1` | Blocking safety problem | Exit `2` |
-| `Tier2` | Needs review | Exit `0` |
-| `Tier3` | Informational guidance | Exit `0` |
+```yaml
+name: Check migrations
+on:
+  pull_request:
+  merge_group:
 
-Operational failures—such as invalid SQL, configuration, or cache data—exit
-`1`. Every finding includes a stable rule ID, a reason, and remediation:
+permissions:
+  contents: read
 
-```text
-[HALT] Require concurrent index (require-concurrent-index)
-  reason : Creating this index can block writes on a large table.
-  recipe : Use CREATE INDEX CONCURRENTLY outside a transaction.
+jobs:
+  safe-migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dsecurity49/safe-migrate@v0.14.0
+        with:
+          path: migrations
+        env:
+          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
 ```
 
-Use `--json` for automation or `--markdown` for review artifacts. See the
-[CLI and report contract](docs/CONTRACT.md) for schemas, confidence, verdicts,
-and compatibility guarantees.
+See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for baseline refresh setup, self-hosted/tunneled runners, fork policies, and all Action inputs/outputs.
 
-## Commands
+## CLI commands
 
-| Command | Purpose |
+| Command | Description |
 | --- | --- |
-| `lint --file migration.sql` | Check one migration. |
-| `lint-chain --dir migrations/` | Check ordered migrations with state carried forward. |
-| `sync` | Refresh the database baseline. |
-| `cache inspect` | Show baseline provenance and redacted counts. |
-| `rules` | Browse rules and effective settings. |
-| `init github-actions --path migrations/` | Generate the GitHub integration. |
-| `init cache-key` | Generate a cache-encryption key. |
+| `lint --file <path>` | Check a single migration file (`--json`, `--markdown`, or `--report-dir <dir>`). |
+| `lint-chain --dir <path>` | Check `.sql` files in filename order with simulated schema state carried forward. |
+| `sync` | Refresh `.safe-migrate.cache` from `DATABASE_URL` (`--schemas a,b` scopes sync). |
+| `cache inspect` | Inspect cache provenance, PostgreSQL version, timeouts, and redacted counts. |
+| `rules` | Browse all rules (`--rule <id>` for details, `--json` for machine metadata). |
+| `init github-actions --path <dir>` | Generate the two-workflow GitHub Actions setup (`--configure-secrets`). |
+| `init cache-key` | Generate a 32-byte hex encryption key (`--set-github-secret`). |
 
-Run `safe-migrate <command> --help` for every option.
+### Verdicts and exit codes
 
-## Database baseline
+| Tier / Verdict | Meaning | Exit code |
+| --- | --- | --- |
+| `Tier1` (`HALT`) | Blocking safety or migration-ordering error | `2` |
+| `Tier2` (`CAUTIOUS`) | Review required (or a Tier 1 check lacked baseline evidence) | `0` |
+| `Tier3` (`SAFE WITH RISK` / `SAFE`) | Informational advisory | `0` |
+| Operational error | Parse, I/O, configuration, or cache error | `1` |
 
-`sync` reads PostgreSQL catalogs in a read-only, repeatable-read transaction.
-Direct remote connections are rejected; use localhost, a Unix socket, or a
-trusted tunnel:
-
-```bash
-ssh -N -L 5433:db.internal:5432 bastion
-export DATABASE_URL='postgres://readonly_user@localhost:5433/app'
-safe-migrate sync
-```
-
-The snapshot reflects the connected role and its session defaults. Choose
-between a restricted catalog reader and the real migration role based on the
-accuracy and credential tradeoff described in the
-[Action guide](docs/GITHUB_ACTIONS.md#database-role-and-runner-security).
-
-The cache contains infrastructure metadata, including schema, roles,
-privileges, dependencies, and statistics. It contains no credentials, password
-hashes, or subscription connection strings, but should still be treated as
-sensitive.
-
-`--no-cache` is an explicit degraded mode for parser investigation and limited
-SQL-only checks. Existing objects are unknown, so confidence is `Tainted` and
-many findings become conservative.
+See the [CLI and report contract](docs/CONTRACT.md) for JSON schemas, confidence rules, and precision boundaries.
 
 ## Configuration
 
-Most projects can start with the built-in defaults. Place overrides in
-`safe-migrate.toml`:
+Configure project defaults in `safe-migrate.toml`:
 
 ```toml
 schemas = ["public", "auth"]
 tier1_threshold_rows = 100000
+target_database = "app"
+assume_pg_version = 170000
+stale_stats_days = 7
 
 [rules.missing-idempotency]
 disabled = true
 ```
 
-Unknown settings and rule IDs are rejected. `safe-migrate rules --json` lists
-the configuration supported by each rule.
+To allow inline SQL suppressions (`-- safe-migrate: ignore(require-concurrent-index)`), set `allow_inline_suppressions = true` in `safe-migrate.toml`; otherwise inline directives emit a Tier 1 `inline-suppression-disabled` finding so suppressions stay visible in TOML review diffs.
 
-Without a synchronized baseline, the built-in version fallback is deliberately
-conservative. Set `assume_pg_version` only when the target is known to be
-PostgreSQL 14–18; for example, `assume_pg_version = 170000`.
-
-Set `target_database` to the database the migrations are applied to, for example
-`target_database = "app"`. Checks that depend on it report unknown without it.
-
-Suppress a reviewed finding with its primary rule ID:
-
-```sql
--- safe-migrate: ignore(require-concurrent-index)
-CREATE INDEX users_email_idx ON users (email);
-```
-
-Inline suppressions are **disabled by default**. To enable them, add to
-`safe-migrate.toml`:
-
-```toml
-allow_inline_suppressions = true
-```
-
-Without this setting, each inline directive produces one located Tier 1
-`inline-suppression-disabled` finding instead of suppressing the rule.
-This is intentional: keeping suppressions in the TOML file makes them
-visible in pull request diffs and subject to review. Use per-rule
-`[rules.require-concurrent-index] disabled = true` in `safe-migrate.toml`
-as the standard suppression path.
-
-Keep suppressions narrow and explain the reason in the migration review.
-
-## DDL lock modes
-
-| Operation | Lock mode |
-| --- | --- |
-| Add a `CHECK` constraint (valid or `NOT VALID`) | `ACCESS EXCLUSIVE`; only the valid form scans |
-| Add a `FOREIGN KEY` (valid or `NOT VALID`) | `SHARE ROW EXCLUSIVE` on both tables |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE`; a foreign key also takes `ROW SHARE` on the referenced table |
-| `SET STORAGE`, `SET NOT NULL`, `SET DATA TYPE`, `SET ACCESS METHOD` | `ACCESS EXCLUSIVE` |
-| Add `UNIQUE`, `PRIMARY KEY`, or `EXCLUDE` without `USING INDEX` | `ACCESS EXCLUSIVE` plus `SHARE` while the index is built |
-| Add `UNIQUE` or `PRIMARY KEY` with `USING INDEX` | `ACCESS EXCLUSIVE`; a primary key may also scan |
-| `ATTACH PARTITION` | `ACCESS EXCLUSIVE` on the partition, `SHARE UPDATE EXCLUSIVE` on the parent |
-| `DETACH PARTITION` | `ACCESS EXCLUSIVE` on parent and partition; `CONCURRENTLY` uses `SHARE UPDATE EXCLUSIVE` on the parent |
-| `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` | `SHARE` / `ACCESS EXCLUSIVE` |
-| `REINDEX` without `CONCURRENTLY` | `SHARE` on each table, `ACCESS EXCLUSIVE` on each index |
-| `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` | `ACCESS EXCLUSIVE` |
-| `TRUNCATE` | `ACCESS EXCLUSIVE` |
-| Add a domain constraint | `SHARE` on each table using the domain |
-
-These are reported by `lock-risk` (and `set-storage-lock` for storage
-parameters) regardless of table size. Scan and rewrite cost remains a separate,
-row-count-based finding. Dedicated Tier 1/2 rules such as
-`require-concurrent-index`, `require-concurrent-reindex`,
-`blocking-mat-view-refresh`, and `vacuum-full` still provide the actionable
-warning; `lock-risk` adds the exact mode without replacing them. Brief
-metadata-only operations such as `ADD`/`DROP`/`RENAME COLUMN`, `SET DEFAULT`,
-and `ALTER TYPE` are not separately flagged. Operations outside the curated
-predictor are listed under `not_evaluated` as `lock_prediction_unavailable`;
-that is a coverage gap, not evidence of safety.
-
-## Migration timeouts
-
-If the migration runner does not already set timeouts, add them before
-lock-sensitive changes:
+If your migration runner does not set timeouts automatically, set them before lock-sensitive statements:
 
 ```sql
 SET lock_timeout = '5s';
 SET statement_timeout = '15min';
 ```
 
-Keep a positive `lock_timeout` shorter than a positive `statement_timeout`.
-
 ## Rust library
 
-Rust integrations use `safe_migrate::api`. Load a synchronized baseline when
-one is available; otherwise choose explicit conservative analysis.
+Embed safe-migrate in Rust tools via `safe_migrate::api`:
 
 ```rust,no_run
 use safe_migrate::api::{self, Baseline, Config};
@@ -256,21 +174,7 @@ if outcome.should_halt() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`load_optional` treats only a missing cache as unavailable; corrupt,
-incompatible, or incorrectly encrypted caches remain errors. The API exposes
-typed immutable findings, verdicts, evidence, baseline inspection, rule
-metadata, and synchronization. Mutable parser, cache, and state-machine
-internals are not public. Full API documentation is on
-[docs.rs](https://docs.rs/safe-migrate).
-
-Embedded applications can call `sync_with_secrets` with a validated
-`DatabaseUrl` and optional `CacheKey`. This avoids changing process-wide
-environment variables; the CLI continues to read secrets from its environment.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development commands, test suites,
-and pull-request expectations.
+Full API documentation is on [docs.rs](https://docs.rs/safe-migrate). See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture and development workflows.
 
 ## License
 

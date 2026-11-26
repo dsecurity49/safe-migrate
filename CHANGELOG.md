@@ -7,35 +7,21 @@ notes are available on the
 
 ## v0.14.0 — 2026-11-26
 
-- Added `ALTER ROUTINE` and `DROP ROUTINE` simulation across functions,
-  procedures, and aggregates, along with routine option validation (`COST`,
-  `ROWS`, `PARALLEL`, `SUPPORT`, `SET`, `RESET`, `RESET ALL`), `[NO] DEPENDS ON
-  EXTENSION`, and `OWNER TO` checks.
+- Added `ALTER ROUTINE` and `DROP ROUTINE` across functions, procedures, and
+  aggregates, along with routine option validation (`COST`, `ROWS`, `PARALLEL`,
+  `SUPPORT`, `SET`, `RESET`, `RESET ALL`), `[NO] DEPENDS ON EXTENSION`, and
+  `OWNER TO` checks.
 - Modeled SQL-standard routine body dependencies (`BEGIN ATOMIC ... END` and
-  `RETURN expr`) across tables, columns, routines, and types (`RoutineUsesTable`,
-  `RoutineUsesColumn`, `RoutineUsesRoutine`, `RoutineUsesType`), and expanded
-  `CREATE AGGREGATE` / `DROP AGGREGATE` dependency tracking and `CREATE OR
-  REPLACE AGGREGATE` identity checks.
-- Added full user-defined cast simulation (`CREATE CAST`, `DROP CAST` across
-  `IMPLICIT`, `AS ASSIGNMENT`, and explicit contexts, `WITH FUNCTION` signature
-  and return-type validation, `WITHOUT FUNCTION` physical compatibility checks,
-  pseudo-type rejection, and baseline/in-migration `castfunc` and type drop
-  dependency tracking persisted in Cache V12.1 while retaining seamless V12.0
-  compatibility), extended statistics (`CREATE STATISTICS`, `ALTER
-  STATISTICS`, `DROP STATISTICS`, `STATS_MAX_DIMENSIONS` 8-column limit, default
-  B-tree operator class checks, expression column extraction, and automatic drop
-  on `ALTER TABLE ... DROP COLUMN`), and `ANALYZE` (including non-table target
-  skipping, `missing-idempotency`, `destructive-cascade`, and
-  `ShareUpdateExclusive` lock predictions).
+  `RETURN expr`) across tables, columns, routines, and types, and expanded
+  `CREATE`/`DROP AGGREGATE` dependency and `OR REPLACE` identity checks.
+- Added user-defined casts (`CREATE CAST`, `DROP CAST`), extended statistics
+  (`CREATE`/`ALTER`/`DROP STATISTICS` and auto-drop on `DROP COLUMN`), and
+  `ANALYZE`. Cache V12.1 records full `pg_cast` entries and `castfunc`
+  dependencies while remaining compatible with V12.0 caches.
 - Completed table-rewrite and lock-prediction coverage for `ALTER COLUMN ...
-  SET EXPRESSION` (PostgreSQL 17+ gate, virtual column `CHECK` and publication
-  restrictions, and `TableRewrite` / `MetadataOnly` lock classification),
-  `ALTER TABLE ... SET LOGGED` / `SET UNLOGGED` persistence checks, and
-  `ALTER COLUMN ... ADD GENERATED ... AS IDENTITY`.
-- Resolved composite-type attribute dependency tracking for views and routines,
-  `DROP SCHEMA` composite/foreign-table handling, `ALTER TABLE ... RENAME
-  CONSTRAINT` index renaming, foreign-key column type-change rewrite barriers,
-  and PostgreSQL 14–18 catalog parity gaps.
+  SET EXPRESSION`, `SET LOGGED` / `SET UNLOGGED`, and `ADD GENERATED ... AS
+  IDENTITY`, plus composite-attribute, foreign-key rewrite, and `DROP SCHEMA`
+  dependency fixes.
 
 ## v0.13.0 — 2026-11-22
 
