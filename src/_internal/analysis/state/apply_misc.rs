@@ -917,6 +917,7 @@ impl AnalysisState {
         if self
             .baseline_coverage
             .has(crate::_internal::db::cache::CatalogFamily::Types)
+            && self.local.casts.has_full_cast_coverage()
         {
             return MutationResult::conflict(format!(
                 "cast from type {} to type {} does not exist",

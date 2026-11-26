@@ -154,6 +154,13 @@ const _: () = assert!(
     "the cache magic must stay 9 bytes; a wider version needs a new prefix read"
 );
 
+/// Typed extension payload appended in Cache V12.1 while keeping the major V12
+/// (`SMCACHE12`) header and `DbCache` base layout backward-compatible with V12.0.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CacheExtensionV12_1 {
+    pub casts: Vec<crate::_internal::model::cast::CastEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum DbCacheVersioned {
     // Unit variants reserve the historic bincode discriminants. The reader
@@ -171,13 +178,21 @@ pub(crate) enum DbCacheVersioned {
     V10(Box<DbCache>),
     V11(Box<DbCache>),
     V12(Box<DbCache>),
+    V12_1(Box<DbCache>, CacheExtensionV12_1),
 }
 
 impl DbCacheVersioned {
     /// The variant this build writes. Naming it in one place keeps a format
     /// bump from silently leaving a writer or a fixture on a stale layout.
     pub(crate) fn current(cache: DbCache) -> Self {
-        DbCacheVersioned::V12(Box::new(cache))
+        let ext = CacheExtensionV12_1 {
+            casts: cache
+                .casts
+                .as_ref()
+                .map(|c| c.entries())
+                .unwrap_or_default(),
+        };
+        DbCacheVersioned::V12_1(Box::new(cache), ext)
     }
 
     pub(crate) fn format_version(&self) -> u32 {
@@ -193,7 +208,15 @@ impl DbCacheVersioned {
             DbCacheVersioned::V9(_) => 9,
             DbCacheVersioned::V10(_) => 10,
             DbCacheVersioned::V11(_) => 11,
-            DbCacheVersioned::V12(_) => 12,
+            DbCacheVersioned::V12(_) | DbCacheVersioned::V12_1(_, _) => 12,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn minor_version(&self) -> u32 {
+        match self {
+            DbCacheVersioned::V12_1(_, _) => 1,
+            _ => 0,
         }
     }
 
@@ -214,6 +237,17 @@ impl DbCacheVersioned {
                     .to_string(),
             ),
             DbCacheVersioned::V12(c) => {
+                c.validate_semantics()?;
+                Ok(*c)
+            }
+            DbCacheVersioned::V12_1(mut c, ext) => {
+                if let Some(casts) = c.casts.as_mut() {
+                    casts.hydrate_extension_entries(ext.casts);
+                } else if !ext.casts.is_empty() {
+                    c.casts = Some(crate::_internal::model::cast::CastCatalogue::from_entries(
+                        ext.casts,
+                    ));
+                }
                 c.validate_semantics()?;
                 Ok(*c)
             }

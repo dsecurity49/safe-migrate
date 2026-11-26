@@ -1744,7 +1744,7 @@ pub(crate) enum AlterTableActionFact {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CastContextFact {
     Explicit,
     Assignment,

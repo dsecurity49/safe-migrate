@@ -20,7 +20,8 @@ notes are available on the
   `IMPLICIT`, `AS ASSIGNMENT`, and explicit contexts, `WITH FUNCTION` signature
   and return-type validation, `WITHOUT FUNCTION` physical compatibility checks,
   pseudo-type rejection, and baseline/in-migration `castfunc` and type drop
-  dependency tracking), extended statistics (`CREATE STATISTICS`, `ALTER
+  dependency tracking persisted in Cache V12.1 while retaining seamless V12.0
+  compatibility), extended statistics (`CREATE STATISTICS`, `ALTER
   STATISTICS`, `DROP STATISTICS`, `STATS_MAX_DIMENSIONS` 8-column limit, default
   B-tree operator class checks, expression column extraction, and automatic drop
   on `ALTER TABLE ... DROP COLUMN`), and `ANALYZE` (including non-table target

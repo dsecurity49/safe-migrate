@@ -92,10 +92,10 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V12(cache) = versioned else {
+    let Ok(cache) = versioned.into_cache() else {
         panic!("catalog sync must encode the V8 cache variant");
     };
-    (*cache, payload)
+    (cache, payload)
 }
 
 fn live_database(database_url: &str) -> (postgres::Config, String, i32) {

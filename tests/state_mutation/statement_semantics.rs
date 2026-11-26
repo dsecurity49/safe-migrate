@@ -754,3 +754,40 @@ fn drop_function_on_baseline_cast_function_conflicts_without_cascade_and_drops_c
         "DROP FUNCTION CASCADE must remove the baseline cast from CastCatalogue"
     );
 }
+
+#[test]
+fn v12_0_cache_with_partial_cast_coverage_stays_honest_on_drop_cast() {
+    let mut cache = synced_cache();
+    let src_id = object_id("public", "v12_0_src");
+    let dst_id = object_id("public", "v12_0_dst");
+    cache.casts = Some(safe_migrate::_internal::model::cast::CastCatalogue::fallback());
+    for id in [&src_id, &dst_id] {
+        cache.types.insert(
+            id.clone(),
+            TypeState {
+                id: id.clone(),
+                owner: object_id("", "postgres"),
+                kind: TypeKind::Composite { fields: Vec::new() },
+                generation: 1,
+            },
+        );
+    }
+    // Simulate a V12.0 cache decoded via bincode (where `entries` was not yet populated).
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let v12_0 = safe_migrate::_internal::db::cache::DbCacheVersioned::V12(Box::new(cache));
+    let bytes = bincode::serde::encode_to_vec(&v12_0, config).unwrap();
+    let decoded: safe_migrate::_internal::db::cache::DbCacheVersioned =
+        bincode::serde::decode_from_slice(&bytes, config).unwrap().0;
+    let hydrated_cache = decoded.into_cache().unwrap();
+
+    let engine = setup_engine();
+    let mut state = AnalysisState::new(hydrated_cache);
+    let findings = engine
+        .analyze("DROP CAST (v12_0_src AS v12_0_dst);", &mut state)
+        .unwrap();
+    assert!(
+        !findings.iter().any(|f| f.rule_id == "chain-conflict"),
+        "a V12.0 cache only recorded implicit casts, so DROP CAST on an unrecorded cast must taint rather than falsely claim conflict: {findings:?}"
+    );
+    assert_eq!(*state.confidence(), Confidence::Tainted);
+}
