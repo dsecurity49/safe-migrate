@@ -965,14 +965,35 @@ impl AstVisitor {
             .unwrap_or_default();
         let on_clause = node.statistics_on_clause()?;
         let mut columns = Vec::new();
+        let mut expression_columns = Vec::new();
         let mut expr_texts = Vec::new();
         for expr in on_clause.exprs() {
-            match &expr {
+            let mut unwrapped = expr.clone();
+            while let ast::Expr::ParenExpr(pe) = &unwrapped {
+                if let Some(inner) = pe.expr() {
+                    unwrapped = inner;
+                } else {
+                    break;
+                }
+            }
+            match &unwrapped {
                 ast::Expr::NameRef(nr) => {
                     columns.push(Self::resolve_name_ref(nr));
                 }
                 _ => {
-                    expr_texts.push(expr.syntax().text().to_string().trim().to_string());
+                    if let Some(refs) =
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::convert(
+                            unwrapped.clone(),
+                        )
+                        .referenced_columns()
+                    {
+                        for col in refs {
+                            if !expression_columns.contains(&col) {
+                                expression_columns.push(col);
+                            }
+                        }
+                    }
+                    expr_texts.push(unwrapped.syntax().text().to_string().trim().to_string());
                 }
             }
         }
@@ -986,6 +1007,8 @@ impl AstVisitor {
                 if_not_exists,
                 kinds,
                 columns,
+                expression_columns,
+                expressions: expr_texts,
                 expression_count,
                 expressions_sql,
                 table,

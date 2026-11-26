@@ -1626,11 +1626,20 @@ impl AnalysisState {
             let mut known_dependency = false;
             if let Some(RelationOverlay::Present(relation)) = self.local.relations.get(&alter.id) {
                 for statistics in relation.extended_statistics.values() {
-                    if statistics.columns.iter().any(|column| column == name) {
-                        known_dependency = true;
-                        if *cascade {
-                            drop_column_statistics.insert(statistics.id.clone());
-                        }
+                    let refs_expr = statistics
+                        .expressions
+                        .as_deref()
+                        .and_then(
+                            crate::_internal::analysis::expr_visitor::ExprVisitor::parse_expression_list,
+                        )
+                        .is_some_and(|exprs| {
+                            exprs.iter().any(|expr| {
+                                expr.referenced_columns()
+                                    .is_some_and(|cols| cols.contains(name))
+                            })
+                        });
+                    if statistics.columns.iter().any(|column| column == name) || refs_expr {
+                        drop_column_statistics.insert(statistics.id.clone());
                     }
                 }
             }
@@ -1828,6 +1837,33 @@ impl AnalysisState {
             // operation conservative rather than dropping a column while
             // retaining a typed foreign-key/constraint edge.
             if !cascade_generated_columns.is_empty() {
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get(&alter.id)
+                {
+                    for statistics in relation.extended_statistics.values() {
+                        let refs_expr = statistics
+                            .expressions
+                            .as_deref()
+                            .and_then(
+                                crate::_internal::analysis::expr_visitor::ExprVisitor::parse_expression_list,
+                            )
+                            .is_some_and(|exprs| {
+                                exprs.iter().any(|expr| {
+                                    expr.referenced_columns().is_some_and(|cols| {
+                                        cols.iter().any(|c| cascade_generated_columns.contains(c))
+                                    })
+                                })
+                            });
+                        if statistics
+                            .columns
+                            .iter()
+                            .any(|column| cascade_generated_columns.contains(column))
+                            || refs_expr
+                        {
+                            drop_column_statistics.insert(statistics.id.clone());
+                        }
+                    }
+                }
                 for edge in self.local.graph.edges() {
                     if !self.dependency_edge_is_current(edge) {
                         continue;

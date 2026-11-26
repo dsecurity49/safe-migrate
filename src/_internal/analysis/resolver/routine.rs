@@ -196,9 +196,21 @@ impl Resolver {
         let method = match &fact.method {
             CastMethodFact::WithoutFunction => CastMethodMutation::WithoutFunction,
             CastMethodFact::WithInout => CastMethodMutation::WithInout,
-            CastMethodFact::WithFunction(sig) => CastMethodMutation::WithFunction(
-                Self::resolve_routine_lookup_name(&sig.name, &sig.params, state),
-            ),
+            CastMethodFact::WithFunction(sig) => {
+                let id = if sig.params.is_empty() {
+                    let base = Self::resolve_routine_namespace_name(&sig.name, state);
+                    let candidates: Vec<_> =
+                        state.routine_overloads_under(&base).cloned().collect();
+                    if candidates.len() == 1 {
+                        candidates[0].clone()
+                    } else {
+                        Self::resolve_routine_lookup_name(&sig.name, &sig.params, state)
+                    }
+                } else {
+                    Self::resolve_routine_lookup_name(&sig.name, &sig.params, state)
+                };
+                CastMethodMutation::WithFunction(id)
+            }
         };
         Mutation::CreateCast(CreateCastMutation {
             source_type: Self::resolve_cast_type_identity(&fact.source_type, state),
@@ -229,6 +241,8 @@ impl Resolver {
             if_not_exists: fact.if_not_exists,
             kinds: fact.kinds.clone(),
             columns: fact.columns.clone(),
+            expression_columns: fact.expression_columns.clone(),
+            expressions: fact.expressions.clone(),
             expression_count: fact.expression_count,
             expressions_sql: fact.expressions_sql.clone(),
             table: Self::resolve_relation_lookup_name(&fact.table, state),

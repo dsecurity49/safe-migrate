@@ -2,7 +2,7 @@ use super::index_topology::AttachRefusal;
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{
-    AlterStatisticsActionFact, CastContextFact, IndexStatisticsColumn, StatisticsTarget,
+    AlterStatisticsActionFact, IndexStatisticsColumn, StatisticsTarget,
 };
 use crate::_internal::analysis::graph::DependencyKind;
 use crate::_internal::analysis::mutations::{
@@ -477,7 +477,50 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
-    fn validate_cast_type(&mut self, type_name: &str) -> Result<(), MutationResult> {
+    fn is_pseudo_type_name(type_name: &str) -> bool {
+        let stripped = type_name.trim().trim_end_matches("[]").trim();
+        matches!(
+            stripped.to_ascii_lowercase().as_str(),
+            "\"any\""
+                | "any"
+                | "anyarray"
+                | "anycompatible"
+                | "anycompatiblearray"
+                | "anycompatiblemultirange"
+                | "anycompatiblenonarray"
+                | "anycompatiblerange"
+                | "anyelement"
+                | "anyenum"
+                | "anymultirange"
+                | "anynonarray"
+                | "anyrange"
+                | "cstring"
+                | "event_trigger"
+                | "fdw_handler"
+                | "index_am_handler"
+                | "internal"
+                | "language_handler"
+                | "pg_ddl_command"
+                | "record"
+                | "table_am_handler"
+                | "trigger"
+                | "tsm_handler"
+                | "unknown"
+                | "void"
+        )
+    }
+
+    fn validate_cast_type(
+        &mut self,
+        type_name: &str,
+        is_source: bool,
+    ) -> Result<(), MutationResult> {
+        if Self::is_pseudo_type_name(type_name) {
+            let side = if is_source { "source" } else { "target" };
+            return Err(MutationResult::conflict(format!(
+                "{side} data type {type_name} is a pseudo-type"
+            )));
+        }
         if self.declared_type_resolves(type_name) {
             return Ok(());
         }
@@ -493,99 +536,495 @@ impl AnalysisState {
         Err(self.unresolved(EvidenceCode::UnknownObjectState))
     }
 
+    fn canonical_cast_type(&self, raw: &str) -> String {
+        if let Some(id) = self.resolve_type_reference(raw) {
+            return id.to_string();
+        }
+        let identity = crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+            raw,
+            self.builtin_types(),
+        );
+        if identity.is_unknown() {
+            return crate::_internal::model::data_type::ParsedDataType::parse(
+                raw,
+                self.builtin_types(),
+            )
+            .to_string();
+        }
+        identity.render()
+    }
+
+    fn unwrap_domain_to_base(&self, mut ty: String) -> String {
+        let mut visited = HashSet::new();
+        while visited.insert(ty.clone()) {
+            let Some(id) = self.resolve_type_reference(&ty) else {
+                break;
+            };
+            let (base_id, is_array) = Self::strip_array_type_id(&id);
+            if is_array {
+                break;
+            }
+            let Some(crate::_internal::model::types::TypeOverlay::Present(state)) =
+                self.local.types.get(&base_id)
+            else {
+                break;
+            };
+            let crate::_internal::model::types::TypeKind::Domain {
+                base_type,
+                base_type_id,
+                ..
+            } = &state.kind
+            else {
+                break;
+            };
+            if let Some(next_id) = base_type_id {
+                ty = next_id.to_string();
+            } else {
+                ty = self.canonical_cast_type(base_type);
+            }
+        }
+        ty
+    }
+
+    fn cast_type_is_binary_coercible(&self, from: &str, to: &str) -> bool {
+        let from_canon = self.canonical_cast_type(from);
+        let to_canon = self.canonical_cast_type(to);
+        if from_canon == to_canon {
+            return true;
+        }
+        let from_base = self.unwrap_domain_to_base(from_canon);
+        if from_base == to_canon {
+            return true;
+        }
+        self.local.casts.is_binary_coercible(&from_base, &to_canon)
+    }
+
+    fn builtin_base_physical_layout(type_name: &str) -> Option<(i16, bool, char)> {
+        match type_name {
+            "\"char\"" | "char" | "boolean" | "bool" => Some((1, true, 'c')),
+            "smallint" | "int2" => Some((2, true, 's')),
+            "integer" | "int4" | "real" | "float4" | "date" | "oid" | "xid" | "cid" | "regproc"
+            | "regprocedure" | "regoper" | "regoperator" | "regclass" | "regtype" | "regrole"
+            | "regnamespace" | "regconfig" | "regdictionary" | "regcollation" => {
+                Some((4, true, 'i'))
+            }
+            "bigint"
+            | "int8"
+            | "double precision"
+            | "float8"
+            | "money"
+            | "pg_lsn"
+            | "xid8"
+            | "time without time zone"
+            | "time"
+            | "timestamp without time zone"
+            | "timestamp"
+            | "timestamp with time zone"
+            | "timestamptz" => Some((8, true, 'd')),
+            "tid" => Some((6, false, 's')),
+            "macaddr" => Some((6, false, 'i')),
+            "macaddr8" => Some((8, false, 'i')),
+            "time with time zone" | "timetz" => Some((12, false, 'd')),
+            "uuid" => Some((16, false, 'c')),
+            "aclitem" | "interval" | "point" => Some((16, false, 'd')),
+            "circle" | "line" => Some((24, false, 'd')),
+            "box" | "lseg" => Some((32, false, 'd')),
+            "name" => Some((64, false, 'c')),
+            "path" | "polygon" | "pg_snapshot" | "txid_snapshot" => Some((-1, false, 'd')),
+            "bit"
+            | "bit varying"
+            | "varbit"
+            | "bytea"
+            | "character"
+            | "bpchar"
+            | "character varying"
+            | "varchar"
+            | "cidr"
+            | "gtsvector"
+            | "inet"
+            | "int2vector"
+            | "json"
+            | "jsonb"
+            | "jsonpath"
+            | "numeric"
+            | "oidvector"
+            | "pg_brin_bloom_summary"
+            | "pg_brin_minmax_multi_summary"
+            | "pg_dependencies"
+            | "pg_mcv_list"
+            | "pg_ndistinct"
+            | "pg_node_tree"
+            | "refcursor"
+            | "text"
+            | "tsquery"
+            | "tsvector"
+            | "xml" => Some((-1, false, 'i')),
+            _ => None,
+        }
+    }
+
+    fn validate_binary_compatible_cast_type(
+        &self,
+        type_name: &str,
+    ) -> Result<Option<(i16, bool, char)>, MutationResult> {
+        let parsed = crate::_internal::model::data_type::ParsedDataType::parse(
+            type_name,
+            self.builtin_types(),
+        );
+        if parsed.array_dimensions > 0
+            || type_name.ends_with("[]")
+            || matches!(type_name, "int2vector" | "oidvector")
+        {
+            return Err(MutationResult::conflict(
+                "array data types are not binary-compatible".to_string(),
+            ));
+        }
+        if let Some(id) = self.resolve_type_reference(type_name) {
+            if let Some(crate::_internal::model::relation::RelationOverlay::Present(_)) =
+                self.local.relations.get(&id)
+            {
+                return Err(MutationResult::conflict(
+                    "composite data types are not binary-compatible".to_string(),
+                ));
+            }
+            if let Some(crate::_internal::model::types::TypeOverlay::Present(state)) =
+                self.local.types.get(&id)
+            {
+                return match &state.kind {
+                    crate::_internal::model::types::TypeKind::Composite { .. } => {
+                        Err(MutationResult::conflict(
+                            "composite data types are not binary-compatible".to_string(),
+                        ))
+                    }
+                    crate::_internal::model::types::TypeKind::Enum { .. } => {
+                        Err(MutationResult::conflict(
+                            "enum data types are not binary-compatible".to_string(),
+                        ))
+                    }
+                    crate::_internal::model::types::TypeKind::Range { .. }
+                    | crate::_internal::model::types::TypeKind::Multirange { .. } => {
+                        Err(MutationResult::conflict(
+                            "range data types are not binary-compatible".to_string(),
+                        ))
+                    }
+                    crate::_internal::model::types::TypeKind::Domain { .. } => {
+                        Err(MutationResult::conflict(
+                            "domain data types must not be marked binary-compatible".to_string(),
+                        ))
+                    }
+                    crate::_internal::model::types::TypeKind::Base { options, .. } => {
+                        if options.element.is_some() {
+                            return Err(MutationResult::conflict(
+                                "array data types are not binary-compatible".to_string(),
+                            ));
+                        }
+                        if let Some(like_type) = &options.like {
+                            let canon_like = self.canonical_cast_type(like_type);
+                            return self.validate_binary_compatible_cast_type(&canon_like);
+                        }
+                        let typlen = match &options.internallength {
+                            Some(crate::_internal::model::types::BaseTypeLength::Variable)
+                            | None => -1,
+                            Some(crate::_internal::model::types::BaseTypeLength::Fixed(n)) => *n,
+                        };
+                        let typbyval = options.passed_by_value.unwrap_or(false);
+                        let typalign = match options
+                            .alignment
+                            .as_deref()
+                            .unwrap_or("int4")
+                            .to_ascii_lowercase()
+                            .as_str()
+                        {
+                            "char" => 'c',
+                            "int2" => 's',
+                            "double" => 'd',
+                            _ => 'i',
+                        };
+                        Ok(Some((typlen, typbyval, typalign)))
+                    }
+                };
+            }
+        }
+        if let Some(builtin) = parsed.builtin()
+            && builtin.category == crate::_internal::model::builtin_type::TypeCategory::Range
+        {
+            return Err(MutationResult::conflict(
+                "range data types are not binary-compatible".to_string(),
+            ));
+        }
+        Ok(Self::builtin_base_physical_layout(type_name))
+    }
+
     pub(super) fn apply_create_cast(&mut self, cast: &CreateCastMutation) -> MutationResult {
-        if let Err(result) = self.validate_cast_type(&cast.source_type) {
+        if let Err(result) = self.validate_cast_type(&cast.source_type, true) {
             return result;
         }
-        if let Err(result) = self.validate_cast_type(&cast.target_type) {
+        if let Err(result) = self.validate_cast_type(&cast.target_type, false) {
             return result;
         }
-        if cast.source_type == cast.target_type {
-            return MutationResult::conflict(
-                "source data type and target data type are the same".to_string(),
-            );
-        }
-        if let CastMethodMutation::WithFunction(func_id) = &cast.method {
-            match self.local.functions.get(func_id) {
-                Some(crate::_internal::model::function::FunctionOverlay::Present(fn_state)) => {
-                    if !matches!(
-                        fn_state.routine_kind,
-                        crate::_internal::model::function::RoutineKind::Function
-                    ) {
+        let mut num_args = 0usize;
+        let entry_method = match &cast.method {
+            CastMethodMutation::WithoutFunction => {
+                let src_layout = match self.validate_binary_compatible_cast_type(&cast.source_type)
+                {
+                    Ok(layout) => layout,
+                    Err(result) => return result,
+                };
+                let dst_layout = match self.validate_binary_compatible_cast_type(&cast.target_type)
+                {
+                    Ok(layout) => layout,
+                    Err(result) => return result,
+                };
+                if let (Some(src), Some(dst)) = (src_layout, dst_layout)
+                    && src != dst
+                {
+                    return MutationResult::conflict(
+                        "source and target data types are not physically compatible".to_string(),
+                    );
+                }
+                crate::_internal::model::cast::CastEntryMethod::WithoutFunction
+            }
+            CastMethodMutation::WithInout => {
+                crate::_internal::model::cast::CastEntryMethod::WithInout
+            }
+            CastMethodMutation::WithFunction(func_id) => {
+                match self.local.functions.get(func_id) {
+                    Some(crate::_internal::model::function::FunctionOverlay::Present(fn_state)) => {
+                        if !matches!(
+                            fn_state.routine_kind,
+                            crate::_internal::model::function::RoutineKind::Function
+                        ) {
+                            return MutationResult::conflict(
+                                "cast function must be a normal function".to_string(),
+                            );
+                        }
+                        if fn_state.returns_set {
+                            return MutationResult::conflict(
+                                "cast function must not return a set".to_string(),
+                            );
+                        }
+                        num_args = fn_state.arg_types.len();
+                        if !(1..=3).contains(&num_args) {
+                            return MutationResult::conflict(
+                                "cast function must take one to three arguments".to_string(),
+                            );
+                        }
+                        if !self.cast_type_is_binary_coercible(
+                            &cast.source_type,
+                            &fn_state.arg_types[0],
+                        ) {
+                            return MutationResult::conflict(
+                                "argument of cast function must match or be binary-coercible from source data type"
+                                    .to_string(),
+                            );
+                        }
+                        if num_args > 1
+                            && self.canonical_cast_type(&fn_state.arg_types[1]) != "integer"
+                        {
+                            return MutationResult::conflict(
+                                "second argument of cast function must be type integer".to_string(),
+                            );
+                        }
+                        if num_args > 2
+                            && self.canonical_cast_type(&fn_state.arg_types[2]) != "boolean"
+                        {
+                            return MutationResult::conflict(
+                                "third argument of cast function must be type boolean".to_string(),
+                            );
+                        }
+                        if !self
+                            .cast_type_is_binary_coercible(&fn_state.return_type, &cast.target_type)
+                        {
+                            return MutationResult::conflict(
+                                "return data type of cast function must match or be binary-coercible to target data type"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Some(crate::_internal::model::function::FunctionOverlay::Dropped) => {
                         return MutationResult::conflict(format!(
                             "function '{}' does not exist",
                             func_id
                         ));
                     }
+                    None if self.baseline_covers_family_object(
+                        func_id,
+                        crate::_internal::db::cache::CatalogFamily::Routines,
+                    ) =>
+                    {
+                        return MutationResult::conflict(format!(
+                            "function '{}' does not exist",
+                            func_id
+                        ));
+                    }
+                    None => {
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                    }
                 }
-                Some(crate::_internal::model::function::FunctionOverlay::Dropped) => {
-                    return MutationResult::conflict(format!(
-                        "function '{}' does not exist",
-                        func_id
-                    ));
-                }
-                None if self.baseline_covers_family_object(
-                    func_id,
-                    crate::_internal::db::cache::CatalogFamily::Routines,
-                ) =>
-                {
-                    return MutationResult::conflict(format!(
-                        "function '{}' does not exist",
-                        func_id
-                    ));
-                }
-                None => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                }
+                crate::_internal::model::cast::CastEntryMethod::WithFunction(Some(func_id.clone()))
             }
+        };
+        if cast.source_type == cast.target_type && num_args < 2 {
+            return MutationResult::conflict(
+                "source data type and target data type are the same".to_string(),
+            );
         }
         if self
             .local
             .casts
-            .coerces_implicitly(&cast.source_type, &cast.target_type)
+            .has_cast(&cast.source_type, &cast.target_type)
         {
             return MutationResult::conflict(format!(
                 "cast from type {} to type {} already exists",
                 cast.source_type, cast.target_type
             ));
         }
-        if cast.context == CastContextFact::Implicit {
-            self.snapshot_casts();
-            self.local
-                .casts
-                .insert_implicit(cast.source_type.clone(), cast.target_type.clone());
-        } else {
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-        }
+        self.snapshot_casts();
+        self.local
+            .casts
+            .insert_cast(crate::_internal::model::cast::CastEntry {
+                source: cast.source_type.clone(),
+                target: cast.target_type.clone(),
+                context: cast.context,
+                method: entry_method,
+            });
         MutationResult::Applied
     }
 
     pub(super) fn apply_drop_cast(&mut self, cast: &DropCastMutation) -> MutationResult {
         if !cast.if_exists {
-            if let Err(result) = self.validate_cast_type(&cast.source_type) {
+            if let Err(result) = self.validate_cast_type(&cast.source_type, true) {
                 return result;
             }
-            if let Err(result) = self.validate_cast_type(&cast.target_type) {
+            if let Err(result) = self.validate_cast_type(&cast.target_type, false) {
                 return result;
             }
         }
         if self
             .local
             .casts
-            .coerces_implicitly(&cast.source_type, &cast.target_type)
-            && cast.source_type != cast.target_type
+            .has_cast(&cast.source_type, &cast.target_type)
         {
             self.snapshot_casts();
             self.local
                 .casts
-                .remove_implicit(&cast.source_type, &cast.target_type);
+                .remove_cast(&cast.source_type, &cast.target_type);
             return MutationResult::Applied;
         }
         if cast.if_exists {
             return MutationResult::NoOp;
         }
-        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-        MutationResult::Applied
+        if self
+            .baseline_coverage
+            .has(crate::_internal::db::cache::CatalogFamily::Types)
+        {
+            return MutationResult::conflict(format!(
+                "cast from type {} to type {} does not exist",
+                cast.source_type, cast.target_type
+            ));
+        }
+        self.unresolved(EvidenceCode::UnknownObjectState)
+    }
+
+    fn is_system_column_name(col: &str) -> bool {
+        matches!(col, "ctid" | "xmin" | "xmax" | "cmin" | "cmax" | "tableoid")
+    }
+
+    fn builtin_type_lacks_default_btree(type_name: &str) -> bool {
+        let base = type_name.trim().trim_end_matches("[]").trim();
+        matches!(
+            base,
+            "aclitem"
+                | "box"
+                | "cid"
+                | "circle"
+                | "gtsvector"
+                | "int2vector"
+                | "json"
+                | "jsonpath"
+                | "line"
+                | "lseg"
+                | "path"
+                | "pg_brin_bloom_summary"
+                | "pg_brin_minmax_multi_summary"
+                | "pg_snapshot"
+                | "point"
+                | "polygon"
+                | "refcursor"
+                | "txid_snapshot"
+                | "xid"
+                | "xml"
+        )
+    }
+
+    fn type_lacks_default_btree_for_statistics(
+        &self,
+        data_type: Option<&str>,
+        type_id: Option<&ObjectId>,
+        visited: &mut HashSet<ObjectId>,
+    ) -> bool {
+        if let Some(id) = type_id {
+            let (base_id, _) = Self::strip_array_type_id(id);
+            if !visited.insert(base_id.clone()) {
+                return false;
+            }
+            if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+                self.local.relations.get(&base_id)
+            {
+                return rel.columns.iter().any(|col| {
+                    self.type_lacks_default_btree_for_statistics(
+                        col.data_type.as_deref(),
+                        col.type_id.as_ref(),
+                        visited,
+                    )
+                });
+            }
+            if let Some(crate::_internal::model::types::TypeOverlay::Present(state)) =
+                self.local.types.get(&base_id)
+            {
+                return match &state.kind {
+                    crate::_internal::model::types::TypeKind::Domain {
+                        base_type,
+                        base_type_id,
+                        ..
+                    } => self.type_lacks_default_btree_for_statistics(
+                        Some(base_type),
+                        base_type_id.as_ref(),
+                        visited,
+                    ),
+                    crate::_internal::model::types::TypeKind::Composite { fields } => {
+                        fields.iter().any(|field| {
+                            self.type_lacks_default_btree_for_statistics(
+                                Some(&field.data_type),
+                                field.data_type_id.as_ref(),
+                                visited,
+                            )
+                        })
+                    }
+                    crate::_internal::model::types::TypeKind::Base { .. } => self
+                        .local
+                        .opclasses
+                        .default_class(Some(&state.id.name), "btree", &[])
+                        .is_none(),
+                    crate::_internal::model::types::TypeKind::Enum { .. }
+                    | crate::_internal::model::types::TypeKind::Range { .. }
+                    | crate::_internal::model::types::TypeKind::Multirange { .. } => false,
+                };
+            }
+        }
+        let Some(raw) = data_type else {
+            return false;
+        };
+        if let Some(resolved_id) = self.resolve_type_reference(raw) {
+            return self.type_lacks_default_btree_for_statistics(
+                Some(raw),
+                Some(&resolved_id),
+                visited,
+            );
+        }
+        let canon = self.canonical_cast_type(raw);
+        Self::builtin_type_lacks_default_btree(&canon)
+            || Self::builtin_type_lacks_default_btree(raw)
     }
 
     pub(super) fn apply_create_statistics(
@@ -614,12 +1053,18 @@ impl AnalysisState {
                 }
                 id.clone()
             }
-            None => self.next_generated_statistics_name_avoiding(
-                &create.table.schema,
-                &create.table.name,
-                &create.columns,
-                &HashSet::new(),
-            ),
+            None => {
+                let mut name_elems = create.columns.clone();
+                for _ in 0..create.expression_count {
+                    name_elems.push("expr".to_string());
+                }
+                self.next_generated_statistics_name_avoiding(
+                    &create.table.schema,
+                    &create.table.name,
+                    &name_elems,
+                    &HashSet::new(),
+                )
+            }
         };
         if self.extended_statistics_is_present(&stats_id) {
             if create.if_not_exists {
@@ -630,10 +1075,87 @@ impl AnalysisState {
                 stats_id
             ));
         }
+        let total_dimensions = create.columns.len() + create.expression_count;
+        if total_dimensions > 8 {
+            return MutationResult::conflict(
+                "cannot have more than 8 columns in statistics".to_string(),
+            );
+        }
+        if create.columns.is_empty() && create.expression_count == 1 && !create.kinds.is_empty() {
+            return MutationResult::conflict(
+                "when building statistics on a single expression, statistics kinds may not be specified"
+                    .to_string(),
+            );
+        }
+        for col in create
+            .columns
+            .iter()
+            .chain(create.expression_columns.iter())
+        {
+            if Self::is_system_column_name(col) {
+                return MutationResult::conflict(
+                    "statistics creation on system columns is not supported".to_string(),
+                );
+            }
+        }
+        if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
+            self.local.relations.get(&create.table)
+        {
+            for col in &create.columns {
+                if rel.columns_complete && !rel.has_column(col) {
+                    return MutationResult::conflict(format!("column \"{col}\" does not exist"));
+                }
+                if let Some(col_state) = rel.columns.iter().find(|c| &c.name == col) {
+                    if rel.generated_columns.get(col).is_some_and(|g| {
+                        matches!(
+                            g.kind,
+                            crate::_internal::model::relation::GeneratedColumnKind::Virtual
+                        )
+                    }) {
+                        return MutationResult::conflict(
+                            "statistics creation on virtual generated columns is not supported"
+                                .to_string(),
+                        );
+                    }
+                    let mut visited = HashSet::new();
+                    if self.type_lacks_default_btree_for_statistics(
+                        col_state.data_type.as_deref(),
+                        col_state.type_id.as_ref(),
+                        &mut visited,
+                    ) {
+                        let type_label = col_state.data_type.as_deref().unwrap_or("unknown");
+                        return MutationResult::conflict(format!(
+                            "column \"{col}\" cannot be used in statistics because its type {type_label} has no default btree operator class"
+                        ));
+                    }
+                }
+            }
+            for col in &create.expression_columns {
+                if rel.columns_complete && !rel.has_column(col) {
+                    return MutationResult::conflict(format!("column \"{col}\" does not exist"));
+                }
+                if rel.generated_columns.get(col).is_some_and(|g| {
+                    matches!(
+                        g.kind,
+                        crate::_internal::model::relation::GeneratedColumnKind::Virtual
+                    )
+                }) {
+                    return MutationResult::conflict(
+                        "statistics creation on virtual generated columns is not supported"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         let mut normalized_kinds = Vec::new();
         if create.kinds.is_empty() {
-            for k in ["d", "f", "m"] {
-                normalized_kinds.push(k.to_string());
+            if total_dimensions >= 2 {
+                for k in ["d", "f", "m"] {
+                    normalized_kinds.push(k.to_string());
+                }
+            }
+            if create.expression_count > 0 {
+                normalized_kinds.push("e".to_string());
             }
         } else {
             for k in &create.kinds {
@@ -651,12 +1173,11 @@ impl AnalysisState {
                     normalized_kinds.push(code.to_string());
                 }
             }
+            if create.expression_count > 0 && !normalized_kinds.iter().any(|k| k == "e") {
+                normalized_kinds.push("e".to_string());
+            }
         }
-        if create.columns.len() + create.expression_count < 2
-            && !(create.columns.is_empty()
-                && create.expression_count == 1
-                && create.kinds.is_empty())
-        {
+        if total_dimensions < 2 && !(create.columns.is_empty() && create.expression_count == 1) {
             return MutationResult::conflict(
                 "extended statistics require at least 2 columns".to_string(),
             );
@@ -669,14 +1190,18 @@ impl AnalysisState {
                 );
             }
         }
-        if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
-            self.local.relations.get(&create.table)
-            && rel.columns_complete
-        {
-            for col in &create.columns {
-                if !rel.has_column(col) {
-                    return MutationResult::conflict(format!("column \"{col}\" does not exist"));
-                }
+        let mut seen_exprs = HashSet::new();
+        for expr in &create.expressions {
+            if !seen_exprs.insert(expr) {
+                return MutationResult::conflict(
+                    "duplicate expression in statistics definition".to_string(),
+                );
+            }
+        }
+        let mut tracked_columns = create.columns.clone();
+        for col in &create.expression_columns {
+            if !tracked_columns.contains(col) {
+                tracked_columns.push(col.clone());
             }
         }
         self.snapshot_relation(&create.table);
@@ -688,7 +1213,7 @@ impl AnalysisState {
                 crate::_internal::model::relation::ExtendedStatisticsState {
                     id: stats_id,
                     kinds: normalized_kinds,
-                    columns: create.columns.clone(),
+                    columns: tracked_columns,
                     expressions: create.expressions_sql.clone(),
                     target: None,
                 },
@@ -886,40 +1411,68 @@ impl AnalysisState {
             }
             return MutationResult::Applied;
         }
+        let mut analyzable_targets = Vec::new();
         for target in &analyze.targets {
-            if let Err(result) = self.ensure_relation_target(
-                &target.table_id,
-                |kind| {
-                    matches!(
-                        kind,
+            if self.lookup_shadowed(&target.table_id) {
+                return self.unresolved(EvidenceCode::UnknownObjectState);
+            }
+            match self.local.relations.get(&target.table_id) {
+                Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) => {
+                    if matches!(
+                        rel.kind,
                         RelationKind::Table
                             | RelationKind::MaterializedView
                             | RelationKind::ForeignTable
-                    )
-                },
-                format!("relation '{}' does not exist", target.table_id),
-                format!("cannot analyze relation '{}'", target.table_id),
-            ) {
-                return result;
-            }
-            if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
-                self.local.relations.get(&target.table_id)
-                && rel.columns_complete
-            {
-                for col in &target.columns {
-                    if !rel.has_column(col) {
-                        return MutationResult::conflict(format!(
-                            "column \"{col}\" of relation \"{}\" does not exist",
-                            target.table_id
-                        ));
+                    ) {
+                        if rel.columns_complete {
+                            for col in &target.columns {
+                                if !rel.has_column(col) {
+                                    return MutationResult::conflict(format!(
+                                        "column \"{col}\" of relation \"{}\" does not exist",
+                                        target.table_id
+                                    ));
+                                }
+                            }
+                        }
+                        analyzable_targets.push(target.table_id.clone());
                     }
+                }
+                Some(crate::_internal::model::relation::RelationOverlay::Dropped) => {
+                    return MutationResult::conflict(format!(
+                        "relation '{}' does not exist",
+                        target.table_id
+                    ));
+                }
+                None if self.sequence_is_present(&target.table_id)
+                    || self.index_is_present(&target.table_id)
+                    || matches!(
+                        self.local.types.get(&target.table_id),
+                        Some(crate::_internal::model::types::TypeOverlay::Present(
+                            crate::_internal::model::types::TypeState {
+                                kind: crate::_internal::model::types::TypeKind::Composite { .. },
+                                ..
+                            }
+                        ))
+                    ) => {}
+                None if self.baseline_covers_family_object(
+                    &target.table_id,
+                    crate::_internal::db::cache::CatalogFamily::Relations,
+                ) =>
+                {
+                    return MutationResult::conflict(format!(
+                        "relation '{}' does not exist",
+                        target.table_id
+                    ));
+                }
+                None => {
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
             }
         }
-        for target in &analyze.targets {
-            self.snapshot_relation(&target.table_id);
+        for table_id in analyzable_targets {
+            self.snapshot_relation(&table_id);
             if let Some(crate::_internal::model::relation::RelationOverlay::Present(rel)) =
-                self.local.relations.get_mut(&target.table_id)
+                self.local.relations.get_mut(&table_id)
             {
                 rel.last_analyze = Some("in-migration".to_string());
             }

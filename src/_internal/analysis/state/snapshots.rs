@@ -174,6 +174,10 @@ impl AnalysisState {
             );
         }
 
+        if !self.local.casts.casts_using_function(old_id).is_empty() {
+            self.snapshot_casts();
+            self.local.casts.rewire_function_id(old_id, new_id);
+        }
         self.snapshot_graph_full();
         self.local.graph.propagate_function_rename(old_id, new_id);
         self.remap_range_routine_reference(old_id, new_id);
@@ -226,6 +230,10 @@ impl AnalysisState {
     }
 
     pub(super) fn drop_routine_with_edges(&mut self, id: &ObjectId) {
+        if !self.local.casts.casts_using_function(id).is_empty() {
+            self.snapshot_casts();
+            self.local.casts.remove_casts_using_function(id);
+        }
         self.snapshot_function(id);
         self.local.functions.insert(
             id.clone(),

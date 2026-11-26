@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.14.0 — 2026-11-25
+## v0.14.0 — 2026-11-26
 
 - Added `ALTER ROUTINE` and `DROP ROUTINE` simulation across functions,
   procedures, and aggregates, along with routine option validation (`COST`,
@@ -16,10 +16,16 @@ notes are available on the
   `RoutineUsesColumn`, `RoutineUsesRoutine`, `RoutineUsesType`), and expanded
   `CREATE AGGREGATE` / `DROP AGGREGATE` dependency tracking and `CREATE OR
   REPLACE AGGREGATE` identity checks.
-- Added user-defined cast simulation (`CREATE CAST`, `DROP CAST`), extended
-  statistics (`CREATE STATISTICS`, `ALTER STATISTICS`, `DROP STATISTICS`), and
-  `ANALYZE`, including `missing-idempotency`, `destructive-cascade`, and lock
-  predictions (`ShareUpdateExclusive`).
+- Added full user-defined cast simulation (`CREATE CAST`, `DROP CAST` across
+  `IMPLICIT`, `AS ASSIGNMENT`, and explicit contexts, `WITH FUNCTION` signature
+  and return-type validation, `WITHOUT FUNCTION` physical compatibility checks,
+  pseudo-type rejection, and baseline/in-migration `castfunc` and type drop
+  dependency tracking), extended statistics (`CREATE STATISTICS`, `ALTER
+  STATISTICS`, `DROP STATISTICS`, `STATS_MAX_DIMENSIONS` 8-column limit, default
+  B-tree operator class checks, expression column extraction, and automatic drop
+  on `ALTER TABLE ... DROP COLUMN`), and `ANALYZE` (including non-table target
+  skipping, `missing-idempotency`, `destructive-cascade`, and
+  `ShareUpdateExclusive` lock predictions).
 - Completed table-rewrite and lock-prediction coverage for `ALTER COLUMN ...
   SET EXPRESSION` (PostgreSQL 17+ gate, virtual column `CHECK` and publication
   restrictions, and `TableRewrite` / `MetadataOnly` lock classification),

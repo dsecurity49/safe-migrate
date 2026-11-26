@@ -25,6 +25,15 @@ impl AnalysisState {
     pub(super) fn apply_type_cascade(&mut self, victims: &[ObjectId]) -> bool {
         let mut complete = true;
         let (dropped_types, removed_fields) = self.type_cascade_closure(victims);
+        if dropped_types
+            .iter()
+            .any(|id| self.local.casts.has_casts_for_type(&id.to_string()))
+        {
+            self.snapshot_casts();
+            for id in &dropped_types {
+                self.local.casts.remove_casts_for_type(&id.to_string());
+            }
+        }
 
         // A composite survives the loss of a field; only the field goes.
         for (composite, field) in &removed_fields {

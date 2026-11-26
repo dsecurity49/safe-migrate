@@ -145,13 +145,14 @@ fn like_extended_statistics_follow_column_lifecycle_and_rollback() {
         .analyze("ALTER TABLE copy DROP COLUMN renamed RESTRICT;", &mut state)
         .unwrap();
     assert!(
-        findings
+        !findings
             .iter()
-            .any(|finding| finding.rule_id == "chain-conflict")
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "PostgreSQL records DEPENDENCY_AUTO on extended statistics columns and drops the statistics automatically on DROP COLUMN RESTRICT: {findings:?}"
     );
     assert!(state
             .get_relation(&copy)
-            .is_some_and(|overlay| matches!(overlay, RelationOverlay::Present(relation) if relation.has_column("renamed") && !relation.extended_statistics.is_empty())));
+            .is_some_and(|overlay| matches!(overlay, RelationOverlay::Present(relation) if !relation.has_column("renamed") && relation.extended_statistics.is_empty())));
 }
 
 #[test]
@@ -366,4 +367,390 @@ fn rollback_restores_every_destructively_rewritten_graph_edge() {
             && edge.referenced == parent
             && matches!(edge.kind, DependencyKind::PartitionOf)
     }));
+}
+
+#[test]
+fn analyze_on_view_sequence_index_and_composite_type_is_a_noop_like_postgres() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TABLE t (id integer, name text);
+             CREATE VIEW v AS SELECT id FROM t;
+             CREATE SEQUENCE seq;
+             CREATE INDEX idx ON t (id);
+             CREATE TYPE comp AS (a integer, b text);
+             ANALYZE v (nonexistent_col);
+             ANALYZE seq (nonexistent_col);
+             ANALYZE idx (nonexistent_col);
+             ANALYZE comp;
+             ANALYZE t (id);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|f| f.rule_id == "chain-conflict"),
+        "ANALYZE on view/sequence/index/composite must not conflict: {findings:?}"
+    );
+    assert_eq!(*state.confidence(), Confidence::Exact);
+
+    let bad = engine
+        .analyze("ANALYZE t (missing_col);", &mut state)
+        .unwrap();
+    assert!(
+        bad.iter()
+            .any(|f| f.rule_id == "chain-conflict" && f.reason.contains("missing_col")),
+        "ANALYZE on table with missing column must conflict: {bad:?}"
+    );
+}
+
+#[test]
+fn create_statistics_enforces_max_dimensions_btree_opclass_and_expression_columns() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let setup = engine
+        .analyze(
+            "CREATE TABLE stats_probe (
+                 c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int,
+                 pt point,
+                 pt_arr point[],
+                 js json,
+                 xm xml,
+                 virt int GENERATED ALWAYS AS (c1 + 1) VIRTUAL
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(!setup.iter().any(|f| f.rule_id == "chain-conflict"));
+
+    for (sql, expected_substr) in [
+        (
+            "CREATE STATISTICS s_too_many ON c1, c2, c3, c4, c5, c6, c7, c8, c9 FROM stats_probe;",
+            "cannot have more than 8 columns in statistics",
+        ),
+        (
+            "CREATE STATISTICS s_too_many_expr ON c1, c2, c3, c4, c5, c6, c7, c8, ((c9 + 1)) FROM stats_probe;",
+            "cannot have more than 8 columns in statistics",
+        ),
+        (
+            "CREATE STATISTICS s_point ON pt, c1 FROM stats_probe;",
+            "has no default btree operator class",
+        ),
+        (
+            "CREATE STATISTICS s_point_paren ON (pt), c1 FROM stats_probe;",
+            "has no default btree operator class",
+        ),
+        (
+            "CREATE STATISTICS s_point_arr ON pt_arr, c1 FROM stats_probe;",
+            "has no default btree operator class",
+        ),
+        (
+            "CREATE STATISTICS s_json ON js, c1 FROM stats_probe;",
+            "has no default btree operator class",
+        ),
+        (
+            "CREATE STATISTICS s_xml ON xm, c1 FROM stats_probe;",
+            "has no default btree operator class",
+        ),
+        (
+            "CREATE STATISTICS s_missing_expr ON ((missing_col + 1)), c1 FROM stats_probe;",
+            "column \"missing_col\" does not exist",
+        ),
+        (
+            "CREATE STATISTICS s_dup_paren ON c1, (c1) FROM stats_probe;",
+            "duplicate column name in statistics definition",
+        ),
+        (
+            "CREATE STATISTICS s_dup_expr ON ((c1 + 1)), ((c1 + 1)) FROM stats_probe;",
+            "duplicate expression in statistics definition",
+        ),
+        (
+            "CREATE STATISTICS s_single_expr_kinds (ndistinct) ON ((c1 + 1)) FROM stats_probe;",
+            "when building statistics on a single expression, statistics kinds may not be specified",
+        ),
+        (
+            "CREATE STATISTICS s_syscol ON ctid, c1 FROM stats_probe;",
+            "statistics creation on system columns is not supported",
+        ),
+        (
+            "CREATE STATISTICS s_syscol_expr ON ((xmin::text)), c1 FROM stats_probe;",
+            "statistics creation on system columns is not supported",
+        ),
+        (
+            "CREATE STATISTICS s_virt ON virt, c1 FROM stats_probe;",
+            "statistics creation on virtual generated columns is not supported",
+        ),
+        (
+            "CREATE STATISTICS s_virt_expr ON ((virt + 1)), c1 FROM stats_probe;",
+            "statistics creation on virtual generated columns is not supported",
+        ),
+    ] {
+        let mut probe_state = state.clone();
+        let findings = engine.analyze(sql, &mut probe_state).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "chain-conflict" && f.reason.contains(expected_substr)),
+            "expected '{expected_substr}' for `{sql}`, got: {findings:?}"
+        );
+    }
+
+    let ok = engine
+        .analyze(
+            "CREATE STATISTICS s_valid_single_expr ON ((c1 + 1)) FROM stats_probe;
+             CREATE STATISTICS s_valid_expr_and_col ON ((c1 + c2)), c3 FROM stats_probe;
+             ALTER TABLE stats_probe DROP COLUMN c2;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !ok.iter().any(|f| f.rule_id == "chain-conflict"),
+        "valid expression statistics and DROP COLUMN auto-drop must succeed: {ok:?}"
+    );
+    let Some(RelationOverlay::Present(rel)) =
+        state.get_relation(&object_id("public", "stats_probe"))
+    else {
+        panic!("stats_probe missing");
+    };
+    assert!(
+        rel.extended_statistics
+            .contains_key(&object_id("public", "s_valid_single_expr"))
+    );
+    assert!(
+        !rel.extended_statistics
+            .contains_key(&object_id("public", "s_valid_expr_and_col")),
+        "dropping c2 must auto-drop s_valid_expr_and_col which references c2 in an expression"
+    );
+}
+
+#[test]
+fn create_and_drop_cast_full_vertical_slice_and_function_dependencies() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let setup = engine
+        .analyze(
+            "CREATE TYPE c_src AS (v int);
+             CREATE TYPE c_dst AS (v int);
+             CREATE TYPE c_other AS (v int);
+             CREATE DOMAIN d_int AS integer;
+             CREATE FUNCTION fn_cast_ok(c_src) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_2arg(c_src, integer) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_3arg(c_src, integer, boolean) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_4arg(c_src, integer, boolean, text) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_bad_arg1(c_other) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_bad_arg2(c_src, text) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_bad_arg3(c_src, integer, integer) RETURNS c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';
+             CREATE FUNCTION fn_cast_bad_ret(c_src) RETURNS c_other LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_other';
+             CREATE FUNCTION fn_cast_setof(c_src) RETURNS SETOF c_dst LANGUAGE sql IMMUTABLE AS 'SELECT ROW(($1).v)::c_dst';",
+            &mut state,
+        )
+        .unwrap();
+    assert!(!setup.iter().any(|f| f.rule_id == "chain-conflict"));
+    assert_eq!(*state.confidence(), Confidence::Exact);
+
+    for (sql, expected_substr) in [
+        (
+            "CREATE CAST (internal AS c_dst) WITH INOUT;",
+            "source data type internal is a pseudo-type",
+        ),
+        (
+            "CREATE CAST (c_src AS void) WITH INOUT;",
+            "target data type void is a pseudo-type",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITHOUT FUNCTION;",
+            "composite data types are not binary-compatible",
+        ),
+        (
+            "CREATE CAST (integer[] AS text[]) WITHOUT FUNCTION;",
+            "array data types are not binary-compatible",
+        ),
+        (
+            "CREATE CAST (d_int AS text) WITHOUT FUNCTION;",
+            "domain data types must not be marked binary-compatible",
+        ),
+        (
+            "CREATE CAST (int4range AS text) WITHOUT FUNCTION;",
+            "range data types are not binary-compatible",
+        ),
+        (
+            "CREATE CAST (integer AS bigint) WITHOUT FUNCTION;",
+            "source and target data types are not physically compatible",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_4arg(c_src, integer, boolean, text);",
+            "cast function must take one to three arguments",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_bad_arg1(c_other);",
+            "argument of cast function must match or be binary-coercible from source data type",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_bad_arg2(c_src, text);",
+            "second argument of cast function must be type integer",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_bad_arg3(c_src, integer, integer);",
+            "third argument of cast function must be type boolean",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_bad_ret(c_src);",
+            "return data type of cast function must match or be binary-coercible to target data type",
+        ),
+        (
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_setof(c_src);",
+            "cast function must not return a set",
+        ),
+        (
+            "DROP CAST (c_src AS c_dst);",
+            "cast from type public.c_src to type public.c_dst does not exist",
+        ),
+    ] {
+        let mut probe = state.clone();
+        let findings = engine.analyze(sql, &mut probe).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "chain-conflict" && f.reason.contains(expected_substr)),
+            "expected '{expected_substr}' for `{sql}`, got: {findings:?}"
+        );
+    }
+
+    // Explicit and assignment casts are tracked without tainting the chain!
+    let findings = engine
+        .analyze(
+            "CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_ok(c_src) AS ASSIGNMENT;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(!findings.iter().any(|f| f.rule_id == "chain-conflict"));
+    assert_eq!(*state.confidence(), Confidence::Exact);
+
+    // Duplicate cast (even with a different context) is rejected:
+    let dup = engine
+        .analyze(
+            "CREATE CAST (c_src AS c_dst) WITH INOUT;",
+            &mut state.clone(),
+        )
+        .unwrap();
+    assert!(
+        dup.iter()
+            .any(|f| f.rule_id == "chain-conflict" && f.reason.contains("already exists")),
+        "duplicate cast must conflict: {dup:?}"
+    );
+
+    // Dropping the cast function without CASCADE fails:
+    let drop_fn = engine
+        .analyze("DROP FUNCTION fn_cast_ok(c_src);", &mut state.clone())
+        .unwrap();
+    assert!(
+        drop_fn
+            .iter()
+            .any(|f| f.rule_id == "chain-conflict" && f.reason.contains("cast from")),
+        "dropping cast function without CASCADE must conflict: {drop_fn:?}"
+    );
+
+    // Dropping the source type without CASCADE fails:
+    let drop_ty = engine
+        .analyze("DROP TYPE c_src;", &mut state.clone())
+        .unwrap();
+    assert!(
+        drop_ty
+            .iter()
+            .any(|f| f.rule_id == "chain-conflict" && f.reason.contains("has dependent objects")),
+        "dropping cast source type without CASCADE must conflict: {drop_ty:?}"
+    );
+
+    // Dropping the cast function WITH CASCADE removes the cast so it can be recreated:
+    let cascade_ok = engine
+        .analyze(
+            "DROP FUNCTION fn_cast_ok(c_src) CASCADE;
+             CREATE CAST (c_src AS c_dst) WITH FUNCTION fn_cast_2arg(c_src, integer);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !cascade_ok.iter().any(|f| f.rule_id == "chain-conflict"),
+        "DROP FUNCTION CASCADE must drop dependent cast: {cascade_ok:?}"
+    );
+    assert_eq!(*state.confidence(), Confidence::Exact);
+}
+
+#[test]
+fn drop_function_on_baseline_cast_function_conflicts_without_cascade_and_drops_cast_with_cascade() {
+    use safe_migrate::_internal::analysis::facts::CastContextFact;
+    use safe_migrate::_internal::model::cast::{CastEntry, CastEntryMethod};
+
+    let mut cache = synced_cache();
+    let src_id = object_id("public", "base_cast_src");
+    let dst_id = object_id("public", "base_cast_dst");
+    cache.types.insert(
+        src_id.clone(),
+        TypeState {
+            id: src_id.clone(),
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Composite { fields: Vec::new() },
+            generation: 1,
+        },
+    );
+    cache.types.insert(
+        dst_id.clone(),
+        TypeState {
+            id: dst_id.clone(),
+            owner: object_id("", "postgres"),
+            kind: TypeKind::Composite { fields: Vec::new() },
+            generation: 1,
+        },
+    );
+    let func_id = object_id("public", "fn_base_cast(public.base_cast_src)");
+    let mut fn_state = FunctionState::with_inputs(
+        func_id.clone(),
+        RoutineKind::Function,
+        vec!["public.base_cast_src".to_string()],
+    );
+    fn_state.return_type = "public.base_cast_dst".to_string();
+    cache.functions.insert(func_id.clone(), fn_state);
+
+    let mut casts = safe_migrate::_internal::model::cast::CastCatalogue::fallback();
+    casts.insert_cast(CastEntry {
+        source: "public.base_cast_src".to_string(),
+        target: "public.base_cast_dst".to_string(),
+        context: CastContextFact::Explicit,
+        method: CastEntryMethod::WithFunction(Some(func_id.clone())),
+    });
+    cache.casts = Some(casts);
+
+    let engine = setup_engine();
+    let state = AnalysisState::new(cache);
+
+    let findings = engine
+        .analyze(
+            "DROP FUNCTION fn_base_cast(base_cast_src);",
+            &mut state.clone(),
+        )
+        .unwrap();
+    assert!(
+        findings.iter().any(|f| f.rule_id == "chain-conflict"
+            && f.reason
+                .contains("cast from public.base_cast_src to public.base_cast_dst requires it")),
+        "dropping a baseline cast's function without CASCADE must conflict: {findings:?}"
+    );
+
+    let mut cascade_state = state;
+    let ok = engine
+        .analyze(
+            "DROP FUNCTION fn_base_cast(base_cast_src) CASCADE;",
+            &mut cascade_state,
+        )
+        .unwrap();
+    assert!(
+        !ok.iter().any(|f| f.rule_id == "chain-conflict"),
+        "dropping a baseline cast's function with CASCADE must succeed: {ok:?}"
+    );
+    assert!(
+        !cascade_state
+            .casts()
+            .has_cast("public.base_cast_src", "public.base_cast_dst"),
+        "DROP FUNCTION CASCADE must remove the baseline cast from CastCatalogue"
+    );
 }

@@ -110,6 +110,8 @@ impl AnalysisState {
     /// dropped.
     pub(super) fn rename_schema_namespace(&mut self, old_name: &str, new_name: &str) {
         self.snapshot_namespace();
+        self.snapshot_casts();
+        self.local.casts.rewire_schema(old_name, new_name);
 
         let mut aliases = Vec::new();
         let mut relations = HashMap::new();

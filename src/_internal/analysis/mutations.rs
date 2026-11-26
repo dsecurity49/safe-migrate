@@ -1193,6 +1193,8 @@ pub(crate) struct CreateStatisticsMutation {
     pub if_not_exists: bool,
     pub kinds: Vec<String>,
     pub columns: Vec<String>,
+    pub expression_columns: Vec<String>,
+    pub expressions: Vec<String>,
     pub expression_count: usize,
     pub expressions_sql: Option<String>,
     pub table: ObjectId,
