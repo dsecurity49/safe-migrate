@@ -207,6 +207,10 @@ impl AnalysisState {
                 DependencyKind::SequenceOwnedBy { .. } => {
                     !closure.dropped_relations.contains(&resolve(&e.referenced))
                 }
+                DependencyKind::StatisticsUsesRoutine { table_id, .. }
+                | DependencyKind::StatisticsUsesType { table_id } => {
+                    !closure.dropped_relations.contains(&resolve(table_id))
+                }
                 _ => true,
             });
         } else {
@@ -288,6 +292,12 @@ impl AnalysisState {
                             | DependencyKind::SequenceOwnedBy { .. }
                             | DependencyKind::ColumnGeneratedFrom { .. }
                     );
+                }
+                if let DependencyKind::StatisticsUsesRoutine { table_id, .. }
+                | DependencyKind::StatisticsUsesType { table_id } = &e.kind
+                    && roots.contains(&resolve(table_id))
+                {
+                    return false;
                 }
                 true
             });

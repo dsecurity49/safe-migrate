@@ -60,6 +60,15 @@ pub(crate) enum DependencyKind {
     },
     /// A routine or aggregate that depends on a user-defined type.
     RoutineUsesType,
+    /// An extended statistics object whose expression calls a routine.
+    StatisticsUsesRoutine {
+        table_id: ObjectId,
+        unresolved_name: Option<ObjectId>,
+    },
+    /// An extended statistics object whose expression casts to a type.
+    StatisticsUsesType {
+        table_id: ObjectId,
+    },
     IndexOnRelation {
         definition: IndexDefinition,
         dependency_columns: Vec<String>,
@@ -1023,6 +1032,22 @@ impl DependencyGraph {
                     remap(&mut edge.referenced);
                     remap(name);
                 }
+                DependencyKind::StatisticsUsesRoutine {
+                    table_id,
+                    unresolved_name,
+                } => {
+                    remap(&mut edge.dependent);
+                    remap(&mut edge.referenced);
+                    remap(table_id);
+                    if let Some(name) = unresolved_name {
+                        remap(name);
+                    }
+                }
+                DependencyKind::StatisticsUsesType { table_id } => {
+                    remap(&mut edge.dependent);
+                    remap(&mut edge.referenced);
+                    remap(table_id);
+                }
                 _ => {
                     remap(&mut edge.dependent);
                     remap(&mut edge.referenced);
@@ -1148,6 +1173,19 @@ impl DependencyGraph {
             }
             DependencyKind::RoutineUsesType => {
                 changed |= remap_endpoint(&mut edge.dependent, &plan.routines);
+                changed |= remap_endpoint(&mut edge.referenced, &plan.types);
+            }
+            DependencyKind::StatisticsUsesRoutine {
+                table_id,
+                unresolved_name,
+            } => {
+                changed |= remap_endpoint(table_id, &plan.relations);
+                if unresolved_name.is_none() {
+                    changed |= remap_endpoint(&mut edge.referenced, &plan.routines);
+                }
+            }
+            DependencyKind::StatisticsUsesType { table_id } => {
+                changed |= remap_endpoint(table_id, &plan.relations);
                 changed |= remap_endpoint(&mut edge.referenced, &plan.types);
             }
             DependencyKind::ColumnDefaultOnSequence { .. } => {
@@ -1792,6 +1830,33 @@ impl DependencyGraph {
             .filter(|edge| {
                 matches!(edge.kind, DependencyKind::RoutineUsesType)
                     && (self.resolve_rename(&edge.referenced) == target || &edge.referenced == ty)
+            })
+            .collect()
+    }
+
+    pub(crate) fn statistics_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        let target = self.resolve_rename(ty);
+        self.edges
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::StatisticsUsesType { .. })
+                    && (self.resolve_rename(&edge.referenced) == target || &edge.referenced == ty)
+            })
+            .collect()
+    }
+
+    pub(crate) fn statistics_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
+        let (schema, signature) = Self::split_routine_signature(function_id);
+        self.edges
+            .iter()
+            .filter(|edge| match &edge.kind {
+                DependencyKind::StatisticsUsesRoutine {
+                    unresolved_name, ..
+                } => match unresolved_name {
+                    None => &edge.referenced == function_id,
+                    Some(name) => name.schema == schema && name.name == signature,
+                },
+                _ => false,
             })
             .collect()
     }

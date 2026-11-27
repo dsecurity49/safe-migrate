@@ -30,6 +30,7 @@ use crate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
+mod apply_cast;
 mod apply_extension;
 mod apply_misc;
 mod apply_policy_trigger;
@@ -40,6 +41,7 @@ mod apply_routine;
 mod apply_schema;
 mod apply_sequence;
 mod apply_settings;
+mod apply_statistics;
 mod apply_transaction;
 mod apply_type;
 mod apply_view_index;

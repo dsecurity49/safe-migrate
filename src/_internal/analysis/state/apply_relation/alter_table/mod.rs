@@ -38,53 +38,20 @@ impl AnalysisState {
         } else {
             Vec::new()
         };
-        if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
-            let resolved_alter_id = self.local.graph.resolve_rename(&alter.id);
-            let closure_set: HashSet<&ObjectId> = recursive_rename_descendants
-                .iter()
-                .map(|id| self.local.graph.resolve_rename(id))
-                .collect();
-            for descendant in &recursive_rename_descendants {
-                let Some(RelationOverlay::Present(relation)) = self.local.relations.get(descendant)
-                else {
-                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-                };
-                if relation.has_column(to) {
-                    return MutationResult::conflict(format!(
-                        "column '{}' already exists on relation '{}'",
-                        to, descendant
-                    ));
-                }
-                if relation.generated_columns.values().any(|generated| {
-                    generated.expression.as_deref().is_none_or(|source| {
-                        crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
-                            source,
-                            &descendant.name,
-                            from,
-                            to,
-                        )
-                        .is_none()
-                    })
-                }) {
-                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-                }
-                let Some(provenance) = relation.column_inheritance.get(from) else {
-                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-                };
-                let expected_parents = self
-                    .local
-                    .graph
-                    .inheritance_parents_of(descendant)
-                    .into_iter()
-                    .filter(|&parent| parent == resolved_alter_id || closure_set.contains(parent))
-                    .count() as u32;
-                if provenance.parent_count > expected_parents {
-                    return MutationResult::conflict(format!(
-                        "cannot rename inherited column '{}'",
-                        from
-                    ));
-                }
-            }
+        if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action
+            && let Some(result) = self.validate_rename_column_descendants(
+                &alter.id,
+                from,
+                to,
+                &recursive_rename_descendants,
+            )
+        {
+            return result;
+        }
+        if let AlterTableActionMutation::SetType { column, .. } = &alter.action
+            && let Some(result) = self.check_column_set_type_dependents(&alter.id, column)
+        {
+            return result;
         }
         if alter.only
             && matches!(alter.action, AlterTableActionMutation::RenameColumn { .. })
@@ -146,7 +113,14 @@ impl AnalysisState {
         let Some((kind, partitioned)) = target else {
             return self.unresolved(EvidenceCode::UnknownObjectState);
         };
-        if !alter_table_action_permits(&alter.action, &kind, partitioned) {
+        if !alter_table_action_permits(&alter.action, &kind, partitioned)
+            || (partitioned
+                && matches!(
+                    alter.action,
+                    AlterTableActionMutation::SetPersistence { .. }
+                )
+                && self.pg_version_num.unwrap_or(180_000) >= 180_000)
+        {
             return MutationResult::conflict(format!(
                 "ALTER action cannot be performed on relation '{}'",
                 alter.id
@@ -482,7 +456,9 @@ impl AnalysisState {
                         alter.id
                     ));
                 }
-                if relation.persistence == *persistence {
+                if relation.persistence == *persistence
+                    || (partitioned && self.pg_version_num.unwrap_or(180_000) < 180_000)
+                {
                     return MutationResult::NoOp;
                 }
                 if *persistence == Persistence::Unlogged

@@ -1489,6 +1489,9 @@ fn range_type_routine_and_opclass_references_hydrate_from_baseline_cache() {
             internal_type_owner: None,
             security: crate::_internal::model::function::SecurityMode::Invoker,
             aggregate: None,
+            owner: None,
+            dependent_extensions: std::collections::BTreeSet::new(),
+            support_function: None,
         },
     );
 

@@ -146,6 +146,49 @@ impl AnalysisState {
             let _ = self.apply_drop_relation_family(&view_seeds, true, "view");
         }
 
+        let mut stats_seeds: Vec<(ObjectId, ObjectId)> = Vec::new();
+        for id in &dropped_types {
+            for probe in [id.clone(), Self::array_type_id(id)] {
+                for edge in self.local.graph.statistics_for_type(&probe) {
+                    if let DependencyKind::StatisticsUsesType { table_id } = &edge.kind
+                        && self.extended_statistics_is_present(&edge.dependent)
+                    {
+                        let pair = (table_id.clone(), edge.dependent.clone());
+                        if !stats_seeds.contains(&pair) {
+                            stats_seeds.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+        if !stats_seeds.is_empty() {
+            let mut dropped_stats = HashSet::new();
+            for (table_id, stats_id) in stats_seeds {
+                if let Some(RelationOverlay::Present(rel)) = self.local.relations.get(&table_id)
+                    && rel.extended_statistics.contains_key(&stats_id)
+                {
+                    self.snapshot_relation(&table_id);
+                    if let Some(RelationOverlay::Present(rel)) =
+                        self.local.relations.get_mut(&table_id)
+                    {
+                        rel.extended_statistics.remove(&stats_id);
+                    }
+                    dropped_stats.insert(stats_id);
+                }
+            }
+            if !dropped_stats.is_empty() {
+                self.snapshot_graph_full();
+                self.local.graph.retain_edges(|e| {
+                    !(dropped_stats.contains(&e.dependent)
+                        && matches!(
+                            e.kind,
+                            DependencyKind::StatisticsUsesRoutine { .. }
+                                | DependencyKind::StatisticsUsesType { .. }
+                        ))
+                });
+            }
+        }
+
         for (relation_id, column) in self.type_cascade_columns(&dropped_types, &removed_fields) {
             if !matches!(
                 self.local.relations.get(&relation_id),

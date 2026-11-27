@@ -205,6 +205,7 @@ pub(super) fn populate_cache_from_client(
         .unwrap_or_else(BuiltinTypeCatalogue::fallback);
     cache.view_object_dependencies =
         load_view_object_dependencies(client, &schema_values, &builtin_types)?;
+    cache.routine_dependencies = load_routine_dependencies(client, &schema_values, &builtin_types)?;
     coverage.record(CatalogFamily::Dependencies);
     let scoped_external =
         load_scoped_external_dependencies(client, &schema_values, &builtin_types)?;

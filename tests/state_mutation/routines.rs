@@ -827,13 +827,11 @@ fn creating_a_new_function_taints_unmodeled_options() {
 
     engine
         .analyze(
-            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql STRICT AS $$ SELECT 1 $$;",
+            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql TRANSFORM FOR TYPE integer AS $$ SELECT 1 $$;",
             &mut state,
         )
         .unwrap();
 
-    // FunctionState tracks identity and selected options, but not STRICT;
-    // retaining Exact here would overstate what later checks can prove.
     assert_eq!(state.local.confidence, Confidence::Tainted);
     assert!(matches!(
         state.local.functions.get(&object_id("public", "work()")),
@@ -1914,4 +1912,258 @@ fn drop_aggregate_enforces_and_cascades_dependent_atomic_routines() {
             .get(&object_id("public", "uses_agg(integer)")),
         Some(safe_migrate::_internal::model::function::FunctionOverlay::Dropped)
     ));
+}
+
+#[test]
+fn differential_audit_f1_to_f10_regression_suite() {
+    use safe_migrate::_internal::analysis::facts::CastContextFact;
+    use safe_migrate::_internal::db::cache::{
+        DbCacheVersioned, RoutineDependencyCache, RoutineDependencyTarget,
+    };
+    use safe_migrate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    cache.roles.insert(
+        object_id("", "app_role"),
+        safe_migrate::_internal::model::role::RoleState {
+            id: object_id("", "app_role"),
+            can_login: false,
+            is_superuser: false,
+            inherits: true,
+            member_of: Vec::new(),
+            can_administer_membership: Vec::new(),
+            can_inherit_from: Vec::new(),
+            can_set_role_to: Vec::new(),
+        },
+    );
+    cache.extensions.insert(
+        "pg_trgm".to_string(),
+        safe_migrate::_internal::model::extension::ExtensionState {
+            name: "pg_trgm".to_string(),
+            schema: Some("public".to_string()),
+            version: Some("1.6".to_string()),
+            relocatable: Some(true),
+            owner: object_id("", "postgres"),
+            members: Default::default(),
+            members_complete: true,
+            config_tables: Vec::new(),
+            generation: 0,
+        },
+    );
+    let mut state = AnalysisState::new(cache);
+
+    // F1, F2, F3, F9, F10: valid forms execute without conflict AND remain Confidence::Exact
+    let valid_sql = "
+        CREATE TABLE public.t (a int, b text);
+        CREATE AGGREGATE public.agg1(int) (sfunc = int4pl, stype = int);
+        ALTER FUNCTION public.agg1(int) RENAME TO agg9;
+        ALTER ROUTINE public.agg9(int) OWNER TO app_role;
+        ALTER FUNCTION public.agg9(int) DEPENDS ON EXTENSION pg_trgm;
+        ALTER FUNCTION public.agg9(int) NO DEPENDS ON EXTENSION pg_trgm;
+        CREATE FUNCTION public.srf1() RETURNS SETOF int LANGUAGE sql
+            ROWS 10 COST 20 PARALLEL SAFE STRICT LEAKPROOF
+            SET statement_timeout = '5s' RESET statement_timeout
+            AS 'SELECT a FROM public.t';
+        ALTER FUNCTION public.srf1() SUPPORT pg_catalog.generate_series_int4_support;
+        ALTER FUNCTION public.srf1() SUPPORT generate_series_int4_support;
+        ANALYZE pg_class;
+        ANALYZE pg_catalog.pg_class;
+        ANALYZE (VERBOSE, SKIP_LOCKED true, BUFFER_USAGE_LIMIT '256kB') public.t (a);
+        CREATE FUNCTION public.h(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x;
+        CREATE STATISTICS public.s1 ON public.h(a), b FROM public.t;
+        ALTER STATISTICS public.s1 OWNER TO app_role;
+        ALTER STATISTICS public.s1 SET STATISTICS 20000;
+    ";
+    let violations = engine.analyze(valid_sql, &mut state).unwrap();
+    assert!(
+        !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+        "F1/F2/F3/F9/F10 valid statements must not conflict: {violations:?}"
+    );
+    // Note: CREATE AGGREGATE with definition taints because transition state validation is server-side;
+    // verify an isolated state for F1/F2/F3/F9/F10 stays Confidence::Exact!
+    let mut exact_state = state.clone();
+    exact_state.local.confidence = Confidence::Exact;
+    let exact_violations = engine
+        .analyze(
+            "ALTER FUNCTION public.agg9(int) RENAME TO agg10;
+             ALTER ROUTINE public.agg10(int) OWNER TO app_role;
+             ALTER FUNCTION public.srf1() SUPPORT pg_catalog.generate_series_int4_support;
+             ALTER FUNCTION public.srf1() SUPPORT generate_series_int4_support;
+             ALTER FUNCTION public.srf1() PARALLEL RESTRICTED ROWS 50 COST 100 SET work_mem = '8MB' RESET work_mem;
+             ANALYZE pg_class;
+             ANALYZE pg_catalog.pg_class;
+             ALTER STATISTICS public.s1 OWNER TO app_role;
+             ALTER STATISTICS public.s1 SET STATISTICS 20000;",
+            &mut exact_state,
+        )
+        .unwrap();
+    assert!(
+        !exact_violations
+            .iter()
+            .any(|v| v.rule_id == "chain-conflict"),
+        "expected no conflict: {exact_violations:?}"
+    );
+    assert_eq!(
+        exact_state.local.confidence,
+        Confidence::Exact,
+        "F1/F2/F3/F9/F10 operations must preserve Confidence::Exact"
+    );
+
+    // F1 (options on aggregate), F5, F6, F7, F9 (r18, r25, r47): invalid forms must conflict
+    for bad_sql in [
+        "ALTER FUNCTION public.agg9(int) IMMUTABLE;",
+        "DROP FUNCTION public.h(int);",
+        "CREATE FUNCTION public.bad_tbl() RETURNS int BEGIN ATOMIC SELECT a FROM public.no_such_tbl; END;",
+        "CREATE FUNCTION public.bad_col() RETURNS int BEGIN ATOMIC SELECT no_such_col FROM public.t; END;",
+        "CREATE FUNCTION public.bad_fn() RETURNS int BEGIN ATOMIC SELECT public.no_such_fn(a) FROM public.t; END;",
+        "CREATE FUNCTION public.bad_ret1() RETURNS int RETURN 'not_an_int';",
+        "CREATE FUNCTION public.bad_ret2() RETURNS int BEGIN ATOMIC SELECT b FROM public.t; END;",
+        "CREATE FUNCTION public.bad_str_col() RETURNS int LANGUAGE sql AS 'SELECT no_such_col FROM public.t';",
+        "CREATE FUNCTION public.bad_str_ret() RETURNS int LANGUAGE sql AS 'SELECT b FROM public.t';",
+        "ANALYZE (BOGUS) public.t;",
+        "ANALYZE (VERBOSE foo) public.t;",
+        "ANALYZE (BUFFER_USAGE_LIMIT 'bad') public.t;",
+        "ANALYZE public.t (a, a);",
+        "ALTER FUNCTION public.srf1() SET statement_timeout = 'abc';",
+        "ALTER FUNCTION public.srf1() SUPPORT no_such_support;",
+        "DROP ROLE app_role;",
+    ] {
+        let mut s = state.clone();
+        let v = engine.analyze(bad_sql, &mut s).unwrap();
+        assert!(
+            v.iter().any(|f| f.rule_id == "chain-conflict"),
+            "expected chain-conflict for `{bad_sql}`, got: {v:?}"
+        );
+    }
+
+    // F4: synced SQL-standard function dependencies hydrated from Cache V12.1
+    let mut f4_cache = cache_with_table("public", "t", None);
+    let tbl_id = object_id("public", "t");
+    if let Some(rel) = f4_cache.relations.get_mut(&tbl_id) {
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "a".into(),
+                data_type: Some("integer".into()),
+                not_null: false,
+                default: None,
+            },
+        );
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "b".into(),
+                data_type: Some("text".into()),
+                not_null: false,
+                default: None,
+            },
+        );
+    }
+    let fn_id = object_id("public", "uses_ta()");
+    f4_cache.functions.insert(
+        fn_id.clone(),
+        FunctionState::with_inputs(fn_id.clone(), RoutineKind::Function, Vec::new()),
+    );
+    f4_cache.routine_dependencies.push(RoutineDependencyCache {
+        dependent: fn_id,
+        target: RoutineDependencyTarget::Relation {
+            relation: tbl_id,
+            column: Some("a".to_string()),
+        },
+    });
+    let f4_state = AnalysisState::new(f4_cache);
+    for f4_sql in [
+        "DROP TABLE public.t;",
+        "ALTER TABLE public.t DROP COLUMN a;",
+        "ALTER TABLE public.t ALTER COLUMN a TYPE bigint;",
+    ] {
+        let mut s = f4_state.clone();
+        let v = engine.analyze(f4_sql, &mut s).unwrap();
+        assert!(
+            v.iter().any(|f| f.rule_id == "chain-conflict"),
+            "F4 expected chain-conflict for `{f4_sql}` on hydrated routine dependency, got: {v:?}"
+        );
+    }
+
+    // F8: V12.0 cache without full cast coverage taints CREATE CAST and DROP FUNCTION
+    let mut v12_0_cache = synced_cache();
+    let cast_fn = object_id("public", "cast_fn(integer)");
+    let mut fn_state = FunctionState::with_inputs(
+        cast_fn.clone(),
+        RoutineKind::Function,
+        vec!["integer".into()],
+    );
+    fn_state.return_type = "text".into();
+    v12_0_cache.functions.insert(cast_fn, fn_state);
+    let mut partial_casts = CastCatalogue::fallback();
+    partial_casts.insert_cast(CastEntry {
+        source: "smallint".into(),
+        target: "integer".into(),
+        context: CastContextFact::Implicit,
+        method: CastEntryMethod::WithoutFunction,
+    });
+    v12_0_cache.casts = Some(partial_casts);
+    let hydrated_v12_0 = DbCacheVersioned::V12(Box::new(v12_0_cache))
+        .into_cache()
+        .unwrap();
+    assert!(
+        !hydrated_v12_0
+            .casts
+            .as_ref()
+            .unwrap()
+            .has_full_cast_coverage()
+    );
+
+    let mut s_cast = AnalysisState::new(hydrated_v12_0.clone());
+    engine
+        .analyze("CREATE TYPE public.src_t AS (x int); CREATE TYPE public.dst_t AS (x int); CREATE CAST (public.src_t AS public.dst_t) WITH INOUT;", &mut s_cast)
+        .unwrap();
+    assert_eq!(
+        s_cast.local.confidence,
+        Confidence::Tainted,
+        "F8: CREATE CAST against a V12.0 cache must taint"
+    );
+
+    let mut s_drop = AnalysisState::new(hydrated_v12_0);
+    engine
+        .analyze("DROP FUNCTION public.cast_fn(integer);", &mut s_drop)
+        .unwrap();
+    assert_eq!(
+        s_drop.local.confidence,
+        Confidence::Tainted,
+        "F8: DROP FUNCTION against a V12.0 cache must taint"
+    );
+
+    // Built-in pg_catalog routine: ALTER FUNCTION OWNER TO is accepted (tainted), while DROP FUNCTION is rejected
+    let mut s_pg_alter = state.clone();
+    let alter_pg = engine
+        .analyze(
+            "ALTER FUNCTION pg_catalog.abs(int) OWNER TO app_role;",
+            &mut s_pg_alter,
+        )
+        .unwrap();
+    assert!(
+        !alter_pg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "ALTER FUNCTION pg_catalog.abs(int) OWNER TO must not conflict: {alter_pg:?}"
+    );
+
+    let mut s_pg_drop = state.clone();
+    let drop_pg = engine
+        .analyze("DROP FUNCTION pg_catalog.abs(int);", &mut s_pg_drop)
+        .unwrap();
+    assert!(
+        drop_pg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP FUNCTION pg_catalog.abs(int) must conflict: {drop_pg:?}"
+    );
+
+    let mut s_pg_missing = state.clone();
+    let missing_pg = engine
+        .analyze(
+            "ALTER FUNCTION pg_catalog.no_such_builtin_fn(int) OWNER TO app_role;",
+            &mut s_pg_missing,
+        )
+        .unwrap();
+    assert!(
+        missing_pg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "ALTER FUNCTION on nonexistent pg_catalog routine must conflict: {missing_pg:?}"
+    );
 }

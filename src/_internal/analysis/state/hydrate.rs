@@ -463,6 +463,40 @@ impl AnalysisState {
             }
         }
 
+        for dependency in cache.routine_dependencies {
+            let dependent = dependency.dependent;
+            match dependency.target {
+                crate::_internal::db::cache::RoutineDependencyTarget::Relation {
+                    relation,
+                    column,
+                } => {
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        relation,
+                        DependencyKind::RoutineUsesRelation {
+                            referenced_column: column,
+                        },
+                    ));
+                }
+                crate::_internal::db::cache::RoutineDependencyTarget::Routine { routine } => {
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        routine,
+                        DependencyKind::RoutineUsesRoutine {
+                            unresolved_name: None,
+                        },
+                    ));
+                }
+                crate::_internal::db::cache::RoutineDependencyTarget::Type { ty } => {
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        ty,
+                        DependencyKind::RoutineUsesType,
+                    ));
+                }
+            }
+        }
+
         for inheritance in cache.inheritances {
             // A committed first phase of DETACH CONCURRENTLY remains visible
             // as an inheritance row with inhdetachpending until FINALIZE.
@@ -738,7 +772,64 @@ impl AnalysisState {
             );
         }
         state.hydrate_range_type_references(&catalog_search_path);
+        state.hydrate_statistics_expression_dependencies();
         state
+    }
+
+    fn hydrate_statistics_expression_dependencies(&mut self) {
+        let mut stats_exprs = Vec::new();
+        for (table_id, overlay) in &self.local.relations {
+            let RelationOverlay::Present(rel) = overlay else {
+                continue;
+            };
+            for (stats_id, stats) in &rel.extended_statistics {
+                if let Some(ref exprs_sql) = stats.expressions
+                    && !exprs_sql.trim().is_empty()
+                {
+                    stats_exprs.push((table_id.clone(), stats_id.clone(), exprs_sql.clone()));
+                }
+            }
+        }
+        for (table_id, stats_id, exprs_sql) in stats_exprs {
+            let synthetic = format!("SELECT {exprs_sql};");
+            let parsed = squawk_syntax::SourceFile::parse(&synthetic);
+            use squawk_syntax::ast::AstNode;
+            let raw_routines = crate::_internal::ast::visitor::AstVisitor::extract_view_routines(
+                parsed.tree().syntax(),
+            );
+            let raw_types = crate::_internal::ast::visitor::AstVisitor::extract_view_cast_types(
+                parsed.tree().syntax(),
+            );
+            for routine in crate::_internal::analysis::resolver::Resolver::resolve_view_routines(
+                &raw_routines,
+                Some(&table_id),
+                self,
+            ) {
+                let (referenced, unresolved_name) = match routine.signature {
+                    Some(sig) => (sig, None),
+                    None => (routine.name.clone(), Some(routine.name)),
+                };
+                self.local.graph.add_edge(DependencyEdge::new(
+                    stats_id.clone(),
+                    referenced,
+                    DependencyKind::StatisticsUsesRoutine {
+                        table_id: table_id.clone(),
+                        unresolved_name,
+                    },
+                ));
+            }
+            for ty in
+                crate::_internal::analysis::resolver::Resolver::resolve_cast_types(&raw_types, self)
+            {
+                self.local.graph.add_edge(DependencyEdge::new(
+                    stats_id.clone(),
+                    ty,
+                    DependencyKind::StatisticsUsesType {
+                        table_id: table_id.clone(),
+                    },
+                ));
+            }
+        }
     }
 
     /// Fill missing range IDs by resolving the names stored in the cache.

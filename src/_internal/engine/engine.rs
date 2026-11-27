@@ -816,6 +816,7 @@ impl SafeMigrateEngine {
         let mut index = 0;
         let mut at_statement_start = true;
         let mut rewrite_offsets = Vec::new();
+        let mut alter_stats_if_exists_spans = Vec::new();
 
         while index < bytes.len() {
             match bytes[index] {
@@ -848,11 +849,14 @@ impl SafeMigrateEngine {
                 }
                 byte if byte.is_ascii_whitespace() => index += 1,
                 _ => {
-                    if at_statement_start
-                        && starts_with_keyword(bytes, index, b"EXECUTE")
-                        && next_token_is_string(bytes, index + b"EXECUTE".len())
-                    {
-                        rewrite_offsets.push(index);
+                    if at_statement_start {
+                        if starts_with_keyword(bytes, index, b"EXECUTE")
+                            && next_token_is_string(bytes, index + b"EXECUTE".len())
+                        {
+                            rewrite_offsets.push(index);
+                        } else if let Some(span) = alter_statistics_if_exists_span(bytes, index) {
+                            alter_stats_if_exists_spans.push(span);
+                        }
                     }
                     index += 1;
                     at_statement_start = false;
@@ -860,13 +864,22 @@ impl SafeMigrateEngine {
             }
         }
 
-        if rewrite_offsets.is_empty() {
+        if rewrite_offsets.is_empty() && alter_stats_if_exists_spans.is_empty() {
             return std::borrow::Cow::Borrowed(sql);
         }
 
         let mut mutated = bytes.to_vec();
         for offset in rewrite_offsets {
             mutated[offset..offset + b"EXECUTE".len()].copy_from_slice(b"DO     ");
+        }
+        for (start, end) in alter_stats_if_exists_spans {
+            mutated[start..start + 7].copy_from_slice(b"/*IF_EX");
+            for b in &mut mutated[start + 7..end - 2] {
+                if *b != b'\n' && *b != b'\r' {
+                    *b = b' ';
+                }
+            }
+            mutated[end - 2..end].copy_from_slice(b"*/");
         }
         std::borrow::Cow::Owned(
             String::from_utf8(mutated)
@@ -973,6 +986,44 @@ impl SafeMigrateEngine {
         }
         &s[pos..]
     }
+}
+
+fn skip_ws_and_comments(bytes: &[u8], mut index: usize) -> usize {
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
+            index = skip_line_comment(bytes, index);
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_block_comment(bytes, index);
+            continue;
+        }
+        break;
+    }
+    index
+}
+
+fn alter_statistics_if_exists_span(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if !starts_with_keyword(bytes, start, b"ALTER") {
+        return None;
+    }
+    let stats_pos = skip_ws_and_comments(bytes, start + b"ALTER".len());
+    if !starts_with_keyword(bytes, stats_pos, b"STATISTICS") {
+        return None;
+    }
+    let if_pos = skip_ws_and_comments(bytes, stats_pos + b"STATISTICS".len());
+    if !starts_with_keyword(bytes, if_pos, b"IF") {
+        return None;
+    }
+    let exists_pos = skip_ws_and_comments(bytes, if_pos + b"IF".len());
+    if !starts_with_keyword(bytes, exists_pos, b"EXISTS") {
+        return None;
+    }
+    let exists_end = exists_pos + b"EXISTS".len();
+    (exists_end - if_pos >= 9).then_some((if_pos, exists_end))
 }
 
 fn starts_with_keyword(bytes: &[u8], start: usize, word: &[u8]) -> bool {

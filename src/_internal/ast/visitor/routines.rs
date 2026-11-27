@@ -19,7 +19,7 @@ impl AstVisitor {
             },
             name: param
                 .name()
-                .and_then(|n| n.ident_token())
+                .and_then(|n| n.syntax().first_token())
                 .map(|t| Self::resolve_identifier_token(t.text())),
             ty: param
                 .func_type()
@@ -178,17 +178,56 @@ impl AstVisitor {
                 crate::_internal::analysis::facts::FuncOptionFact::Rows(value)
             }
             ast::FuncOption::SetFuncOption(f) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Set(
-                    f.set_config_param()
-                        .and_then(|scp| scp.config_parameter_ref())
-                        .and_then(|cpr| cpr.path_ref())
-                        .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                        .map(|qn| match qn.schema {
-                            Some(schema) => format!("{}.{}", schema.resolve(), qn.name.resolve()),
-                            None => qn.name.resolve(),
-                        })
-                        .unwrap_or_default(),
-                )
+                let name = f
+                    .set_config_param()
+                    .and_then(|scp| scp.config_parameter_ref())
+                    .and_then(|cpr| cpr.path_ref())
+                    .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
+                    .map(|qn| match qn.schema {
+                        Some(schema) => format!("{}.{}", schema.resolve(), qn.name.resolve()),
+                        None => qn.name.resolve(),
+                    })
+                    .unwrap_or_default();
+                let mut value = None;
+                let mut from_current_or_default = false;
+                if let Some(scp) = f.set_config_param() {
+                    match scp.config_assignment() {
+                        Some(ast::ConfigAssignment::FromCurrent(_)) => {
+                            from_current_or_default = true;
+                        }
+                        Some(ast::ConfigAssignment::ToConfigValue(assignment))
+                            if assignment.default_token().is_some() =>
+                        {
+                            from_current_or_default = true;
+                        }
+                        Some(ast::ConfigAssignment::ToConfigValue(assignment)) => {
+                            let vals: Vec<String> = assignment
+                                .config_values()
+                                .filter_map(|v| match v {
+                                    ast::ConfigValue::ConfigValueName(n) => {
+                                        n.ident_token().map(|t| t.text().to_string())
+                                    }
+                                    ast::ConfigValue::Literal(lit) => {
+                                        Self::resolve_string_literal(&lit)
+                                            .or_else(|| Some(lit.syntax().text().to_string()))
+                                    }
+                                    ast::ConfigValue::PrefixExpr(pe) => {
+                                        Some(pe.syntax().text().to_string())
+                                    }
+                                })
+                                .collect();
+                            if !vals.is_empty() {
+                                value = Some(vals.join(", "));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                crate::_internal::analysis::facts::FuncOptionFact::Set {
+                    name,
+                    value,
+                    from_current_or_default,
+                }
             }
             ast::FuncOption::ResetFuncOption(f) => {
                 let target = if f.all_token().is_some() {
@@ -247,16 +286,196 @@ impl AstVisitor {
         }
     }
 
+    pub(super) fn is_sql_special_value_ident(name: &str) -> bool {
+        matches!(
+            name,
+            "current_user"
+                | "session_user"
+                | "current_role"
+                | "user"
+                | "current_catalog"
+                | "current_schema"
+                | "current_date"
+                | "current_time"
+                | "current_timestamp"
+                | "localtime"
+                | "localtimestamp"
+                | "null"
+                | "true"
+                | "false"
+        ) || (name.starts_with('$') && name[1..].chars().all(|c| c.is_ascii_digit()))
+    }
+
+    pub(super) fn name_ref_in_non_column_position(
+        name_ref: &ast::NameRef,
+        root: &squawk_syntax::SyntaxNode,
+    ) -> bool {
+        for ancestor in name_ref.syntax().ancestors() {
+            if &ancestor == root {
+                break;
+            }
+            if ast::FromClause::can_cast(ancestor.kind())
+                || ast::Type::can_cast(ancestor.kind())
+                || ast::FuncType::can_cast(ancestor.kind())
+                || ast::TableArgList::can_cast(ancestor.kind())
+                || ast::WithTable::can_cast(ancestor.kind())
+                || ast::SetClause::can_cast(ancestor.kind())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn infer_return_expr_fact(
+        expr: ast::Expr,
+        param_types: &std::collections::HashMap<String, String>,
+        scope: &AggregateScopeFact,
+        single_binding: Option<&QualifiedName>,
+    ) -> Option<crate::_internal::analysis::facts::RoutineReturnExprFact> {
+        use crate::_internal::analysis::facts::RoutineReturnExprFact;
+        let mut current = expr;
+        while let ast::Expr::ParenExpr(pe) = current {
+            current = pe.expr()?;
+        }
+        match current {
+            ast::Expr::CastExpr(ce) => ce
+                .ty()
+                .map(|t| RoutineReturnExprFact::ExplicitCast(t.syntax().text().to_string())),
+            ast::Expr::Literal(lit) => {
+                let raw = lit.syntax().text().to_string();
+                let trimmed = raw.trim();
+                if trimmed.eq_ignore_ascii_case("null") {
+                    None
+                } else if trimmed.eq_ignore_ascii_case("true")
+                    || trimmed.eq_ignore_ascii_case("false")
+                {
+                    Some(RoutineReturnExprFact::LiteralType("boolean".to_string()))
+                } else if trimmed.starts_with('$')
+                    && trimmed[1..].chars().all(|c| c.is_ascii_digit())
+                {
+                    param_types
+                        .get(trimmed)
+                        .map(|pty| RoutineReturnExprFact::ParameterType(pty.clone()))
+                } else if trimmed.starts_with('\'')
+                    || trimmed.starts_with("E\'")
+                    || trimmed.starts_with("e\'")
+                    || (trimmed.starts_with('$') && trimmed.ends_with('$') && trimmed.len() >= 2)
+                {
+                    Some(RoutineReturnExprFact::LiteralType("text".to_string()))
+                } else if trimmed.chars().all(|c| c.is_ascii_digit() || c == '_') {
+                    Some(RoutineReturnExprFact::LiteralType("integer".to_string()))
+                } else if trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-' | '_'))
+                {
+                    Some(RoutineReturnExprFact::LiteralType("numeric".to_string()))
+                } else {
+                    None
+                }
+            }
+            ast::Expr::NameRef(nr) => {
+                let ident = Self::resolve_name_ref(&nr);
+                if ident == "null" {
+                    None
+                } else if ident == "true" || ident == "false" {
+                    Some(RoutineReturnExprFact::LiteralType("boolean".to_string()))
+                } else if let Some(pty) = param_types.get(&ident) {
+                    Some(RoutineReturnExprFact::ParameterType(pty.clone()))
+                } else {
+                    single_binding.map(|rel| RoutineReturnExprFact::Column {
+                        relation: Some(rel.clone()),
+                        column: ident,
+                    })
+                }
+            }
+            ast::Expr::FieldExpr(fe) => {
+                if fe.star_token().is_some() {
+                    return None;
+                }
+                let field_name = fe
+                    .field()
+                    .and_then(|f| f.syntax().first_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))?;
+                let ast::Expr::NameRef(base_name) = fe.base()? else {
+                    return None;
+                };
+                let qualifier = base_name
+                    .syntax()
+                    .first_token()
+                    .map(|t| Self::resolve_identifier_token(t.text()))?;
+                let binding = scope.bindings.iter().find(|b| b.alias == qualifier)?;
+                Some(RoutineReturnExprFact::Column {
+                    relation: binding.relation.clone(),
+                    column: field_name,
+                })
+            }
+            ast::Expr::CallExpr(ce) => {
+                let callee = ce.expr()?;
+                let qname = match callee {
+                    ast::Expr::NameRef(nr) => {
+                        QualifiedName::new(None, Ident::new(Self::resolve_name_ref(&nr), true))
+                    }
+                    ast::Expr::FieldExpr(fe) => {
+                        let fn_name = fe
+                            .field()
+                            .and_then(|f| f.syntax().first_token())
+                            .map(|t| Self::resolve_identifier_token(t.text()))?;
+                        let ast::Expr::NameRef(base) = fe.base()? else {
+                            return None;
+                        };
+                        let schema = Self::resolve_name_ref(&base);
+                        QualifiedName::new(
+                            Some(Ident::new(schema, true)),
+                            Ident::new(fn_name, true),
+                        )
+                    }
+                    _ => return None,
+                };
+                Some(RoutineReturnExprFact::RoutineCall(qname))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn extract_routine_body_dependencies(
         body: Option<squawk_syntax::ast::RoutineBody>,
+        params: &[crate::_internal::analysis::facts::ParamFact],
     ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
         let Some(body) = body else {
             return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
         };
-        let syntax = body.syntax();
+        Self::extract_routine_body_dependencies_from_syntax(body.syntax(), params, false)
+    }
+
+    pub(super) fn extract_routine_body_dependencies_from_syntax(
+        syntax: &squawk_syntax::SyntaxNode,
+        params: &[crate::_internal::analysis::facts::ParamFact],
+        has_syntax_error: bool,
+    ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+        let mut param_names = std::collections::HashSet::new();
+        let mut param_types = std::collections::HashMap::new();
+        for (idx, p) in params.iter().enumerate() {
+            let pos_key = format!("${}", idx + 1);
+            param_names.insert(pos_key.clone());
+            param_types.insert(pos_key, p.ty.clone());
+            if let Some(ref name) = p.name {
+                param_names.insert(name.clone());
+                param_types.insert(name.clone(), p.ty.clone());
+            }
+        }
+        let mut cte_names = std::collections::HashSet::new();
+        for cte_name in syntax.descendants().filter_map(CteName::cast) {
+            if let Some(token) = cte_name.ident_token() {
+                cte_names.insert(Self::resolve_identifier_token(token.text()));
+            }
+        }
         let mut relations: Vec<crate::_internal::analysis::facts::RoutineRelationReferenceFact> =
             Vec::new();
         for qname in Self::extract_view_dependencies(syntax) {
+            if qname.schema.is_none() && cte_names.contains(&qname.name.resolve()) {
+                continue;
+            }
             let rel_fact = crate::_internal::analysis::facts::RoutineRelationReferenceFact {
                 relation: qname,
                 column: None,
@@ -265,6 +484,86 @@ impl AstVisitor {
                 relations.push(rel_fact);
             }
         }
+        let mut unqualified_columns = Vec::new();
+        let mut return_expr = None;
+
+        for ret_stmt in syntax.descendants().filter_map(ast::ReturnStmt::cast) {
+            if let Some(expr) = ret_stmt.expr() {
+                let empty_scope = AggregateScopeFact {
+                    bindings: Vec::new(),
+                    unknown: false,
+                };
+                return_expr =
+                    Self::infer_return_expr_fact(expr.clone(), &param_types, &empty_scope, None);
+                let mut field_children = std::collections::HashSet::new();
+                let mut callees = std::collections::HashSet::new();
+                for node in expr.syntax().descendants() {
+                    if let Some(call) = ast::CallExpr::cast(node.clone())
+                        && let Some(callee) = call.expr()
+                    {
+                        callees.insert(callee.syntax().clone());
+                    }
+                    if let Some(field) = ast::FieldExpr::cast(node) {
+                        if let Some(b) = field.base() {
+                            field_children.insert(b.syntax().clone());
+                        }
+                        if let Some(f) = field.field() {
+                            field_children.insert(f.syntax().clone());
+                        }
+                    }
+                }
+                for name_ref in expr.syntax().descendants().filter_map(ast::NameRef::cast) {
+                    if field_children.contains(name_ref.syntax())
+                        || callees.contains(name_ref.syntax())
+                        || Self::name_ref_in_non_column_position(&name_ref, expr.syntax())
+                    {
+                        continue;
+                    }
+                    let col_name = Self::resolve_name_ref(&name_ref);
+                    if param_names.contains(&col_name)
+                        || cte_names.contains(&col_name)
+                        || Self::is_sql_special_value_ident(&col_name)
+                    {
+                        continue;
+                    }
+                    if !unqualified_columns.contains(&col_name) {
+                        unqualified_columns.push(col_name);
+                    }
+                }
+            }
+        }
+
+        let has_intermediate_select =
+            |node: &squawk_syntax::SyntaxNode, limit: &squawk_syntax::SyntaxNode| -> bool {
+                node.ancestors()
+                    .skip(1)
+                    .take_while(|a| a != limit)
+                    .any(|a| ast::Select::can_cast(a.kind()))
+            };
+        let is_top_level_select = |select: &ast::Select| -> bool {
+            !select
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a != syntax)
+                .any(|a| {
+                    ast::Select::can_cast(a.kind())
+                        || ast::ReturnStmt::can_cast(a.kind())
+                        || ast::WithTable::can_cast(a.kind())
+                        || ast::Insert::can_cast(a.kind())
+                        || ast::Update::can_cast(a.kind())
+                        || ast::Delete::can_cast(a.kind())
+                })
+        };
+        let any_enclosing_select_has_from = |select: &ast::Select| -> bool {
+            select
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a != syntax)
+                .filter_map(ast::Select::cast)
+                .any(|parent_sel| parent_sel.from_clause().is_some())
+        };
         for select in syntax.descendants().filter_map(ast::Select::cast) {
             let mut scope = AggregateScopeFact {
                 bindings: Vec::new(),
@@ -280,12 +579,45 @@ impl AstVisitor {
             } else {
                 None
             };
+            let mut target_aliases = std::collections::HashSet::new();
+            if let Some(sc) = select.select_clause()
+                && let Some(tl) = sc.target_list()
+            {
+                let targets: Vec<_> = tl.targets().collect();
+                for t in &targets {
+                    if let Some(as_name) = t.as_name()
+                        && let Some(tok) = as_name.syntax().first_token()
+                    {
+                        target_aliases.insert(Self::resolve_identifier_token(tok.text()));
+                    }
+                }
+                if is_top_level_select(&select) {
+                    if targets.len() > 1 {
+                        return_expr = Some(
+                            crate::_internal::analysis::facts::RoutineReturnExprFact::MultiColumn,
+                        );
+                    } else if targets.len() == 1
+                        && let Some(expr) = targets[0].expr()
+                    {
+                        return_expr = Self::infer_return_expr_fact(
+                            expr,
+                            &param_types,
+                            &scope,
+                            single_binding.as_ref(),
+                        );
+                    }
+                }
+            }
+            let binding_aliases: std::collections::HashSet<String> =
+                scope.bindings.iter().map(|b| b.alias.clone()).collect();
             for field in select
                 .syntax()
                 .descendants()
                 .filter_map(ast::FieldExpr::cast)
             {
-                if field.star_token().is_some() {
+                if field.star_token().is_some()
+                    || has_intermediate_select(field.syntax(), select.syntax())
+                {
                     continue;
                 }
                 let Some(field_name) = field
@@ -308,6 +640,9 @@ impl AstVisitor {
                 if let Some(binding) = scope.bindings.iter().find(|b| b.alias == qualifier)
                     && let Some(ref rel_qname) = binding.relation
                 {
+                    if rel_qname.schema.is_none() && cte_names.contains(&rel_qname.name.resolve()) {
+                        continue;
+                    }
                     let rel_fact =
                         crate::_internal::analysis::facts::RoutineRelationReferenceFact {
                             relation: rel_qname.clone(),
@@ -318,44 +653,74 @@ impl AstVisitor {
                     }
                 }
             }
-            if let Some(rel_qname) = single_binding {
-                let mut field_children = std::collections::HashSet::new();
-                let mut callees = std::collections::HashSet::new();
-                for node in select.syntax().descendants() {
-                    if let Some(call) = ast::CallExpr::cast(node.clone())
-                        && let Some(callee) = call.expr()
-                    {
-                        callees.insert(callee.syntax().clone());
+            let mut field_children = std::collections::HashSet::new();
+            let mut callees = std::collections::HashSet::new();
+            for node in select.syntax().descendants() {
+                if let Some(call) = ast::CallExpr::cast(node.clone())
+                    && let Some(callee) = call.expr()
+                {
+                    callees.insert(callee.syntax().clone());
+                }
+                if let Some(field) = ast::FieldExpr::cast(node) {
+                    if let Some(b) = field.base() {
+                        field_children.insert(b.syntax().clone());
                     }
-                    if let Some(field) = ast::FieldExpr::cast(node) {
-                        if let Some(b) = field.base() {
-                            field_children.insert(b.syntax().clone());
+                    if let Some(f) = field.field() {
+                        field_children.insert(f.syntax().clone());
+                    }
+                }
+            }
+            if let Some(rel_qname) = single_binding {
+                if !(rel_qname.schema.is_none() && cte_names.contains(&rel_qname.name.resolve())) {
+                    for name_ref in select.syntax().descendants().filter_map(ast::NameRef::cast) {
+                        if has_intermediate_select(name_ref.syntax(), select.syntax())
+                            || field_children.contains(name_ref.syntax())
+                            || callees.contains(name_ref.syntax())
+                            || Self::name_ref_in_non_column_position(&name_ref, select.syntax())
+                        {
+                            continue;
                         }
-                        if let Some(f) = field.field() {
-                            field_children.insert(f.syntax().clone());
+                        let col_name = Self::resolve_name_ref(&name_ref);
+                        if param_names.contains(&col_name)
+                            || cte_names.contains(&col_name)
+                            || target_aliases.contains(&col_name)
+                            || binding_aliases.contains(&col_name)
+                            || Self::is_sql_special_value_ident(&col_name)
+                        {
+                            continue;
+                        }
+                        let rel_fact =
+                            crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                                relation: rel_qname.clone(),
+                                column: Some(col_name),
+                            };
+                        if !relations.contains(&rel_fact) {
+                            relations.push(rel_fact);
                         }
                     }
                 }
+            } else if !scope.unknown
+                && scope.bindings.is_empty()
+                && !any_enclosing_select_has_from(&select)
+            {
                 for name_ref in select.syntax().descendants().filter_map(ast::NameRef::cast) {
-                    if field_children.contains(name_ref.syntax())
+                    if has_intermediate_select(name_ref.syntax(), select.syntax())
+                        || field_children.contains(name_ref.syntax())
                         || callees.contains(name_ref.syntax())
+                        || Self::name_ref_in_non_column_position(&name_ref, select.syntax())
                     {
                         continue;
                     }
-                    let Some(col_name) = name_ref
-                        .syntax()
-                        .first_token()
-                        .map(|t| Self::resolve_identifier_token(t.text()))
-                    else {
+                    let col_name = Self::resolve_name_ref(&name_ref);
+                    if param_names.contains(&col_name)
+                        || cte_names.contains(&col_name)
+                        || target_aliases.contains(&col_name)
+                        || Self::is_sql_special_value_ident(&col_name)
+                    {
                         continue;
-                    };
-                    let rel_fact =
-                        crate::_internal::analysis::facts::RoutineRelationReferenceFact {
-                            relation: rel_qname.clone(),
-                            column: Some(col_name),
-                        };
-                    if !relations.contains(&rel_fact) {
-                        relations.push(rel_fact);
+                    }
+                    if !unqualified_columns.contains(&col_name) {
+                        unqualified_columns.push(col_name);
                     }
                 }
             }
@@ -364,7 +729,47 @@ impl AstVisitor {
             relations,
             routines: Self::extract_view_routines(syntax),
             types: Self::extract_view_cast_types(syntax),
+            unqualified_columns,
+            return_expr,
+            has_syntax_error,
         }
+    }
+
+    fn extract_sql_string_validation_dependencies(
+        options: &[crate::_internal::analysis::facts::FuncOptionFact],
+        params: &[crate::_internal::analysis::facts::ParamFact],
+    ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+        let language = options
+            .iter()
+            .find_map(|opt| match opt {
+                crate::_internal::analysis::facts::FuncOptionFact::Language(l) => Some(l.as_str()),
+                _ => None,
+            })
+            .unwrap_or("sql");
+        if !language.eq_ignore_ascii_case("sql") {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        }
+        let Some(sql_def) = options.iter().find_map(|opt| match opt {
+            crate::_internal::analysis::facts::FuncOptionFact::As {
+                definition: Some(def),
+                obj_file: None,
+                ..
+            } => Some(def.as_str()),
+            _ => None,
+        }) else {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        };
+        let trimmed = sql_def.trim();
+        if trimmed.is_empty() {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        }
+        let parsed = squawk_syntax::SourceFile::parse(trimmed);
+        let has_syntax_error = !parsed.errors().is_empty();
+        Self::extract_routine_body_dependencies_from_syntax(
+            parsed.tree().syntax(),
+            params,
+            has_syntax_error,
+        )
     }
 
     pub(super) fn extract_create_function(
@@ -373,12 +778,12 @@ impl AstVisitor {
         let path = node.name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         let or_replace = node.or_replace().is_some();
-        let params = node
+        let params: Vec<_> = node
             .param_list()
             .map(|pl| pl.params().map(|p| Self::extract_param(&p)).collect())
             .unwrap_or_default();
         let return_type = node.ret_type().map(|r| Self::extract_ret_type(&r));
-        let options = node
+        let options: Vec<_> = node
             .option_list()
             .map(|ol| {
                 ol.options()
@@ -387,7 +792,12 @@ impl AstVisitor {
             })
             .unwrap_or_default();
 
-        let body_dependencies = Self::extract_routine_body_dependencies(node.body());
+        let body_dependencies = Self::extract_routine_body_dependencies(node.body(), &params);
+        let validation_dependencies = if node.body().is_some() {
+            body_dependencies.clone()
+        } else {
+            Self::extract_sql_string_validation_dependencies(&options, &params)
+        };
         Some(StatementFact::CreateFunction(
             crate::_internal::analysis::facts::CreateFunctionFact {
                 name,
@@ -396,6 +806,7 @@ impl AstVisitor {
                 return_type,
                 options,
                 body_dependencies,
+                validation_dependencies,
             },
         ))
     }
@@ -489,11 +900,11 @@ impl AstVisitor {
         let path = node.name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         let or_replace = node.or_replace().is_some();
-        let params = node
+        let params: Vec<_> = node
             .param_list()
             .map(|pl| pl.params().map(|p| Self::extract_param(&p)).collect())
             .unwrap_or_default();
-        let options = node
+        let options: Vec<_> = node
             .option_list()
             .map(|ol| {
                 ol.options()
@@ -502,7 +913,12 @@ impl AstVisitor {
             })
             .unwrap_or_default();
 
-        let body_dependencies = Self::extract_routine_body_dependencies(node.body());
+        let body_dependencies = Self::extract_routine_body_dependencies(node.body(), &params);
+        let validation_dependencies = if node.body().is_some() {
+            body_dependencies.clone()
+        } else {
+            Self::extract_sql_string_validation_dependencies(&options, &params)
+        };
         Some(StatementFact::CreateProcedure(
             crate::_internal::analysis::facts::CreateProcedureFact {
                 name,
@@ -510,6 +926,7 @@ impl AstVisitor {
                 params,
                 options,
                 body_dependencies,
+                validation_dependencies,
             },
         ))
     }
@@ -1001,6 +1418,8 @@ impl AstVisitor {
         let expressions_sql = (!expr_texts.is_empty()).then(|| expr_texts.join(", "));
         let table_path = node.from_table()?.table_name_ref()?.path_ref()?;
         let table = Self::path_ref_to_qualified_name(&table_path)?;
+        let expression_routines = Self::extract_view_routines(on_clause.syntax());
+        let expression_types = Self::extract_view_cast_types(on_clause.syntax());
         Some(StatementFact::CreateStatistics(
             crate::_internal::analysis::facts::CreateStatisticsFact {
                 name,
@@ -1011,6 +1430,8 @@ impl AstVisitor {
                 expressions: expr_texts,
                 expression_count,
                 expressions_sql,
+                expression_routines,
+                expression_types,
                 table,
             },
         ))
@@ -1047,8 +1468,19 @@ impl AstVisitor {
                 crate::_internal::analysis::facts::AlterStatisticsActionFact::SetStatistics(target)
             }
         };
+        let if_exists = node
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| {
+                t.kind() == squawk_syntax::SyntaxKind::COMMENT && t.text().starts_with("/*IF_EX")
+            });
         Some(StatementFact::AlterStatistics(
-            crate::_internal::analysis::facts::AlterStatisticsFact { name, action },
+            crate::_internal::analysis::facts::AlterStatisticsFact {
+                name,
+                if_exists,
+                action,
+            },
         ))
     }
 
@@ -1071,6 +1503,44 @@ impl AstVisitor {
     }
 
     pub(super) fn extract_analyze(node: &ast::Analyze) -> Option<StatementFact> {
+        let mut options = Vec::new();
+        if node.verbose_token().is_some() {
+            options.push(crate::_internal::analysis::facts::AttributeFact {
+                name: "verbose".to_string(),
+                value: None,
+                namespace: None,
+            });
+        }
+        if let Some(opt_list) = node.option_item_list() {
+            for item in opt_list.option_items() {
+                let Some(key) = item
+                    .option_item_key()
+                    .and_then(|k| k.syntax().first_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                let value = item.option_item_value().map(|v| {
+                    if let Some(expr) = v.expr() {
+                        if let ast::Expr::Literal(lit) = &expr
+                            && let Some(s) = Self::resolve_string_literal(lit)
+                        {
+                            return s;
+                        }
+                        expr.syntax().text().to_string().trim().to_string()
+                    } else if let Some(vn) = v.option_item_value_name() {
+                        vn.syntax().text().to_string().trim().to_string()
+                    } else {
+                        v.syntax().text().to_string().trim().to_string()
+                    }
+                });
+                options.push(crate::_internal::analysis::facts::AttributeFact {
+                    name: key,
+                    value,
+                    namespace: None,
+                });
+            }
+        }
         let mut targets = Vec::new();
         if let Some(list) = node.table_and_columns_list() {
             for tc in list.table_and_columnss() {
@@ -1094,7 +1564,7 @@ impl AstVisitor {
             }
         }
         Some(StatementFact::Analyze(
-            crate::_internal::analysis::facts::AnalyzeFact { targets },
+            crate::_internal::analysis::facts::AnalyzeFact { options, targets },
         ))
     }
 }

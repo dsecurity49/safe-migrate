@@ -84,6 +84,7 @@ impl AstVisitor {
             select_source_name: outcome.select_source_name,
             routines: Self::extract_view_routines(node.syntax()),
             cast_types: Self::extract_view_cast_types(node.syntax()),
+            column_dependencies: Self::extract_view_column_dependencies(node.syntax()),
         })
     }
 
@@ -735,7 +736,7 @@ impl AstVisitor {
     /// PostgreSQL records the dependency from anywhere in the definition —
     /// `WHERE`, `HAVING`, `JOIN ... ON` and the grouping clauses all hold one.
     /// The types a view body casts to, which a drop of that type must clear.
-    pub(super) fn extract_view_cast_types(
+    pub(crate) fn extract_view_cast_types(
         syntax: &squawk_syntax::SyntaxNode,
     ) -> Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> {
         let mut references: Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> =
@@ -753,7 +754,7 @@ impl AstVisitor {
     }
 
     /// The routine and cast references a view query makes.
-    pub(super) fn extract_view_routines(
+    pub(crate) fn extract_view_routines(
         syntax: &squawk_syntax::SyntaxNode,
     ) -> Vec<crate::_internal::analysis::facts::RoutineReferenceFact> {
         let mut references: Vec<crate::_internal::analysis::facts::RoutineReferenceFact> =
@@ -946,6 +947,7 @@ impl AstVisitor {
             select_source,
             routines: Self::extract_view_routines(node.syntax()),
             cast_types: Self::extract_view_cast_types(node.syntax()),
+            column_dependencies: Self::extract_view_column_dependencies(node.syntax()),
         })
     }
 
@@ -1113,6 +1115,161 @@ impl AstVisitor {
             if_exists: node.if_exists().is_some(),
             cascade: Self::is_cascade(node.drop_behavior()),
         })
+    }
+
+    /// Collect relation and column dependencies referenced inside a view or
+    /// materialized-view query.
+    pub(super) fn extract_view_column_dependencies(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::RoutineRelationReferenceFact> {
+        let mut cte_names = std::collections::HashSet::new();
+        for cte_name in syntax.descendants().filter_map(CteName::cast) {
+            if let Some(token) = cte_name.ident_token() {
+                cte_names.insert(Self::resolve_identifier_token(token.text()));
+            }
+        }
+        let mut relations: Vec<crate::_internal::analysis::facts::RoutineRelationReferenceFact> =
+            Vec::new();
+        for select in syntax.descendants().filter_map(ast::Select::cast) {
+            let mut scope = AggregateScopeFact {
+                bindings: Vec::new(),
+                unknown: false,
+            };
+            if let Some(from) = select.from_clause() {
+                for item in from.items() {
+                    Self::collect_scope_item(&item, &mut scope);
+                }
+            }
+            let single_binding = if !scope.unknown && scope.bindings.len() == 1 {
+                scope.bindings[0].relation.clone()
+            } else {
+                None
+            };
+            let mut target_aliases = std::collections::HashSet::new();
+            let mut has_unqualified_star = false;
+            if let Some(sc) = select.select_clause()
+                && let Some(tl) = sc.target_list()
+            {
+                for t in tl.targets() {
+                    if t.star_token().is_some() {
+                        has_unqualified_star = true;
+                    }
+                    if let Some(as_name) = t.as_name()
+                        && let Some(tok) = as_name.syntax().first_token()
+                    {
+                        target_aliases.insert(Self::resolve_identifier_token(tok.text()));
+                    }
+                }
+            }
+            if has_unqualified_star {
+                for binding in &scope.bindings {
+                    if let Some(ref rel_qname) = binding.relation {
+                        if rel_qname.schema.is_none()
+                            && cte_names.contains(&rel_qname.name.resolve())
+                        {
+                            continue;
+                        }
+                        let star_fact =
+                            crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                                relation: rel_qname.clone(),
+                                column: Some("*".to_string()),
+                            };
+                        if !relations.contains(&star_fact) {
+                            relations.push(star_fact);
+                        }
+                    }
+                }
+            }
+            let binding_aliases: std::collections::HashSet<String> =
+                scope.bindings.iter().map(|b| b.alias.clone()).collect();
+            for field in select
+                .syntax()
+                .descendants()
+                .filter_map(ast::FieldExpr::cast)
+            {
+                let Some(ast::Expr::NameRef(base_name)) = field.base() else {
+                    continue;
+                };
+                let Some(qualifier) = base_name
+                    .syntax()
+                    .first_token()
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                if let Some(binding) = scope.bindings.iter().find(|b| b.alias == qualifier)
+                    && let Some(ref rel_qname) = binding.relation
+                {
+                    if rel_qname.schema.is_none() && cte_names.contains(&rel_qname.name.resolve()) {
+                        continue;
+                    }
+                    let col_opt = if field.star_token().is_some() {
+                        Some("*".to_string())
+                    } else {
+                        field
+                            .field()
+                            .and_then(|f| f.syntax().first_token())
+                            .map(|t| Self::resolve_identifier_token(t.text()))
+                    };
+                    if let Some(col_name) = col_opt {
+                        let rel_fact =
+                            crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                                relation: rel_qname.clone(),
+                                column: Some(col_name),
+                            };
+                        if !relations.contains(&rel_fact) {
+                            relations.push(rel_fact);
+                        }
+                    }
+                }
+            }
+            let mut field_children = std::collections::HashSet::new();
+            let mut callees = std::collections::HashSet::new();
+            for node in select.syntax().descendants() {
+                if let Some(call) = ast::CallExpr::cast(node.clone())
+                    && let Some(callee) = call.expr()
+                {
+                    callees.insert(callee.syntax().clone());
+                }
+                if let Some(field) = ast::FieldExpr::cast(node) {
+                    if let Some(b) = field.base() {
+                        field_children.insert(b.syntax().clone());
+                    }
+                    if let Some(f) = field.field() {
+                        field_children.insert(f.syntax().clone());
+                    }
+                }
+            }
+            if let Some(rel_qname) = single_binding
+                && !(rel_qname.schema.is_none() && cte_names.contains(&rel_qname.name.resolve()))
+            {
+                for name_ref in select.syntax().descendants().filter_map(ast::NameRef::cast) {
+                    if field_children.contains(name_ref.syntax())
+                        || callees.contains(name_ref.syntax())
+                        || Self::name_ref_in_non_column_position(&name_ref, select.syntax())
+                    {
+                        continue;
+                    }
+                    let col_name = Self::resolve_name_ref(&name_ref);
+                    if cte_names.contains(&col_name)
+                        || target_aliases.contains(&col_name)
+                        || binding_aliases.contains(&col_name)
+                        || Self::is_sql_special_value_ident(&col_name)
+                    {
+                        continue;
+                    }
+                    let rel_fact =
+                        crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                            relation: rel_qname.clone(),
+                            column: Some(col_name),
+                        };
+                    if !relations.contains(&rel_fact) {
+                        relations.push(rel_fact);
+                    }
+                }
+            }
+        }
+        relations
     }
 
     /// Collect relation names referenced by a view body, skipping CTE

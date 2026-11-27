@@ -106,6 +106,7 @@ fn like_extended_statistics_follow_column_lifecycle_and_rollback() {
             columns: vec!["a".to_string(), "b".to_string()],
             expressions: Some("(a + b), (a * b)".to_string()),
             target: Some(250),
+            owner: None,
         },
     );
 
@@ -790,4 +791,467 @@ fn v12_0_cache_with_partial_cast_coverage_stays_honest_on_drop_cast() {
         "a V12.0 cache only recorded implicit casts, so DROP CAST on an unrecorded cast must taint rather than falsely claim conflict: {findings:?}"
     );
     assert_eq!(*state.confidence(), Confidence::Tainted);
+}
+
+#[test]
+fn audit_v0_14_0_c2_to_c6_h1_to_h9_v1_to_v7_m1_to_m3() {
+    use safe_migrate::_internal::analysis::facts::CastContextFact;
+    use safe_migrate::_internal::db::cache::{RoutineDependencyCache, RoutineDependencyTarget};
+    use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+    use safe_migrate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+    use safe_migrate::_internal::model::extension::{
+        ExtensionMember, ExtensionMemberKind, ExtensionState,
+    };
+    use safe_migrate::_internal::model::relation::{ColumnAction, ExtendedStatisticsState};
+    use safe_migrate::_internal::model::types::{BaseTypeOptions, TypeKind, TypeState};
+    use safe_migrate::api::Config;
+
+    let mut base_cache = synced_cache();
+    base_cache.pg_version_num = Some(180_000);
+
+    // C2: DROP EXTENSION owning both a type and a cast on that type
+    let mut ext_cache = base_cache.clone();
+    let hstore_id = object_id("public", "hstore");
+    ext_cache.types.insert(
+        hstore_id.clone(),
+        TypeState {
+            id: hstore_id.clone(),
+            kind: TypeKind::Base {
+                shell: false,
+                options: BaseTypeOptions::default(),
+            },
+            owner: object_id("", "postgres"),
+            generation: 0,
+        },
+    );
+    let mut casts = CastCatalogue::fallback();
+    casts.insert_cast(CastEntry {
+        source: "public.hstore".into(),
+        target: "json".into(),
+        context: CastContextFact::Assignment,
+        method: CastEntryMethod::WithFunction(Some(object_id(
+            "public",
+            "hstore_to_json(public.hstore)",
+        ))),
+    });
+    ext_cache.casts = Some(casts);
+    ext_cache.extensions.insert(
+        "hstore".into(),
+        ExtensionState {
+            name: "hstore".into(),
+            schema: Some("public".into()),
+            version: Some("1.8".into()),
+            relocatable: Some(true),
+            owner: object_id("", "postgres"),
+            members_complete: true,
+            config_tables: Vec::new(),
+            members: [
+                ExtensionMember {
+                    kind: ExtensionMemberKind::Type,
+                    id: hstore_id.clone(),
+                },
+                ExtensionMember {
+                    kind: ExtensionMemberKind::Cast,
+                    id: object_id("pg_catalog", "public.hstore->json"),
+                },
+            ]
+            .into_iter()
+            .collect(),
+            generation: 0,
+        },
+    );
+    let engine = setup_engine();
+    let mut s_ext = AnalysisState::new(ext_cache);
+    let f_ext = engine
+        .analyze("DROP EXTENSION hstore;", &mut s_ext)
+        .unwrap();
+    assert!(
+        !f_ext.iter().any(|v| v.rule_id == "chain-conflict"),
+        "C2: DROP EXTENSION owning type + cast must not self-conflict: {f_ext:?}"
+    );
+    assert_eq!(s_ext.local.confidence, Confidence::Exact);
+    assert!(!s_ext.local.casts.has_casts_for_type("public.hstore"));
+
+    // C3: EXISTS (SELECT 1, 2 ...) subquery inside scalar SQL function + MultiColumn composite return
+    let mut s_c3 = AnalysisState::new(base_cache.clone());
+    let f_c3 = engine
+        .analyze(
+            "CREATE TABLE public.t (a int, b text);
+             CREATE FUNCTION public.scalar_with_exists() RETURNS boolean
+                 LANGUAGE sql AS $$ SELECT EXISTS (SELECT 1, 2 FROM public.t WHERE t.a > 0) $$;
+             CREATE TYPE public.pair_t AS (x int, y text);
+             CREATE FUNCTION public.make_pair() RETURNS public.pair_t
+                 LANGUAGE sql BEGIN ATOMIC SELECT a, b FROM public.t; END;",
+            &mut s_c3,
+        )
+        .unwrap();
+    assert!(
+        !f_c3.iter().any(|v| v.rule_id == "chain-conflict"),
+        "C3: EXISTS multi-col subquery and composite return must be accepted: {f_c3:?}"
+    );
+
+    // C4: Transitive cascade through BEGIN ATOMIC routine to dependent view
+    let mut s_c4 = AnalysisState::new(base_cache.clone());
+    let f_c4 = engine
+        .analyze(
+            "CREATE TABLE public.base_t (id int);
+             CREATE FUNCTION public.read_base() RETURNS int
+                 LANGUAGE sql BEGIN ATOMIC SELECT id FROM public.base_t; END;
+             CREATE VIEW public.v_on_fn AS SELECT public.read_base() AS v;
+             DROP TABLE public.base_t CASCADE;",
+            &mut s_c4,
+        )
+        .unwrap();
+    assert!(
+        !f_c4.iter().any(|v| v.rule_id == "chain-conflict"),
+        "C4: DROP TABLE CASCADE must transitively drop view depending on cascaded routine: {f_c4:?}"
+    );
+    assert!(
+        matches!(
+            s_c4.get_relation(&object_id("public", "v_on_fn")),
+            Some(RelationOverlay::Dropped) | None
+        ),
+        "C4: dependent view v_on_fn must be dropped"
+    );
+
+    // C5: DROP CAST on built-in system cast must conflict
+    let mut s_c5 = AnalysisState::new(base_cache.clone());
+    let f_c5 = engine
+        .analyze("DROP CAST IF EXISTS (integer AS bigint);", &mut s_c5)
+        .unwrap();
+    assert!(
+        f_c5.iter().any(|v| v.rule_id == "chain-conflict"),
+        "C5: DROP CAST IF EXISTS on built-in system cast must be rejected: {f_c5:?}"
+    );
+
+    // C6: Synced extended statistics expression dependencies on quoted identifier + unparenthesized cast
+    let mut stats_cache = cache_with_table("public", "items", None);
+    let items_id = object_id("public", "items");
+    if let Some(rel) = stats_cache.relations.get_mut(&items_id) {
+        rel.apply_column_action(&ColumnAction::Add {
+            name: "MixedCol".into(),
+            data_type: Some("integer".into()),
+            not_null: false,
+            default: None,
+        });
+        rel.extended_statistics.insert(
+            object_id("public", "items_expr_stat"),
+            ExtendedStatisticsState {
+                id: object_id("public", "items_expr_stat"),
+                kinds: vec!["d".into()],
+                columns: Vec::new(),
+                expressions: Some(
+                    "public.\"MixedFn\"(\"MixedCol\"), \"MixedCol\"::public.custom_dom".into(),
+                ),
+                target: None,
+                owner: Some(object_id("", "postgres")),
+            },
+        );
+    }
+    stats_cache.functions.insert(
+        object_id("public", "MixedFn(integer)"),
+        FunctionState::with_inputs(
+            object_id("public", "MixedFn(integer)"),
+            RoutineKind::Function,
+            vec!["integer".into()],
+        ),
+    );
+    stats_cache.types.insert(
+        object_id("public", "custom_dom"),
+        TypeState {
+            id: object_id("public", "custom_dom"),
+            kind: TypeKind::Domain {
+                base_type: "integer".into(),
+                base_type_id: None,
+                collation: None,
+                collation_id: None,
+                default: None,
+                default_text: None,
+                not_null: false,
+                not_null_constraint: None,
+                constraints: Default::default(),
+            },
+            owner: object_id("", "postgres"),
+            generation: 0,
+        },
+    );
+    let s_c6 = AnalysisState::new(stats_cache);
+    let mut s_c6_fn = s_c6.clone();
+    let f_c6_fn = engine
+        .analyze("DROP FUNCTION public.\"MixedFn\"(integer);", &mut s_c6_fn)
+        .unwrap();
+    assert!(
+        f_c6_fn.iter().any(|v| v.rule_id == "chain-conflict"),
+        "C6: DROP FUNCTION on quoted routine referenced by synced statistics expression must conflict: {f_c6_fn:?}"
+    );
+    let mut s_c6_ty = s_c6;
+    let f_c6_ty = engine
+        .analyze("DROP DOMAIN public.custom_dom;", &mut s_c6_ty)
+        .unwrap();
+    assert!(
+        f_c6_ty.iter().any(|v| v.rule_id == "chain-conflict"),
+        "C6: DROP DOMAIN on type referenced by unparenthesized cast in synced statistics expression must conflict: {f_c6_ty:?}"
+    );
+
+    // H1: Multi-target DROP FUNCTION excluding co-dropped sibling
+    let mut s_h1 = AnalysisState::new(base_cache.clone());
+    let f_h1 = engine
+        .analyze(
+            "CREATE FUNCTION public.helper() RETURNS int LANGUAGE sql BEGIN ATOMIC RETURN 1; END;
+             CREATE FUNCTION public.caller() RETURNS int LANGUAGE sql BEGIN ATOMIC RETURN public.helper(); END;
+             DROP FUNCTION public.helper(), public.caller();",
+            &mut s_h1,
+        )
+        .unwrap();
+    assert!(
+        !f_h1.iter().any(|v| v.rule_id == "chain-conflict"),
+        "H1: multi-target DROP FUNCTION of helper and caller together must succeed: {f_h1:?}"
+    );
+
+    // H2: Schema-qualified missing routine call must not match different schema in search_path
+    let mut s_h2 = AnalysisState::new(base_cache.clone());
+    let f_h2 = engine
+        .analyze(
+            "CREATE SCHEMA other_s;
+             CREATE FUNCTION public.only_in_public(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+             CREATE FUNCTION public.bad_caller() RETURNS int LANGUAGE sql
+                 BEGIN ATOMIC SELECT other_s.only_in_public(1); END;",
+            &mut s_h2,
+        )
+        .unwrap();
+    assert!(
+        f_h2.iter().any(|v| v.rule_id == "chain-conflict"),
+        "H2: schema-qualified call to other_s.only_in_public(1) must conflict when function is in public: {f_h2:?}"
+    );
+
+    // H5: ALTER FUNCTION ... SUPPORT replaces previous support edge
+    let mut s_h5 = AnalysisState::new(base_cache.clone());
+    let f_h5 = engine
+        .analyze(
+            "CREATE FUNCTION public.sup1(internal) RETURNS internal LANGUAGE internal AS ' int4recv ';
+             CREATE FUNCTION public.sup2(internal) RETURNS internal LANGUAGE internal AS ' int4send ';
+             CREATE FUNCTION public.fn_with_sup() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             ALTER FUNCTION public.fn_with_sup() SUPPORT public.sup1;
+             ALTER FUNCTION public.fn_with_sup() SUPPORT public.sup2;
+             DROP FUNCTION public.sup1(internal);",
+            &mut s_h5,
+        )
+        .unwrap();
+    assert!(
+        !f_h5.iter().any(|v| v.rule_id == "chain-conflict"),
+        "H5: dropping replaced support function sup1 must not conflict: {f_h5:?}"
+    );
+
+    // H6: CREATE CAST ... WITH FUNCTION using single OUT parameter
+    let mut s_h6 = AnalysisState::new(base_cache.clone());
+    let f_h6 = engine
+        .analyze(
+            "CREATE TYPE public.out_src AS (v int);
+             CREATE TYPE public.out_dst AS (v int);
+             CREATE FUNCTION public.cast_via_out(src public.out_src, OUT res public.out_dst)
+                 LANGUAGE sql IMMUTABLE AS 'SELECT ROW((src).v)::public.out_dst';
+             CREATE CAST (public.out_src AS public.out_dst) WITH FUNCTION public.cast_via_out(public.out_src);",
+            &mut s_h6,
+        )
+        .unwrap();
+    assert!(
+        !f_h6.iter().any(|v| v.rule_id == "chain-conflict"),
+        "H6: CREATE CAST WITH FUNCTION having single OUT parameter must succeed: {f_h6:?}"
+    );
+
+    // H7: Subscriptable base type with ELEMENT and raw_array_subscript_handler in CREATE CAST WITHOUT FUNCTION
+    let mut s_h7 = AnalysisState::new(base_cache.clone());
+    let f_h7 = engine
+        .analyze(
+            "CREATE TYPE public.myvec;
+             CREATE FUNCTION public.myvec_in(cstring) RETURNS public.myvec LANGUAGE internal IMMUTABLE STRICT AS 'int4in';
+             CREATE FUNCTION public.myvec_out(public.myvec) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+             CREATE TYPE public.myvec (
+                 INPUT = public.myvec_in,
+                 OUTPUT = public.myvec_out,
+                 INTERNALLENGTH = 16,
+                 ELEMENT = float4,
+                 SUBSCRIPT = raw_array_subscript_handler
+             );
+             CREATE TYPE public.myvec2;
+             CREATE FUNCTION public.myvec2_in(cstring) RETURNS public.myvec2 LANGUAGE internal IMMUTABLE STRICT AS 'int4in';
+             CREATE FUNCTION public.myvec2_out(public.myvec2) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+             CREATE TYPE public.myvec2 (
+                 INPUT = public.myvec2_in,
+                 OUTPUT = public.myvec2_out,
+                 INTERNALLENGTH = 16,
+                 ELEMENT = float4,
+                 SUBSCRIPT = raw_array_subscript_handler
+             );
+             CREATE CAST (public.myvec AS public.myvec2) WITHOUT FUNCTION;",
+            &mut s_h7,
+        )
+        .unwrap();
+    assert!(
+        !f_h7.iter().any(|v| v.rule_id == "chain-conflict"),
+        "H7: CREATE CAST WITHOUT FUNCTION on base type with ELEMENT + raw_array_subscript_handler must succeed: {f_h7:?}"
+    );
+
+    // H8: CREATE STATISTICS expression cast to type lacking default B-tree opclass (json)
+    let mut s_h8 = AnalysisState::new(base_cache.clone());
+    let f_h8 = engine
+        .analyze(
+            "CREATE TABLE public.j_tbl (j text, id int);
+             CREATE STATISTICS public.j_stats ON ((j::json)), id FROM public.j_tbl;",
+            &mut s_h8,
+        )
+        .unwrap();
+    assert!(
+        f_h8.iter().any(|v| v.rule_id == "chain-conflict"),
+        "H8: CREATE STATISTICS on expression returning json must conflict: {f_h8:?}"
+    );
+
+    // H9: ANALYZE pg_catalog.pg_class (relname) taints with CatalogCoverageIncomplete, and ALTER FUNCTION SET unknown_guc taints
+    let mut s_h9_a = AnalysisState::new(base_cache.clone());
+    engine
+        .analyze("ANALYZE pg_catalog.pg_class (relname);", &mut s_h9_a)
+        .unwrap();
+    assert_eq!(
+        s_h9_a.local.confidence,
+        Confidence::Tainted,
+        "H9: ANALYZE pg_catalog.pg_class with explicit columns must taint"
+    );
+    let mut s_h9_b = AnalysisState::new(base_cache.clone());
+    engine
+        .analyze(
+            "CREATE FUNCTION public.guc_fn() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             ALTER FUNCTION public.guc_fn() SET custom.ext_param = 'val';",
+            &mut s_h9_b,
+        )
+        .unwrap();
+    assert_eq!(
+        s_h9_b.local.confidence,
+        Confidence::Tainted,
+        "H9: ALTER FUNCTION SET unknown GUC must taint"
+    );
+
+    // V1-V7: Version gates (PG 15 vs PG 16 vs PG 17 vs PG 18) and ALTER STATISTICS IF EXISTS
+    let mut cache_pg15 = base_cache.clone();
+    cache_pg15.pg_version_num = Some(150_000);
+    let engine_pg15 = SafeMigrateEngine::new(Config {
+        assume_pg_version: Some(150_000),
+        ..Config::default()
+    });
+    let mut s_v1_15 = AnalysisState::new(cache_pg15.clone());
+    let f_v1_15 = engine_pg15
+        .analyze(
+            "CREATE TABLE public.t15 (id int);
+             ANALYZE (BUFFER_USAGE_LIMIT '256kB') public.t15;",
+            &mut s_v1_15,
+        )
+        .unwrap();
+    assert!(
+        f_v1_15.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V1: ANALYZE BUFFER_USAGE_LIMIT must conflict on PG 15: {f_v1_15:?}"
+    );
+
+    let mut cache_pg16 = base_cache.clone();
+    cache_pg16.pg_version_num = Some(160_000);
+    let engine_pg16 = SafeMigrateEngine::new(Config {
+        assume_pg_version: Some(160_000),
+        ..Config::default()
+    });
+    let mut s_v2_16 = AnalysisState::new(cache_pg16.clone());
+    let f_v2_16 = engine_pg16
+        .analyze(
+            "CREATE TABLE public.t16 (a int, b int);
+             CREATE STATISTICS public.s16 ON a, b FROM public.t16;
+             ALTER STATISTICS public.s16 SET STATISTICS DEFAULT;",
+            &mut s_v2_16,
+        )
+        .unwrap();
+    assert!(
+        f_v2_16.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V2: ALTER STATISTICS SET STATISTICS DEFAULT must conflict on PG 16: {f_v2_16:?}"
+    );
+
+    let mut s_v3_16 = AnalysisState::new(cache_pg16.clone());
+    let f_v3_16 = engine_pg16
+        .analyze(
+            "CREATE FUNCTION public.f16() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             ALTER FUNCTION public.f16() SET transaction_timeout = 1000;",
+            &mut s_v3_16,
+        )
+        .unwrap();
+    assert!(
+        f_v3_16.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V3: SET transaction_timeout must conflict on PG 16: {f_v3_16:?}"
+    );
+
+    // V6: Partitioned table SET UNLOGGED is accepted on PG 17, rejected on PG 18
+    let mut cache_pg17 = base_cache.clone();
+    cache_pg17.pg_version_num = Some(170_000);
+    let engine_pg17 = SafeMigrateEngine::new(Config {
+        assume_pg_version: Some(170_000),
+        ..Config::default()
+    });
+    let mut s_v6_17 = AnalysisState::new(cache_pg17);
+    let f_v6_17 = engine_pg17
+        .analyze(
+            "CREATE TABLE public.p17 (id int) PARTITION BY RANGE (id);
+             ALTER TABLE public.p17 SET UNLOGGED;",
+            &mut s_v6_17,
+        )
+        .unwrap();
+    assert!(
+        !f_v6_17.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V6: ALTER TABLE <partitioned> SET UNLOGGED must be accepted on PG 17: {f_v6_17:?}"
+    );
+
+    let mut s_v6_18 = AnalysisState::new(base_cache.clone());
+    let f_v6_18 = engine
+        .analyze(
+            "CREATE TABLE public.p18 (id int) PARTITION BY RANGE (id);
+             ALTER TABLE public.p18 SET UNLOGGED;",
+            &mut s_v6_18,
+        )
+        .unwrap();
+    assert!(
+        f_v6_18.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V6: ALTER TABLE <partitioned> SET UNLOGGED must conflict on PG 18: {f_v6_18:?}"
+    );
+
+    // V7: ALTER STATISTICS IF EXISTS on missing statistics object (SET STATISTICS is valid; OWNER TO with IF EXISTS conflicts)
+    let mut s_v7 = AnalysisState::new(base_cache.clone());
+    let f_v7 = engine
+        .analyze(
+            "ALTER STATISTICS IF EXISTS public.missing_stats SET STATISTICS 100;",
+            &mut s_v7,
+        )
+        .unwrap();
+    assert!(
+        !f_v7.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V7: ALTER STATISTICS IF EXISTS ... SET STATISTICS on missing statistics object must not conflict: {f_v7:?}"
+    );
+    assert_eq!(s_v7.local.confidence, Confidence::Exact);
+    let mut s_v7_bad = AnalysisState::new(base_cache.clone());
+    let f_v7_bad = engine
+        .analyze(
+            "ALTER STATISTICS IF EXISTS public.missing_stats OWNER TO postgres;",
+            &mut s_v7_bad,
+        )
+        .unwrap();
+    assert!(
+        f_v7_bad.iter().any(|v| v.rule_id == "chain-conflict"),
+        "V7: ALTER STATISTICS IF EXISTS ... OWNER TO must conflict as in PostgreSQL grammar: {f_v7_bad:?}"
+    );
+
+    // M1: Cache semantic validation rejects dangling routine_dependencies
+    let mut bad_cache = base_cache.clone();
+    bad_cache.routine_dependencies.push(RoutineDependencyCache {
+        dependent: object_id("public", "nonexistent_fn()"),
+        target: RoutineDependencyTarget::Relation {
+            relation: object_id("public", "nonexistent_tbl"),
+            column: None,
+        },
+    });
+    assert!(
+        bad_cache.validate_semantics().is_err(),
+        "M1: validate_semantics must reject routine_dependencies with missing routine"
+    );
 }

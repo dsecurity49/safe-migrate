@@ -32,12 +32,17 @@ pub(crate) struct CastCatalogue {
     implicit: BTreeMap<String, BTreeSet<String>>,
     #[serde(skip)]
     entries: BTreeMap<(String, String), CastEntry>,
+    #[serde(skip)]
+    full_coverage: bool,
 }
 
 impl CastCatalogue {
     #[cfg(test)]
     pub(crate) fn new(edges: impl IntoIterator<Item = (String, String)>) -> Self {
-        let mut catalogue = Self::default();
+        let mut catalogue = Self {
+            full_coverage: true,
+            ..Self::default()
+        };
         for (source, target) in edges {
             catalogue.insert_cast(CastEntry {
                 source,
@@ -50,7 +55,10 @@ impl CastCatalogue {
     }
 
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = CastEntry>) -> Self {
-        let mut catalogue = Self::default();
+        let mut catalogue = Self {
+            full_coverage: true,
+            ..Self::default()
+        };
         for entry in entries {
             catalogue.insert_cast(entry);
         }
@@ -65,14 +73,102 @@ impl CastCatalogue {
     /// V12.1+ cache or the static fallback), rather than a legacy V12.0 cache
     /// that recorded only `implicit` casts.
     pub(crate) fn has_full_cast_coverage(&self) -> bool {
-        !self.entries.is_empty() || self.implicit.is_empty()
+        self.full_coverage
+    }
+
+    pub(crate) fn clear_full_cast_coverage(&mut self) {
+        self.full_coverage = false;
+        self.entries.clear();
     }
 
     pub(crate) fn hydrate_extension_entries(&mut self, entries: Vec<CastEntry>) {
         self.entries.clear();
+        self.full_coverage = true;
         for entry in entries {
             self.insert_cast(entry);
         }
+    }
+
+    /// Validate that V12.1 extension entries agree with the base `implicit` map
+    /// before hydrating them into the catalogue.
+    pub(crate) fn validate_and_hydrate_extension_entries(
+        &mut self,
+        entries: Vec<CastEntry>,
+    ) -> Result<(), String> {
+        let mut derived_implicit: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut seen_pairs = BTreeSet::new();
+        for entry in &entries {
+            if entry.source.trim().is_empty() || entry.target.trim().is_empty() {
+                return Err("cast cache entry contains an empty source or target type".to_string());
+            }
+            if !seen_pairs.insert((entry.source.clone(), entry.target.clone())) {
+                return Err(format!(
+                    "cast cache extension contains duplicate cast ({} AS {})",
+                    entry.source, entry.target
+                ));
+            }
+            if let CastEntryMethod::WithFunction(Some(func_id)) = &entry.method
+                && (func_id.schema.is_empty() || func_id.name.is_empty() || func_id.inferred_schema)
+            {
+                return Err(format!(
+                    "cast cache entry ({} AS {}) has invalid cast function identity '{}'",
+                    entry.source, entry.target, func_id
+                ));
+            }
+            if entry.context == CastContextFact::Implicit {
+                derived_implicit
+                    .entry(entry.source.clone())
+                    .or_default()
+                    .insert(entry.target.clone());
+            }
+        }
+        if derived_implicit != self.implicit {
+            return Err(
+                "cache V12.1 cast extension disagrees with base implicit cast catalogue"
+                    .to_string(),
+            );
+        }
+        self.hydrate_extension_entries(entries);
+        Ok(())
+    }
+
+    pub(crate) fn validate_invariants(&self) -> Result<(), String> {
+        for (source, targets) in &self.implicit {
+            if source.trim().is_empty() || targets.is_empty() {
+                return Err(
+                    "cast cache contains an empty implicit cast source or target set".into(),
+                );
+            }
+            if targets.iter().any(|t| t.trim().is_empty()) {
+                return Err(format!(
+                    "cast cache source '{source}' contains an empty implicit target type"
+                ));
+            }
+        }
+        if self.full_coverage {
+            let mut derived_implicit: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for ((src, dst), entry) in &self.entries {
+                if src.trim().is_empty()
+                    || dst.trim().is_empty()
+                    || src != &entry.source
+                    || dst != &entry.target
+                {
+                    return Err("cast cache contains an inconsistent full-coverage entry".into());
+                }
+                if entry.context == CastContextFact::Implicit {
+                    derived_implicit
+                        .entry(entry.source.clone())
+                        .or_default()
+                        .insert(entry.target.clone());
+                }
+            }
+            if derived_implicit != self.implicit {
+                return Err(
+                    "cast cache full-coverage entries disagree with base implicit casts".into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The generated static table, used only on the `--no-cache` path.
@@ -87,6 +183,23 @@ impl CastCatalogue {
                 .implicit
                 .get(from)
                 .is_some_and(|targets| targets.contains(to))
+    }
+
+    /// Whether `from` coerces to `to` under PostgreSQL `COERCION_ASSIGNMENT`
+    /// rules (used by `RETURN` and SQL function output checking).
+    pub(crate) fn coerces_for_assignment(&self, from: &str, to: &str) -> bool {
+        if self.coerces_implicitly(from, to) {
+            return true;
+        }
+        if let Some(entry) = self.entries.get(&(from.to_string(), to.to_string())) {
+            return matches!(
+                entry.context,
+                CastContextFact::Implicit | CastContextFact::Assignment
+            );
+        }
+        // PostgreSQL's `find_coercion_pathway` permits assignment coercion via
+        // I/O (`CoerceViaIO`) when the target is in `TYPCATEGORY_STRING`.
+        matches!(to, "text" | "character varying" | "character")
     }
 
     /// Whether any cast (`IMPLICIT`, `AS ASSIGNMENT`, or explicit) is recorded
@@ -166,6 +279,38 @@ impl CastCatalogue {
             }
         }
         changed
+    }
+
+    pub(crate) fn has_external_casts_for_type(
+        &self,
+        type_name: &str,
+        co_dropped: &std::collections::HashSet<ObjectId>,
+        internal_group: &[String],
+    ) -> bool {
+        let array_name = format!("{type_name}[]");
+        let is_co_dropped_cast = |src: &str, dst: &str, method: Option<&CastEntryMethod>| -> bool {
+            if co_dropped.contains(&ObjectId::new("", format!("{src}->{dst}"))) {
+                return true;
+            }
+            if let Some(CastEntryMethod::WithFunction(Some(fn_id))) = method
+                && co_dropped.contains(fn_id)
+            {
+                return true;
+            }
+            internal_group.len() > 1
+                && internal_group.iter().any(|g| g == src)
+                && internal_group.iter().any(|g| g == dst)
+        };
+        if self.full_coverage {
+            return self.entries.values().any(|entry| {
+                let touches = entry.source == type_name
+                    || entry.target == type_name
+                    || entry.source == array_name
+                    || entry.target == array_name;
+                touches && !is_co_dropped_cast(&entry.source, &entry.target, Some(&entry.method))
+            });
+        }
+        self.has_casts_for_type(type_name)
     }
 
     pub(crate) fn has_casts_for_type(&self, type_name: &str) -> bool {

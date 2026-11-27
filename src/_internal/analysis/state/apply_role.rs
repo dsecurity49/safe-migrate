@@ -152,6 +152,55 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    fn role_has_dependent_objects(&self, role_id: &ObjectId) -> bool {
+        use crate::_internal::model::{
+            extension::ExtensionOverlay,
+            function::FunctionOverlay,
+            relation::RelationOverlay,
+            replication::{PublicationOverlay, SubscriptionOverlay},
+            schema::SchemaOverlay,
+            sequence::SequenceOverlay,
+            types::TypeOverlay,
+        };
+        self.local.relations.values().any(|overlay| {
+            matches!(
+                overlay,
+                RelationOverlay::Present(rel)
+                    if &rel.owner == role_id
+                        || rel.privileges.grants.contains_key(role_id)
+                        || rel
+                            .extended_statistics
+                            .values()
+                            .any(|s| s.owner.as_ref() == Some(role_id))
+            )
+        }) || self.local.functions.values().any(|overlay| {
+            matches!(
+                overlay,
+                FunctionOverlay::Present(func) if func.owner.as_ref() == Some(role_id)
+            )
+        }) || self.local.types.values().any(|overlay| {
+            matches!(overlay, TypeOverlay::Present(ty) if &ty.owner == role_id)
+        }) || self.local.sequences.values().any(|overlay| {
+            matches!(overlay, SequenceOverlay::Present(seq) if &seq.owner == role_id)
+        }) || self.local.schemas.values().any(|overlay| {
+            matches!(overlay, SchemaOverlay::Present(schema) if &schema.owner == role_id)
+        }) || self.local.extensions.values().any(|overlay| {
+            matches!(overlay, ExtensionOverlay::Present(ext) if &ext.owner == role_id)
+        }) || self.local.publications.values().any(|overlay| {
+            matches!(
+                overlay,
+                PublicationOverlay::Present(pub_state)
+                    if pub_state.owner.as_deref() == Some(role_id.name.as_str())
+            )
+        }) || self.local.subscriptions.values().any(|overlay| {
+            matches!(
+                overlay,
+                SubscriptionOverlay::Present(sub_state)
+                    if sub_state.owner.as_deref() == Some(role_id.name.as_str())
+            )
+        })
+    }
+
     pub(super) fn apply_drop_role(&mut self, role: &DropRoleMutation) -> MutationResult {
         let mut present_roles = Vec::new();
         for name in &role.names {
@@ -176,6 +225,14 @@ impl AnalysisState {
                     }
                     RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
                 }
+            }
+        }
+        for role_id in &present_roles {
+            if self.role_has_dependent_objects(role_id) {
+                return MutationResult::conflict(format!(
+                    "role \"{}\" cannot be dropped because some objects depend on it",
+                    role_id.name
+                ));
             }
         }
         // DROP ROLE can fail because a role owns objects or has

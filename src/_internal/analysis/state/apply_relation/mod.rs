@@ -641,7 +641,7 @@ fn alter_table_action_permits(
         | Action::SetCluster { .. }
         | Action::SetReplicaIdentity { .. } => table || partitioned_table || matview,
         Action::SetStatistics { .. } => table || partitioned_table || matview || foreign,
-        Action::SetPersistence { .. } => table,
+        Action::SetPersistence { .. } => table || partitioned_table,
         Action::AlterConstraint { .. }
         | Action::SetRowSecurity { .. }
         | Action::SetForceRowSecurity { .. }

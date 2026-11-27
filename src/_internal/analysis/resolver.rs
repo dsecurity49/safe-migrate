@@ -369,6 +369,7 @@ impl Resolver {
                 select_source_name,
                 routines,
                 cast_types,
+                column_dependencies,
             } => {
                 mutations.push(Self::resolve_create_view(
                     name,
@@ -385,6 +386,7 @@ impl Resolver {
                     select_source_name.as_deref(),
                     routines,
                     cast_types,
+                    column_dependencies,
                     state,
                 ));
             }
@@ -409,6 +411,7 @@ impl Resolver {
                 select_source,
                 routines,
                 cast_types,
+                column_dependencies,
             } => {
                 mutations.push(Self::resolve_create_materialized_view(
                     name,
@@ -424,6 +427,7 @@ impl Resolver {
                     select_source.as_ref(),
                     routines,
                     cast_types,
+                    column_dependencies,
                     state,
                 ));
             }

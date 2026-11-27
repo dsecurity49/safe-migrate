@@ -4,7 +4,7 @@ use crate::_internal::analysis::facts::{
     AlterStatisticsFact, AnalyzeFact, CastMethodFact, CreateAggregateFact, CreateCastFact,
     CreateFunctionFact, CreateProcedureFact, CreateStatisticsFact, DropAggregateFact, DropCastFact,
     DropFunctionFact, DropProcedureFact, DropRoutineFact, DropStatisticsFact, FunctionSigFact,
-    RoutineBodyDependenciesFact,
+    RoutineBodyDependenciesFact, RoutineReturnExprFact,
 };
 use crate::_internal::analysis::mutations::{
     AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, AlterRoutineMutation,
@@ -12,7 +12,7 @@ use crate::_internal::analysis::mutations::{
     CreateAggregateMutation, CreateCastMutation, CreateFunctionMutation, CreateProcedureMutation,
     CreateStatisticsMutation, DropAggregateMutation, DropCastMutation, DropFunctionMutation,
     DropProcedureMutation, DropRoutineMutation, DropStatisticsMutation, Mutation,
-    RoutineBodyDependencies, RoutineRelationDependency,
+    RoutineBodyDependencies, RoutineRelationDependency, RoutineReturnExprMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 
@@ -29,6 +29,10 @@ impl Resolver {
             options: fact.options.clone(),
             body_dependencies: Self::resolve_routine_body_dependencies(
                 &fact.body_dependencies,
+                state,
+            ),
+            validation_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.validation_dependencies,
                 state,
             ),
         })
@@ -66,6 +70,10 @@ impl Resolver {
             options: fact.options.clone(),
             body_dependencies: Self::resolve_routine_body_dependencies(
                 &fact.body_dependencies,
+                state,
+            ),
+            validation_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.validation_dependencies,
                 state,
             ),
         })
@@ -168,10 +176,37 @@ impl Resolver {
             }
             (distinct_rels.len() == 1).then(|| distinct_rels[0].clone())
         };
+        let return_expr = deps.return_expr.as_ref().map(|expr| match expr {
+            RoutineReturnExprFact::LiteralType(ty) => {
+                RoutineReturnExprMutation::LiteralType(ty.clone())
+            }
+            RoutineReturnExprFact::ExplicitCast(ty) => {
+                RoutineReturnExprMutation::ExplicitCast(ty.clone())
+            }
+            RoutineReturnExprFact::Column { relation, column } => {
+                RoutineReturnExprMutation::Column {
+                    relation: relation
+                        .as_ref()
+                        .map(|r| Self::resolve_relation_lookup_name(r, state))
+                        .or_else(|| single_source.clone()),
+                    column: column.clone(),
+                }
+            }
+            RoutineReturnExprFact::ParameterType(ty) => {
+                RoutineReturnExprMutation::ParameterType(ty.clone())
+            }
+            RoutineReturnExprFact::RoutineCall(qname) => RoutineReturnExprMutation::RoutineCall(
+                Self::resolve_routine_namespace_name(qname, state),
+            ),
+            RoutineReturnExprFact::MultiColumn => RoutineReturnExprMutation::MultiColumn,
+        });
         RoutineBodyDependencies {
             relations,
             routines: Self::resolve_view_routines(&deps.routines, single_source.as_ref(), state),
             types: Self::resolve_cast_types(&deps.types, state),
+            unqualified_columns: deps.unqualified_columns.clone(),
+            return_expr,
+            has_syntax_error: deps.has_syntax_error,
         }
     }
 
@@ -245,6 +280,12 @@ impl Resolver {
             expressions: fact.expressions.clone(),
             expression_count: fact.expression_count,
             expressions_sql: fact.expressions_sql.clone(),
+            expression_routines: Self::resolve_view_routines(
+                &fact.expression_routines,
+                Some(&Self::resolve_relation_lookup_name(&fact.table, state)),
+                state,
+            ),
+            expression_types: Self::resolve_cast_types(&fact.expression_types, state),
             table: Self::resolve_relation_lookup_name(&fact.table, state),
         })
     }
@@ -255,6 +296,7 @@ impl Resolver {
     ) -> Mutation {
         Mutation::AlterStatistics(AlterStatisticsMutation {
             id: Self::resolve_statistics_lookup_name(&fact.name, state),
+            if_exists: fact.if_exists,
             action: fact.action.clone(),
         })
     }
@@ -276,11 +318,13 @@ impl Resolver {
 
     pub(super) fn resolve_analyze(fact: &AnalyzeFact, state: &AnalysisState) -> Mutation {
         Mutation::Analyze(AnalyzeMutation {
+            options: fact.options.clone(),
             targets: fact
                 .targets
                 .iter()
                 .map(|t| AnalyzeTargetMutation {
                     table_id: Self::resolve_relation_lookup_name(&t.relation, state),
+                    is_unqualified: t.relation.schema.is_none(),
                     columns: t.columns.clone(),
                 })
                 .collect(),

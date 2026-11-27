@@ -1676,3 +1676,79 @@ fn v12_0_and_v12_1_caches_coexist_under_major_v12_while_older_versions_fail() {
         vec![("public.src_t".to_string(), "public.dst_t".to_string())]
     );
 }
+
+#[test]
+fn v12_1_validates_extension_casts_against_base_implicit_map_and_preserves_routine_dependencies() {
+    use crate::_internal::analysis::facts::CastContextFact;
+    use crate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+
+    // C1: empty V12.1 extension still marks full_coverage = true when base implicit map is empty
+    let mut empty_cache = synced_cache();
+    empty_cache.casts = Some(CastCatalogue::from_entries(Vec::new()));
+    let decoded_empty = DbCacheVersioned::current(empty_cache)
+        .into_cache()
+        .expect("empty V12.1 cast catalogue must validate");
+    assert!(
+        decoded_empty
+            .casts
+            .as_ref()
+            .unwrap()
+            .has_full_cast_coverage()
+    );
+
+    // C2: extension record claiming Implicit when base implicit map disagrees must fail validation
+    let mut mismatched = synced_cache();
+    mismatched.casts = Some(CastCatalogue::from_entries(vec![CastEntry {
+        source: "smallint".to_string(),
+        target: "integer".to_string(),
+        context: CastContextFact::Implicit,
+        method: CastEntryMethod::WithoutFunction,
+    }]));
+    let bad_ext = CacheExtensionV12_1 {
+        casts: vec![CastEntry {
+            source: "smallint".to_string(),
+            target: "integer".to_string(),
+            context: CastContextFact::Explicit,
+            method: CastEntryMethod::WithoutFunction,
+        }],
+        routine_dependencies: Vec::new(),
+    };
+    let err = DbCacheVersioned::V12_1(Box::new(mismatched), bad_ext)
+        .into_cache()
+        .unwrap_err();
+    assert!(
+        err.contains("disagrees with base implicit cast"),
+        "expected C2 disagreement error, got: {err}"
+    );
+
+    // F4: routine_dependencies round-trip through CacheExtensionV12_1
+    let mut dep_cache = synced_cache();
+    let tbl_id = ObjectId::new("public", "t");
+    dep_cache
+        .relations
+        .insert(tbl_id.clone(), table(tbl_id.clone(), &["a"]));
+    let fn_id = ObjectId::new("public", "uses_ta()");
+    dep_cache.functions.insert(
+        fn_id.clone(),
+        crate::_internal::model::function::FunctionState::with_inputs(
+            fn_id.clone(),
+            crate::_internal::model::function::RoutineKind::Function,
+            Vec::new(),
+        ),
+    );
+    let dep_entry = RoutineDependencyCache {
+        dependent: fn_id,
+        target: RoutineDependencyTarget::Relation {
+            relation: tbl_id,
+            column: Some("a".to_string()),
+        },
+    };
+    dep_cache.routine_dependencies.push(dep_entry.clone());
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded =
+        bincode::serde::encode_to_vec(DbCacheVersioned::current(dep_cache), config).unwrap();
+    let (decoded_ver, _): (DbCacheVersioned, _) =
+        bincode::serde::decode_from_slice(&encoded, config).unwrap();
+    let hydrated = decoded_ver.into_cache().unwrap();
+    assert_eq!(hydrated.routine_dependencies, vec![dep_entry]);
+}

@@ -1,5 +1,6 @@
 pub(crate) mod aggregate;
 pub(crate) mod aggregate_fallback;
+pub(crate) mod builtin_routine;
 pub(crate) mod builtin_type;
 pub(crate) mod builtin_type_fallback;
 pub(crate) mod cast;

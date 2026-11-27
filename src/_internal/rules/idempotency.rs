@@ -78,6 +78,17 @@ impl Rule for IdempotencyRule {
                     format!("CREATE EXTENSION {} without IF NOT EXISTS", c.name),
                 );
             }
+            Mutation::CreateStatistics(c) if !c.if_not_exists => {
+                let name =
+                    c.id.as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| c.table.to_string());
+                add_violation(
+                    ObjectKind::Table,
+                    name.clone(),
+                    format!("CREATE STATISTICS {} without IF NOT EXISTS", name),
+                );
+            }
 
             // Drop Guards
             Mutation::DropTable(d) if !d.if_exists => {
@@ -165,6 +176,33 @@ impl Rule for IdempotencyRule {
                         ObjectKind::Extension,
                         name.clone(),
                         format!("DROP EXTENSION {} without IF EXISTS", name),
+                    );
+                }
+            }
+            Mutation::DropCast(d) if !d.if_exists => {
+                let pair = format!("({} AS {})", d.source_type, d.target_type);
+                add_violation(
+                    ObjectKind::Type,
+                    pair.clone(),
+                    format!("DROP CAST {} without IF EXISTS", pair),
+                );
+            }
+            Mutation::DropStatistics(d) if !d.if_exists => {
+                for id in &d.ids {
+                    add_violation(
+                        ObjectKind::Table,
+                        id.to_string(),
+                        format!("DROP STATISTICS {} without IF EXISTS", id),
+                    );
+                }
+            }
+            Mutation::DropRoutine(d) if !d.if_exists => {
+                for sig in &d.signatures {
+                    let name = context.state().routine_signature_id(sig).to_string();
+                    add_violation(
+                        ObjectKind::Function,
+                        name.clone(),
+                        format!("DROP ROUTINE {} without IF EXISTS", name),
                     );
                 }
             }

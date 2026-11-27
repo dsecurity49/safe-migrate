@@ -279,6 +279,37 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     );
                 }
             }
+            DependencyKind::StatisticsUsesRoutine {
+                table_id,
+                unresolved_name,
+            } => {
+                if let Some(name) = unresolved_name {
+                    assert_eq!(
+                        edge.referenced, *name,
+                        "a name-only statistics routine edge must use the written name as its endpoint"
+                    );
+                }
+                let present = matches!(
+                    local.relations.get(table_id),
+                    Some(RelationOverlay::Present(rel))
+                        if rel.extended_statistics.contains_key(&edge.dependent)
+                );
+                assert!(
+                    present,
+                    "statistics routine dependency must belong to a present statistics object"
+                );
+            }
+            DependencyKind::StatisticsUsesType { table_id } => {
+                let present = matches!(
+                    local.relations.get(table_id),
+                    Some(RelationOverlay::Present(rel))
+                        if rel.extended_statistics.contains_key(&edge.dependent)
+                );
+                assert!(
+                    present,
+                    "statistics type dependency must belong to a present statistics object"
+                );
+            }
             DependencyKind::RoutineUsesRelation { .. } | DependencyKind::RoutineUsesType => {
                 let dependent_is_modeled_routine = matches!(
                     local.functions.get(&edge.dependent),

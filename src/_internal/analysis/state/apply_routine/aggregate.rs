@@ -13,6 +13,7 @@ use crate::_internal::model::function::{
     FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
 };
 use crate::_internal::model::trigger::TriggerOverlay;
+use crate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::HashSet;
 
 use super::{DropTarget, RoutineLookup};
@@ -345,6 +346,12 @@ impl AnalysisState {
                     aggregate.kind,
                     aggregate.direct_count,
                 )),
+                owner: self
+                    .local
+                    .current_role_known
+                    .then(|| ObjectId::new("", &self.local.current_role)),
+                dependent_extensions: std::collections::BTreeSet::new(),
+                support_function: None,
             }),
         );
         self.record_aggregate_dependencies(aggregate);
@@ -365,6 +372,9 @@ impl AnalysisState {
                     "aggregate '{}' does not exist",
                     aggregate.id
                 ));
+            }
+            RoutineLookup::Unknown if aggregate.id.schema == "pg_catalog" => {
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             RoutineLookup::Unknown => {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
@@ -392,7 +402,7 @@ impl AnalysisState {
                 self.move_function(&aggregate.id, &new_id);
             }
             AlterFunctionAction::OwnerChange(owner) => {
-                return self.apply_routine_owner_change(owner);
+                return self.apply_routine_owner_change(&aggregate.id, owner);
             }
             _ => unreachable!("aggregate extraction only emits rename, owner, or schema"),
         }
@@ -405,6 +415,41 @@ impl AnalysisState {
     /// `dropped` carries every routine the statement is dropping, so a view
     /// whose call never resolved survives while any overload of its written
     /// name remains. Returns whether such a surviving reference exists.
+    pub(in crate::_internal::analysis::state) fn routine_call_reference_exists(
+        &self,
+        name: &ObjectId,
+    ) -> bool {
+        let bare = &name.name;
+        if !name.inferred_schema {
+            let in_schema = self.local.functions.iter().any(|(id, overlay)| {
+                matches!(overlay, FunctionOverlay::Present(_))
+                    && id.schema == name.schema
+                    && DependencyGraph::split_routine_signature(id).1 == bare
+            }) || matches!(
+                self.local.types.get(&ObjectId::new(&name.schema, bare)),
+                Some(TypeOverlay::Present(_))
+            ) || matches!(
+                self.local.relations.get(&ObjectId::new(&name.schema, bare)),
+                Some(RelationOverlay::Present(_))
+            );
+            if in_schema {
+                return true;
+            }
+            if name.schema == "pg_catalog" {
+                return crate::_internal::model::builtin_routine::is_builtin_pg_catalog_routine(
+                    bare,
+                ) || self.local.aggregates.signatures(bare).is_some()
+                    || self.builtin_types().resolve(bare).is_some();
+            }
+            return false;
+        }
+        self.routine_named(bare)
+            || crate::_internal::model::builtin_routine::is_builtin_pg_catalog_routine(bare)
+            || self.local.aggregates.signatures(bare).is_some()
+            || self.resolve_type_reference(bare).is_some()
+            || self.builtin_types().resolve(bare).is_some()
+    }
+
     pub(in crate::_internal::analysis::state) fn apply_routine_cascade_drop(
         &mut self,
         id: &ObjectId,
@@ -412,7 +457,85 @@ impl AnalysisState {
         dependent_views: &[(ObjectId, Option<ObjectId>)],
         dropped: &HashSet<ObjectId>,
     ) -> bool {
+        let computed_triggers: Vec<(ObjectId, ObjectId)> = if dependent_triggers.is_empty() {
+            self.local
+                .graph
+                .edges()
+                .iter()
+                .filter_map(|edge| {
+                    let DependencyKind::TriggerOnTable { function_id, .. } = &edge.kind else {
+                        return None;
+                    };
+                    (function_id == id && !self.co_dropped_objects.contains(&edge.dependent))
+                        .then(|| (edge.dependent.clone(), edge.referenced.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dependent_triggers = if dependent_triggers.is_empty() {
+            computed_triggers.as_slice()
+        } else {
+            dependent_triggers
+        };
+        let computed_views: Vec<(ObjectId, Option<ObjectId>)> = if dependent_views.is_empty() {
+            self.local
+                .graph
+                .views_for_function(id)
+                .into_iter()
+                .filter_map(|edge| {
+                    let DependencyKind::ViewUsesRoutine { unresolved_name } = &edge.kind else {
+                        return None;
+                    };
+                    (!self.co_dropped_objects.contains(&edge.dependent))
+                        .then(|| (edge.dependent.clone(), unresolved_name.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dependent_views = if dependent_views.is_empty() {
+            computed_views.as_slice()
+        } else {
+            dependent_views
+        };
+        let mut dependent_types: Vec<ObjectId> = self
+            .types_requiring_routine(id)
+            .into_iter()
+            .map(|(type_id, _)| type_id)
+            .collect();
+        let stats_to_drop: Vec<ObjectId> = self
+            .local
+            .graph
+            .statistics_for_function(id)
+            .into_iter()
+            .map(|e| e.dependent.clone())
+            .collect();
         self.drop_routine_with_edges(id);
+        if !stats_to_drop.is_empty() {
+            for stats_id in &stats_to_drop {
+                let owner_table = self.local.relations.iter().find_map(|(t_id, overlay)| {
+                    if let RelationOverlay::Present(rel) = overlay
+                        && rel.extended_statistics.contains_key(stats_id)
+                    {
+                        Some(t_id.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(t_id) = owner_table {
+                    self.snapshot_relation(&t_id);
+                    if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&t_id)
+                    {
+                        rel.extended_statistics.remove(stats_id);
+                    }
+                }
+            }
+            self.snapshot_graph_full();
+            self.local
+                .graph
+                .retain_edges(|edge| !stats_to_drop.contains(&edge.dependent));
+        }
 
         // A name-only view reference is definitely cleared by this statement
         // only when every overload of its written name is being dropped.
@@ -461,6 +584,16 @@ impl AnalysisState {
                     .iter()
                     .any(|(trigger_id, _)| edge.dependent == *trigger_id)
             });
+        }
+        if !dependent_types.is_empty() {
+            dependent_types.sort();
+            dependent_types.dedup();
+            if !self.apply_type_cascade(&dependent_types) {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+            }
         }
         let dependent_routines: Vec<ObjectId> = self
             .local
@@ -563,6 +696,12 @@ impl AnalysisState {
                 RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
                     return MutationResult::conflict(format!("aggregate '{}' does not exist", id));
                 }
+                RoutineLookup::Unknown if id.schema == "pg_catalog" => {
+                    return MutationResult::conflict(format!(
+                        "cannot drop function {} because it is required by the database system",
+                        id.name
+                    ));
+                }
                 RoutineLookup::Unknown => {
                     return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
@@ -653,7 +792,40 @@ impl AnalysisState {
                     surviving_reference = true;
                 }
             } else {
+                let stats_to_drop: Vec<ObjectId> = self
+                    .local
+                    .graph
+                    .statistics_for_function(id)
+                    .into_iter()
+                    .map(|e| e.dependent.clone())
+                    .collect();
                 self.drop_routine_with_edges(id);
+                if !stats_to_drop.is_empty() {
+                    for stats_id in &stats_to_drop {
+                        let owner_table =
+                            self.local.relations.iter().find_map(|(t_id, overlay)| {
+                                if let RelationOverlay::Present(rel) = overlay
+                                    && rel.extended_statistics.contains_key(stats_id)
+                                {
+                                    Some(t_id.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                        if let Some(t_id) = owner_table {
+                            self.snapshot_relation(&t_id);
+                            if let Some(RelationOverlay::Present(rel)) =
+                                self.local.relations.get_mut(&t_id)
+                            {
+                                rel.extended_statistics.remove(stats_id);
+                            }
+                        }
+                    }
+                    self.snapshot_graph_full();
+                    self.local
+                        .graph
+                        .retain_edges(|edge| !stats_to_drop.contains(&edge.dependent));
+                }
             }
         }
         if surviving_reference {
@@ -704,6 +876,226 @@ impl AnalysisState {
             })
             .collect();
         (matches.len() == 1).then(|| matches[0].clone())
+    }
+
+    fn unwrap_domain_to_canonical_type(&self, raw_type: &str) -> String {
+        let mut current = raw_type.trim().to_string();
+        for _ in 0..8 {
+            let Some(type_id) = self.resolve_type_reference(&current) else {
+                break;
+            };
+            let Some(crate::_internal::model::types::TypeOverlay::Present(state)) =
+                self.local.types.get(&type_id)
+            else {
+                return type_id.to_string();
+            };
+            if let crate::_internal::model::types::TypeKind::Domain { base_type, .. } = &state.kind
+            {
+                current = base_type.clone();
+            } else {
+                return type_id.to_string();
+            }
+        }
+        self.canonical_cast_type(&current)
+    }
+
+    fn resolve_routine_return_expr_type(
+        &self,
+        expr: &crate::_internal::analysis::mutations::RoutineReturnExprMutation,
+    ) -> Option<String> {
+        use crate::_internal::analysis::mutations::RoutineReturnExprMutation;
+        match expr {
+            RoutineReturnExprMutation::LiteralType(ty)
+            | RoutineReturnExprMutation::ExplicitCast(ty)
+            | RoutineReturnExprMutation::ParameterType(ty) => Some(ty.clone()),
+            RoutineReturnExprMutation::Column {
+                relation: Some(rel_id),
+                column,
+            } => {
+                let Some(RelationOverlay::Present(rel)) = self.local.relations.get(rel_id) else {
+                    return None;
+                };
+                rel.get_column(column).and_then(|c| c.data_type.clone())
+            }
+            RoutineReturnExprMutation::Column { relation: None, .. } => None,
+            RoutineReturnExprMutation::RoutineCall(name_id) => {
+                let mut candidates = self.routine_overloads_under(name_id);
+                let first = candidates.next()?;
+                if candidates.next().is_some() {
+                    return None;
+                }
+                let Some(FunctionOverlay::Present(func)) = self.local.functions.get(first) else {
+                    return None;
+                };
+                (!func.return_type.is_empty() && !func.return_type.starts_with("TABLE("))
+                    .then(|| func.return_type.clone())
+            }
+            RoutineReturnExprMutation::MultiColumn => None,
+        }
+    }
+
+    pub(in crate::_internal::analysis::state) fn validate_routine_body(
+        &mut self,
+        is_procedure: bool,
+        params: &[crate::_internal::analysis::facts::ParamFact],
+        return_type: Option<&RetTypeFact>,
+        deps: &crate::_internal::analysis::mutations::RoutineBodyDependencies,
+    ) -> Result<(), MutationResult> {
+        if deps.has_syntax_error {
+            return Err(MutationResult::conflict(
+                "syntax error in function body".to_string(),
+            ));
+        }
+        if let Some(col) = deps.unqualified_columns.first() {
+            return Err(MutationResult::conflict(format!(
+                "column \"{col}\" does not exist"
+            )));
+        }
+        for rel_dep in &deps.relations {
+            match self.local.relations.get(&rel_dep.relation) {
+                Some(RelationOverlay::Present(rel)) => {
+                    if let Some(ref col) = rel_dep.column
+                        && rel.columns_complete
+                        && !rel.has_column(col)
+                        && !matches!(
+                            col.as_str(),
+                            "ctid" | "xmin" | "xmax" | "cmin" | "cmax" | "tableoid"
+                        )
+                    {
+                        return Err(MutationResult::conflict(format!(
+                            "column \"{col}\" does not exist"
+                        )));
+                    }
+                }
+                Some(RelationOverlay::Dropped) => {
+                    return Err(MutationResult::conflict(format!(
+                        "relation \"{}\" does not exist",
+                        rel_dep.relation
+                    )));
+                }
+                None => {
+                    if rel_dep.relation.schema == "pg_catalog" {
+                        if !crate::_internal::model::builtin_routine::is_pg_catalog_relation_name(
+                            &rel_dep.relation.name,
+                        ) {
+                            return Err(MutationResult::conflict(format!(
+                                "relation \"{}\" does not exist",
+                                rel_dep.relation
+                            )));
+                        }
+                    } else if self.baseline_covers_family_object(
+                        &rel_dep.relation,
+                        crate::_internal::db::cache::CatalogFamily::Relations,
+                    )
+                        && !crate::_internal::model::builtin_routine::is_pg_catalog_relation_name(
+                            &rel_dep.relation.name,
+                        )
+                    {
+                        return Err(MutationResult::conflict(format!(
+                            "relation \"{}\" does not exist",
+                            rel_dep.relation
+                        )));
+                    }
+                }
+            }
+        }
+        for routine_ref in &deps.routines {
+            let known = self.routine_call_reference_exists(&routine_ref.name);
+            if !known
+                && (routine_ref.name.schema == "pg_catalog"
+                    || self.baseline_covers_family_object(
+                        &routine_ref.name,
+                        crate::_internal::db::cache::CatalogFamily::Routines,
+                    ))
+            {
+                return Err(MutationResult::conflict(format!(
+                    "function {}() does not exist",
+                    routine_ref.name
+                )));
+            }
+        }
+        if !is_procedure {
+            let outputs: Vec<_> = params
+                .iter()
+                .filter(|p| matches!(p.mode, ParamModeFact::Out | ParamModeFact::InOut))
+                .collect();
+            if outputs.len() <= 1 && !matches!(return_type, Some(RetTypeFact::Table(_))) {
+                let declared_raw = if let Some(RetTypeFact::Scalar { ty, .. }) = return_type {
+                    Some(ty.as_str())
+                } else if outputs.len() == 1 {
+                    Some(outputs[0].ty.as_str())
+                } else {
+                    None
+                };
+                if let Some(declared_ty) = declared_raw {
+                    let canon_decl = self.unwrap_domain_to_canonical_type(declared_ty);
+                    if !matches!(
+                        canon_decl.as_str(),
+                        "void"
+                            | "record"
+                            | "any"
+                            | "anyelement"
+                            | "anyarray"
+                            | "anynonarray"
+                            | "anyenum"
+                            | "anyrange"
+                            | "anymultirange"
+                            | "anycompatible"
+                            | "anycompatiblearray"
+                            | "anycompatiblenonarray"
+                            | "anycompatiblerange"
+                            | "anycompatiblemultirange"
+                            | "trigger"
+                            | "event_trigger"
+                            | "internal"
+                    ) {
+                        let is_composite_return = !canon_decl.ends_with("[]")
+                            && self
+                                .resolve_type_reference(declared_ty)
+                                .or_else(|| self.resolve_type_reference(&canon_decl))
+                                .is_some_and(|type_id| {
+                                    matches!(
+                                        self.local.relations.get(&type_id),
+                                        Some(RelationOverlay::Present(_))
+                                    ) || matches!(
+                                        self.local.types.get(&type_id),
+                                        Some(TypeOverlay::Present(TypeState {
+                                            kind: TypeKind::Composite { .. },
+                                            ..
+                                        }))
+                                    )
+                                });
+                        if matches!(
+                            deps.return_expr,
+                            Some(
+                                crate::_internal::analysis::mutations::RoutineReturnExprMutation::MultiColumn
+                            )
+                        ) && !is_composite_return
+                        {
+                            return Err(MutationResult::conflict(format!(
+                                "return type mismatch in function declared to return {canon_decl}"
+                            )));
+                        }
+                        if let Some(ref ret_expr) = deps.return_expr
+                            && let Some(actual_raw) =
+                                self.resolve_routine_return_expr_type(ret_expr)
+                        {
+                            let canon_actual = self.unwrap_domain_to_canonical_type(&actual_raw);
+                            if !self
+                                .local
+                                .casts
+                                .coerces_for_assignment(&canon_actual, &canon_decl)
+                            {
+                                return Err(MutationResult::conflict(format!(
+                                    "return type mismatch in function declared to return {canon_decl}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::_internal::analysis::state) fn record_routine_body_dependencies(
@@ -826,6 +1218,12 @@ impl AnalysisState {
                     routine.id
                 ));
             }
+            RoutineLookup::Unknown if routine.id.schema == "pg_catalog" => {
+                return self.apply_alter_function(&AlterFunctionMutation {
+                    id: routine.id.clone(),
+                    action: routine.action.clone(),
+                });
+            }
             RoutineLookup::Unknown => {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             }
@@ -848,9 +1246,11 @@ impl AnalysisState {
                 AlterFunctionAction::OptionsChange(_) => {
                     MutationResult::conflict(format!("'{}' is an aggregate function", routine.id))
                 }
-                AlterFunctionAction::DependsOnExtension { extension }
-                | AlterFunctionAction::NoDependsOnExtension { extension } => {
-                    self.apply_routine_depends_on_extension(extension)
+                AlterFunctionAction::DependsOnExtension { extension } => {
+                    self.apply_routine_depends_on_extension(&routine.id, extension, false)
+                }
+                AlterFunctionAction::NoDependsOnExtension { extension } => {
+                    self.apply_routine_depends_on_extension(&routine.id, extension, true)
                 }
                 _ => self.apply_alter_aggregate(&AlterAggregateMutation {
                     id: routine.id.clone(),
@@ -864,6 +1264,19 @@ impl AnalysisState {
         &mut self,
         routine: &DropRoutineMutation,
     ) -> MutationResult {
+        let target_ids_in_stmt: HashSet<ObjectId> = routine
+            .signatures
+            .iter()
+            .map(|signature| {
+                let signature_name = format!(
+                    "{}({})",
+                    signature.name.name.resolve(),
+                    signature.params.join(",")
+                );
+                let schema = self.resolve_function_schema(&signature.name, &signature_name);
+                ObjectId::new(schema, signature_name)
+            })
+            .collect();
         let mut targets: Vec<DropTarget> = Vec::new();
         let mut cascade_types: Vec<ObjectId> = Vec::new();
         for signature in &routine.signatures {
@@ -889,6 +1302,12 @@ impl AnalysisState {
                     if routine.if_exists => {}
                 RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
                     return MutationResult::conflict(format!("routine '{}' does not exist", id));
+                }
+                RoutineLookup::Unknown if id.schema == "pg_catalog" => {
+                    return MutationResult::conflict(format!(
+                        "cannot drop function {} because it is required by the database system",
+                        id.name
+                    ));
                 }
                 RoutineLookup::Unknown => {
                     return self.unresolved(EvidenceCode::UnknownObjectState);
@@ -970,6 +1389,7 @@ impl AnalysisState {
                         .into_iter()
                         .filter(|edge| {
                             !self.co_dropped_objects.contains(&edge.dependent)
+                                && !target_ids_in_stmt.contains(&edge.dependent)
                                 && matches!(
                                     self.local.functions.get(&edge.dependent),
                                     Some(FunctionOverlay::Present(_))
@@ -990,6 +1410,23 @@ impl AnalysisState {
                             id, dependent_casts[0].0, dependent_casts[0].1
                         ));
                     }
+                    let dependent_stats: Vec<ObjectId> = self
+                        .local
+                        .graph
+                        .statistics_for_function(&id)
+                        .into_iter()
+                        .filter(|edge| {
+                            !self.co_dropped_objects.contains(&edge.dependent)
+                                && self.extended_statistics_is_present(&edge.dependent)
+                        })
+                        .map(|edge| edge.dependent.clone())
+                        .collect();
+                    if !dependent_stats.is_empty() && !routine.cascade {
+                        return MutationResult::conflict(format!(
+                            "cannot drop function {} because statistics object {} requires it; use CASCADE",
+                            id, dependent_stats[0]
+                        ));
+                    }
                     if !targets.iter().any(|(existing, _, _)| existing == &id) {
                         targets.push((id, dependent_triggers, dependent_views));
                     }
@@ -998,6 +1435,12 @@ impl AnalysisState {
         }
         if targets.is_empty() {
             return MutationResult::NoOp;
+        }
+        if self.baseline_is_available() && !self.local.casts.has_full_cast_coverage() {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         if targets.iter().any(|(id, _, _)| {
             self.baseline_scoped_family_object(
@@ -1020,7 +1463,40 @@ impl AnalysisState {
                     surviving_reference = true;
                 }
             } else {
+                let stats_to_drop: Vec<ObjectId> = self
+                    .local
+                    .graph
+                    .statistics_for_function(id)
+                    .into_iter()
+                    .map(|e| e.dependent.clone())
+                    .collect();
                 self.drop_routine_with_edges(id);
+                if !stats_to_drop.is_empty() {
+                    for stats_id in &stats_to_drop {
+                        let owner_table =
+                            self.local.relations.iter().find_map(|(t_id, overlay)| {
+                                if let RelationOverlay::Present(rel) = overlay
+                                    && rel.extended_statistics.contains_key(stats_id)
+                                {
+                                    Some(t_id.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                        if let Some(t_id) = owner_table {
+                            self.snapshot_relation(&t_id);
+                            if let Some(RelationOverlay::Present(rel)) =
+                                self.local.relations.get_mut(&t_id)
+                            {
+                                rel.extended_statistics.remove(stats_id);
+                            }
+                        }
+                    }
+                    self.snapshot_graph_full();
+                    self.local
+                        .graph
+                        .retain_edges(|edge| !stats_to_drop.contains(&edge.dependent));
+                }
             }
         }
         if !cascade_types.is_empty() {
@@ -1042,13 +1518,19 @@ impl AnalysisState {
     pub(in crate::_internal::analysis::state) fn function_option_unmodeled(
         option: &FuncOptionFact,
     ) -> bool {
-        // `AS` bodies create no catalog dependencies; PostgreSQL parses
-        // string bodies lazily.
         !matches!(
             option,
             FuncOptionFact::Language(_)
                 | FuncOptionFact::Volatility(_)
                 | FuncOptionFact::Security(_)
+                | FuncOptionFact::Strict(_)
+                | FuncOptionFact::Leakproof(_)
+                | FuncOptionFact::Parallel(_)
+                | FuncOptionFact::Cost(_)
+                | FuncOptionFact::Rows(_)
+                | FuncOptionFact::Set { .. }
+                | FuncOptionFact::Reset(_)
+                | FuncOptionFact::Support(_)
                 | FuncOptionFact::As { .. }
                 | FuncOptionFact::Window
         )

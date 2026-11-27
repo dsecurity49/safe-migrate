@@ -280,7 +280,7 @@ pub(super) fn load_types(
     // types are excluded because PostgreSQL refuses both for them ("cannot
     // alter/drop array type"), so they are never independently addressable.
     let type_predicate = "t.typtype IN ('e', 'd', 'c', 'r', 'm') \
-                          OR (t.typtype = 'b' AND t.typelem = 0)";
+                          OR (t.typtype = 'b' AND t.typcategory <> 'A')";
     let query = format!(
         "
         SELECT

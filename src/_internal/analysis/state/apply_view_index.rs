@@ -811,7 +811,30 @@ impl AnalysisState {
                     ))
             });
         }
+        let mut covered_relations = HashSet::new();
+        for col_dep in &create.column_dependencies {
+            if let Some(ref col) = col_dep.column
+                && let Some(RelationOverlay::Present(rel)) =
+                    self.local.relations.get(&col_dep.relation)
+                && rel.columns_complete
+                && !rel.has_column(col)
+            {
+                continue;
+            }
+            covered_relations.insert(col_dep.relation.clone());
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                col_dep.relation.clone(),
+                DependencyKind::ViewDependency {
+                    view_generation: generation,
+                    referenced_column: col_dep.column.clone(),
+                },
+            ));
+        }
         for dependency in &create.depends_on {
+            if covered_relations.contains(dependency) {
+                continue;
+            }
             self.local.graph.add_edge(DependencyEdge::new(
                 create.id.clone(),
                 dependency.clone(),
@@ -889,7 +912,30 @@ impl AnalysisState {
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
         self.snapshot_graph_full();
+        let mut covered_relations = HashSet::new();
+        for col_dep in &create.column_dependencies {
+            if let Some(ref col) = col_dep.column
+                && let Some(RelationOverlay::Present(rel)) =
+                    self.local.relations.get(&col_dep.relation)
+                && rel.columns_complete
+                && !rel.has_column(col)
+            {
+                continue;
+            }
+            covered_relations.insert(col_dep.relation.clone());
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                col_dep.relation.clone(),
+                DependencyKind::ViewDependency {
+                    view_generation: generation,
+                    referenced_column: col_dep.column.clone(),
+                },
+            ));
+        }
         for dependency in &create.depends_on {
+            if covered_relations.contains(dependency) {
+                continue;
+            }
             self.local.graph.add_edge(DependencyEdge::new(
                 create.id.clone(),
                 dependency.clone(),

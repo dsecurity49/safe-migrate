@@ -1,6 +1,149 @@
 use super::*;
 
 impl AnalysisState {
+    pub(super) fn validate_rename_column_descendants(
+        &mut self,
+        alter_id: &ObjectId,
+        from: &str,
+        to: &str,
+        recursive_rename_descendants: &[ObjectId],
+    ) -> Option<MutationResult> {
+        let resolved_alter_id = self.local.graph.resolve_rename(alter_id);
+        let closure_set: HashSet<&ObjectId> = recursive_rename_descendants
+            .iter()
+            .map(|id| self.local.graph.resolve_rename(id))
+            .collect();
+        for descendant in recursive_rename_descendants {
+            let Some(RelationOverlay::Present(relation)) = self.local.relations.get(descendant)
+            else {
+                return Some(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+            };
+            if relation.has_column(to) {
+                return Some(MutationResult::conflict(format!(
+                    "column '{}' already exists on relation '{}'",
+                    to, descendant
+                )));
+            }
+            if relation.generated_columns.values().any(|generated| {
+                generated.expression.as_deref().is_none_or(|source| {
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
+                        source,
+                        &descendant.name,
+                        from,
+                        to,
+                    )
+                    .is_none()
+                })
+            }) {
+                return Some(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+            }
+            let Some(provenance) = relation.column_inheritance.get(from) else {
+                return Some(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+            };
+            let expected_parents = self
+                .local
+                .graph
+                .inheritance_parents_of(descendant)
+                .into_iter()
+                .filter(|&parent| parent == resolved_alter_id || closure_set.contains(parent))
+                .count() as u32;
+            if provenance.parent_count > expected_parents {
+                return Some(MutationResult::conflict(format!(
+                    "cannot rename inherited column '{}'",
+                    from
+                )));
+            }
+        }
+        None
+    }
+
+    pub(super) fn check_column_set_type_dependents(
+        &mut self,
+        table_id: &ObjectId,
+        column: &str,
+    ) -> Option<MutationResult> {
+        let resolved_table = self.local.graph.resolve_rename(table_id).clone();
+        let mut has_unknown_view_dep = false;
+        for edge in self.local.graph.edges() {
+            if !self.dependency_edge_is_current(edge) {
+                continue;
+            }
+            if self.local.graph.resolve_rename(&edge.referenced) != &resolved_table {
+                continue;
+            }
+            match &edge.kind {
+                DependencyKind::ViewDependency {
+                    referenced_column: Some(col),
+                    ..
+                } if col == column => {
+                    let dependent = self.local.graph.resolve_rename(&edge.dependent);
+                    let view_present = matches!(
+                        self.local.relations.get(dependent),
+                        Some(RelationOverlay::Present(rel))
+                            if matches!(
+                                rel.kind,
+                                crate::_internal::model::relation::RelationKind::View
+                                    | crate::_internal::model::relation::RelationKind::MaterializedView
+                            )
+                    ) || self
+                        .baseline_schemas
+                        .as_ref()
+                        .is_some_and(|schemas| !schemas.contains(&dependent.schema));
+                    if view_present {
+                        return Some(MutationResult::conflict(format!(
+                            "cannot alter type of a column used by a view or rule ({})",
+                            edge.dependent
+                        )));
+                    }
+                }
+                DependencyKind::ViewDependency {
+                    referenced_column: None,
+                    ..
+                } => {
+                    let dependent = self.local.graph.resolve_rename(&edge.dependent).clone();
+                    let has_specific_col_edge = self.local.graph.edges().iter().any(|other| {
+                        self.dependency_edge_is_current(other)
+                            && self.local.graph.resolve_rename(&other.dependent) == &dependent
+                            && self.local.graph.resolve_rename(&other.referenced) == &resolved_table
+                            && matches!(
+                                other.kind,
+                                DependencyKind::ViewDependency {
+                                    referenced_column: Some(_),
+                                    ..
+                                }
+                            )
+                    });
+                    if !has_specific_col_edge {
+                        has_unknown_view_dep = true;
+                    }
+                }
+                DependencyKind::RoutineUsesRelation {
+                    referenced_column: Some(col),
+                } if col == column
+                    && matches!(
+                        self.local.functions.get(&edge.dependent),
+                        Some(crate::_internal::model::function::FunctionOverlay::Present(
+                            _
+                        ))
+                    ) =>
+                {
+                    return Some(MutationResult::conflict(format!(
+                        "cannot alter type of a column used by a function or procedure ({})",
+                        edge.dependent
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if has_unknown_view_dep {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+        }
+        None
+    }
+
     /// Finish an ALTER TABLE after its action: update graph edges, owned
     /// sequences, and cascade effects.
     pub(super) fn alter_table_finish(
@@ -955,6 +1098,17 @@ impl AnalysisState {
             } else {
                 self.drop_not_null_constraint(&alter.id, &column);
             }
+        }
+        if !drop_column_statistics.is_empty() {
+            self.snapshot_graph_full();
+            self.local.graph.retain_edges(|edge| {
+                !(drop_column_statistics.contains(&edge.dependent)
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::StatisticsUsesRoutine { .. }
+                            | DependencyKind::StatisticsUsesType { .. }
+                    ))
+            });
         }
         match &alter.action {
             AlterTableActionMutation::InheritTable { parent }

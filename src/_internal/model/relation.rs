@@ -537,6 +537,8 @@ pub(crate) struct ExtendedStatisticsState {
     pub columns: Vec<String>,
     pub expressions: Option<String>,
     pub target: Option<i32>,
+    #[serde(skip)]
+    pub owner: Option<ObjectId>,
 }
 
 impl IdentityGeneration {

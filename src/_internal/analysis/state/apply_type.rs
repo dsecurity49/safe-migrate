@@ -344,6 +344,9 @@ impl AnalysisState {
                     language: "internal".to_string(),
                     security: crate::_internal::model::function::SecurityMode::Invoker,
                     aggregate: None,
+                    owner: None,
+                    dependent_extensions: std::collections::BTreeSet::new(),
+                    support_function: None,
                 }
             };
 

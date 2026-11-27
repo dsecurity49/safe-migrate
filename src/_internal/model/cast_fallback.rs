@@ -399,6 +399,12 @@ const ALL_CASTS: &[(&str, &str, &str, &str)] = &[
     ("xml", "text", "a", "b"),
 ];
 
+pub(crate) fn is_builtin_cast(source: &str, target: &str) -> bool {
+    ALL_CASTS
+        .binary_search_by_key(&(source, target), |(s, t, _, _)| (*s, *t))
+        .is_ok()
+}
+
 pub(crate) fn catalogue() -> CastCatalogue {
     CastCatalogue::from_entries(ALL_CASTS.iter().map(|(source, target, ctx, method)| {
         let context = match *ctx {

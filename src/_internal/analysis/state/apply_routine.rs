@@ -57,7 +57,7 @@ impl AnalysisState {
     pub(super) fn routine_lookup(
         &self,
         id: &ObjectId,
-        expected: impl FnOnce(RoutineKind) -> bool,
+        expected: impl Fn(RoutineKind) -> bool,
     ) -> ObjectLookup {
         if self.lookup_shadowed(id) {
             return ObjectLookup::Unknown;
@@ -68,6 +68,25 @@ impl AnalysisState {
             }
             Some(FunctionOverlay::Present(_)) => ObjectLookup::WrongKind,
             Some(FunctionOverlay::Dropped) => ObjectLookup::Tombstone,
+            None if id.schema == "pg_catalog" => {
+                let bare = id.name.split('(').next().unwrap_or(id.name.as_str());
+                let is_agg = self.local.aggregates.signatures(bare).is_some();
+                let is_fn =
+                    crate::_internal::model::builtin_routine::is_builtin_pg_catalog_routine(bare);
+                if (is_agg && expected(RoutineKind::Aggregate))
+                    || (is_fn && (expected(RoutineKind::Function) || expected(RoutineKind::Window)))
+                {
+                    ObjectLookup::Unknown
+                } else if (is_agg || is_fn)
+                    && !(expected(RoutineKind::Aggregate)
+                        || expected(RoutineKind::Function)
+                        || expected(RoutineKind::Window))
+                {
+                    ObjectLookup::WrongKind
+                } else {
+                    ObjectLookup::AuthoritativelyAbsent
+                }
+            }
             None if self.baseline_covers_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Routines,
@@ -361,6 +380,7 @@ impl AnalysisState {
 
     pub(super) fn apply_routine_owner_change(
         &mut self,
+        id: &ObjectId,
         owner: &crate::_internal::analysis::facts::RoleFact,
     ) -> MutationResult {
         let Some((owner_name, known)) = self.role_fact_identity(owner) else {
@@ -375,11 +395,19 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
         }
-        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        self.snapshot_function(id);
+        if let Some(FunctionOverlay::Present(existing)) = self.local.functions.get_mut(id) {
+            existing.owner = Some(ObjectId::new("", owner_name));
+        }
         MutationResult::Applied
     }
 
-    pub(super) fn apply_routine_depends_on_extension(&mut self, extension: &str) -> MutationResult {
+    pub(super) fn apply_routine_depends_on_extension(
+        &mut self,
+        id: &ObjectId,
+        extension: &str,
+        is_no: bool,
+    ) -> MutationResult {
         match self.local.extensions.get(extension) {
             Some(crate::_internal::model::extension::ExtensionOverlay::Present(_)) => {}
             Some(crate::_internal::model::extension::ExtensionOverlay::Dropped) => {
@@ -400,7 +428,14 @@ impl AnalysisState {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
         }
-        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        self.snapshot_function(id);
+        if let Some(FunctionOverlay::Present(existing)) = self.local.functions.get_mut(id) {
+            if is_no {
+                existing.dependent_extensions.remove(extension);
+            } else {
+                existing.dependent_extensions.insert(extension.to_string());
+            }
+        }
         MutationResult::Applied
     }
 
@@ -462,9 +497,18 @@ impl AnalysisState {
                     }
                 }
                 FuncOptionFact::Support(Some(qname)) => {
-                    let sig_name = format!("{}(internal)", qname.name.resolve());
+                    let bare_name = qname.name.resolve();
+                    let sig_name = format!("{bare_name}(internal)");
                     let schema = self.resolve_function_schema(qname, &sig_name);
                     let support_id = ObjectId::new(schema, sig_name);
+                    let is_pg_catalog_builtin = qname
+                        .schema
+                        .as_ref()
+                        .is_none_or(|s| s.resolve() == "pg_catalog")
+                        && crate::_internal::model::builtin_routine::is_builtin_pg_catalog_support_for_version(
+                            &bare_name,
+                            self.pg_version_num,
+                        );
                     match self.routine_lookup(&support_id, |kind| kind == RoutineKind::Function) {
                         RoutineLookup::Present => {
                             if let Some(FunctionOverlay::Present(support_fn)) =
@@ -473,8 +517,7 @@ impl AnalysisState {
                                 && !support_fn.return_type.eq_ignore_ascii_case("internal")
                             {
                                 return Err(MutationResult::conflict(format!(
-                                    "support function {} must return type internal",
-                                    qname.name.resolve()
+                                    "support function {bare_name} must return type internal"
                                 )));
                             }
                             support_functions.push(support_id);
@@ -485,15 +528,75 @@ impl AnalysisState {
                                 support_id
                             )));
                         }
-                        RoutineLookup::AuthoritativelyAbsent if qname.schema.is_some() => {
+                        RoutineLookup::AuthoritativelyAbsent | RoutineLookup::Unknown
+                            if is_pg_catalog_builtin => {}
+                        RoutineLookup::AuthoritativelyAbsent => {
                             return Err(MutationResult::conflict(format!(
                                 "function '{}' does not exist",
                                 support_id
                             )));
                         }
-                        RoutineLookup::AuthoritativelyAbsent | RoutineLookup::Unknown => {
+                        RoutineLookup::Unknown => {
                             self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                         }
+                    }
+                }
+                FuncOptionFact::Set {
+                    name,
+                    value,
+                    from_current_or_default,
+                } => {
+                    let key = name.to_ascii_lowercase();
+                    if key == "transaction_timeout"
+                        && self.pg_version_num.unwrap_or(180_000) < 170_000
+                    {
+                        return Err(MutationResult::conflict(format!(
+                            "unrecognized configuration parameter \"{name}\""
+                        )));
+                    }
+                    if matches!(
+                        key.as_str(),
+                        "statement_timeout"
+                            | "lock_timeout"
+                            | "idle_in_transaction_session_timeout"
+                            | "transaction_timeout"
+                    ) {
+                        if !*from_current_or_default
+                            && !value.as_deref().is_some_and(|v| {
+                                crate::_internal::analysis::settings::parse_timeout_ms(v).is_ok()
+                            })
+                        {
+                            return Err(MutationResult::conflict(format!(
+                                "invalid value for parameter \"{name}\""
+                            )));
+                        }
+                    } else if !matches!(
+                        key.as_str(),
+                        "search_path"
+                            | "role"
+                            | "work_mem"
+                            | "temp_buffers"
+                            | "maintenance_work_mem"
+                            | "client_min_messages"
+                            | "log_min_messages"
+                            | "timezone"
+                            | "datestyle"
+                            | "intervalstyle"
+                            | "application_name"
+                            | "check_function_bodies"
+                            | "row_security"
+                            | "jit"
+                            | "enable_seqscan"
+                            | "enable_indexscan"
+                            | "enable_bitmapscan"
+                            | "enable_hashjoin"
+                            | "enable_mergejoin"
+                            | "enable_nestloop"
+                            | "default_transaction_isolation"
+                            | "default_transaction_read_only"
+                            | "default_transaction_deferrable"
+                    ) {
+                        self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                     }
                 }
                 _ => {}
@@ -563,6 +666,14 @@ impl AnalysisState {
                 Ok(support) => support,
                 Err(result) => return result,
             };
+        if let Err(result) = self.validate_routine_body(
+            false,
+            &function.params,
+            function.return_type.as_ref(),
+            &function.validation_dependencies,
+        ) {
+            return result;
+        }
         self.snapshot_function(&function.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -600,10 +711,6 @@ impl AnalysisState {
             .unwrap_or_else(|| "sql".to_string());
 
         if function.options.iter().any(Self::function_option_unmodeled) {
-            // FunctionState intentionally stores only the attributes used by
-            // current rules.  Keep the useful identity/volatility fields, but
-            // taint the state when PostgreSQL attributes such as STRICT,
-            // PARALLEL, COST, or SUPPORT cannot be represented.
             self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
@@ -651,6 +758,12 @@ impl AnalysisState {
                 language,
                 security,
                 aggregate: None,
+                owner: self
+                    .local
+                    .current_role_known
+                    .then(|| ObjectId::new("", &self.local.current_role)),
+                dependent_extensions: std::collections::BTreeSet::new(),
+                support_function: support_functions.last().cloned(),
             }),
         );
         self.record_routine_body_dependencies(&function.id, &function.body_dependencies);
@@ -672,7 +785,10 @@ impl AnalysisState {
         function: &AlterFunctionMutation,
     ) -> MutationResult {
         match self.routine_lookup(&function.id, |kind| {
-            matches!(kind, RoutineKind::Function | RoutineKind::Window)
+            matches!(
+                kind,
+                RoutineKind::Function | RoutineKind::Window | RoutineKind::Aggregate
+            )
         }) {
             RoutineLookup::Present => {}
             RoutineLookup::WrongKind => {
@@ -684,6 +800,9 @@ impl AnalysisState {
                     function.id
                 ));
             }
+            RoutineLookup::Unknown if function.id.schema == "pg_catalog" => {
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+            }
             RoutineLookup::Unknown => {
                 return self.unresolved(EvidenceCode::UnknownObjectState);
             }
@@ -691,6 +810,15 @@ impl AnalysisState {
 
         match &function.action {
             AlterFunctionAction::OptionsChange(options) => {
+                if self
+                    .existing_routine(&function.id)
+                    .is_some_and(|existing| existing.routine_kind == RoutineKind::Aggregate)
+                {
+                    return MutationResult::conflict(format!(
+                        "'{}' is an aggregate function",
+                        function.id
+                    ));
+                }
                 let returns_set = self
                     .existing_routine(&function.id)
                     .is_some_and(|existing| existing.returns_set);
@@ -730,8 +858,28 @@ impl AnalysisState {
                         }
                     }
                 }
-                if !support_functions.is_empty() {
+                if options
+                    .iter()
+                    .any(|o| matches!(o, FuncOptionFact::Support(_)))
+                {
+                    let old_support = self.local.functions.get_mut(&function.id).and_then(
+                        |overlay| match overlay {
+                            FunctionOverlay::Present(existing) => {
+                                let prev = existing.support_function.take();
+                                existing.support_function = support_functions.last().cloned();
+                                prev
+                            }
+                            _ => None,
+                        },
+                    );
                     self.snapshot_graph_full();
+                    if let Some(prev_id) = old_support {
+                        self.local.graph.retain_edges(|edge| {
+                            !(edge.dependent == function.id
+                                && edge.referenced == prev_id
+                                && matches!(edge.kind, DependencyKind::RoutineUsesRoutine { .. }))
+                        });
+                    }
                     for support_id in support_functions {
                         self.local.graph.add_edge(DependencyEdge::new(
                             function.id.clone(),
@@ -767,11 +915,13 @@ impl AnalysisState {
                 self.move_function(&function.id, &new_id);
             }
             AlterFunctionAction::OwnerChange(owner) => {
-                return self.apply_routine_owner_change(owner);
+                return self.apply_routine_owner_change(&function.id, owner);
             }
-            AlterFunctionAction::DependsOnExtension { extension }
-            | AlterFunctionAction::NoDependsOnExtension { extension } => {
-                return self.apply_routine_depends_on_extension(extension);
+            AlterFunctionAction::DependsOnExtension { extension } => {
+                return self.apply_routine_depends_on_extension(&function.id, extension, false);
+            }
+            AlterFunctionAction::NoDependsOnExtension { extension } => {
+                return self.apply_routine_depends_on_extension(&function.id, extension, true);
             }
         }
         MutationResult::Applied
@@ -835,6 +985,19 @@ impl AnalysisState {
         // DROP.  Preflight the complete set first so an unknown or invalid
         // later signature cannot leave an earlier function dropped in the
         // simulator when the statement itself would fail.
+        let target_ids_in_stmt: HashSet<ObjectId> = function
+            .signatures
+            .iter()
+            .map(|signature| {
+                let signature_name = format!(
+                    "{}({})",
+                    signature.name.name.resolve(),
+                    signature.params.join(",")
+                );
+                let schema = self.resolve_function_schema(&signature.name, &signature_name);
+                ObjectId::new(schema, signature_name)
+            })
+            .collect();
         let mut targets: Vec<DropTarget> = Vec::new();
         let mut cascade_types: Vec<ObjectId> = Vec::new();
         for signature in &function.signatures {
@@ -864,6 +1027,12 @@ impl AnalysisState {
                 }
                 RoutineLookup::AuthoritativelyAbsent if !function.if_exists => {
                     return MutationResult::conflict(format!("function '{}' does not exist", id));
+                }
+                RoutineLookup::Unknown if id.schema == "pg_catalog" => {
+                    return MutationResult::conflict(format!(
+                        "cannot drop function {} because it is required by the database system",
+                        id.name
+                    ));
                 }
                 RoutineLookup::Unknown => {
                     return self.unresolved(EvidenceCode::UnknownObjectState);
@@ -955,6 +1124,7 @@ impl AnalysisState {
                         .into_iter()
                         .filter(|edge| {
                             !self.co_dropped_objects.contains(&edge.dependent)
+                                && !target_ids_in_stmt.contains(&edge.dependent)
                                 && matches!(
                                     self.local.functions.get(&edge.dependent),
                                     Some(FunctionOverlay::Present(_))
@@ -968,11 +1138,38 @@ impl AnalysisState {
                             id, dependent_routines[0]
                         ));
                     }
-                    let dependent_casts = self.local.casts.casts_using_function(&id);
+                    let dependent_casts: Vec<(String, String)> = self
+                        .local
+                        .casts
+                        .casts_using_function(&id)
+                        .into_iter()
+                        .filter(|(src, dst)| {
+                            !self
+                                .co_dropped_objects
+                                .contains(&ObjectId::new("", format!("{src}->{dst}")))
+                        })
+                        .collect();
                     if !dependent_casts.is_empty() && !function.cascade {
                         return MutationResult::conflict(format!(
                             "cannot drop function {} because cast from {} to {} requires it; use CASCADE",
                             id, dependent_casts[0].0, dependent_casts[0].1
+                        ));
+                    }
+                    let dependent_stats: Vec<ObjectId> = self
+                        .local
+                        .graph
+                        .statistics_for_function(&id)
+                        .into_iter()
+                        .filter(|edge| {
+                            !self.co_dropped_objects.contains(&edge.dependent)
+                                && self.extended_statistics_is_present(&edge.dependent)
+                        })
+                        .map(|edge| edge.dependent.clone())
+                        .collect();
+                    if !dependent_stats.is_empty() && !function.cascade {
+                        return MutationResult::conflict(format!(
+                            "cannot drop function {} because statistics object {} requires it; use CASCADE",
+                            id, dependent_stats[0]
                         ));
                     }
                     if !targets.iter().any(|(existing, _, _)| existing == &id) {
@@ -985,6 +1182,13 @@ impl AnalysisState {
 
         if targets.is_empty() {
             return MutationResult::NoOp;
+        }
+
+        if self.baseline_is_available() && !self.local.casts.has_full_cast_coverage() {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
 
         if targets.iter().any(|(id, _, _)| {
@@ -1062,6 +1266,14 @@ impl AnalysisState {
             return result;
         }
         if let Err(result) = self.validate_routine_options(true, false, &procedure.options) {
+            return result;
+        }
+        if let Err(result) = self.validate_routine_body(
+            true,
+            &procedure.params,
+            None,
+            &procedure.validation_dependencies,
+        ) {
             return result;
         }
         self.snapshot_function(&procedure.id);
@@ -1149,6 +1361,12 @@ impl AnalysisState {
                 language,
                 security,
                 aggregate: None,
+                owner: self
+                    .local
+                    .current_role_known
+                    .then(|| ObjectId::new("", &self.local.current_role)),
+                dependent_extensions: std::collections::BTreeSet::new(),
+                support_function: None,
             }),
         );
         self.record_routine_body_dependencies(&procedure.id, &procedure.body_dependencies);
@@ -1224,11 +1442,13 @@ impl AnalysisState {
                 }
             }
             AlterFunctionAction::OwnerChange(owner) => {
-                return self.apply_routine_owner_change(owner);
+                return self.apply_routine_owner_change(&procedure.id, owner);
             }
-            AlterFunctionAction::DependsOnExtension { extension }
-            | AlterFunctionAction::NoDependsOnExtension { extension } => {
-                return self.apply_routine_depends_on_extension(extension);
+            AlterFunctionAction::DependsOnExtension { extension } => {
+                return self.apply_routine_depends_on_extension(&procedure.id, extension, false);
+            }
+            AlterFunctionAction::NoDependsOnExtension { extension } => {
+                return self.apply_routine_depends_on_extension(&procedure.id, extension, true);
             }
         }
         MutationResult::Applied

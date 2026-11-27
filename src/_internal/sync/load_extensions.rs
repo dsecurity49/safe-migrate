@@ -86,8 +86,16 @@ pub(super) fn load_extensions(
                 tg.tgname AS trigger_name,
                 coln.nspname AS collation_schema,
                 col.collname AS collation_name,
-                pg_catalog.format_type(castsrc.oid, NULL) AS cast_source,
-                pg_catalog.format_type(casttgt.oid, NULL) AS cast_target
+                CASE
+                    WHEN castsrc_ns.nspname = 'pg_catalog' THEN pg_catalog.format_type(castsrc.oid, NULL)
+                    WHEN castsrc.typcategory = 'A' AND castsrc.typelem <> 0 THEN castsrc_ns.nspname || '.' || castsrc_elem.typname || '[]'
+                    ELSE castsrc_ns.nspname || '.' || castsrc.typname
+                END AS cast_source,
+                CASE
+                    WHEN casttgt_ns.nspname = 'pg_catalog' THEN pg_catalog.format_type(casttgt.oid, NULL)
+                    WHEN casttgt.typcategory = 'A' AND casttgt.typelem <> 0 THEN casttgt_ns.nspname || '.' || casttgt_elem.typname || '[]'
+                    ELSE casttgt_ns.nspname || '.' || casttgt.typname
+                END AS cast_target
             FROM pg_extension e
             JOIN pg_depend d
               ON d.refclassid = 'pg_extension'::regclass
@@ -118,7 +126,11 @@ pub(super) fn load_extensions(
             LEFT JOIN pg_cast cast_row
               ON d.classid = 'pg_cast'::regclass AND cast_row.oid = d.objid
             LEFT JOIN pg_type castsrc ON castsrc.oid = cast_row.castsource
+            LEFT JOIN pg_namespace castsrc_ns ON castsrc_ns.oid = castsrc.typnamespace
+            LEFT JOIN pg_type castsrc_elem ON castsrc_elem.oid = castsrc.typelem
             LEFT JOIN pg_type casttgt ON casttgt.oid = cast_row.casttarget
+            LEFT JOIN pg_namespace casttgt_ns ON casttgt_ns.oid = casttgt.typnamespace
+            LEFT JOIN pg_type casttgt_elem ON casttgt_elem.oid = casttgt.typelem
             ORDER BY e.extname, d.classid, d.objid;
             ",
             &[],

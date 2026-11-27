@@ -317,6 +317,7 @@ pub(crate) struct CreateMaterializedView {
     pub projection_complete: bool,
     pub routines: Vec<ViewRoutine>,
     pub cast_types: Vec<ObjectId>,
+    pub column_dependencies: Vec<RoutineRelationDependency>,
     pub access_method: Option<String>,
     pub tablespace: Option<String>,
     pub options: Vec<crate::_internal::analysis::facts::AttributeFact>,
@@ -613,6 +614,7 @@ pub(crate) struct CreateView {
     pub depends_on: Vec<ObjectId>,
     pub routines: Vec<ViewRoutine>,
     pub cast_types: Vec<ObjectId>,
+    pub column_dependencies: Vec<RoutineRelationDependency>,
     /// Projected columns, empty when the projection could not be derived.
     pub columns: Vec<ViewColumn>,
     /// Explicit output-column names, applied to the projection prefix.
@@ -723,11 +725,27 @@ pub(crate) struct RoutineRelationDependency {
     pub column: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RoutineReturnExprMutation {
+    LiteralType(String),
+    ExplicitCast(String),
+    Column {
+        relation: Option<ObjectId>,
+        column: String,
+    },
+    ParameterType(String),
+    RoutineCall(ObjectId),
+    MultiColumn,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RoutineBodyDependencies {
     pub relations: Vec<RoutineRelationDependency>,
     pub routines: Vec<ViewRoutine>,
     pub types: Vec<ObjectId>,
+    pub unqualified_columns: Vec<String>,
+    pub return_expr: Option<RoutineReturnExprMutation>,
+    pub has_syntax_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -738,6 +756,7 @@ pub(crate) struct CreateFunctionMutation {
     pub return_type: Option<crate::_internal::analysis::facts::RetTypeFact>,
     pub options: Vec<crate::_internal::analysis::facts::FuncOptionFact>,
     pub body_dependencies: RoutineBodyDependencies,
+    pub validation_dependencies: RoutineBodyDependencies,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -760,6 +779,7 @@ pub(crate) struct CreateProcedureMutation {
     pub params: Vec<crate::_internal::analysis::facts::ParamFact>,
     pub options: Vec<crate::_internal::analysis::facts::FuncOptionFact>,
     pub body_dependencies: RoutineBodyDependencies,
+    pub validation_dependencies: RoutineBodyDependencies,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1187,7 +1207,7 @@ pub(crate) struct DropCastMutation {
     pub cascade: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateStatisticsMutation {
     pub id: Option<ObjectId>,
     pub if_not_exists: bool,
@@ -1197,12 +1217,15 @@ pub(crate) struct CreateStatisticsMutation {
     pub expressions: Vec<String>,
     pub expression_count: usize,
     pub expressions_sql: Option<String>,
+    pub expression_routines: Vec<ViewRoutine>,
+    pub expression_types: Vec<ObjectId>,
     pub table: ObjectId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AlterStatisticsMutation {
     pub id: ObjectId,
+    pub if_exists: bool,
     pub action: crate::_internal::analysis::facts::AlterStatisticsActionFact,
 }
 
@@ -1216,10 +1239,12 @@ pub(crate) struct DropStatisticsMutation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AnalyzeTargetMutation {
     pub table_id: ObjectId,
+    pub is_unqualified: bool,
     pub columns: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AnalyzeMutation {
+    pub options: Vec<crate::_internal::analysis::facts::AttributeFact>,
     pub targets: Vec<AnalyzeTargetMutation>,
 }

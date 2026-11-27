@@ -225,6 +225,9 @@ pub(crate) fn for_mutation(
         Mutation::DropRoutine(_) => {
             reads.functions.require_all();
         }
+        Mutation::AlterStatistics(_) | Mutation::DropStatistics(_) => {
+            reads.relations.require_all();
+        }
         Mutation::CreateSchema(_)
         | Mutation::AlterSchema(_)
         | Mutation::DropSchema(_)
@@ -286,8 +289,6 @@ pub(crate) fn for_mutation(
         | Mutation::CreateCast(_)
         | Mutation::DropCast(_)
         | Mutation::CreateStatistics(_)
-        | Mutation::AlterStatistics(_)
-        | Mutation::DropStatistics(_)
         | Mutation::Analyze(_)
         | Mutation::Vacuum { .. } => {}
     }

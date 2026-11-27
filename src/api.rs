@@ -810,6 +810,7 @@ pub struct Baseline {
     available: bool,
     encrypted: bool,
     format_version: Option<u32>,
+    format_minor_version: Option<u32>,
     path: Option<std::path::PathBuf>,
 }
 
@@ -836,6 +837,7 @@ impl Baseline {
             available: false,
             encrypted: false,
             format_version: None,
+            format_minor_version: None,
             path: None,
         }
     }
@@ -848,12 +850,14 @@ impl Baseline {
     /// Returns [`ErrorKind::Cache`] when the file cannot be read, its encryption
     /// configuration or key is wrong, or its encoded contents fail validation.
     pub fn load(path: &Path, config: &Config) -> Result<Self, Error> {
-        let (inner, format_version, encrypted) = decode_cache(path, config.cache_encryption())?;
+        let (inner, format_version, format_minor_version, encrypted) =
+            decode_cache(path, config.cache_encryption())?;
         Ok(Self {
             inner,
             available: true,
             encrypted,
             format_version: Some(format_version),
+            format_minor_version: Some(format_minor_version),
             path: Some(path.to_path_buf()),
         })
     }
@@ -869,12 +873,14 @@ impl Baseline {
     /// or [`ErrorKind::Cache`] when the cache cannot be authenticated or decoded.
     pub fn load_with_key(path: &Path, config: &Config, key: &CacheKey) -> Result<Self, Error> {
         require_cache_encryption(config)?;
-        let (inner, format_version, encrypted) = decode_cache_with_key(path, key)?;
+        let (inner, format_version, format_minor_version, encrypted) =
+            decode_cache_with_key(path, key)?;
         Ok(Self {
             inner,
             available: true,
             encrypted,
             format_version: Some(format_version),
+            format_minor_version: Some(format_minor_version),
             path: Some(path.to_path_buf()),
         })
     }
@@ -978,7 +984,7 @@ impl Baseline {
 fn decode_cache(
     path: &Path,
     cache_encryption: bool,
-) -> Result<(InternalDbCache, u32, bool), Error> {
+) -> Result<(InternalDbCache, u32, u32, bool), Error> {
     let encoded = read_cache_bytes(path).map_err(|error| {
         let detail = error.to_string();
         Error::with_anyhow_source(
@@ -1005,7 +1011,7 @@ fn decode_cache_payload(
     path: &Path,
     decrypted: Vec<u8>,
     encrypted: bool,
-) -> Result<(InternalDbCache, u32, bool), Error> {
+) -> Result<(InternalDbCache, u32, u32, bool), Error> {
     let decrypted = Zeroizing::new(decrypted);
     let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(decrypted)).map_err(|error| {
         Error::with_source(
@@ -1044,6 +1050,26 @@ fn decode_cache_payload(
         .with_limit::<MAX_CACHE_DECODE_BYTES>();
     let versioned: DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, codec)
         .map_err(|error| {
+            let is_unknown_version_variant = match &error {
+                bincode::error::DecodeError::UnexpectedVariant {
+                    type_name: "DbCacheVersioned",
+                    ..
+                } => true,
+                bincode::error::DecodeError::OtherString(msg) => {
+                    msg.contains("expected variant index 0 <= i < 13")
+                }
+                _ => false,
+            };
+            if is_unknown_version_variant {
+                return Error::with_source(
+                    ErrorKind::Cache,
+                    format!(
+                        "{} uses an unsupported cache format; run `safe-migrate sync`",
+                        path.display()
+                    ),
+                    error,
+                );
+            }
             let detail = if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
                 format!(
                     "exceeds the {} MiB decoded-size limit",
@@ -1081,6 +1107,7 @@ fn decode_cache_payload(
         )));
     }
     let format_version = versioned.format_version();
+    let format_minor_version = versioned.minor_version();
     if format_version != CACHE_FORMAT_VERSION {
         return Err(Error::cache(format!(
             "{} has a mismatched cache format header",
@@ -1088,13 +1115,13 @@ fn decode_cache_payload(
         )));
     }
     let cache = versioned.into_cache().map_err(Error::cache)?;
-    Ok((cache, format_version, encrypted))
+    Ok((cache, format_version, format_minor_version, encrypted))
 }
 
 fn decode_cache_with_key(
     path: &Path,
     key: &CacheKey,
-) -> Result<(InternalDbCache, u32, bool), Error> {
+) -> Result<(InternalDbCache, u32, u32, bool), Error> {
     let encoded = read_cache_bytes(path).map_err(|error| {
         let detail = error.to_string();
         Error::with_anyhow_source(
@@ -1258,6 +1285,12 @@ pub struct BaselineContents {
     pub dependencies: usize,
     /// Number of inheritance edges.
     pub inheritances: usize,
+    /// Number of extended statistics objects.
+    pub extended_statistics: usize,
+    /// Number of casts in the cast catalogue.
+    pub casts: usize,
+    /// Number of routine body dependency edges.
+    pub routine_dependencies: usize,
 }
 
 /// Redacted baseline inspection suitable for display or serialization.
@@ -1270,6 +1303,8 @@ pub struct BaselineInspection {
     pub path: Option<String>,
     /// On-disk cache format version, when a cache is present.
     pub format_version: Option<u32>,
+    /// Minor cache format version (e.g. `1` for V12.1), when a cache is present.
+    pub format_minor_version: Option<u32>,
     /// Whether the source cache was encrypted.
     pub encrypted: bool,
     /// Baseline creation time as Unix seconds.
@@ -1322,8 +1357,10 @@ impl BaselineInspection {
         let mut materialized_views = 0;
         let mut foreign_tables = 0;
         let mut columns = 0;
+        let mut extended_statistics = 0;
         for relation in cache.relations.values() {
             columns += relation.columns.len();
+            extended_statistics += relation.extended_statistics.len();
             match relation.kind {
                 RelationKind::Table => tables += 1,
                 RelationKind::View => views += 1,
@@ -1350,6 +1387,7 @@ impl BaselineInspection {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             format_version: baseline.format_version,
+            format_minor_version: baseline.format_minor_version,
             encrypted: baseline.encrypted,
             created_at_unix_secs: cache.metadata.created_at_unix_secs,
             age_seconds: cache
@@ -1403,6 +1441,9 @@ impl BaselineInspection {
                 roles: cache.roles.len(),
                 dependencies: cache.dependencies.len(),
                 inheritances: cache.inheritances.len(),
+                extended_statistics,
+                casts: cache.casts.as_ref().map_or(0, |c| c.entries().len()),
+                routine_dependencies: cache.routine_dependencies.len(),
             },
         }
     }
@@ -1862,6 +1903,21 @@ mod tests {
         assert_eq!(
             markdown_inline_code("cache\x1b[2J\r\n`"),
             "cache\\u{1b}[2J  '"
+        );
+    }
+
+    #[test]
+    fn unknown_minor_cache_variant_reports_unsupported_format_instead_of_corruption() {
+        let mut raw = crate::_internal::db::cache::CACHE_MAGIC.to_vec();
+        raw.extend_from_slice(&[99, 0, 0, 0]);
+        let payload = zstd::stream::encode_all(std::io::Cursor::new(raw), 1)
+            .expect("zstd encode should succeed");
+        let err = decode_cache_payload(Path::new("future_minor.cache"), payload, false)
+            .expect_err("unknown DbCacheVersioned variant should fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("uses an unsupported cache format; run `safe-migrate sync`"),
+            "unexpected error message: {msg}"
         );
     }
 }

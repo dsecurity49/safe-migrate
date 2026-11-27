@@ -1095,11 +1095,21 @@ impl AnalysisState {
                                 self.local.functions.get(&edge.dependent),
                                 Some(FunctionOverlay::Present(_))
                             )
+                    }) || self.local.graph.statistics_for_type(probe).iter().any(|edge| {
+                        !self.co_dropped_objects.contains(&edge.dependent)
+                            && self.extended_statistics_is_present(&edge.dependent)
                     })
                 })
-        }) || ids
-            .iter()
-            .any(|blocking| self.local.casts.has_casts_for_type(&blocking.to_string()))
+        }) || {
+            let group_names: Vec<String> = ids.iter().map(ToString::to_string).collect();
+            ids.iter().any(|blocking| {
+                self.local.casts.has_external_casts_for_type(
+                    &blocking.to_string(),
+                    &self.co_dropped_objects,
+                    &group_names,
+                )
+            })
+        }
     }
 }
 

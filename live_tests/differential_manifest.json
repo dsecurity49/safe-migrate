@@ -1811,7 +1811,19 @@
     "024_statistics_type_without_btree_opclass.sql",
     "025_statistics_missing_expression_column.sql",
     "026_drop_cast_function_without_cascade.sql",
-    "027_drop_missing_cast.sql"
+    "027_drop_missing_cast.sql",
+    "safe_060_alter_function_and_routine_on_aggregate.sql",
+    "safe_061_routine_support_and_depends_on_extension.sql",
+    "safe_062_analyze_pg_catalog_and_statistics_options.sql",
+    "safe_063_begin_atomic_function_lifecycle.sql",
+    "028_drop_table_used_by_synced_begin_atomic_function.sql",
+    "029_drop_column_used_by_synced_begin_atomic_function.sql",
+    "030_drop_function_used_by_statistics_expression.sql",
+    "031_create_function_begin_atomic_missing_column.sql",
+    "032_create_function_return_type_mismatch.sql",
+    "033_analyze_invalid_option_and_duplicate_column.sql",
+    "034_alter_function_invalid_set_and_missing_support.sql",
+    "035_drop_role_owning_aggregate.sql"
    ],
    "fixture_transactional": {
     "safe_010_role_transaction_semantics.sql": false,
@@ -1846,7 +1858,8 @@
     "safe_035_metadata_reset.sql": 160000,
     "safe_023_role_options.sql": 160000,
     "safe_052_crashed_detach_finalize.sql": 140000,
-    "safe_053_cancelled_detach_finalize.sql": 140000
+    "safe_053_cancelled_detach_finalize.sql": 140000,
+    "safe_062_analyze_pg_catalog_and_statistics_options.sql": 160000
    },
    "pending_detach_setup": {
     "safe_052_crashed_detach_finalize.sql": {
@@ -1935,6 +1948,38 @@
     },
     "027_drop_missing_cast.sql": {
      "sqlstate": "42704",
+     "simulator_rule": "chain-conflict"
+    },
+    "028_drop_table_used_by_synced_begin_atomic_function.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "029_drop_column_used_by_synced_begin_atomic_function.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "030_drop_function_used_by_statistics_expression.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "031_create_function_begin_atomic_missing_column.sql": {
+     "sqlstate": "42703",
+     "simulator_rule": "chain-conflict"
+    },
+    "032_create_function_return_type_mismatch.sql": {
+     "sqlstate": "42P13",
+     "simulator_rule": "chain-conflict"
+    },
+    "033_analyze_invalid_option_and_duplicate_column.sql": {
+     "sqlstate": "42701",
+     "simulator_rule": "chain-conflict"
+    },
+    "034_alter_function_invalid_set_and_missing_support.sql": {
+     "sqlstate": "22023",
+     "simulator_rule": "chain-conflict"
+    },
+    "035_drop_role_owning_aggregate.sql": {
+     "sqlstate": "2BP01",
      "simulator_rule": "chain-conflict"
     }
    },
@@ -2268,6 +2313,19 @@
     ],
     "safe_059_cast_lifecycle_and_function_cascade.sql": [
      "types",
+     "functions"
+    ],
+    "safe_060_alter_function_and_routine_on_aggregate.sql": [
+     "functions"
+    ],
+    "safe_061_routine_support_and_depends_on_extension.sql": [
+     "functions"
+    ],
+    "safe_062_analyze_pg_catalog_and_statistics_options.sql": [
+     "relations",
+     "extended_statistics"
+    ],
+    "safe_063_begin_atomic_function_lifecycle.sql": [
      "functions"
     ]
    },

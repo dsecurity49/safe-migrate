@@ -13,4 +13,5 @@ use safe_migrate::_internal::report::violations::{ObjectKind, ViolationTier};
 use safe_migrate::api::{Certainty, Config, RuleConfig};
 
 mod object_rules;
+mod object_rules_more;
 mod relation_rules;

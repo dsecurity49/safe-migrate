@@ -349,7 +349,8 @@ pub(super) fn load_relations_and_columns(
                 ORDER BY attribute.attname
             ) AS columns,
             pg_get_expr(stats.stxexprs, stats.stxrelid, false) AS expressions,
-            stats.stxstattarget::integer AS statistics_target
+            stats.stxstattarget::integer AS statistics_target,
+            pg_catalog.pg_get_userbyid(stats.stxowner) AS owner_name
         FROM pg_statistic_ext stats
         JOIN pg_class c ON c.oid = stats.stxrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -395,6 +396,10 @@ pub(super) fn load_relations_and_columns(
                 target: row
                     .try_get("statistics_target")
                     .context("extended statistics target")?,
+                owner: Some(relation_owner_id(
+                    row.try_get::<_, String>("owner_name")
+                        .context("extended statistics owner")?,
+                )),
             },
         );
     }

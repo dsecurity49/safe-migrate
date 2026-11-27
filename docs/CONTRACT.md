@@ -143,7 +143,7 @@ TOML keys and effective values).
        base `DbCache` layout.
      - `DbCacheVersioned::V12_1(Box<DbCache>, CacheExtensionV12_1)` (**Cache
        V12.1**, discriminant 12): unchanged `Box<DbCache>` plus typed minor
-       extensions (`CacheExtensionV12_1 { casts: Vec<CastEntry> }`).
+       extensions (`CacheExtensionV12_1 { casts: Vec<CastEntry>, routine_dependencies: Vec<RoutineDependencyCache> }`).
      - `V1`–`V11` and trailing bytes are rejected before semantic validation.
        `sync` writes `V12_1`, while the reader accepts both `V12.0` and `V12.1`
        under major version `12`.
