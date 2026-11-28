@@ -91,11 +91,11 @@ pub(super) fn populate_cache_from_client(
     // they are read first because every loader that renders a type name needs
     // them to agree with what a migration would resolve.
     cache.builtin_types = Some(load_builtin_types(client)?);
+    let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     cache.opclasses = Some(load_opclasses(client)?);
     cache.collations = Some(load_collations(client)?);
-    cache.casts = Some(load_casts(client)?);
+    cache.casts = Some(load_casts(client, builtin_types)?);
     cache.aggregates = Some(load_aggregates(client)?);
-    let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's
     // effective search path skips those entries, so do not let them become
@@ -205,6 +205,7 @@ pub(super) fn populate_cache_from_client(
         .unwrap_or_else(BuiltinTypeCatalogue::fallback);
     cache.view_object_dependencies =
         load_view_object_dependencies(client, &schema_values, &builtin_types)?;
+    cache.routine_dependencies = load_routine_dependencies(client, &schema_values, &builtin_types)?;
     coverage.record(CatalogFamily::Dependencies);
     let scoped_external =
         load_scoped_external_dependencies(client, &schema_values, &builtin_types)?;

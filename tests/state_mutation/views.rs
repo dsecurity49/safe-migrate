@@ -1573,3 +1573,72 @@ fn alter_view_owner_updates_relation_metadata() {
     };
     assert_eq!(relation.owner, object_id("", "new_owner"));
 }
+
+#[test]
+fn alter_column_type_is_rejected_when_used_by_synced_in_chain_or_materialized_view() {
+    let (cache, _table_id, _view_id) = view_column_dependency_cache();
+    let engine = setup_engine();
+
+    // 1. Synced view column dependency: altering referenced column fails; altering unreferenced succeeds.
+    let mut synced_state = AnalysisState::new(cache.clone());
+    let blocked = engine
+        .analyze(
+            "ALTER TABLE orders ALTER COLUMN customer_id TYPE bigint;",
+            &mut synced_state,
+        )
+        .unwrap();
+    assert!(
+        blocked.iter().any(|v| v.rule_id == "chain-conflict"
+            && v.reason
+                .contains("cannot alter type of a column used by a view or rule")),
+        "expected chain-conflict on synced view column: {blocked:?}"
+    );
+
+    let mut synced_ok = AnalysisState::new(cache);
+    let ok = engine
+        .analyze(
+            "ALTER TABLE orders ALTER COLUMN id TYPE bigint;",
+            &mut synced_ok,
+        )
+        .unwrap();
+    assert!(
+        !ok.iter().any(|v| v.rule_id == "chain-conflict"),
+        "unreferenced column alter type should succeed: {ok:?}"
+    );
+    assert_eq!(synced_ok.local.confidence, Confidence::Exact);
+
+    // 2. In-chain view and materialized view
+    for create_sql in [
+        "CREATE TABLE t (a int, b int); CREATE VIEW v AS SELECT a FROM t;",
+        "CREATE TABLE t (a int, b int); CREATE VIEW v AS SELECT * FROM t;",
+        "CREATE TABLE t (a int, b int); CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;",
+        "CREATE TABLE t (a int, b int); CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;",
+    ] {
+        let mut st = setup_state();
+        engine.analyze(create_sql, &mut st).unwrap();
+        let findings = engine
+            .analyze("ALTER TABLE t ALTER COLUMN a TYPE bigint;", &mut st)
+            .unwrap();
+        assert!(
+            findings.iter().any(|v| v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("cannot alter type of a column used by a view or rule")),
+            "expected chain-conflict for `{create_sql}`, got: {findings:?}"
+        );
+    }
+
+    // In-chain view referencing only `a` allows altering `b`
+    let mut st_unused = setup_state();
+    let findings = engine
+        .analyze(
+            "CREATE TABLE t (a int, b int);
+             CREATE VIEW v AS SELECT a FROM t;
+             ALTER TABLE t ALTER COLUMN b TYPE bigint;",
+            &mut st_unused,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "expected no conflict altering unused column b: {findings:?}"
+    );
+}

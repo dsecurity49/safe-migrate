@@ -79,6 +79,7 @@ impl Resolver {
         select_source_name: Option<&str>,
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
+        column_dependencies: &[crate::_internal::analysis::facts::RoutineRelationReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
@@ -127,6 +128,7 @@ impl Resolver {
             invalid_aggregate,
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
+            column_dependencies: Self::resolve_view_column_dependencies(column_dependencies, state),
         })
     }
 
@@ -428,7 +430,7 @@ impl Resolver {
     /// resolves to the exact routine identity. Any other call falls back to the
     /// lone routine of that name when the modeled universe holds one; only a
     /// call that is still ambiguous keeps just the qualified name.
-    fn resolve_view_routines(
+    pub(crate) fn resolve_view_routines(
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         source: Option<&ObjectId>,
         state: &AnalysisState,
@@ -488,7 +490,50 @@ impl Resolver {
     }
 
     /// The types a view body casts to, as identities the drop path can match.
-    fn resolve_cast_types(
+    fn resolve_view_column_dependencies(
+        deps: &[crate::_internal::analysis::facts::RoutineRelationReferenceFact],
+        state: &AnalysisState,
+    ) -> Vec<crate::_internal::analysis::mutations::RoutineRelationDependency> {
+        let mut resolved = Vec::new();
+        for dep in deps {
+            let rel_id = Self::resolve_relation_lookup_name(&dep.relation, state);
+            if dep.column.as_deref() == Some("*") {
+                if let Some(cols) = state.relation_columns(&rel_id)
+                    && !cols.is_empty()
+                {
+                    for col in cols {
+                        let item =
+                            crate::_internal::analysis::mutations::RoutineRelationDependency {
+                                relation: rel_id.clone(),
+                                column: Some(col.name.clone()),
+                            };
+                        if !resolved.contains(&item) {
+                            resolved.push(item);
+                        }
+                    }
+                    continue;
+                }
+                let item = crate::_internal::analysis::mutations::RoutineRelationDependency {
+                    relation: rel_id,
+                    column: None,
+                };
+                if !resolved.contains(&item) {
+                    resolved.push(item);
+                }
+            } else {
+                let item = crate::_internal::analysis::mutations::RoutineRelationDependency {
+                    relation: rel_id,
+                    column: dep.column.clone(),
+                };
+                if !resolved.contains(&item) {
+                    resolved.push(item);
+                }
+            }
+        }
+        resolved
+    }
+
+    pub(crate) fn resolve_cast_types(
         cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
     ) -> Vec<ObjectId> {
@@ -571,6 +616,7 @@ impl Resolver {
         select_source: Option<&QualifiedName>,
         view_routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
+        column_dependencies: &[crate::_internal::analysis::facts::RoutineRelationReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
@@ -588,6 +634,7 @@ impl Resolver {
             projection_complete,
             routines: Self::resolve_view_routines(view_routines, source.as_ref(), state),
             cast_types: Self::resolve_cast_types(cast_types, state),
+            column_dependencies: Self::resolve_view_column_dependencies(column_dependencies, state),
             access_method: access_method.clone(),
             tablespace: tablespace.clone(),
             options: options.to_vec(),

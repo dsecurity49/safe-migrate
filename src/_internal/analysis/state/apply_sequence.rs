@@ -947,7 +947,22 @@ impl AnalysisState {
                         .co_dropped_objects
                         .contains(self.local.graph.resolve_rename(&edge.dependent))
             });
-            if (sequence.kind == SequenceKind::SerialLike || has_default_dependencies)
+            let has_routine_dependencies = self.local.graph.edges().iter().any(|edge| {
+                self.local.graph.resolve_rename(&edge.referenced) == id
+                    && matches!(edge.kind, DependencyKind::RoutineUsesRelation { .. })
+                    && matches!(
+                        self.local.functions.get(&edge.dependent),
+                        Some(crate::_internal::model::function::FunctionOverlay::Present(
+                            _
+                        ))
+                    )
+                    && !self
+                        .co_dropped_objects
+                        .contains(self.local.graph.resolve_rename(&edge.dependent))
+            });
+            if (sequence.kind == SequenceKind::SerialLike
+                || has_default_dependencies
+                || has_routine_dependencies)
                 && !drop.cascade
             {
                 return MutationResult::conflict(format!(
@@ -974,6 +989,29 @@ impl AnalysisState {
             for (id, kind, owned_by) in sequences {
                 self.clear_sequence_defaults_on_cascade(&id, kind, owned_by);
             }
+            let routines_to_drop: Vec<ObjectId> = self
+                .local
+                .graph
+                .edges()
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.kind, DependencyKind::RoutineUsesRelation { .. })
+                        && present.contains(self.local.graph.resolve_rename(&edge.referenced))
+                        && matches!(
+                            self.local.functions.get(&edge.dependent),
+                            Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                _
+                            ))
+                        )
+                })
+                .map(|edge| edge.dependent.clone())
+                .collect();
+            if !routines_to_drop.is_empty() {
+                let dropped_set: HashSet<ObjectId> = routines_to_drop.iter().cloned().collect();
+                for routine_id in routines_to_drop {
+                    let _ = self.apply_routine_cascade_drop(&routine_id, &[], &[], &dropped_set);
+                }
+            }
         }
         for id in &present {
             self.snapshot_sequence(id);
@@ -984,7 +1022,8 @@ impl AnalysisState {
         self.snapshot_graph_full();
         self.local.graph.retain_edges(|edge| !match edge.kind {
             DependencyKind::SequenceOwnedBy { .. } => present.contains(&edge.dependent),
-            DependencyKind::ColumnDefaultOnSequence { .. } => present.contains(&edge.referenced),
+            DependencyKind::ColumnDefaultOnSequence { .. }
+            | DependencyKind::RoutineUsesRelation { .. } => present.contains(&edge.referenced),
             _ => false,
         });
         MutationResult::Applied

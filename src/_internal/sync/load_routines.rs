@@ -41,7 +41,18 @@ pub(super) fn load_routines(
             l.lanname AS language,
             p.prosecdef AS security_definer,
             owner_ns.nspname AS internal_owner_schema,
-            owner_t.typname AS internal_owner_name
+            owner_t.typname AS internal_owner_name,
+            pg_catalog.pg_get_userbyid(p.proowner) AS owner_name,
+            ARRAY(
+                SELECT e.extname
+                FROM pg_depend d
+                JOIN pg_extension e ON e.oid = d.refobjid
+                WHERE d.classid = 'pg_proc'::regclass
+                  AND d.objid = p.oid
+                  AND d.refclassid = 'pg_extension'::regclass
+                  AND d.deptype = 'x'
+                ORDER BY e.extname
+            )::text[] AS dependent_extensions
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
@@ -207,6 +218,16 @@ pub(super) fn load_routines(
                         _ => None,
                     },
                     aggregate,
+                    owner: Some(relation_owner_id(
+                        row.try_get::<_, String>("owner_name")
+                            .context("routine owner")?,
+                    )),
+                    dependent_extensions: row
+                        .try_get::<_, Vec<String>>("dependent_extensions")
+                        .context("routine dependent extensions")?
+                        .into_iter()
+                        .collect(),
+                    support_function: None,
                 },
             ))
         })

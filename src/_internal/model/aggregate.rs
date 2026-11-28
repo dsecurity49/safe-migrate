@@ -131,8 +131,13 @@ impl AggregateCatalogue {
         self.signatures.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn fallback() -> Self {
         super::aggregate_fallback::catalogue()
+    }
+
+    pub(crate) fn fallback_for_version(pg_version_num: Option<u32>) -> Self {
+        super::aggregate_fallback::catalogue_for_version(pg_version_num)
     }
 }
 

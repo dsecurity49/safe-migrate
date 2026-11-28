@@ -519,10 +519,20 @@ mod atomic_write_tests {
             return;
         };
         let mut client = connect_database(&url).expect("connect for aggregate parity");
+        let version_str: String = client
+            .query_one("SHOW server_version_num", &[])
+            .expect("query server_version_num")
+            .get(0);
+        let version_num: u32 = version_str
+            .trim()
+            .parse()
+            .expect("parse server_version_num");
         let synced = load_aggregates(&mut client).expect("load built-in aggregates");
         assert_eq!(
             synced,
-            crate::_internal::model::aggregate::AggregateCatalogue::fallback()
+            crate::_internal::model::aggregate::AggregateCatalogue::fallback_for_version(Some(
+                version_num
+            ))
         );
     }
 

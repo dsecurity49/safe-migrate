@@ -219,6 +219,15 @@ pub(crate) fn for_mutation(
         Mutation::DropProcedure(_) => {
             reads.functions.require_all();
         }
+        Mutation::AlterRoutine(alter) => {
+            reads.functions.insert(alter.id.clone());
+        }
+        Mutation::DropRoutine(_) => {
+            reads.functions.require_all();
+        }
+        Mutation::AlterStatistics(_) | Mutation::DropStatistics(_) => {
+            reads.relations.require_all();
+        }
         Mutation::CreateSchema(_)
         | Mutation::AlterSchema(_)
         | Mutation::DropSchema(_)
@@ -277,6 +286,10 @@ pub(crate) fn for_mutation(
         | Mutation::SwitchRole { .. }
         | Mutation::Opaque(_)
         | Mutation::Reindex { .. }
+        | Mutation::CreateCast(_)
+        | Mutation::DropCast(_)
+        | Mutation::CreateStatistics(_)
+        | Mutation::Analyze(_)
         | Mutation::Vacuum { .. } => {}
     }
 

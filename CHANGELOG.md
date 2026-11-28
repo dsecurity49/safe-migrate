@@ -5,6 +5,26 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.14.0 — 2026-11-26
+
+- Added `ALTER ROUTINE` and `DROP ROUTINE` across functions, procedures, and
+  aggregates, along with routine option validation (`COST`, `ROWS`, `PARALLEL`,
+  `SUPPORT`, `SET`, `RESET`, `RESET ALL`), `[NO] DEPENDS ON EXTENSION`, and
+  `OWNER TO` checks.
+- Modeled SQL-standard (`BEGIN ATOMIC ... END`, `RETURN expr`) and `LANGUAGE sql`
+  routine body validation and dependencies across tables, columns, routines, and
+  types (including synced `pg_depend` edges), and expanded `CREATE`/`DROP
+  AGGREGATE` dependency and `OR REPLACE` identity checks.
+- Added user-defined casts (`CREATE CAST`, `DROP CAST`), extended statistics
+  (`CREATE`/`ALTER`/`DROP STATISTICS`, expression function dependencies, and
+  auto-drop on `DROP COLUMN`), and `ANALYZE`. Cache V12.1 records full `pg_cast`
+  entries and synced routine body dependencies while remaining compatible with
+  V12.0 caches.
+- Completed table-rewrite and lock-prediction coverage for `ALTER COLUMN ...
+  SET EXPRESSION`, `SET LOGGED` / `SET UNLOGGED`, and `ADD GENERATED ... AS
+  IDENTITY`, plus composite-attribute, foreign-key rewrite, and `DROP SCHEMA`
+  dependency fixes.
+
 ## v0.13.0 — 2026-11-22
 
 - Added `lock-risk`, a size-independent Tier 3 advisory for lock modes on

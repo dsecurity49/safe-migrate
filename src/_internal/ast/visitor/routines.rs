@@ -19,7 +19,7 @@ impl AstVisitor {
             },
             name: param
                 .name()
-                .and_then(|n| n.ident_token())
+                .and_then(|n| n.syntax().first_token())
                 .map(|t| Self::resolve_identifier_token(t.text())),
             ty: param
                 .func_type()
@@ -151,20 +151,98 @@ impl AstVisitor {
                         .unwrap_or_default(),
                 )
             }
-            ast::FuncOption::CostFuncOption(_) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Cost
+            ast::FuncOption::CostFuncOption(f) => {
+                let value = f
+                    .literal()
+                    .map(|l| l.syntax().text().to_string())
+                    .or_else(|| {
+                        f.syntax()
+                            .children()
+                            .find_map(ast::PrefixExpr::cast)
+                            .map(|pe| pe.syntax().text().to_string())
+                    })
+                    .and_then(|raw| raw.replace([' ', '\t', '\n'], "").parse::<f64>().ok());
+                crate::_internal::analysis::facts::FuncOptionFact::Cost(value)
             }
-            ast::FuncOption::RowsFuncOption(_) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Rows
+            ast::FuncOption::RowsFuncOption(f) => {
+                let value = f
+                    .literal()
+                    .map(|l| l.syntax().text().to_string())
+                    .or_else(|| {
+                        f.syntax()
+                            .children()
+                            .find_map(ast::PrefixExpr::cast)
+                            .map(|pe| pe.syntax().text().to_string())
+                    })
+                    .and_then(|raw| raw.replace([' ', '\t', '\n'], "").parse::<f64>().ok());
+                crate::_internal::analysis::facts::FuncOptionFact::Rows(value)
+            }
+            ast::FuncOption::SetFuncOption(f) => {
+                let name = f
+                    .set_config_param()
+                    .and_then(|scp| scp.config_parameter_ref())
+                    .and_then(|cpr| cpr.path_ref())
+                    .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
+                    .map(|qn| match qn.schema {
+                        Some(schema) => format!("{}.{}", schema.resolve(), qn.name.resolve()),
+                        None => qn.name.resolve(),
+                    })
+                    .unwrap_or_default();
+                let mut value = None;
+                let mut from_current_or_default = false;
+                if let Some(scp) = f.set_config_param() {
+                    match scp.config_assignment() {
+                        Some(ast::ConfigAssignment::FromCurrent(_)) => {
+                            from_current_or_default = true;
+                        }
+                        Some(ast::ConfigAssignment::ToConfigValue(assignment))
+                            if assignment.default_token().is_some() =>
+                        {
+                            from_current_or_default = true;
+                        }
+                        Some(ast::ConfigAssignment::ToConfigValue(assignment)) => {
+                            let vals: Vec<String> = assignment
+                                .config_values()
+                                .filter_map(|v| match v {
+                                    ast::ConfigValue::ConfigValueName(n) => {
+                                        n.ident_token().map(|t| t.text().to_string())
+                                    }
+                                    ast::ConfigValue::Literal(lit) => {
+                                        Self::resolve_string_literal(&lit)
+                                            .or_else(|| Some(lit.syntax().text().to_string()))
+                                    }
+                                    ast::ConfigValue::PrefixExpr(pe) => {
+                                        Some(pe.syntax().text().to_string())
+                                    }
+                                })
+                                .collect();
+                            if !vals.is_empty() {
+                                value = Some(vals.join(", "));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                crate::_internal::analysis::facts::FuncOptionFact::Set {
+                    name,
+                    value,
+                    from_current_or_default,
+                }
             }
             ast::FuncOption::ResetFuncOption(f) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Reset(
+                let target = if f.all_token().is_some() {
+                    "all".to_string()
+                } else {
                     f.config_parameter_ref()
                         .and_then(|cpr| cpr.path_ref())
                         .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                        .map(|qn| qn.name.resolve())
-                        .unwrap_or_default(),
-                )
+                        .map(|qn| match qn.schema {
+                            Some(schema) => format!("{}.{}", schema.resolve(), qn.name.resolve()),
+                            None => qn.name.resolve(),
+                        })
+                        .unwrap_or_default()
+                };
+                crate::_internal::analysis::facts::FuncOptionFact::Reset(target)
             }
             ast::FuncOption::AsFuncOption(f) => {
                 let (definition, obj_file, link_symbol) = match f.as_func_target() {
@@ -198,11 +276,504 @@ impl AstVisitor {
             ast::FuncOption::WindowFuncOption(_) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Window
             }
-            ast::FuncOption::SupportFuncOption(_) => {
-                crate::_internal::analysis::facts::FuncOptionFact::Support
+            ast::FuncOption::SupportFuncOption(f) => {
+                let support_fn = f
+                    .function_name_ref()
+                    .and_then(|fnr| fnr.path_ref())
+                    .and_then(|pr| Self::path_ref_to_qualified_name(&pr));
+                crate::_internal::analysis::facts::FuncOptionFact::Support(support_fn)
             }
-            _ => crate::_internal::analysis::facts::FuncOptionFact::Unknown,
         }
+    }
+
+    pub(super) fn is_sql_special_value_ident(name: &str) -> bool {
+        matches!(
+            name,
+            "current_user"
+                | "session_user"
+                | "current_role"
+                | "user"
+                | "current_catalog"
+                | "current_schema"
+                | "current_date"
+                | "current_time"
+                | "current_timestamp"
+                | "localtime"
+                | "localtimestamp"
+                | "null"
+                | "true"
+                | "false"
+        ) || (name.starts_with('$') && name[1..].chars().all(|c| c.is_ascii_digit()))
+    }
+
+    pub(super) fn name_ref_in_non_column_position(
+        name_ref: &ast::NameRef,
+        root: &squawk_syntax::SyntaxNode,
+    ) -> bool {
+        for ancestor in name_ref.syntax().ancestors() {
+            if &ancestor == root {
+                break;
+            }
+            if ast::FromClause::can_cast(ancestor.kind())
+                || ast::Type::can_cast(ancestor.kind())
+                || ast::FuncType::can_cast(ancestor.kind())
+                || ast::TableArgList::can_cast(ancestor.kind())
+                || ast::WithTable::can_cast(ancestor.kind())
+                || ast::SetClause::can_cast(ancestor.kind())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn infer_return_expr_fact(
+        expr: ast::Expr,
+        param_types: &std::collections::HashMap<String, String>,
+        scope: &AggregateScopeFact,
+        single_binding: Option<&QualifiedName>,
+    ) -> Option<crate::_internal::analysis::facts::RoutineReturnExprFact> {
+        use crate::_internal::analysis::facts::RoutineReturnExprFact;
+        let mut current = expr;
+        while let ast::Expr::ParenExpr(pe) = current {
+            current = pe.expr()?;
+        }
+        match current {
+            ast::Expr::CastExpr(ce) => ce
+                .ty()
+                .map(|t| RoutineReturnExprFact::ExplicitCast(t.syntax().text().to_string())),
+            ast::Expr::Literal(lit) => {
+                let raw = lit.syntax().text().to_string();
+                let trimmed = raw.trim();
+                if trimmed.eq_ignore_ascii_case("null") {
+                    None
+                } else if trimmed.eq_ignore_ascii_case("true")
+                    || trimmed.eq_ignore_ascii_case("false")
+                {
+                    Some(RoutineReturnExprFact::LiteralType("boolean".to_string()))
+                } else if trimmed.starts_with('$')
+                    && trimmed[1..].chars().all(|c| c.is_ascii_digit())
+                {
+                    param_types
+                        .get(trimmed)
+                        .map(|pty| RoutineReturnExprFact::ParameterType(pty.clone()))
+                } else if trimmed.starts_with('\'')
+                    || trimmed.starts_with("E\'")
+                    || trimmed.starts_with("e\'")
+                    || (trimmed.starts_with('$') && trimmed.ends_with('$') && trimmed.len() >= 2)
+                {
+                    Some(RoutineReturnExprFact::LiteralType("text".to_string()))
+                } else if trimmed.chars().all(|c| c.is_ascii_digit() || c == '_') {
+                    Some(RoutineReturnExprFact::LiteralType("integer".to_string()))
+                } else if trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-' | '_'))
+                {
+                    Some(RoutineReturnExprFact::LiteralType("numeric".to_string()))
+                } else {
+                    None
+                }
+            }
+            ast::Expr::NameRef(nr) => {
+                let ident = Self::resolve_name_ref(&nr);
+                if ident == "null" {
+                    None
+                } else if ident == "true" || ident == "false" {
+                    Some(RoutineReturnExprFact::LiteralType("boolean".to_string()))
+                } else if !ident.starts_with('$')
+                    && let Some(rel) = single_binding
+                {
+                    Some(RoutineReturnExprFact::Column {
+                        relation: Some(rel.clone()),
+                        column: ident,
+                    })
+                } else {
+                    param_types
+                        .get(&ident)
+                        .map(|pty| RoutineReturnExprFact::ParameterType(pty.clone()))
+                }
+            }
+            ast::Expr::FieldExpr(fe) => {
+                if fe.star_token().is_some() {
+                    return None;
+                }
+                let field_name = fe
+                    .field()
+                    .and_then(|f| f.syntax().first_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))?;
+                let ast::Expr::NameRef(base_name) = fe.base()? else {
+                    return None;
+                };
+                let qualifier = base_name
+                    .syntax()
+                    .first_token()
+                    .map(|t| Self::resolve_identifier_token(t.text()))?;
+                let binding = scope.bindings.iter().find(|b| b.alias == qualifier)?;
+                Some(RoutineReturnExprFact::Column {
+                    relation: binding.relation.clone(),
+                    column: field_name,
+                })
+            }
+            ast::Expr::CallExpr(ce) => {
+                let callee = ce.expr()?;
+                let qname = match callee {
+                    ast::Expr::NameRef(nr) => {
+                        QualifiedName::new(None, Ident::new(Self::resolve_name_ref(&nr), true))
+                    }
+                    ast::Expr::FieldExpr(fe) => {
+                        let fn_name = fe
+                            .field()
+                            .and_then(|f| f.syntax().first_token())
+                            .map(|t| Self::resolve_identifier_token(t.text()))?;
+                        let ast::Expr::NameRef(base) = fe.base()? else {
+                            return None;
+                        };
+                        let schema = Self::resolve_name_ref(&base);
+                        QualifiedName::new(
+                            Some(Ident::new(schema, true)),
+                            Ident::new(fn_name, true),
+                        )
+                    }
+                    _ => return None,
+                };
+                Some(RoutineReturnExprFact::RoutineCall(qname))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn extract_routine_body_dependencies(
+        body: Option<squawk_syntax::ast::RoutineBody>,
+        params: &[crate::_internal::analysis::facts::ParamFact],
+    ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+        let Some(body) = body else {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        };
+        Self::extract_routine_body_dependencies_from_syntax(body.syntax(), params, false)
+    }
+
+    pub(super) fn extract_routine_body_dependencies_from_syntax(
+        syntax: &squawk_syntax::SyntaxNode,
+        params: &[crate::_internal::analysis::facts::ParamFact],
+        has_syntax_error: bool,
+    ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+        let mut param_names = std::collections::HashSet::new();
+        let mut param_types = std::collections::HashMap::new();
+        for (idx, p) in params.iter().enumerate() {
+            let pos_key = format!("${}", idx + 1);
+            param_names.insert(pos_key.clone());
+            param_types.insert(pos_key, p.ty.clone());
+            if let Some(ref name) = p.name {
+                param_names.insert(name.clone());
+                param_types.insert(name.clone(), p.ty.clone());
+            }
+        }
+        let mut cte_names = std::collections::HashSet::new();
+        for cte_name in syntax.descendants().filter_map(CteName::cast) {
+            if let Some(token) = cte_name.ident_token() {
+                cte_names.insert(Self::resolve_identifier_token(token.text()));
+            }
+        }
+        let mut relations: Vec<crate::_internal::analysis::facts::RoutineRelationReferenceFact> =
+            Vec::new();
+        for qname in Self::extract_view_dependencies(syntax) {
+            if qname.schema.is_none() && cte_names.contains(&qname.name.resolve()) {
+                continue;
+            }
+            let rel_fact = crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                relation: qname,
+                column: None,
+            };
+            if !relations.contains(&rel_fact) {
+                relations.push(rel_fact);
+            }
+        }
+        let mut unqualified_columns = Vec::new();
+        let mut return_expr = None;
+
+        for ret_stmt in syntax.descendants().filter_map(ast::ReturnStmt::cast) {
+            if let Some(expr) = ret_stmt.expr() {
+                let empty_scope = AggregateScopeFact {
+                    bindings: Vec::new(),
+                    unknown: false,
+                };
+                return_expr =
+                    Self::infer_return_expr_fact(expr.clone(), &param_types, &empty_scope, None);
+                let mut field_children = std::collections::HashSet::new();
+                let mut callees = std::collections::HashSet::new();
+                for node in expr.syntax().descendants() {
+                    if let Some(call) = ast::CallExpr::cast(node.clone())
+                        && let Some(callee) = call.expr()
+                    {
+                        callees.insert(callee.syntax().clone());
+                    }
+                    if let Some(field) = ast::FieldExpr::cast(node) {
+                        if let Some(b) = field.base() {
+                            field_children.insert(b.syntax().clone());
+                        }
+                        if let Some(f) = field.field() {
+                            field_children.insert(f.syntax().clone());
+                        }
+                    }
+                }
+                for name_ref in expr.syntax().descendants().filter_map(ast::NameRef::cast) {
+                    if field_children.contains(name_ref.syntax())
+                        || callees.contains(name_ref.syntax())
+                        || Self::name_ref_in_non_column_position(&name_ref, expr.syntax())
+                    {
+                        continue;
+                    }
+                    let col_name = Self::resolve_name_ref(&name_ref);
+                    if param_names.contains(&col_name)
+                        || cte_names.contains(&col_name)
+                        || Self::is_sql_special_value_ident(&col_name)
+                    {
+                        continue;
+                    }
+                    if !unqualified_columns.contains(&col_name) {
+                        unqualified_columns.push(col_name);
+                    }
+                }
+            }
+        }
+
+        let has_intermediate_select =
+            |node: &squawk_syntax::SyntaxNode, limit: &squawk_syntax::SyntaxNode| -> bool {
+                node.ancestors()
+                    .skip(1)
+                    .take_while(|a| a != limit)
+                    .any(|a| ast::Select::can_cast(a.kind()))
+            };
+        let is_top_level_select = |select: &ast::Select| -> bool {
+            !select
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a != syntax)
+                .any(|a| {
+                    ast::Select::can_cast(a.kind())
+                        || ast::ReturnStmt::can_cast(a.kind())
+                        || ast::WithTable::can_cast(a.kind())
+                        || ast::Insert::can_cast(a.kind())
+                        || ast::Update::can_cast(a.kind())
+                        || ast::Delete::can_cast(a.kind())
+                })
+        };
+        let any_enclosing_select_has_from = |select: &ast::Select| -> bool {
+            select
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a != syntax)
+                .filter_map(ast::Select::cast)
+                .any(|parent_sel| parent_sel.from_clause().is_some())
+        };
+        for select in syntax.descendants().filter_map(ast::Select::cast) {
+            let mut scope = AggregateScopeFact {
+                bindings: Vec::new(),
+                unknown: false,
+            };
+            if let Some(from) = select.from_clause() {
+                for item in from.items() {
+                    Self::collect_scope_item(&item, &mut scope);
+                }
+            }
+            let single_binding = if !scope.unknown && scope.bindings.len() == 1 {
+                scope.bindings[0].relation.clone()
+            } else {
+                None
+            };
+            let mut target_aliases = std::collections::HashSet::new();
+            if let Some(sc) = select.select_clause()
+                && let Some(tl) = sc.target_list()
+            {
+                let targets: Vec<_> = tl.targets().collect();
+                for t in &targets {
+                    if let Some(as_name) = t.as_name()
+                        && let Some(tok) = as_name.syntax().first_token()
+                    {
+                        target_aliases.insert(Self::resolve_identifier_token(tok.text()));
+                    }
+                }
+                if is_top_level_select(&select) {
+                    if targets.len() > 1 {
+                        return_expr = Some(
+                            crate::_internal::analysis::facts::RoutineReturnExprFact::MultiColumn,
+                        );
+                    } else if targets.len() == 1
+                        && let Some(expr) = targets[0].expr()
+                    {
+                        return_expr = Self::infer_return_expr_fact(
+                            expr,
+                            &param_types,
+                            &scope,
+                            single_binding.as_ref(),
+                        );
+                    }
+                }
+            }
+            let binding_aliases: std::collections::HashSet<String> =
+                scope.bindings.iter().map(|b| b.alias.clone()).collect();
+            for field in select
+                .syntax()
+                .descendants()
+                .filter_map(ast::FieldExpr::cast)
+            {
+                if field.star_token().is_some()
+                    || has_intermediate_select(field.syntax(), select.syntax())
+                {
+                    continue;
+                }
+                let Some(field_name) = field
+                    .field()
+                    .and_then(|f| f.syntax().first_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                let Some(ast::Expr::NameRef(base_name)) = field.base() else {
+                    continue;
+                };
+                let Some(qualifier) = base_name
+                    .syntax()
+                    .first_token()
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                if let Some(binding) = scope.bindings.iter().find(|b| b.alias == qualifier)
+                    && let Some(ref rel_qname) = binding.relation
+                {
+                    if rel_qname.schema.is_none() && cte_names.contains(&rel_qname.name.resolve()) {
+                        continue;
+                    }
+                    let rel_fact =
+                        crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                            relation: rel_qname.clone(),
+                            column: Some(field_name),
+                        };
+                    if !relations.contains(&rel_fact) {
+                        relations.push(rel_fact);
+                    }
+                }
+            }
+            let mut field_children = std::collections::HashSet::new();
+            let mut callees = std::collections::HashSet::new();
+            for node in select.syntax().descendants() {
+                if let Some(call) = ast::CallExpr::cast(node.clone())
+                    && let Some(callee) = call.expr()
+                {
+                    callees.insert(callee.syntax().clone());
+                }
+                if let Some(field) = ast::FieldExpr::cast(node) {
+                    if let Some(b) = field.base() {
+                        field_children.insert(b.syntax().clone());
+                    }
+                    if let Some(f) = field.field() {
+                        field_children.insert(f.syntax().clone());
+                    }
+                }
+            }
+            if let Some(rel_qname) = single_binding {
+                if !(rel_qname.schema.is_none() && cte_names.contains(&rel_qname.name.resolve())) {
+                    for name_ref in select.syntax().descendants().filter_map(ast::NameRef::cast) {
+                        if has_intermediate_select(name_ref.syntax(), select.syntax())
+                            || field_children.contains(name_ref.syntax())
+                            || callees.contains(name_ref.syntax())
+                            || Self::name_ref_in_non_column_position(&name_ref, select.syntax())
+                        {
+                            continue;
+                        }
+                        let col_name = Self::resolve_name_ref(&name_ref);
+                        if col_name.starts_with('$')
+                            || cte_names.contains(&col_name)
+                            || target_aliases.contains(&col_name)
+                            || binding_aliases.contains(&col_name)
+                            || Self::is_sql_special_value_ident(&col_name)
+                        {
+                            continue;
+                        }
+                        let rel_fact =
+                            crate::_internal::analysis::facts::RoutineRelationReferenceFact {
+                                relation: rel_qname.clone(),
+                                column: Some(col_name),
+                            };
+                        if !relations.contains(&rel_fact) {
+                            relations.push(rel_fact);
+                        }
+                    }
+                }
+            } else if !scope.unknown
+                && scope.bindings.is_empty()
+                && !any_enclosing_select_has_from(&select)
+            {
+                for name_ref in select.syntax().descendants().filter_map(ast::NameRef::cast) {
+                    if has_intermediate_select(name_ref.syntax(), select.syntax())
+                        || field_children.contains(name_ref.syntax())
+                        || callees.contains(name_ref.syntax())
+                        || Self::name_ref_in_non_column_position(&name_ref, select.syntax())
+                    {
+                        continue;
+                    }
+                    let col_name = Self::resolve_name_ref(&name_ref);
+                    if param_names.contains(&col_name)
+                        || cte_names.contains(&col_name)
+                        || target_aliases.contains(&col_name)
+                        || Self::is_sql_special_value_ident(&col_name)
+                    {
+                        continue;
+                    }
+                    if !unqualified_columns.contains(&col_name) {
+                        unqualified_columns.push(col_name);
+                    }
+                }
+            }
+        }
+        crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+            relations,
+            routines: Self::extract_view_routines(syntax),
+            types: Self::extract_view_cast_types(syntax),
+            unqualified_columns,
+            return_expr,
+            has_syntax_error,
+        }
+    }
+
+    fn extract_sql_string_validation_dependencies(
+        options: &[crate::_internal::analysis::facts::FuncOptionFact],
+        params: &[crate::_internal::analysis::facts::ParamFact],
+    ) -> crate::_internal::analysis::facts::RoutineBodyDependenciesFact {
+        let language = options
+            .iter()
+            .find_map(|opt| match opt {
+                crate::_internal::analysis::facts::FuncOptionFact::Language(l) => Some(l.as_str()),
+                _ => None,
+            })
+            .unwrap_or("sql");
+        if !language.eq_ignore_ascii_case("sql") {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        }
+        let Some(sql_def) = options.iter().find_map(|opt| match opt {
+            crate::_internal::analysis::facts::FuncOptionFact::As {
+                definition: Some(def),
+                obj_file: None,
+                ..
+            } => Some(def.as_str()),
+            _ => None,
+        }) else {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        };
+        let trimmed = sql_def.trim();
+        if trimmed.is_empty() {
+            return crate::_internal::analysis::facts::RoutineBodyDependenciesFact::default();
+        }
+        let parsed = squawk_syntax::SourceFile::parse(trimmed);
+        let has_syntax_error = !parsed.errors().is_empty();
+        Self::extract_routine_body_dependencies_from_syntax(
+            parsed.tree().syntax(),
+            params,
+            has_syntax_error,
+        )
     }
 
     pub(super) fn extract_create_function(
@@ -211,12 +782,12 @@ impl AstVisitor {
         let path = node.name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         let or_replace = node.or_replace().is_some();
-        let params = node
+        let params: Vec<_> = node
             .param_list()
             .map(|pl| pl.params().map(|p| Self::extract_param(&p)).collect())
             .unwrap_or_default();
         let return_type = node.ret_type().map(|r| Self::extract_ret_type(&r));
-        let options = node
+        let options: Vec<_> = node
             .option_list()
             .map(|ol| {
                 ol.options()
@@ -225,6 +796,12 @@ impl AstVisitor {
             })
             .unwrap_or_default();
 
+        let body_dependencies = Self::extract_routine_body_dependencies(node.body(), &params);
+        let validation_dependencies = if node.body().is_some() {
+            body_dependencies.clone()
+        } else {
+            Self::extract_sql_string_validation_dependencies(&options, &params)
+        };
         Some(StatementFact::CreateFunction(
             crate::_internal::analysis::facts::CreateFunctionFact {
                 name,
@@ -232,6 +809,8 @@ impl AstVisitor {
                 params,
                 return_type,
                 options,
+                body_dependencies,
+                validation_dependencies,
             },
         ))
     }
@@ -257,31 +836,21 @@ impl AstVisitor {
                     Self::extract_role(&ot.role_ref()?),
                 ),
             ),
-            ast::AlterFunctionAction::SetSchema(ss) => {
-                let token = ss.schema_ref()?.ident_token()?;
-                Some(
-                    crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
-                        new_schema: Self::resolve_identifier_token(token.text()),
-                    },
-                )
-            }
-            ast::AlterFunctionAction::DependsOnExtension(de) => {
-                let ext = Self::resolve_identifier_token(de.extension_ref()?.ident_token()?.text());
-                Some(
-                    crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
-                        extension: ext,
-                    },
-                )
-            }
-            ast::AlterFunctionAction::NoDependsOnExtension(nde) => {
-                let ext =
-                    Self::resolve_identifier_token(nde.extension_ref()?.ident_token()?.text());
-                Some(
-                    crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
-                        extension: ext,
-                    },
-                )
-            }
+            ast::AlterFunctionAction::SetSchema(ss) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
+                    new_schema: Self::resolve_ast_identifier(&ss.schema_ref()?),
+                },
+            ),
+            ast::AlterFunctionAction::DependsOnExtension(de) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&de.extension_ref()?),
+                },
+            ),
+            ast::AlterFunctionAction::NoDependsOnExtension(nde) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&nde.extension_ref()?),
+                },
+            ),
             ast::AlterFunctionAction::FuncOptionList(ol) => Some(
                 crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
                     ol.options()
@@ -335,11 +904,11 @@ impl AstVisitor {
         let path = node.name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         let or_replace = node.or_replace().is_some();
-        let params = node
+        let params: Vec<_> = node
             .param_list()
             .map(|pl| pl.params().map(|p| Self::extract_param(&p)).collect())
             .unwrap_or_default();
-        let options = node
+        let options: Vec<_> = node
             .option_list()
             .map(|ol| {
                 ol.options()
@@ -348,12 +917,20 @@ impl AstVisitor {
             })
             .unwrap_or_default();
 
+        let body_dependencies = Self::extract_routine_body_dependencies(node.body(), &params);
+        let validation_dependencies = if node.body().is_some() {
+            body_dependencies.clone()
+        } else {
+            Self::extract_sql_string_validation_dependencies(&options, &params)
+        };
         Some(StatementFact::CreateProcedure(
             crate::_internal::analysis::facts::CreateProcedureFact {
                 name,
                 or_replace,
                 params,
                 options,
+                body_dependencies,
+                validation_dependencies,
             },
         ))
     }
@@ -381,9 +958,17 @@ impl AstVisitor {
             ),
             ast::AlterProcedureAction::SetSchema(ss) => Some(
                 crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
-                    new_schema: Self::resolve_identifier_token(
-                        ss.schema_ref()?.ident_token()?.text(),
-                    ),
+                    new_schema: Self::resolve_ast_identifier(&ss.schema_ref()?),
+                },
+            ),
+            ast::AlterProcedureAction::DependsOnExtension(de) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&de.extension_ref()?),
+                },
+            ),
+            ast::AlterProcedureAction::NoDependsOnExtension(nde) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&nde.extension_ref()?),
                 },
             ),
             // A procedure takes the same option list a function does, so
@@ -396,7 +981,6 @@ impl AstVisitor {
                         .collect(),
                 ),
             ),
-            _ => None,
         });
 
         Some(StatementFact::AlterProcedure(
@@ -644,6 +1228,347 @@ impl AstVisitor {
                 if_exists: node.if_exists().is_some(),
                 cascade: Self::is_cascade(node.drop_behavior()),
             },
+        ))
+    }
+
+    pub(super) fn extract_alter_routine(node: &ast::AlterRoutine) -> Option<StatementFact> {
+        let sig = node.routine_sig()?;
+        let path = sig.routine_name_ref()?.path_ref()?;
+        let name = Self::path_ref_to_qualified_name(&path)?;
+        let params = Self::extract_signature_params(sig.param_list());
+
+        let action = node.action().and_then(|a| match a {
+            ast::AlterRoutineAction::RoutineRenameTo(rt) => {
+                let new_name = Self::resolve_name(rt.routine_name()?.path()?.segment()?);
+                Some(
+                    crate::_internal::analysis::facts::AlterFunctionAction::Rename {
+                        from: name.name.resolve(),
+                        to: new_name,
+                    },
+                )
+            }
+            ast::AlterRoutineAction::OwnerTo(ot) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
+                    Self::extract_role(&ot.role_ref()?),
+                ),
+            ),
+            ast::AlterRoutineAction::SetSchema(ss) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
+                    new_schema: Self::resolve_ast_identifier(&ss.schema_ref()?),
+                },
+            ),
+            ast::AlterRoutineAction::DependsOnExtension(de) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&de.extension_ref()?),
+                },
+            ),
+            ast::AlterRoutineAction::NoDependsOnExtension(nde) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+                    extension: Self::resolve_ast_identifier(&nde.extension_ref()?),
+                },
+            ),
+            ast::AlterRoutineAction::FuncOptionList(ol) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    ol.options()
+                        .map(|o| Self::extract_func_option(&o))
+                        .collect(),
+                ),
+            ),
+        });
+
+        Some(StatementFact::AlterRoutine(
+            crate::_internal::analysis::facts::AlterRoutineFact {
+                name,
+                params,
+                action: action?,
+            },
+        ))
+    }
+
+    pub(super) fn extract_drop_routine(node: &ast::DropRoutine) -> Option<StatementFact> {
+        let signatures = node
+            .routine_sig_list()
+            .map(|sl| {
+                sl.routine_sigs()
+                    .filter_map(|sig| {
+                        let path = sig.routine_name_ref()?.path_ref()?;
+                        Some(crate::_internal::analysis::facts::FunctionSigFact {
+                            name: Self::path_ref_to_qualified_name(&path)?,
+                            params: Self::extract_signature_params(sig.param_list()),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Some(StatementFact::DropRoutine(
+            crate::_internal::analysis::facts::DropRoutineFact {
+                signatures,
+                if_exists: node.if_exists().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
+            },
+        ))
+    }
+
+    fn extract_cast_sig_types(sig: &ast::CastSig) -> Option<(String, String)> {
+        let mut types = sig.syntax().children().filter_map(ast::Type::cast);
+        let source = types.next()?.syntax().text().to_string();
+        let target = types.next()?.syntax().text().to_string();
+        Some((source, target))
+    }
+
+    pub(super) fn extract_create_cast(node: &ast::CreateCast) -> Option<StatementFact> {
+        let (source_type, target_type) = Self::extract_cast_sig_types(&node.cast_sig()?)?;
+        let method = match node.cast_method()? {
+            ast::CastMethod::WithoutFunction(_) => {
+                crate::_internal::analysis::facts::CastMethodFact::WithoutFunction
+            }
+            ast::CastMethod::WithInout(_) => {
+                crate::_internal::analysis::facts::CastMethodFact::WithInout
+            }
+            ast::CastMethod::WithFunction(wf) => {
+                let sig = wf.function_sig()?;
+                let path = sig.function_name_ref()?.path_ref()?;
+                let name = Self::path_ref_to_qualified_name(&path)?;
+                let params = Self::extract_signature_params(sig.param_list());
+                crate::_internal::analysis::facts::CastMethodFact::WithFunction(
+                    crate::_internal::analysis::facts::FunctionSigFact { name, params },
+                )
+            }
+        };
+        let context = match node.cast_context() {
+            Some(ast::CastContext::AsImplicit(_)) => {
+                crate::_internal::analysis::facts::CastContextFact::Implicit
+            }
+            Some(ast::CastContext::AsAssignment(_)) => {
+                crate::_internal::analysis::facts::CastContextFact::Assignment
+            }
+            None => crate::_internal::analysis::facts::CastContextFact::Explicit,
+        };
+        Some(StatementFact::CreateCast(
+            crate::_internal::analysis::facts::CreateCastFact {
+                source_type,
+                target_type,
+                method,
+                context,
+            },
+        ))
+    }
+
+    pub(super) fn extract_drop_cast(node: &ast::DropCast) -> Option<StatementFact> {
+        let (source_type, target_type) = Self::extract_cast_sig_types(&node.cast_sig()?)?;
+        Some(StatementFact::DropCast(
+            crate::_internal::analysis::facts::DropCastFact {
+                source_type,
+                target_type,
+                if_exists: node.if_exists().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
+            },
+        ))
+    }
+
+    pub(super) fn extract_create_statistics(node: &ast::CreateStatistics) -> Option<StatementFact> {
+        let name = node
+            .statistics()
+            .and_then(|s| s.path())
+            .and_then(|p| Self::path_to_qualified_name(&p));
+        let if_not_exists = node.if_not_exists().is_some();
+        let kinds = node
+            .stat_types()
+            .map(|st| {
+                st.statistics_kinds()
+                    .filter_map(|k| {
+                        k.ident_token()
+                            .map(|t| Self::resolve_identifier_token(t.text()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let on_clause = node.statistics_on_clause()?;
+        let mut columns = Vec::new();
+        let mut expression_columns = Vec::new();
+        let mut expr_texts = Vec::new();
+        for expr in on_clause.exprs() {
+            let mut unwrapped = expr.clone();
+            while let ast::Expr::ParenExpr(pe) = &unwrapped {
+                if let Some(inner) = pe.expr() {
+                    unwrapped = inner;
+                } else {
+                    break;
+                }
+            }
+            match &unwrapped {
+                ast::Expr::NameRef(nr) => {
+                    columns.push(Self::resolve_name_ref(nr));
+                }
+                _ => {
+                    if let Some(refs) =
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::convert(
+                            unwrapped.clone(),
+                        )
+                        .referenced_columns()
+                    {
+                        for col in refs {
+                            if !expression_columns.contains(&col) {
+                                expression_columns.push(col);
+                            }
+                        }
+                    }
+                    expr_texts.push(unwrapped.syntax().text().to_string().trim().to_string());
+                }
+            }
+        }
+        let expression_count = expr_texts.len();
+        let expressions_sql = (!expr_texts.is_empty()).then(|| expr_texts.join(", "));
+        let table_path = node.from_table()?.table_name_ref()?.path_ref()?;
+        let table = Self::path_ref_to_qualified_name(&table_path)?;
+        let expression_routines = Self::extract_view_routines(on_clause.syntax());
+        let expression_types = Self::extract_view_cast_types(on_clause.syntax());
+        Some(StatementFact::CreateStatistics(
+            crate::_internal::analysis::facts::CreateStatisticsFact {
+                name,
+                if_not_exists,
+                kinds,
+                columns,
+                expression_columns,
+                expressions: expr_texts,
+                expression_count,
+                expressions_sql,
+                expression_routines,
+                expression_types,
+                table,
+            },
+        ))
+    }
+
+    pub(super) fn extract_alter_statistics(node: &ast::AlterStatistics) -> Option<StatementFact> {
+        let path = node.statistics_ref()?.path_ref()?;
+        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action = match node.action()? {
+            ast::AlterStatisticsAction::StatisticsRenameTo(rt) => {
+                let seg = rt.statistics()?.path()?.segment()?;
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::RenameTo(
+                    Self::resolve_name(seg),
+                )
+            }
+            ast::AlterStatisticsAction::OwnerTo(ot) => {
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::OwnerTo(
+                    Self::extract_role(&ot.role_ref()?),
+                )
+            }
+            ast::AlterStatisticsAction::SetSchema(ss) => {
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::SetSchema(
+                    Self::resolve_ast_identifier(&ss.schema_ref()?),
+                )
+            }
+            ast::AlterStatisticsAction::SetStatistics(ss) => {
+                let target = if ss.default_token().is_some() {
+                    crate::_internal::analysis::facts::StatisticsTarget::Default
+                } else {
+                    let raw = ss.expr()?.syntax().text().to_string();
+                    let val = raw.trim().parse::<i32>().ok()?;
+                    crate::_internal::analysis::facts::StatisticsTarget::Value(val)
+                };
+                crate::_internal::analysis::facts::AlterStatisticsActionFact::SetStatistics(target)
+            }
+        };
+        let if_exists = node
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| {
+                t.kind() == squawk_syntax::SyntaxKind::COMMENT && t.text().starts_with("/*IF_EX")
+            });
+        Some(StatementFact::AlterStatistics(
+            crate::_internal::analysis::facts::AlterStatisticsFact {
+                name,
+                if_exists,
+                action,
+            },
+        ))
+    }
+
+    pub(super) fn extract_drop_statistics(node: &ast::DropStatistics) -> Option<StatementFact> {
+        let names: Vec<QualifiedName> = node
+            .statistics_refs()
+            .filter_map(|r| r.path_ref())
+            .filter_map(|p| Self::path_ref_to_qualified_name(&p))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(StatementFact::DropStatistics(
+            crate::_internal::analysis::facts::DropStatisticsFact {
+                names,
+                if_exists: node.if_exists().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
+            },
+        ))
+    }
+
+    pub(super) fn extract_analyze(node: &ast::Analyze) -> Option<StatementFact> {
+        let mut options = Vec::new();
+        if node.verbose_token().is_some() {
+            options.push(crate::_internal::analysis::facts::AttributeFact {
+                name: "verbose".to_string(),
+                value: None,
+                namespace: None,
+            });
+        }
+        if let Some(opt_list) = node.option_item_list() {
+            for item in opt_list.option_items() {
+                let Some(key) = item
+                    .option_item_key()
+                    .and_then(|k| k.syntax().first_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                else {
+                    continue;
+                };
+                let value = item.option_item_value().map(|v| {
+                    if let Some(expr) = v.expr() {
+                        if let ast::Expr::Literal(lit) = &expr
+                            && let Some(s) = Self::resolve_string_literal(lit)
+                        {
+                            return s;
+                        }
+                        expr.syntax().text().to_string().trim().to_string()
+                    } else if let Some(vn) = v.option_item_value_name() {
+                        vn.syntax().text().to_string().trim().to_string()
+                    } else {
+                        v.syntax().text().to_string().trim().to_string()
+                    }
+                });
+                options.push(crate::_internal::analysis::facts::AttributeFact {
+                    name: key,
+                    value,
+                    namespace: None,
+                });
+            }
+        }
+        let mut targets = Vec::new();
+        if let Some(list) = node.table_and_columns_list() {
+            for tc in list.table_and_columnss() {
+                let path = tc.table_relation_name()?.table_name_ref()?.path_ref()?;
+                let relation = Self::path_ref_to_qualified_name(&path)?;
+                let columns = tc
+                    .column_ref_list()
+                    .map(|cl| {
+                        cl.column_name_refs()
+                            .filter_map(|c| {
+                                c.ident_token()
+                                    .map(|t| Self::resolve_identifier_token(t.text()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                targets.push(crate::_internal::analysis::facts::AnalyzeTargetFact {
+                    relation,
+                    columns,
+                });
+            }
+        }
+        Some(StatementFact::Analyze(
+            crate::_internal::analysis::facts::AnalyzeFact { options, targets },
         ))
     }
 }

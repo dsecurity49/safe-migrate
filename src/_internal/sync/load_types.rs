@@ -2,35 +2,100 @@ use super::*;
 
 pub(super) fn load_casts(
     client: &mut impl GenericClient,
+    builtin_types: &crate::_internal::model::builtin_type::BuiltinTypeCatalogue,
 ) -> Result<crate::_internal::model::cast::CastCatalogue> {
+    use crate::_internal::analysis::facts::CastContextFact;
+    use crate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+
     let rows = client
         .query(
             "
             SELECT
-                pg_catalog.format_type(c.castsource, NULL) AS source,
-                pg_catalog.format_type(c.casttarget, NULL) AS target
+                CASE
+                    WHEN sn.nspname = 'pg_catalog' THEN pg_catalog.format_type(c.castsource, NULL)
+                    WHEN s.typcategory = 'A' AND s.typelem <> 0 THEN sn.nspname || '.' || se.typname || '[]'
+                    ELSE sn.nspname || '.' || s.typname
+                END AS source,
+                CASE
+                    WHEN tn.nspname = 'pg_catalog' THEN pg_catalog.format_type(c.casttarget, NULL)
+                    WHEN t.typcategory = 'A' AND t.typelem <> 0 THEN tn.nspname || '.' || te.typname || '[]'
+                    ELSE tn.nspname || '.' || t.typname
+                END AS target,
+                c.castcontext::text AS context,
+                c.castmethod::text AS method,
+                fn.nspname AS func_schema,
+                p.proname AS func_name,
+                COALESCE(
+                    ARRAY(
+                        SELECT pg_catalog.format_type(arg_oid, NULL)
+                        FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(arg_oid, n)
+                        ORDER BY n
+                    )::text[],
+                    ARRAY[]::text[]
+                ) AS func_arg_types
             FROM pg_catalog.pg_cast c
             JOIN pg_catalog.pg_type s ON s.oid = c.castsource
             JOIN pg_catalog.pg_namespace sn ON sn.oid = s.typnamespace
+            LEFT JOIN pg_catalog.pg_type se ON se.oid = s.typelem
             JOIN pg_catalog.pg_type t ON t.oid = c.casttarget
             JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace
-            WHERE c.castcontext = 'i'
-              AND sn.nspname = 'pg_catalog'
-              AND tn.nspname = 'pg_catalog'
+            LEFT JOIN pg_catalog.pg_type te ON te.oid = t.typelem
+            LEFT JOIN pg_catalog.pg_proc p ON p.oid = c.castfunc
+            LEFT JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+            ORDER BY 1, 2
             ",
             &[],
         )
-        .context("Failed to load implicit casts")?;
-    Ok(crate::_internal::model::cast::CastCatalogue::new(
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("source").context("implicit cast source")?,
-                    row.try_get("target").context("implicit cast target")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?,
-    ))
+        .context("Failed to load casts")?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let source: String = row.try_get("source").context("cast source")?;
+        let target: String = row.try_get("target").context("cast target")?;
+        let context_code: String = row.try_get("context").context("cast context")?;
+        let context = match context_code.as_str() {
+            "i" => CastContextFact::Implicit,
+            "a" => CastContextFact::Assignment,
+            _ => CastContextFact::Explicit,
+        };
+        let method_code: String = row.try_get("method").context("cast method")?;
+        let method = match method_code.as_str() {
+            "b" => CastEntryMethod::WithoutFunction,
+            "i" => CastEntryMethod::WithInout,
+            _ => {
+                let func_schema: Option<String> =
+                    row.try_get("func_schema").context("cast func schema")?;
+                let func_name: Option<String> =
+                    row.try_get("func_name").context("cast func name")?;
+                let func_arg_types: Vec<String> =
+                    row.try_get("func_arg_types").context("cast func args")?;
+                let func_id = match (func_schema, func_name) {
+                    (Some(schema), Some(name)) if schema != "pg_catalog" => {
+                        let args = func_arg_types
+                            .iter()
+                            .map(|arg| {
+                                crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                                    arg,
+                                    builtin_types,
+                                )
+                                .render()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        Some(ObjectId::new(schema, format!("{name}({args})")))
+                    }
+                    _ => None,
+                };
+                CastEntryMethod::WithFunction(func_id)
+            }
+        };
+        entries.push(CastEntry {
+            source,
+            target,
+            context,
+            method,
+        });
+    }
+    Ok(CastCatalogue::from_entries(entries))
 }
 
 /// Load built-in aggregate signatures, collapsing polymorphic arguments to
@@ -215,7 +280,7 @@ pub(super) fn load_types(
     // types are excluded because PostgreSQL refuses both for them ("cannot
     // alter/drop array type"), so they are never independently addressable.
     let type_predicate = "t.typtype IN ('e', 'd', 'c', 'r', 'm') \
-                          OR (t.typtype = 'b' AND t.typelem = 0)";
+                          OR (t.typtype = 'b' AND t.typcategory <> 'A')";
     let query = format!(
         "
         SELECT

@@ -94,4 +94,5 @@ mod statement_semantics;
 mod tables_constraints;
 mod triggers_policies;
 mod types;
+mod types_advanced;
 mod views;

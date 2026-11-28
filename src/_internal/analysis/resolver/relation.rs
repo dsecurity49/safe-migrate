@@ -88,30 +88,6 @@ impl Resolver {
         let of_type = of_type
             .as_ref()
             .map(|name| Self::resolve_type_lookup_name(name, state));
-        if let Some(type_id) = &of_type
-            && let Some(crate::_internal::model::types::TypeOverlay::Present(
-                crate::_internal::model::types::TypeState {
-                    kind: crate::_internal::model::types::TypeKind::Composite { fields },
-                    ..
-                },
-            )) = state.local.types.get(type_id)
-        {
-            columns.extend(fields.iter().map(|field| ColumnMutation {
-                name: field.name.clone(),
-                ty: Some(field.data_type.clone()),
-                type_modifier: None,
-                not_null: false,
-                is_primary_key: false,
-                primary_key_constraint_name: None,
-                is_unique: false,
-                unique_constraint_name: None,
-                default: None,
-                generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
-                identity_sequence: None,
-                generated_expr: None,
-                generated_expr_sql: None,
-            }));
-        }
         let mut as_select_columns_known = !as_select;
         if as_select && select_projection_complete {
             let source_id = select_source

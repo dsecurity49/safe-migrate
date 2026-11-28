@@ -481,14 +481,14 @@
     "009_ctas_where.sql",
     "010_ctas_subquery.sql",
     "005_select_into.sql"
-  ],
-  "excluded_fixtures": [
+   ],
+   "excluded_fixtures": [
     {
-      "fixture": "003_ctas_temp.sql",
-      "reason": "The simulator now places the relation in the session schema, but the harness projection does not include pg_temp, so live PostgreSQL reports it as absent."
+     "fixture": "003_ctas_temp.sql",
+     "reason": "The simulator now places the relation in the session schema, but the harness projection does not include pg_temp, so live PostgreSQL reports it as absent."
     },
     {
-      "fixture": "safe_001_create.sql",
+     "fixture": "safe_001_create.sql",
      "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
     },
     {
@@ -496,11 +496,11 @@
      "reason": "Already represented by rule_18 and produces no CTAS-specific state."
     },
     {
-      "fixture": "safe_003_create_temp.sql",
-      "reason": "The session temporary schema is outside the harness projection, so live PostgreSQL reports the relation as absent."
+     "fixture": "safe_003_create_temp.sql",
+     "reason": "The session temporary schema is outside the harness projection, so live PostgreSQL reports the relation as absent."
     },
     {
-      "fixture": "safe_004_create_unlogged.sql",
+     "fixture": "safe_004_create_unlogged.sql",
      "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
     },
     {
@@ -747,7 +747,7 @@
     "safe_011_create_schema_if_not_exists.sql",
     "safe_012_create_extension_if_not_exists.sql",
     "safe_013_drop_extension_if_exists.sql"
-  ],
+   ],
    "fixture_requires_extensions": {
     "safe_012_create_extension_if_not_exists.sql": [
      "hstore"
@@ -771,8 +771,8 @@
      "reason": "Missing IF EXISTS; rule diagnostic fixture with no live state comparison."
     },
     {
-      "fixture": "009_drop_column.sql",
-      "reason": "Requires column c in the canonical baseline, which conflicts with add-column fixtures."
+     "fixture": "009_drop_column.sql",
+     "reason": "Requires column c in the canonical baseline, which conflicts with add-column fixtures."
     },
     {
      "fixture": "010_drop_policy.sql",
@@ -791,11 +791,11 @@
      "reason": "Requires schema \"s_unique\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
-      "fixture": "safe_004_drop_index_if_exists.sql",
+     "fixture": "safe_004_drop_index_if_exists.sql",
      "reason": "Requires index i in the canonical baseline to produce a state change, which conflicts with enabled create-index fixtures."
     },
     {
-      "fixture": "safe_009_drop_column_if_exists.sql",
+     "fixture": "safe_009_drop_column_if_exists.sql",
      "reason": "Requires column c in the canonical baseline to produce a state change, which conflicts with add-column fixtures."
     }
    ],
@@ -1803,7 +1803,27 @@
     "safe_050_autocommit_on_commit_drop.sql",
     "safe_051_generated_expression_visible_function.sql",
     "safe_052_crashed_detach_finalize.sql",
-    "safe_053_cancelled_detach_finalize.sql"
+    "safe_053_cancelled_detach_finalize.sql",
+    "safe_057_analyze_non_table_relations.sql",
+    "safe_058_drop_column_autodrops_extended_statistics.sql",
+    "safe_059_cast_lifecycle_and_function_cascade.sql",
+    "023_statistics_too_many_columns.sql",
+    "024_statistics_type_without_btree_opclass.sql",
+    "025_statistics_missing_expression_column.sql",
+    "026_drop_cast_function_without_cascade.sql",
+    "027_drop_missing_cast.sql",
+    "safe_060_alter_function_and_routine_on_aggregate.sql",
+    "safe_061_routine_support_and_depends_on_extension.sql",
+    "safe_062_analyze_pg_catalog_and_statistics_options.sql",
+    "safe_063_begin_atomic_function_lifecycle.sql",
+    "028_drop_table_used_by_synced_begin_atomic_function.sql",
+    "029_drop_column_used_by_synced_begin_atomic_function.sql",
+    "030_drop_function_used_by_statistics_expression.sql",
+    "031_create_function_begin_atomic_missing_column.sql",
+    "032_create_function_return_type_mismatch.sql",
+    "033_analyze_invalid_option_and_duplicate_column.sql",
+    "034_alter_function_invalid_set_and_missing_support.sql",
+    "035_drop_role_owning_aggregate.sql"
    ],
    "fixture_transactional": {
     "safe_010_role_transaction_semantics.sql": false,
@@ -1838,7 +1858,8 @@
     "safe_035_metadata_reset.sql": 160000,
     "safe_023_role_options.sql": 160000,
     "safe_052_crashed_detach_finalize.sql": 140000,
-    "safe_053_cancelled_detach_finalize.sql": 140000
+    "safe_053_cancelled_detach_finalize.sql": 140000,
+    "safe_062_analyze_pg_catalog_and_statistics_options.sql": 160000
    },
    "pending_detach_setup": {
     "safe_052_crashed_detach_finalize.sql": {
@@ -1905,8 +1926,60 @@
      "sqlstate": "55000",
      "simulator_rule": "chain-conflict"
     },
-"022_drop_range_constructor.sql": {
-    "sqlstate": "2BP01",
+    "022_drop_range_constructor.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "023_statistics_too_many_columns.sql": {
+     "sqlstate": "54011",
+     "simulator_rule": "chain-conflict"
+    },
+    "024_statistics_type_without_btree_opclass.sql": {
+     "sqlstate": "0A000",
+     "simulator_rule": "chain-conflict"
+    },
+    "025_statistics_missing_expression_column.sql": {
+     "sqlstate": "42703",
+     "simulator_rule": "chain-conflict"
+    },
+    "026_drop_cast_function_without_cascade.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "027_drop_missing_cast.sql": {
+     "sqlstate": "42704",
+     "simulator_rule": "chain-conflict"
+    },
+    "028_drop_table_used_by_synced_begin_atomic_function.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "029_drop_column_used_by_synced_begin_atomic_function.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "030_drop_function_used_by_statistics_expression.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "031_create_function_begin_atomic_missing_column.sql": {
+     "sqlstate": "42703",
+     "simulator_rule": "chain-conflict"
+    },
+    "032_create_function_return_type_mismatch.sql": {
+     "sqlstate": "42P13",
+     "simulator_rule": "chain-conflict"
+    },
+    "033_analyze_invalid_option_and_duplicate_column.sql": {
+     "sqlstate": "42701",
+     "simulator_rule": "chain-conflict"
+    },
+    "034_alter_function_invalid_set_and_missing_support.sql": {
+     "sqlstate": "22023",
+     "simulator_rule": "chain-conflict"
+    },
+    "035_drop_role_owning_aggregate.sql": {
+     "sqlstate": "2BP01",
      "simulator_rule": "chain-conflict"
     }
    },
@@ -2208,7 +2281,7 @@
      "relations",
      "columns"
     ],
-"safe_051_generated_expression_visible_function.sql": [
+    "safe_051_generated_expression_visible_function.sql": [
      "relations",
      "columns",
      "functions"
@@ -2226,6 +2299,34 @@
      "constraints",
      "partitions",
      "index_partitions"
+    ],
+    "safe_057_analyze_non_table_relations.sql": [
+     "relations",
+     "sequences",
+     "indexes",
+     "types"
+    ],
+    "safe_058_drop_column_autodrops_extended_statistics.sql": [
+     "relations",
+     "columns",
+     "extended_statistics"
+    ],
+    "safe_059_cast_lifecycle_and_function_cascade.sql": [
+     "types",
+     "functions"
+    ],
+    "safe_060_alter_function_and_routine_on_aggregate.sql": [
+     "functions"
+    ],
+    "safe_061_routine_support_and_depends_on_extension.sql": [
+     "functions"
+    ],
+    "safe_062_analyze_pg_catalog_and_statistics_options.sql": [
+     "relations",
+     "extended_statistics"
+    ],
+    "safe_063_begin_atomic_function_lifecycle.sql": [
+     "functions"
     ]
    },
    "required_relations": [
@@ -2730,26 +2831,26 @@
    "rule_dir": "rule_32_alter-index",
    "enabled": true,
    "transactional": true,
-  "fixtures": [
-   "safe_003_attach_partition_drop_child.sql",
-   "safe_004_attach_partition_drop_child_direct.sql",
-   "safe_005_attach_partition_drop_child_cascade.sql",
-   "safe_001_alter_index.sql"
-  ],
-  "expected_live_errors": {
-   "safe_003_attach_partition_drop_child.sql": {
-    "sqlstate": "42704",
-    "simulator_rule": "chain-conflict"
+   "fixtures": [
+    "safe_003_attach_partition_drop_child.sql",
+    "safe_004_attach_partition_drop_child_direct.sql",
+    "safe_005_attach_partition_drop_child_cascade.sql",
+    "safe_001_alter_index.sql"
+   ],
+   "expected_live_errors": {
+    "safe_003_attach_partition_drop_child.sql": {
+     "sqlstate": "42704",
+     "simulator_rule": "chain-conflict"
+    },
+    "safe_004_attach_partition_drop_child_direct.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    },
+    "safe_005_attach_partition_drop_child_cascade.sql": {
+     "sqlstate": "2BP01",
+     "simulator_rule": "chain-conflict"
+    }
    },
-   "safe_004_attach_partition_drop_child_direct.sql": {
-    "sqlstate": "2BP01",
-    "simulator_rule": "chain-conflict"
-   },
-   "safe_005_attach_partition_drop_child_cascade.sql": {
-    "sqlstate": "2BP01",
-    "simulator_rule": "chain-conflict"
-   }
-  },
    "schemas": [
     "public",
     "sm_identity",
@@ -2760,15 +2861,15 @@
     "sm_audit",
     "sm_analytics"
    ],
-  "scope": [
-   "relations",
-   "constraints",
-   "indexes",
-   "index_partitions"
-  ],
-  "required_relations": [
-   "public.test_table"
-  ],
+   "scope": [
+    "relations",
+    "constraints",
+    "indexes",
+    "index_partitions"
+   ],
+   "required_relations": [
+    "public.test_table"
+   ],
    "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, extension dependencies, and index attachment."
   },
   {

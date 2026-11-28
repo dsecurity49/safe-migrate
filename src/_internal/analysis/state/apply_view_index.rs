@@ -534,12 +534,21 @@ impl AnalysisState {
     fn has_external_view_dependents(&self, roots: &HashSet<ObjectId>) -> bool {
         self.local.graph.edges().iter().any(|edge| {
             self.dependency_edge_is_current(edge)
-                && matches!(edge.kind, DependencyKind::ViewDependency { .. })
-                && roots.contains(self.local.graph.resolve_rename(&edge.referenced))
-                && !roots.contains(self.local.graph.resolve_rename(&edge.dependent))
-                && !self
-                    .co_dropped_objects
-                    .contains(self.local.graph.resolve_rename(&edge.dependent))
+                && ((matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                    && roots.contains(self.local.graph.resolve_rename(&edge.referenced))
+                    && !roots.contains(self.local.graph.resolve_rename(&edge.dependent))
+                    && !self
+                        .co_dropped_objects
+                        .contains(self.local.graph.resolve_rename(&edge.dependent)))
+                    || (matches!(edge.kind, DependencyKind::RoutineUsesRelation { .. })
+                        && roots.contains(self.local.graph.resolve_rename(&edge.referenced))
+                        && !self.co_dropped_objects.contains(&edge.dependent)
+                        && matches!(
+                            self.local.functions.get(&edge.dependent),
+                            Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                _
+                            ))
+                        )))
         })
     }
 
@@ -618,6 +627,30 @@ impl AnalysisState {
             self.local
                 .relations
                 .insert(id.clone(), RelationOverlay::Dropped);
+        }
+        let routines_to_drop: Vec<ObjectId> = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::RoutineUsesRelation { .. })
+                    && all_dropped_relations
+                        .contains(self.local.graph.resolve_rename(&edge.referenced))
+                    && matches!(
+                        self.local.functions.get(&edge.dependent),
+                        Some(crate::_internal::model::function::FunctionOverlay::Present(
+                            _
+                        ))
+                    )
+            })
+            .map(|edge| edge.dependent.clone())
+            .collect();
+        if !routines_to_drop.is_empty() {
+            let dropped_set: HashSet<ObjectId> = routines_to_drop.iter().cloned().collect();
+            for routine_id in routines_to_drop {
+                let _ = self.apply_routine_cascade_drop(&routine_id, &[], &[], &dropped_set);
+            }
         }
         let resolution_graph = self.local.graph.clone();
         let triggers_to_drop = self
@@ -778,7 +811,30 @@ impl AnalysisState {
                     ))
             });
         }
+        let mut covered_relations = HashSet::new();
+        for col_dep in &create.column_dependencies {
+            if let Some(ref col) = col_dep.column
+                && let Some(RelationOverlay::Present(rel)) =
+                    self.local.relations.get(&col_dep.relation)
+                && rel.columns_complete
+                && !rel.has_column(col)
+            {
+                continue;
+            }
+            covered_relations.insert(col_dep.relation.clone());
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                col_dep.relation.clone(),
+                DependencyKind::ViewDependency {
+                    view_generation: generation,
+                    referenced_column: col_dep.column.clone(),
+                },
+            ));
+        }
         for dependency in &create.depends_on {
+            if covered_relations.contains(dependency) {
+                continue;
+            }
             self.local.graph.add_edge(DependencyEdge::new(
                 create.id.clone(),
                 dependency.clone(),
@@ -856,7 +912,30 @@ impl AnalysisState {
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
         self.snapshot_graph_full();
+        let mut covered_relations = HashSet::new();
+        for col_dep in &create.column_dependencies {
+            if let Some(ref col) = col_dep.column
+                && let Some(RelationOverlay::Present(rel)) =
+                    self.local.relations.get(&col_dep.relation)
+                && rel.columns_complete
+                && !rel.has_column(col)
+            {
+                continue;
+            }
+            covered_relations.insert(col_dep.relation.clone());
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                col_dep.relation.clone(),
+                DependencyKind::ViewDependency {
+                    view_generation: generation,
+                    referenced_column: col_dep.column.clone(),
+                },
+            ));
+        }
         for dependency in &create.depends_on {
+            if covered_relations.contains(dependency) {
+                continue;
+            }
             self.local.graph.add_edge(DependencyEdge::new(
                 create.id.clone(),
                 dependency.clone(),

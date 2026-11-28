@@ -283,6 +283,14 @@ fn lock_prediction_expected(mutation: &Mutation) -> bool {
         | Mutation::CreateAggregate(_)
         | Mutation::AlterAggregate(_)
         | Mutation::DropAggregate(_)
+        | Mutation::AlterRoutine(_)
+        | Mutation::DropRoutine(_)
+        | Mutation::CreateCast(_)
+        | Mutation::DropCast(_)
+        | Mutation::CreateStatistics(_)
+        | Mutation::AlterStatistics(_)
+        | Mutation::DropStatistics(_)
+        | Mutation::Analyze(_)
         | Mutation::CreatePublication(_)
         | Mutation::AlterPublication(_)
         | Mutation::DropPublication(_)
@@ -306,6 +314,7 @@ fn alter_table_action_is_known_metadata_only(action: &AlterTableActionMutation) 
     matches!(
         action,
         AlterTableActionMutation::AddColumn { .. }
+            | AlterTableActionMutation::AddIdentity { .. }
             | AlterTableActionMutation::DropColumn { .. }
             | AlterTableActionMutation::RenameColumn { .. }
             | AlterTableActionMutation::SetDefault { .. }
@@ -655,6 +664,41 @@ fn predict_alter_table(
             work: LockWork::TableRewrite,
             targets: vec![subject_target(LockModeFact::AccessExclusive)],
         }],
+        AlterTableActionMutation::SetPersistence { .. } => vec![LockPrediction {
+            object_kind: ObjectKind::Table,
+            object_name: subject.to_string(),
+            operation: "Changing table persistence",
+            work: LockWork::TableRewrite,
+            targets: vec![subject_target(LockModeFact::AccessExclusive)],
+        }],
+        AlterTableActionMutation::SetGeneratedExpression { column, .. } => {
+            let work = match pre_state.relations.get(subject) {
+                Some(relation) => match relation.generated_columns.get(column) {
+                    Some(generated)
+                        if generated.kind
+                            == crate::_internal::model::relation::GeneratedColumnKind::Virtual =>
+                    {
+                        if relation
+                            .get_column(column)
+                            .is_some_and(|col| !col.is_nullable)
+                        {
+                            LockWork::TableScan
+                        } else {
+                            LockWork::MetadataOnly
+                        }
+                    }
+                    _ => LockWork::TableRewrite,
+                },
+                None => LockWork::TableRewrite,
+            };
+            vec![LockPrediction {
+                object_kind: ObjectKind::Table,
+                object_name: subject.to_string(),
+                operation: "Changing a generated column expression",
+                work,
+                targets: vec![subject_target(LockModeFact::AccessExclusive)],
+            }]
+        }
         AlterTableActionMutation::SetType { .. } => vec![LockPrediction {
             object_kind: ObjectKind::Table,
             object_name: subject.to_string(),

@@ -1,6 +1,34 @@
 use super::*;
 
 impl AnalysisState {
+    pub(super) fn relation_is_in_any_publication(&self, relation_id: &ObjectId) -> bool {
+        let resolved_target = self.local.graph.resolve_rename(relation_id);
+        if self.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::PublicationIncludes { .. })
+                && self.local.graph.resolve_rename(&edge.dependent) == resolved_target
+        }) {
+            return true;
+        }
+        self.local.publications.values().any(|overlay| {
+            let crate::_internal::model::replication::PublicationOverlay::Present(pub_state) =
+                overlay
+            else {
+                return false;
+            };
+            let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+                &pub_state.scope
+            else {
+                return false;
+            };
+            objects.iter().any(|obj| match obj {
+                crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                    name, ..
+                } => &self.resolve_relation_id(name) == resolved_target,
+                _ => false,
+            })
+        })
+    }
+
     pub(super) fn trigger_key(table_id: &ObjectId, name: &str) -> ObjectId {
         // PostgreSQL identifiers cannot contain NUL, so this is an unambiguous
         // internal composite key while keeping the public cache representation

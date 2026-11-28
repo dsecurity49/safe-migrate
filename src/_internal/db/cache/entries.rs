@@ -236,3 +236,23 @@ pub(crate) struct IndexAttachmentCache {
     /// The partitioned (parent) index.
     pub parent: ObjectId,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum RoutineDependencyTarget {
+    Relation {
+        relation: ObjectId,
+        column: Option<String>,
+    },
+    Routine {
+        routine: ObjectId,
+    },
+    Type {
+        ty: ObjectId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct RoutineDependencyCache {
+    pub dependent: ObjectId,
+    pub target: RoutineDependencyTarget,
+}

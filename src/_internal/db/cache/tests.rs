@@ -1605,3 +1605,155 @@ fn current_cache_rejects_extension_member_with_empty_identity() {
             .contains("empty object name")
     );
 }
+
+#[test]
+fn v12_0_and_v12_1_caches_coexist_under_major_v12_while_older_versions_fail() {
+    use crate::_internal::analysis::facts::CastContextFact;
+    use crate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+
+    let mut cache = synced_cache();
+    let func_id = ObjectId::new("public", "fn_cast(public.src_t)");
+    cache.functions.insert(
+        func_id.clone(),
+        crate::_internal::model::function::FunctionState::with_inputs(
+            func_id.clone(),
+            crate::_internal::model::function::RoutineKind::Function,
+            vec!["public.src_t".to_string()],
+        ),
+    );
+    let mut casts = CastCatalogue::fallback();
+    casts.insert_cast(CastEntry {
+        source: "public.src_t".to_string(),
+        target: "public.dst_t".to_string(),
+        context: CastContextFact::Assignment,
+        method: CastEntryMethod::WithFunction(Some(func_id.clone())),
+    });
+    cache.casts = Some(casts);
+
+    let config = bincode::config::standard().with_variable_int_encoding();
+
+    // 1. V12.0 cache (legacy 12.0 layout without CacheExtensionV12_1) still decodes and validates!
+    let v12_0 = DbCacheVersioned::V12(Box::new(cache.clone()));
+    assert_eq!(v12_0.format_version(), 12);
+    assert_eq!(v12_0.minor_version(), 0);
+    let bytes_12_0 = bincode::serde::encode_to_vec(&v12_0, config).unwrap();
+    let decoded_12_0: DbCacheVersioned = bincode::serde::decode_from_slice(&bytes_12_0, config)
+        .unwrap()
+        .0;
+    assert_eq!(decoded_12_0.format_version(), 12);
+    assert_eq!(decoded_12_0.minor_version(), 0);
+    let hydrated_12_0 = decoded_12_0
+        .into_cache()
+        .expect("V12.0 must remain supported");
+    let casts_12_0 = hydrated_12_0.casts.as_ref().unwrap();
+    assert!(casts_12_0.coerces_implicitly("smallint", "integer"));
+    assert!(
+        !casts_12_0.has_full_cast_coverage(),
+        "V12.0 cache must report partial (implicit-only) cast coverage"
+    );
+
+    // 2. V12.1 cache (written by DbCacheVersioned::current) preserves full typed CastEntry records!
+    let v12_1 = DbCacheVersioned::current(cache);
+    assert_eq!(v12_1.format_version(), 12);
+    assert_eq!(v12_1.minor_version(), 1);
+    let bytes_12_1 = bincode::serde::encode_to_vec(&v12_1, config).unwrap();
+    let decoded_12_1: DbCacheVersioned = bincode::serde::decode_from_slice(&bytes_12_1, config)
+        .unwrap()
+        .0;
+    assert_eq!(decoded_12_1.format_version(), 12);
+    assert_eq!(decoded_12_1.minor_version(), 1);
+    let hydrated_12_1 = decoded_12_1
+        .into_cache()
+        .expect("V12.1 must decode cleanly");
+    let hydrated_casts = hydrated_12_1.casts.as_ref().unwrap();
+    assert!(hydrated_casts.has_cast("public.src_t", "public.dst_t"));
+    assert!(
+        hydrated_casts.has_full_cast_coverage(),
+        "V12.1 cache must report full cast coverage"
+    );
+    assert_eq!(
+        hydrated_casts.casts_using_function(&func_id),
+        vec![("public.src_t".to_string(), "public.dst_t".to_string())]
+    );
+}
+
+#[test]
+fn v12_1_validates_extension_casts_against_base_implicit_map_and_preserves_routine_dependencies() {
+    use crate::_internal::analysis::facts::CastContextFact;
+    use crate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+
+    // C1: empty V12.1 extension still marks full_coverage = true after encode/decode when base implicit map is empty
+    let mut empty_cache = synced_cache();
+    empty_cache.casts = Some(CastCatalogue::from_entries(Vec::new()));
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded_empty =
+        bincode::serde::encode_to_vec(DbCacheVersioned::current(empty_cache), config).unwrap();
+    let (decoded_empty_ver, _): (DbCacheVersioned, _) =
+        bincode::serde::decode_from_slice(&encoded_empty, config).unwrap();
+    let decoded_empty = decoded_empty_ver
+        .into_cache()
+        .expect("empty V12.1 cast catalogue must validate");
+    assert!(
+        decoded_empty
+            .casts
+            .as_ref()
+            .unwrap()
+            .has_full_cast_coverage()
+    );
+
+    // C2: extension record claiming Implicit when base implicit map disagrees must fail validation
+    let mut mismatched = synced_cache();
+    mismatched.casts = Some(CastCatalogue::from_entries(vec![CastEntry {
+        source: "smallint".to_string(),
+        target: "integer".to_string(),
+        context: CastContextFact::Implicit,
+        method: CastEntryMethod::WithoutFunction,
+    }]));
+    let bad_ext = CacheExtensionV12_1 {
+        casts: vec![CastEntry {
+            source: "smallint".to_string(),
+            target: "integer".to_string(),
+            context: CastContextFact::Explicit,
+            method: CastEntryMethod::WithoutFunction,
+        }],
+        routine_dependencies: Vec::new(),
+    };
+    let err = DbCacheVersioned::V12_1(Box::new(mismatched), bad_ext)
+        .into_cache()
+        .unwrap_err();
+    assert!(
+        err.contains("disagrees with base implicit cast"),
+        "expected C2 disagreement error, got: {err}"
+    );
+
+    // F4: routine_dependencies round-trip through CacheExtensionV12_1
+    let mut dep_cache = synced_cache();
+    let tbl_id = ObjectId::new("public", "t");
+    dep_cache
+        .relations
+        .insert(tbl_id.clone(), table(tbl_id.clone(), &["a"]));
+    let fn_id = ObjectId::new("public", "uses_ta()");
+    dep_cache.functions.insert(
+        fn_id.clone(),
+        crate::_internal::model::function::FunctionState::with_inputs(
+            fn_id.clone(),
+            crate::_internal::model::function::RoutineKind::Function,
+            Vec::new(),
+        ),
+    );
+    let dep_entry = RoutineDependencyCache {
+        dependent: fn_id,
+        target: RoutineDependencyTarget::Relation {
+            relation: tbl_id,
+            column: Some("a".to_string()),
+        },
+    };
+    dep_cache.routine_dependencies.push(dep_entry.clone());
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded =
+        bincode::serde::encode_to_vec(DbCacheVersioned::current(dep_cache), config).unwrap();
+    let (decoded_ver, _): (DbCacheVersioned, _) =
+        bincode::serde::decode_from_slice(&encoded, config).unwrap();
+    let hydrated = decoded_ver.into_cache().unwrap();
+    assert_eq!(hydrated.routine_dependencies, vec![dep_entry]);
+}

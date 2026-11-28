@@ -259,6 +259,71 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     "type dependency must have a modeled view or an explicitly omitted dependent schema"
                 );
             }
+            DependencyKind::RoutineUsesRoutine { unresolved_name } => {
+                let dependent_is_modeled_routine = matches!(
+                    local.functions.get(&edge.dependent),
+                    Some(safe_migrate::_internal::model::function::FunctionOverlay::Present(_))
+                );
+                let dependent_schema_is_omitted = state
+                    .baseline_schemas
+                    .as_ref()
+                    .is_some_and(|schemas| !schemas.contains(&edge.dependent.schema));
+                assert!(
+                    dependent_is_modeled_routine || dependent_schema_is_omitted,
+                    "routine dependency must have a modeled routine or an explicitly omitted dependent schema"
+                );
+                if let Some(name) = unresolved_name {
+                    assert_eq!(
+                        edge.referenced, *name,
+                        "a name-only routine edge must use the written name as its endpoint"
+                    );
+                }
+            }
+            DependencyKind::StatisticsUsesRoutine {
+                table_id,
+                unresolved_name,
+            } => {
+                if let Some(name) = unresolved_name {
+                    assert_eq!(
+                        edge.referenced, *name,
+                        "a name-only statistics routine edge must use the written name as its endpoint"
+                    );
+                }
+                let present = matches!(
+                    local.relations.get(table_id),
+                    Some(RelationOverlay::Present(rel))
+                        if rel.extended_statistics.contains_key(&edge.dependent)
+                );
+                assert!(
+                    present,
+                    "statistics routine dependency must belong to a present statistics object"
+                );
+            }
+            DependencyKind::StatisticsUsesType { table_id } => {
+                let present = matches!(
+                    local.relations.get(table_id),
+                    Some(RelationOverlay::Present(rel))
+                        if rel.extended_statistics.contains_key(&edge.dependent)
+                );
+                assert!(
+                    present,
+                    "statistics type dependency must belong to a present statistics object"
+                );
+            }
+            DependencyKind::RoutineUsesRelation { .. } | DependencyKind::RoutineUsesType => {
+                let dependent_is_modeled_routine = matches!(
+                    local.functions.get(&edge.dependent),
+                    Some(safe_migrate::_internal::model::function::FunctionOverlay::Present(_))
+                );
+                let dependent_schema_is_omitted = state
+                    .baseline_schemas
+                    .as_ref()
+                    .is_some_and(|schemas| !schemas.contains(&edge.dependent.schema));
+                assert!(
+                    dependent_is_modeled_routine || dependent_schema_is_omitted,
+                    "routine dependency must have a modeled routine or an explicitly omitted dependent schema"
+                );
+            }
             DependencyKind::SequenceOwnedBy { column } => assert!(matches!(
                 local.sequences.get(&edge.dependent),
                 Some(SequenceOverlay::Present(sequence))

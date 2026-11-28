@@ -365,3 +365,166 @@ pub(super) struct ScopedExternalDependencies {
     pub(super) edges: Vec<ScopedDependencyEdge>,
     pub(super) external_schemas: Vec<String>,
 }
+
+pub(super) fn load_routine_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    builtin_types: &BuiltinTypeCatalogue,
+) -> Result<Vec<crate::_internal::db::cache::RoutineDependencyCache>> {
+    let query = r#"
+        SELECT pn.nspname AS obj_schema,
+               p.proname AS obj_name,
+               ARRAY(
+                   SELECT pg_catalog.format_type(t, NULL)
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                   ORDER BY n
+               )::text[] AS obj_args,
+               'pg_class'::text AS ref_kind,
+               rn.nspname AS ref_schema,
+               rc.relname AS ref_name,
+               a.attname AS ref_column,
+               NULL::text[] AS ref_args
+        FROM pg_depend d
+        JOIN pg_proc p ON p.oid = d.objid
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        JOIN pg_class rc ON rc.oid = d.refobjid
+        JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+        LEFT JOIN pg_attribute a
+          ON a.attrelid = rc.oid
+         AND a.attnum = d.refobjsubid
+         AND NOT a.attisdropped
+        WHERE d.classid = 'pg_proc'::regclass
+          AND d.refclassid = 'pg_class'::regclass
+          AND d.deptype = 'n'
+          AND rc.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+          AND pn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND pn.nspname <> 'information_schema'
+          AND rn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND rn.nspname <> 'information_schema'
+          AND ($1::text[] IS NULL OR pn.nspname = ANY($1) OR rn.nspname = ANY($1))
+        UNION ALL
+        SELECT pn.nspname AS obj_schema,
+               p.proname AS obj_name,
+               ARRAY(
+                   SELECT pg_catalog.format_type(t, NULL)
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                   ORDER BY n
+               )::text[] AS obj_args,
+               'pg_proc'::text AS ref_kind,
+               rpn.nspname AS ref_schema,
+               rp.proname AS ref_name,
+               NULL::text AS ref_column,
+               ARRAY(
+                   SELECT pg_catalog.format_type(t, NULL)
+                   FROM unnest(rp.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                   ORDER BY n
+               )::text[] AS ref_args
+        FROM pg_depend d
+        JOIN pg_proc p ON p.oid = d.objid
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        JOIN pg_proc rp ON rp.oid = d.refobjid
+        JOIN pg_namespace rpn ON rpn.oid = rp.pronamespace
+        WHERE d.classid = 'pg_proc'::regclass
+          AND d.refclassid = 'pg_proc'::regclass
+          AND d.deptype = 'n'
+          AND p.oid <> rp.oid
+          AND pn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND pn.nspname <> 'information_schema'
+          AND rpn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND rpn.nspname <> 'information_schema'
+          AND ($1::text[] IS NULL OR pn.nspname = ANY($1) OR rpn.nspname = ANY($1))
+        UNION ALL
+        SELECT pn.nspname AS obj_schema,
+               p.proname AS obj_name,
+               ARRAY(
+                   SELECT pg_catalog.format_type(t, NULL)
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                   ORDER BY n
+               )::text[] AS obj_args,
+               CASE WHEN tc.oid IS NOT NULL THEN 'pg_class'::text ELSE 'pg_type'::text END AS ref_kind,
+               tn.nspname AS ref_schema,
+               COALESCE(tc.relname, et.typname, t.typname) AS ref_name,
+               NULL::text AS ref_column,
+               NULL::text[] AS ref_args
+        FROM pg_depend d
+        JOIN pg_proc p ON p.oid = d.objid
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        JOIN pg_type t ON t.oid = d.refobjid
+        JOIN pg_namespace tn ON tn.oid = t.typnamespace
+        LEFT JOIN pg_type et ON t.typelem <> 0 AND t.typlen = -1 AND et.oid = t.typelem
+        LEFT JOIN pg_class tc
+          ON tc.oid = COALESCE(NULLIF(t.typrelid, 0), NULLIF(et.typrelid, 0))
+         AND tc.relkind IN ('r', 'p', 'v', 'm', 'f')
+        WHERE d.classid = 'pg_proc'::regclass
+          AND d.refclassid = 'pg_type'::regclass
+          AND d.deptype = 'n'
+          AND p.prosqlbody IS NOT NULL
+          AND pn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND pn.nspname <> 'information_schema'
+          AND tn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND tn.nspname <> 'information_schema'
+          AND ($1::text[] IS NULL OR pn.nspname = ANY($1) OR tn.nspname = ANY($1))
+    "#;
+    let rows = client
+        .query(query, &[schema_values])
+        .context("Failed to load routine dependencies from pg_proc/pg_depend")?;
+    let mut dependencies = Vec::new();
+    let mut seen = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let obj_schema: String = row.try_get("obj_schema").context("routine schema")?;
+        let obj_name: String = row.try_get("obj_name").context("routine name")?;
+        let obj_args: Vec<String> = row
+            .try_get::<_, Option<Vec<String>>>("obj_args")
+            .context("routine args")?
+            .unwrap_or_default();
+        let obj_sig = obj_args
+            .iter()
+            .map(|arg| {
+                crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                    arg,
+                    builtin_types,
+                )
+                .render()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let dependent = ObjectId::new(obj_schema, format!("{obj_name}({obj_sig})"));
+        let ref_kind: String = row.try_get("ref_kind").context("ref kind")?;
+        let ref_schema: String = row.try_get("ref_schema").context("ref schema")?;
+        let ref_name: String = row.try_get("ref_name").context("ref name")?;
+        let target = match ref_kind.as_str() {
+            "pg_class" => crate::_internal::db::cache::RoutineDependencyTarget::Relation {
+                relation: ObjectId::new(ref_schema, ref_name),
+                column: row.try_get("ref_column").context("ref column")?,
+            },
+            "pg_proc" => {
+                let ref_args: Vec<String> = row
+                    .try_get::<_, Option<Vec<String>>>("ref_args")
+                    .context("ref args")?
+                    .unwrap_or_default();
+                let ref_sig = ref_args
+                    .iter()
+                    .map(|arg| {
+                        crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                            arg,
+                            builtin_types,
+                        )
+                        .render()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                crate::_internal::db::cache::RoutineDependencyTarget::Routine {
+                    routine: ObjectId::new(ref_schema, format!("{ref_name}({ref_sig})")),
+                }
+            }
+            _ => crate::_internal::db::cache::RoutineDependencyTarget::Type {
+                ty: ObjectId::new(ref_schema, ref_name),
+            },
+        };
+        let entry = crate::_internal::db::cache::RoutineDependencyCache { dependent, target };
+        if seen.insert(entry.clone()) {
+            dependencies.push(entry);
+        }
+    }
+    Ok(dependencies)
+}

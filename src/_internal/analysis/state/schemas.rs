@@ -110,6 +110,8 @@ impl AnalysisState {
     /// dropped.
     pub(super) fn rename_schema_namespace(&mut self, old_name: &str, new_name: &str) {
         self.snapshot_namespace();
+        self.snapshot_casts();
+        self.local.casts.rewire_schema(old_name, new_name);
 
         let mut aliases = Vec::new();
         let mut relations = HashMap::new();
@@ -118,6 +120,30 @@ impl AnalysisState {
             Self::remap_schema_id(&mut id, old_name, new_name);
             if let RelationOverlay::Present(state) = &mut overlay {
                 Self::remap_schema_id(&mut state.id, old_name, new_name);
+                if let Some(of_type) = &mut state.of_type {
+                    Self::remap_schema_id(of_type, old_name, new_name);
+                }
+                for column in &mut state.columns {
+                    if let Some(type_id) = &mut column.type_id {
+                        let old_type_id = type_id.clone();
+                        Self::remap_schema_id(type_id, old_name, new_name);
+                        if *type_id != old_type_id {
+                            column.data_type = Some(Self::remapped_type_display(
+                                column.data_type.as_deref().unwrap_or_default(),
+                                type_id,
+                                true,
+                            ));
+                        }
+                    }
+                }
+                state.extended_statistics = std::mem::take(&mut state.extended_statistics)
+                    .into_iter()
+                    .map(|(mut stat_id, mut stat)| {
+                        Self::remap_schema_id(&mut stat_id, old_name, new_name);
+                        Self::remap_schema_id(&mut stat.id, old_name, new_name);
+                        (stat_id, stat)
+                    })
+                    .collect();
             }
             if id != old_id {
                 aliases.push((old_id, id.clone()));

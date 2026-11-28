@@ -488,9 +488,11 @@ fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
     println!("Cache: {}", display_path(cache_path));
     println!(
         "Format version: {}",
-        inspection
-            .format_version
-            .map_or_else(|| "unavailable".to_owned(), |version| version.to_string())
+        match (inspection.format_version, inspection.format_minor_version) {
+            (Some(major), Some(minor)) if minor > 0 => format!("{major}.{minor}"),
+            (Some(major), _) => major.to_string(),
+            (None, _) => "unavailable".to_owned(),
+        }
     );
     println!(
         "Encryption: {}",
@@ -580,6 +582,11 @@ fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
     println!("    {:<22} {}", "Foreign keys:", contents.foreign_keys);
     println!("    {:<22} {}", "Triggers:", contents.triggers);
     println!("    {:<22} {}", "Types:", contents.types);
+    println!("    {:<22} {}", "Casts:", contents.casts);
+    println!(
+        "    {:<22} {}",
+        "Extended statistics:", contents.extended_statistics
+    );
     println!();
     println!("  Routines");
     println!("    {:<22} {}", "Functions:", contents.functions);
@@ -598,6 +605,10 @@ fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
     println!("    {:<22} {}", "Roles:", contents.roles);
     println!("    {:<22} {}", "Dependencies:", contents.dependencies);
     println!("    {:<22} {}", "Inheritance edges:", contents.inheritances);
+    println!(
+        "    {:<22} {}",
+        "Routine dependencies:", contents.routine_dependencies
+    );
     println!();
     println!(
         "Redaction: this summary intentionally omits object, column, role, and dependency names; cache files still contain that metadata and must be handled as sensitive."

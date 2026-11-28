@@ -375,7 +375,12 @@ impl AnalysisState {
 
     /// Whether a resolved type reference names `id` or its array form.
     pub(crate) fn type_reference_matches(reference: Option<&ObjectId>, id: &ObjectId) -> bool {
-        reference.is_some_and(|reference| reference == id || reference == &Self::array_type_id(id))
+        reference.is_some_and(|reference| {
+            reference == id
+                || reference == &Self::array_type_id(id)
+                || (reference.schema == id.schema
+                    && reference.name.strip_prefix('_') == Some(id.name.as_str()))
+        })
     }
 
     /// Whether a resolved type reference names any of `ids` or an array form.

@@ -458,6 +458,17 @@ CREATE FUNCTION public.f() RETURNS integer
 LANGUAGE sql VOLATILE
 AS 'SELECT 1';
 
+CREATE TABLE sm_core.atomic_dep_table (
+    a integer,
+    b text
+);
+
+CREATE FUNCTION sm_core.uses_atomic_dep_table() RETURNS integer
+LANGUAGE sql
+BEGIN ATOMIC
+    SELECT a FROM sm_core.atomic_dep_table;
+END;
+
 CREATE TRIGGER audit_public_test_table
 AFTER INSERT OR UPDATE OR DELETE ON public.test_table
 FOR EACH ROW EXECUTE FUNCTION sm_audit.capture_row_change();

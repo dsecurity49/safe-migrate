@@ -25,6 +25,15 @@ impl AnalysisState {
     pub(super) fn apply_type_cascade(&mut self, victims: &[ObjectId]) -> bool {
         let mut complete = true;
         let (dropped_types, removed_fields) = self.type_cascade_closure(victims);
+        if dropped_types
+            .iter()
+            .any(|id| self.local.casts.has_casts_for_type(&id.to_string()))
+        {
+            self.snapshot_casts();
+            for id in &dropped_types {
+                self.local.casts.remove_casts_for_type(&id.to_string());
+            }
+        }
 
         // A composite survives the loss of a field; only the field goes.
         for (composite, field) in &removed_fields {
@@ -137,6 +146,49 @@ impl AnalysisState {
             let _ = self.apply_drop_relation_family(&view_seeds, true, "view");
         }
 
+        let mut stats_seeds: Vec<(ObjectId, ObjectId)> = Vec::new();
+        for id in &dropped_types {
+            for probe in [id.clone(), Self::array_type_id(id)] {
+                for edge in self.local.graph.statistics_for_type(&probe) {
+                    if let DependencyKind::StatisticsUsesType { table_id } = &edge.kind
+                        && self.extended_statistics_is_present(&edge.dependent)
+                    {
+                        let pair = (table_id.clone(), edge.dependent.clone());
+                        if !stats_seeds.contains(&pair) {
+                            stats_seeds.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+        if !stats_seeds.is_empty() {
+            let mut dropped_stats = HashSet::new();
+            for (table_id, stats_id) in stats_seeds {
+                if let Some(RelationOverlay::Present(rel)) = self.local.relations.get(&table_id)
+                    && rel.extended_statistics.contains_key(&stats_id)
+                {
+                    self.snapshot_relation(&table_id);
+                    if let Some(RelationOverlay::Present(rel)) =
+                        self.local.relations.get_mut(&table_id)
+                    {
+                        rel.extended_statistics.remove(&stats_id);
+                    }
+                    dropped_stats.insert(stats_id);
+                }
+            }
+            if !dropped_stats.is_empty() {
+                self.snapshot_graph_full();
+                self.local.graph.retain_edges(|e| {
+                    !(dropped_stats.contains(&e.dependent)
+                        && matches!(
+                            e.kind,
+                            DependencyKind::StatisticsUsesRoutine { .. }
+                                | DependencyKind::StatisticsUsesType { .. }
+                        ))
+                });
+            }
+        }
+
         for (relation_id, column) in self.type_cascade_columns(&dropped_types, &removed_fields) {
             if !matches!(
                 self.local.relations.get(&relation_id),
@@ -175,7 +227,7 @@ impl AnalysisState {
     /// A domain or range built on a dropped type goes, a range takes its
     /// multirange companion, and a composite survives with the offending
     /// field removed rather than being dropped.
-    fn type_cascade_closure(
+    pub(super) fn type_cascade_closure(
         &self,
         victims: &[ObjectId],
     ) -> (HashSet<ObjectId>, HashSet<(ObjectId, String)>) {
@@ -295,7 +347,14 @@ impl AnalysisState {
                 }) || Self::type_reference_matches_victims(
                     function.return_type_id.as_ref(),
                     dropped_types,
-                );
+                ) || self.local.graph.edges().iter().any(|edge| {
+                    edge.dependent == *id
+                        && matches!(edge.kind, DependencyKind::RoutineUsesType)
+                        && Self::type_reference_matches_victims(
+                            Some(&edge.referenced),
+                            dropped_types,
+                        )
+                });
                 (owner_dropped || signature_references).then(|| id.clone())
             })
             .collect()

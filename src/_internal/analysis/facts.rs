@@ -250,6 +250,7 @@ pub(crate) enum StatementFact {
         select_source_name: Option<String>,
         routines: Vec<RoutineReferenceFact>,
         cast_types: Vec<CastTypeReferenceFact>,
+        column_dependencies: Vec<RoutineRelationReferenceFact>,
     },
     AlterView {
         name: QualifiedName,
@@ -271,6 +272,7 @@ pub(crate) enum StatementFact {
         select_source: Option<QualifiedName>,
         routines: Vec<RoutineReferenceFact>,
         cast_types: Vec<CastTypeReferenceFact>,
+        column_dependencies: Vec<RoutineRelationReferenceFact>,
     },
     AlterMaterializedView {
         name: QualifiedName,
@@ -473,6 +475,14 @@ pub(crate) enum StatementFact {
     CreateAggregate(CreateAggregateFact),
     AlterAggregate(AlterAggregateFact),
     DropAggregate(DropAggregateFact),
+    AlterRoutine(AlterRoutineFact),
+    DropRoutine(DropRoutineFact),
+    CreateCast(CreateCastFact),
+    DropCast(DropCastFact),
+    CreateStatistics(CreateStatisticsFact),
+    AlterStatistics(AlterStatisticsFact),
+    DropStatistics(DropStatisticsFact),
+    Analyze(AnalyzeFact),
     CreatePublication(CreatePublicationFact),
     AlterPublication(AlterPublicationFact),
     DropPublication(DropPublicationFact),
@@ -791,6 +801,35 @@ pub(crate) struct DropRoleFact {
     pub if_exists: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutineRelationReferenceFact {
+    pub relation: QualifiedName,
+    pub column: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RoutineReturnExprFact {
+    LiteralType(String),
+    ExplicitCast(String),
+    Column {
+        relation: Option<QualifiedName>,
+        column: String,
+    },
+    ParameterType(String),
+    RoutineCall(QualifiedName),
+    MultiColumn,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RoutineBodyDependenciesFact {
+    pub relations: Vec<RoutineRelationReferenceFact>,
+    pub routines: Vec<RoutineReferenceFact>,
+    pub types: Vec<CastTypeReferenceFact>,
+    pub unqualified_columns: Vec<String>,
+    pub return_expr: Option<RoutineReturnExprFact>,
+    pub has_syntax_error: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateFunctionFact {
     pub name: QualifiedName,
@@ -798,6 +837,8 @@ pub(crate) struct CreateFunctionFact {
     pub params: Vec<ParamFact>,
     pub return_type: Option<RetTypeFact>,
     pub options: Vec<FuncOptionFact>,
+    pub body_dependencies: RoutineBodyDependenciesFact,
+    pub validation_dependencies: RoutineBodyDependenciesFact,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -836,8 +877,13 @@ pub(crate) enum FuncOptionFact {
     Strict(StrictKind),
     Leakproof(bool),
     Parallel(String),
-    Cost,
-    Rows,
+    Cost(Option<f64>),
+    Rows(Option<f64>),
+    Set {
+        name: String,
+        value: Option<String>,
+        from_current_or_default: bool,
+    },
     Reset(String),
     As {
         definition: Option<String>,
@@ -846,7 +892,7 @@ pub(crate) enum FuncOptionFact {
     },
     Transform,
     Window,
-    Support,
+    Support(Option<QualifiedName>),
     Unknown,
 }
 
@@ -904,6 +950,8 @@ pub(crate) struct CreateProcedureFact {
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
     pub options: Vec<FuncOptionFact>,
+    pub body_dependencies: RoutineBodyDependenciesFact,
+    pub validation_dependencies: RoutineBodyDependenciesFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -954,6 +1002,20 @@ pub(crate) struct AlterAggregateFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DropAggregateFact {
+    pub signatures: Vec<FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterRoutineFact {
+    pub name: QualifiedName,
+    pub params: Vec<String>,
+    pub action: AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DropRoutineFact {
     pub signatures: Vec<FunctionSigFact>,
     pub if_exists: bool,
     pub cascade: bool,
@@ -1704,4 +1766,83 @@ pub(crate) enum AlterTableActionFact {
         rule_name: Option<String>,
         mode: RuleEnableModeFact,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CastContextFact {
+    Explicit,
+    Assignment,
+    Implicit,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CastMethodFact {
+    WithFunction(FunctionSigFact),
+    WithoutFunction,
+    WithInout,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateCastFact {
+    pub source_type: String,
+    pub target_type: String,
+    pub method: CastMethodFact,
+    pub context: CastContextFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropCastFact {
+    pub source_type: String,
+    pub target_type: String,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateStatisticsFact {
+    pub name: Option<QualifiedName>,
+    pub if_not_exists: bool,
+    pub kinds: Vec<String>,
+    pub columns: Vec<String>,
+    pub expression_columns: Vec<String>,
+    pub expressions: Vec<String>,
+    pub expression_count: usize,
+    pub expressions_sql: Option<String>,
+    pub expression_routines: Vec<RoutineReferenceFact>,
+    pub expression_types: Vec<CastTypeReferenceFact>,
+    pub table: QualifiedName,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterStatisticsActionFact {
+    RenameTo(String),
+    OwnerTo(RoleFact),
+    SetSchema(String),
+    SetStatistics(StatisticsTarget),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterStatisticsFact {
+    pub name: QualifiedName,
+    pub if_exists: bool,
+    pub action: AlterStatisticsActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropStatisticsFact {
+    pub names: Vec<QualifiedName>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeTargetFact {
+    pub relation: QualifiedName,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AnalyzeFact {
+    pub options: Vec<AttributeFact>,
+    pub targets: Vec<AnalyzeTargetFact>,
 }

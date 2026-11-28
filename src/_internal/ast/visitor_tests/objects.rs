@@ -1737,3 +1737,34 @@ fn squawk_264_typed_replication_and_privilege_children_preserve_facts() {
                     })
     ));
 }
+
+#[test]
+fn alter_procedure_extracts_depends_on_extension_and_quoted_schema_names() {
+    let dep = parse_and_extract_statement(
+        "ALTER PROCEDURE public.do_work(integer) DEPENDS ON EXTENSION \"MyExt\";",
+    )
+    .expect("alter procedure depends on extension");
+    let StatementFact::AlterProcedure(dep) = dep else {
+        panic!("expected alter procedure fact");
+    };
+    assert_eq!(
+        dep.action,
+        crate::_internal::analysis::facts::AlterFunctionAction::DependsOnExtension {
+            extension: "MyExt".to_string(),
+        }
+    );
+
+    let no_dep = parse_and_extract_statement(
+        "ALTER PROCEDURE public.do_work(integer) NO DEPENDS ON EXTENSION \"MyExt\";",
+    )
+    .expect("alter procedure no depends on extension");
+    let StatementFact::AlterProcedure(no_dep) = no_dep else {
+        panic!("expected alter procedure fact");
+    };
+    assert_eq!(
+        no_dep.action,
+        crate::_internal::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
+            extension: "MyExt".to_string(),
+        }
+    );
+}

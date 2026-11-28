@@ -687,6 +687,24 @@ impl Rule for GeneralCascadeRule {
             Mutation::DropProcedure(d) if d.cascade => {
                 Some((ObjectKind::Procedure, "procedure".to_string()))
             }
+            Mutation::DropAggregate(d) if d.cascade => {
+                Some((ObjectKind::Function, "aggregate".to_string()))
+            }
+            Mutation::DropRoutine(d) if d.cascade => {
+                Some((ObjectKind::Function, "routine".to_string()))
+            }
+            Mutation::DropCast(d) if d.cascade => Some((
+                ObjectKind::Type,
+                format!("({} AS {})", d.source_type, d.target_type),
+            )),
+            Mutation::DropStatistics(d) if d.cascade => Some((
+                ObjectKind::Table,
+                d.ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
             Mutation::DropPublication(d) if d.cascade => {
                 Some((ObjectKind::Publication, d.names.join(", ")))
             }

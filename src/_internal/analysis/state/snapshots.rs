@@ -78,6 +78,7 @@ impl AnalysisState {
             functions: self.local.functions.clone(),
             sequences: self.local.sequences.clone(),
             collations: self.local.collations.clone(),
+            casts: self.local.casts.clone(),
             extensions: self.local.extensions.clone(),
             publications: self.local.publications.clone(),
             triggers: self.local.triggers.clone(),
@@ -97,6 +98,15 @@ impl AnalysisState {
         };
         self.local
             .push_undo(StateChange::NamespaceSnapshot(Box::new(snapshot)));
+    }
+
+    pub(super) fn snapshot_casts(&mut self) {
+        if !self.local.records_undo() {
+            return;
+        }
+        self.local.push_undo(StateChange::CastsSnapshot {
+            previous: self.local.casts.clone(),
+        });
     }
 
     pub(super) fn snapshot_type(&mut self, id: &ObjectId) {
@@ -164,6 +174,10 @@ impl AnalysisState {
             );
         }
 
+        if !self.local.casts.casts_using_function(old_id).is_empty() {
+            self.snapshot_casts();
+            self.local.casts.rewire_function_id(old_id, new_id);
+        }
         self.snapshot_graph_full();
         self.local.graph.propagate_function_rename(old_id, new_id);
         self.remap_range_routine_reference(old_id, new_id);
@@ -212,6 +226,39 @@ impl AnalysisState {
             // namespace is available again, just as it is in PostgreSQL.
             Some(crate::_internal::model::function::FunctionOverlay::Dropped) => Ok(()),
             None => Ok(()),
+        }
+    }
+
+    pub(super) fn drop_routine_with_edges(&mut self, id: &ObjectId) {
+        if !self.local.casts.casts_using_function(id).is_empty() {
+            self.snapshot_casts();
+            self.local.casts.remove_casts_using_function(id);
+        }
+        self.snapshot_function(id);
+        self.local.functions.insert(
+            id.clone(),
+            crate::_internal::model::function::FunctionOverlay::Dropped,
+        );
+        let has_routine_edges = self.local.graph.edges().iter().any(|edge| {
+            edge.dependent == *id
+                && matches!(
+                    edge.kind,
+                    DependencyKind::RoutineUsesRoutine { .. }
+                        | DependencyKind::RoutineUsesRelation { .. }
+                        | DependencyKind::RoutineUsesType
+                )
+        });
+        if has_routine_edges {
+            self.snapshot_graph_full();
+            self.local.graph.retain_edges(|edge| {
+                !(edge.dependent == *id
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::RoutineUsesRoutine { .. }
+                            | DependencyKind::RoutineUsesRelation { .. }
+                            | DependencyKind::RoutineUsesType
+                    ))
+            });
         }
     }
 

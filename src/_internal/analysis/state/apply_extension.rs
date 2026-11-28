@@ -538,6 +538,7 @@ impl AnalysisState {
             ExtensionMemberKind::Constraint | ExtensionMemberKind::Trigger => {
                 self.remap_attached_extension_member(member)
             }
+            ExtensionMemberKind::Cast => self.remap_cast_extension_member(member),
             ExtensionMemberKind::Schema => member.clone(),
             _ => {
                 let id = self.local.graph.resolve_rename(&member.id).clone();
@@ -546,6 +547,32 @@ impl AnalysisState {
                     id,
                 }
             }
+        }
+    }
+
+    fn remap_cast_extension_member(&self, member: &ExtensionMember) -> ExtensionMember {
+        let Some((src, dst)) = member.id.name.split_once("->") else {
+            return member.clone();
+        };
+        let remap_side = |ty: &str| -> String {
+            let (base, is_arr) = match ty.strip_suffix("[]") {
+                Some(b) => (b, true),
+                None => (ty, false),
+            };
+            let Some((schema, name)) = base.split_once('.') else {
+                return ty.to_string();
+            };
+            let id = ObjectId::new(schema, name);
+            let resolved = self.local.graph.resolve_rename(&id);
+            if is_arr {
+                format!("{resolved}[]")
+            } else {
+                resolved.to_string()
+            }
+        };
+        ExtensionMember {
+            kind: ExtensionMemberKind::Cast,
+            id: ObjectId::new("", format!("{}->{}", remap_side(src), remap_side(dst))),
         }
     }
 
@@ -600,11 +627,21 @@ impl AnalysisState {
             else {
                 continue;
             };
-            let members = extension
+            let mut members = extension
                 .members
                 .iter()
                 .map(|member| working.resolve_extension_member(member))
                 .collect::<BTreeSet<_>>();
+            for (routine_id, overlay) in &working.local.functions {
+                if let FunctionOverlay::Present(func) = overlay
+                    && func.dependent_extensions.contains(name)
+                {
+                    members.insert(ExtensionMember {
+                        kind: ExtensionMemberKind::Routine,
+                        id: routine_id.clone(),
+                    });
+                }
+            }
             statement_co_dropped.extend(working.extension_member_co_dropped(&members));
             for config in &extension.config_tables {
                 statement_co_dropped
@@ -683,6 +720,7 @@ impl AnalysisState {
                 && matches!(
                     edge.kind,
                     DependencyKind::ViewDependency { .. }
+                        | DependencyKind::RoutineUsesRelation { .. }
                         | DependencyKind::ForeignKey { .. }
                         | DependencyKind::InheritanceOf
                         | DependencyKind::PartitionOf
@@ -719,6 +757,18 @@ impl AnalysisState {
                         Some(RelationOverlay::Present(_))
                     )
             })
+            || self
+                .local
+                .graph
+                .routines_for_function(routine)
+                .iter()
+                .any(|edge| {
+                    !co_dropped.contains(&edge.dependent)
+                        && matches!(
+                            self.local.functions.get(&edge.dependent),
+                            Some(FunctionOverlay::Present(_))
+                        )
+                })
     }
 
     fn sequence_has_external_dependents(
@@ -865,11 +915,21 @@ impl AnalysisState {
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
 
-        let members = extension
+        let mut members = extension
             .members
             .iter()
             .map(|member| self.resolve_extension_member(member))
             .collect::<BTreeSet<_>>();
+        for (routine_id, overlay) in &self.local.functions {
+            if let FunctionOverlay::Present(func) = overlay
+                && func.dependent_extensions.contains(&extension.name)
+            {
+                members.insert(ExtensionMember {
+                    kind: ExtensionMemberKind::Routine,
+                    id: routine_id.clone(),
+                });
+            }
+        }
         // Dependencies between members dropped by this statement are not
         // external, so seed the co-drop set before the preflight checks run.
         let mut co_dropped = statement_co_dropped.clone();
@@ -896,6 +956,7 @@ impl AnalysisState {
         let mut triggers = Vec::new();
         let mut constraints = Vec::new();
         let mut collations = Vec::new();
+        let mut casts = Vec::new();
         for member in &members {
             match member.kind {
                 ExtensionMemberKind::Relation => relations.push(member.id.clone()),
@@ -907,8 +968,17 @@ impl AnalysisState {
                 ExtensionMemberKind::Trigger => triggers.push(member.id.clone()),
                 ExtensionMemberKind::Constraint => constraints.push(member.id.clone()),
                 ExtensionMemberKind::Collation => collations.push(member.id.clone()),
-                ExtensionMemberKind::Cast | ExtensionMemberKind::Unmodeled(_) => {
+                ExtensionMemberKind::Cast => casts.push(member.id.clone()),
+                ExtensionMemberKind::Unmodeled(_) => {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                }
+            }
+        }
+        if !casts.is_empty() {
+            self.snapshot_casts();
+            for cast_id in &casts {
+                if let Some((src, dst)) = cast_id.name.split_once("->") {
+                    self.local.casts.remove_cast(src, dst);
                 }
             }
         }
@@ -1448,9 +1518,18 @@ impl AnalysisState {
                     ExtensionMemberPresence::Unknown
                 }
             }
-            ExtensionMemberKind::Cast | ExtensionMemberKind::Unmodeled(_) => {
-                ExtensionMemberPresence::Unknown
+            ExtensionMemberKind::Cast => {
+                if let Some((src, dst)) = member.id.name.split_once("->")
+                    && self.local.casts.has_cast(src, dst)
+                {
+                    ExtensionMemberPresence::Present
+                } else if self.local.casts.has_full_cast_coverage() {
+                    ExtensionMemberPresence::Absent
+                } else {
+                    ExtensionMemberPresence::Unknown
+                }
             }
+            ExtensionMemberKind::Unmodeled(_) => ExtensionMemberPresence::Unknown,
         }
     }
 

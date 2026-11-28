@@ -324,11 +324,43 @@ const SIGNATURES: &[(&str, AggregateKind, usize, &[&str])] = &[
     ("min", AggregateKind::Normal, 1, &["bytea"]),
 ];
 
+fn signature_min_pg_version(index: usize, name: &str, parameters: &[&str]) -> u32 {
+    match (name, parameters) {
+        ("max" | "min", ["xid8"]) => 150_000,
+        ("range_agg", ["*"]) if index >= 147 => 150_000,
+        (
+            "json_agg_strict"
+            | "json_object_agg_strict"
+            | "json_object_agg_unique"
+            | "json_object_agg_unique_strict"
+            | "jsonb_agg_strict"
+            | "jsonb_object_agg_strict"
+            | "jsonb_object_agg_unique"
+            | "jsonb_object_agg_unique_strict"
+            | "any_value",
+            _,
+        ) => 160_000,
+        ("max" | "min", ["bytea"]) => 180_000,
+        ("max" | "min", ["*"]) if index >= 157 => 180_000,
+        _ => 140_000,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn catalogue() -> AggregateCatalogue {
+    catalogue_for_version(None)
+}
+
+pub(crate) fn catalogue_for_version(pg_version_num: Option<u32>) -> AggregateCatalogue {
+    let version = pg_version_num.unwrap_or(180_000);
     AggregateCatalogue::new(
         SIGNATURES
             .iter()
-            .map(|(name, kind, direct_count, parameters)| {
+            .enumerate()
+            .filter(|(index, (name, _, _, parameters))| {
+                version >= signature_min_pg_version(*index, name, parameters)
+            })
+            .map(|(_, (name, kind, direct_count, parameters))| {
                 let arguments = parameters
                     .iter()
                     .map(|parameter| {

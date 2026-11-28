@@ -346,7 +346,7 @@ fn a_baseline_replacement_compares_canonical_type_spellings() {
             ..FunctionState::with_inputs(id.clone(), RoutineKind::Function, vec!["integer".into()])
         },
     );
-    let mut state = AnalysisState::new(cache);
+    let mut state = AnalysisState::new(cache.clone());
     assert_eq!(
         conflict_reason(
             &engine,
@@ -827,13 +827,11 @@ fn creating_a_new_function_taints_unmodeled_options() {
 
     engine
         .analyze(
-            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql STRICT AS $$ SELECT 1 $$;",
+            "CREATE FUNCTION work() RETURNS integer LANGUAGE sql TRANSFORM FOR TYPE integer AS $$ SELECT 1 $$;",
             &mut state,
         )
         .unwrap();
 
-    // FunctionState tracks identity and selected options, but not STRICT;
-    // retaining Exact here would overstate what later checks can prove.
     assert_eq!(state.local.confidence, Confidence::Tainted);
     assert!(matches!(
         state.local.functions.get(&object_id("public", "work()")),
@@ -1470,5 +1468,754 @@ fn distinct_custom_types_are_not_collapsed_into_one_signature() {
             .iter()
             .any(|finding| finding.rule_id == "chain-conflict"),
         "distinct argument types are distinct routines: {findings:?}"
+    );
+}
+
+#[test]
+fn create_aggregate_validates_moving_aggregate_options_and_modifier_flags() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let valid = engine
+        .analyze(
+            "CREATE FUNCTION public.my_sfunc(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+             CREATE FUNCTION public.my_minv(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 - $2';
+             CREATE AGGREGATE public.moving_sum(int) (
+                 sfunc = my_sfunc,
+                 stype = int,
+                 msfunc = my_sfunc,
+                 minvfunc = my_minv,
+                 mstype = int,
+                 mfinalfunc_modify = read_only,
+                 parallel = safe
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !valid.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid moving aggregate with mfinalfunc_modify = read_only must not conflict: {valid:?}"
+    );
+
+    let bad_mstype = engine
+        .analyze(
+            "CREATE AGGREGATE public.bad_moving(int) (
+                 sfunc = my_sfunc,
+                 stype = int,
+                 msfunc = my_sfunc,
+                 minvfunc = my_minv,
+                 mstype = no_such_moving_type
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        bad_mstype.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("type \"no_such_moving_type\" does not exist")
+        }),
+        "nonexistent mstype must conflict: {bad_mstype:?}"
+    );
+
+    let missing_minv = engine
+        .analyze(
+            "CREATE AGGREGATE public.missing_minv(int) (
+                 sfunc = my_sfunc,
+                 stype = int,
+                 msfunc = my_sfunc,
+                 mstype = int
+             );",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        missing_minv.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("aggregate minvfunc must be specified when mstype is specified")
+        }),
+        "mstype without minvfunc must conflict: {missing_minv:?}"
+    );
+}
+
+#[test]
+fn alter_and_drop_routine_dispatch_across_functions_procedures_and_aggregates() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+
+    let findings = engine
+        .analyze(
+            "CREATE FUNCTION public.r_fn(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             ALTER ROUTINE public.r_fn(int, int) IMMUTABLE;
+             ALTER ROUTINE public.r_fn(int, int) RENAME TO r_fn2;
+             CREATE PROCEDURE public.r_proc(int) LANGUAGE sql AS 'SELECT $1';
+             ALTER ROUTINE public.r_proc(int) RENAME TO r_proc2;
+             CREATE AGGREGATE public.r_agg(int) (sfunc = r_fn2, stype = int);
+             ALTER ROUTINE public.r_agg(int) RENAME TO r_agg2;
+             DROP ROUTINE public.r_agg2(int);
+             DROP ROUTINE public.r_fn2(int, int), public.r_proc2(int);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid ALTER/DROP ROUTINE statements must not conflict: {findings:?}"
+    );
+
+    let mut agg_opt_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let agg_opt_findings = engine
+        .analyze(
+            "CREATE FUNCTION public.agg_sf(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+             CREATE AGGREGATE public.agg_test(int) (sfunc = agg_sf, stype = int);
+             ALTER ROUTINE public.agg_test(int) IMMUTABLE;",
+            &mut agg_opt_state,
+        )
+        .unwrap();
+    assert!(
+        agg_opt_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict" && v.reason.contains("is an aggregate function")
+        }),
+        "ALTER ROUTINE option changes on aggregates must conflict: {agg_opt_findings:?}"
+    );
+}
+
+#[test]
+fn create_aggregate_tracks_dependencies_and_validates_or_replace_and_hypothetical_args() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+
+    let dep_block = engine
+        .analyze(
+            "CREATE TYPE public.agg_state_t AS (total int);
+             CREATE FUNCTION public.agg_step(public.agg_state_t, int) RETURNS public.agg_state_t LANGUAGE sql AS 'SELECT $1';
+             CREATE AGGREGATE public.custom_agg(int) (sfunc = agg_step, stype = public.agg_state_t);
+             DROP FUNCTION public.agg_step(public.agg_state_t, int);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        dep_block.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("is required by routine 'public.custom_agg(integer)'")
+        }),
+        "dropping support function of an active aggregate without CASCADE must conflict: {dep_block:?}"
+    );
+
+    let mut type_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let type_block = engine
+        .analyze(
+            "CREATE TYPE public.agg_state_t AS (total int);
+             CREATE FUNCTION public.agg_step(public.agg_state_t, int) RETURNS public.agg_state_t LANGUAGE sql AS 'SELECT $1';
+             CREATE AGGREGATE public.custom_agg(int) (sfunc = agg_step, stype = public.agg_state_t);
+             DROP TYPE public.agg_state_t;",
+            &mut type_state,
+        )
+        .unwrap();
+    assert!(
+        type_block.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping state type of an active aggregate without CASCADE must conflict: {type_block:?}"
+    );
+
+    let mut hyp_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let hyp_conflict = engine
+        .analyze(
+            "CREATE FUNCTION public.hyp_sf(internal, int, text) RETURNS internal LANGUAGE internal AS ' ordered_set_transition_multi ';
+             CREATE FUNCTION public.hyp_ff(internal, VARIADIC \"any\") RETURNS bigint LANGUAGE internal AS ' rank_final ';
+             CREATE AGGREGATE public.bad_hyp(int ORDER BY text) (
+                 sfunc = hyp_sf,
+                 stype = internal,
+                 finalfunc = hyp_ff,
+                 hypothetical
+             );",
+            &mut hyp_state,
+        )
+        .unwrap();
+    assert!(
+        hyp_conflict.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains(
+                    "a hypothetical-set aggregate must have direct arguments matching its aggregated arguments"
+                )
+        }),
+        "mismatched hypothetical direct arguments must conflict: {hyp_conflict:?}"
+    );
+
+    let mut replace_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let init_agg = engine
+        .analyze(
+            "CREATE FUNCTION public.rep_os_sf1(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             CREATE FUNCTION public.rep_os_sf1(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             CREATE FUNCTION public.rep_os_ff1(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE FUNCTION public.rep_os_ff1(int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE AGGREGATE public.rep_agg(int ORDER BY int, int) (
+                 sfunc = rep_os_sf1,
+                 stype = int,
+                 finalfunc = rep_os_ff1
+             );",
+            &mut replace_state,
+        )
+        .unwrap();
+    assert!(
+        !init_agg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "initial ordered-set aggregate must apply cleanly: {init_agg:?}"
+    );
+    let replace_conflict = engine
+        .analyze(
+            "CREATE OR REPLACE AGGREGATE public.rep_agg(int, int ORDER BY int) (
+                 sfunc = rep_os_sf1,
+                 stype = int,
+                 finalfunc = rep_os_ff1
+             );",
+            &mut replace_state,
+        )
+        .unwrap();
+    assert!(
+        replace_conflict.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("cannot change number of direct arguments of an aggregate function")
+        }),
+        "changing direct argument count in CREATE OR REPLACE AGGREGATE must conflict: {replace_conflict:?}"
+    );
+}
+
+#[test]
+fn atomic_routine_bodies_track_relation_column_routine_and_type_dependencies() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    engine
+        .analyze(
+            "CREATE TYPE public.atomic_status AS ENUM ('active', 'closed');
+             CREATE TABLE public.atomic_users (id int PRIMARY KEY, email text, phone text);
+             CREATE FUNCTION public.atomic_helper(int) RETURNS int
+                 BEGIN ATOMIC RETURN $1 + 1; END;
+             CREATE FUNCTION public.atomic_lookup(uid int) RETURNS text
+                 BEGIN ATOMIC
+                     SELECT u.email
+                     FROM public.atomic_users u
+                     WHERE u.id = public.atomic_helper(uid)
+                       AND 'active'::public.atomic_status = 'active'::public.atomic_status;
+                 END;",
+            &mut state,
+        )
+        .unwrap();
+
+    let mut drop_tbl_state = state.clone();
+    let drop_tbl = engine
+        .analyze("DROP TABLE public.atomic_users;", &mut drop_tbl_state)
+        .unwrap();
+    assert!(
+        drop_tbl.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping table referenced by atomic function without CASCADE must conflict: {drop_tbl:?}"
+    );
+
+    let mut drop_col_state = state.clone();
+    let drop_col = engine
+        .analyze(
+            "ALTER TABLE public.atomic_users DROP COLUMN email;",
+            &mut drop_col_state,
+        )
+        .unwrap();
+    assert!(
+        drop_col.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping column referenced by atomic function without CASCADE must conflict: {drop_col:?}"
+    );
+
+    let mut drop_unreferenced_col_state = state.clone();
+    let drop_unreferenced_col = engine
+        .analyze(
+            "ALTER TABLE public.atomic_users DROP COLUMN phone;",
+            &mut drop_unreferenced_col_state,
+        )
+        .unwrap();
+    assert!(
+        !drop_unreferenced_col
+            .iter()
+            .any(|v| v.rule_id == "chain-conflict"),
+        "dropping unreferenced column must succeed: {drop_unreferenced_col:?}"
+    );
+
+    let mut drop_fn_state = state.clone();
+    let drop_fn = engine
+        .analyze(
+            "DROP FUNCTION public.atomic_helper(int);",
+            &mut drop_fn_state,
+        )
+        .unwrap();
+    assert!(
+        drop_fn.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping routine referenced by atomic function without CASCADE must conflict: {drop_fn:?}"
+    );
+
+    let mut drop_type_state = state.clone();
+    let drop_type = engine
+        .analyze("DROP TYPE public.atomic_status;", &mut drop_type_state)
+        .unwrap();
+    assert!(
+        drop_type.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping type cast inside atomic function without CASCADE must conflict: {drop_type:?}"
+    );
+
+    let mut cascade_col_state = state.clone();
+    let cascade_col = engine
+        .analyze(
+            "ALTER TABLE public.atomic_users DROP COLUMN email CASCADE;",
+            &mut cascade_col_state,
+        )
+        .unwrap();
+    assert!(
+        !cascade_col.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP COLUMN CASCADE must drop dependent atomic function: {cascade_col:?}"
+    );
+    assert!(matches!(
+        cascade_col_state
+            .local
+            .functions
+            .get(&object_id("public", "atomic_lookup(integer)")),
+        Some(safe_migrate::_internal::model::function::FunctionOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn routine_options_owner_extension_and_support_dependencies_match_postgresql() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    state.local.roles_known = true;
+    state.local.roles.insert(
+        object_id("", "app_owner"),
+        safe_migrate::_internal::model::role::RoleOverlay::Present(
+            safe_migrate::_internal::model::role::RoleState {
+                id: object_id("", "app_owner"),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        ),
+    );
+    state.local.extensions.insert(
+        "pg_trgm".to_string(),
+        safe_migrate::_internal::model::extension::ExtensionOverlay::Present(
+            safe_migrate::_internal::model::extension::ExtensionState {
+                name: "pg_trgm".to_string(),
+                schema: Some("public".to_string()),
+                version: Some("1.6".to_string()),
+                relocatable: Some(true),
+                owner: object_id("", "postgres"),
+                members: Default::default(),
+                members_complete: true,
+                config_tables: Vec::new(),
+                generation: 0,
+            },
+        ),
+    );
+
+    let violations = engine
+        .analyze(
+            "CREATE FUNCTION public.my_support(internal) RETURNS internal LANGUAGE internal AS 'generate_series_int4_support';
+             CREATE FUNCTION public.set_fn() RETURNS SETOF int LANGUAGE sql
+                 COST 50 ROWS 25 PARALLEL SAFE SUPPORT public.my_support
+                 SET search_path = public RESET search_path RESET ALL
+                 AS 'SELECT 1';
+             ALTER FUNCTION public.set_fn() OWNER TO app_owner;
+             ALTER FUNCTION public.set_fn() DEPENDS ON EXTENSION pg_trgm;
+             ALTER FUNCTION public.set_fn() NO DEPENDS ON EXTENSION pg_trgm;
+             CREATE PROCEDURE public.cfg_proc() LANGUAGE sql
+                 SET work_mem = '4MB' RESET work_mem RESET ALL
+                 AS 'SELECT 1';
+             ALTER PROCEDURE public.cfg_proc() OWNER TO app_owner;
+             ALTER PROCEDURE public.cfg_proc() DEPENDS ON EXTENSION pg_trgm;
+             ALTER PROCEDURE public.cfg_proc() NO DEPENDS ON EXTENSION pg_trgm;
+             CREATE AGGREGATE public.owned_agg(int) (sfunc = int4pl, stype = int);
+             ALTER AGGREGATE public.owned_agg(int) OWNER TO app_owner;
+             ALTER ROUTINE public.owned_agg(int) DEPENDS ON EXTENSION pg_trgm;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid routine options, owners, and extension deps must apply cleanly: {violations:?}"
+    );
+
+    let mut drop_support_state = state.clone();
+    let drop_support = engine
+        .analyze(
+            "DROP FUNCTION public.my_support(internal);",
+            &mut drop_support_state,
+        )
+        .unwrap();
+    assert!(
+        drop_support.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping support function without CASCADE must conflict: {drop_support:?}"
+    );
+
+    for invalid_sql in [
+        "CREATE PROCEDURE public.bad_proc() LANGUAGE sql IMMUTABLE AS 'SELECT 1';",
+        "ALTER PROCEDURE public.cfg_proc() STRICT;",
+        "CREATE FUNCTION public.bad_cost() RETURNS int LANGUAGE sql COST 0 AS 'SELECT 1';",
+        "CREATE FUNCTION public.neg_cost() RETURNS int LANGUAGE sql COST -5 AS 'SELECT 1';",
+        "CREATE FUNCTION public.bad_rows() RETURNS int LANGUAGE sql ROWS 10 AS 'SELECT 1';",
+        "ALTER FUNCTION public.set_fn() ROWS 0;",
+        "CREATE FUNCTION public.bad_par() RETURNS int LANGUAGE sql PARALLEL bogus AS 'SELECT 1';",
+        "ALTER FUNCTION public.set_fn() OWNER TO missing_role;",
+        "ALTER PROCEDURE public.cfg_proc() OWNER TO missing_role;",
+        "ALTER AGGREGATE public.owned_agg(int) OWNER TO missing_role;",
+        "ALTER FUNCTION public.set_fn() DEPENDS ON EXTENSION missing_ext;",
+    ] {
+        let mut s = state.clone();
+        let v = engine.analyze(invalid_sql, &mut s).unwrap();
+        assert!(
+            v.iter().any(|finding| finding.rule_id == "chain-conflict"),
+            "expected chain-conflict for `{invalid_sql}`, got: {v:?}"
+        );
+    }
+}
+
+#[test]
+fn drop_aggregate_enforces_and_cascades_dependent_atomic_routines() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+    let violations = engine
+        .analyze(
+            "CREATE FUNCTION public.agg_add(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2';
+             CREATE AGGREGATE public.agg_sum(int) (sfunc = agg_add, stype = int);
+             CREATE FUNCTION public.uses_agg(v int) RETURNS int
+                 BEGIN ATOMIC
+                     SELECT public.agg_sum(v);
+                 END;",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+        "setup should not conflict: {violations:?}"
+    );
+
+    let mut restrict_state = state.clone();
+    let restrict_v = engine
+        .analyze("DROP AGGREGATE public.agg_sum(int);", &mut restrict_state)
+        .unwrap();
+    assert!(
+        restrict_v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP AGGREGATE without CASCADE must conflict when an atomic routine depends on it: {restrict_v:?}"
+    );
+
+    let mut cascade_state = state.clone();
+    let cascade_v = engine
+        .analyze(
+            "DROP AGGREGATE public.agg_sum(int) CASCADE;",
+            &mut cascade_state,
+        )
+        .unwrap();
+    assert!(
+        !cascade_v.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP AGGREGATE CASCADE must drop dependent routine cleanly: {cascade_v:?}"
+    );
+    assert!(matches!(
+        cascade_state
+            .local
+            .functions
+            .get(&object_id("public", "uses_agg(integer)")),
+        Some(safe_migrate::_internal::model::function::FunctionOverlay::Dropped)
+    ));
+}
+
+#[test]
+fn differential_audit_f1_to_f10_regression_suite() {
+    use safe_migrate::_internal::analysis::facts::CastContextFact;
+    use safe_migrate::_internal::db::cache::{
+        DbCacheVersioned, RoutineDependencyCache, RoutineDependencyTarget,
+    };
+    use safe_migrate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+
+    let engine = setup_engine();
+    let mut cache = synced_cache();
+    cache.roles.insert(
+        object_id("", "app_role"),
+        safe_migrate::_internal::model::role::RoleState {
+            id: object_id("", "app_role"),
+            can_login: false,
+            is_superuser: false,
+            inherits: true,
+            member_of: Vec::new(),
+            can_administer_membership: Vec::new(),
+            can_inherit_from: Vec::new(),
+            can_set_role_to: Vec::new(),
+        },
+    );
+    cache.extensions.insert(
+        "pg_trgm".to_string(),
+        safe_migrate::_internal::model::extension::ExtensionState {
+            name: "pg_trgm".to_string(),
+            schema: Some("public".to_string()),
+            version: Some("1.6".to_string()),
+            relocatable: Some(true),
+            owner: object_id("", "postgres"),
+            members: Default::default(),
+            members_complete: true,
+            config_tables: Vec::new(),
+            generation: 0,
+        },
+    );
+    let mut state = AnalysisState::new(cache.clone());
+
+    // F1, F2, F3, F9, F10: valid forms execute without conflict AND remain Confidence::Exact
+    let valid_sql = "
+        CREATE TABLE public.t (a int, b text);
+        CREATE AGGREGATE public.agg1(int) (sfunc = int4pl, stype = int);
+        ALTER FUNCTION public.agg1(int) RENAME TO agg9;
+        ALTER ROUTINE public.agg9(int) OWNER TO app_role;
+        ALTER FUNCTION public.agg9(int) DEPENDS ON EXTENSION pg_trgm;
+        ALTER FUNCTION public.agg9(int) NO DEPENDS ON EXTENSION pg_trgm;
+        CREATE FUNCTION public.srf1() RETURNS SETOF int LANGUAGE sql
+            ROWS 10 COST 20 PARALLEL SAFE STRICT LEAKPROOF
+            SET statement_timeout = '5s' RESET statement_timeout
+            AS 'SELECT a FROM public.t';
+        ALTER FUNCTION public.srf1() SUPPORT pg_catalog.generate_series_int4_support;
+        ALTER FUNCTION public.srf1() SUPPORT generate_series_int4_support;
+        ANALYZE pg_class;
+        ANALYZE pg_catalog.pg_class;
+        ANALYZE (VERBOSE, SKIP_LOCKED true, BUFFER_USAGE_LIMIT '256kB') public.t (a);
+        CREATE FUNCTION public.h(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x;
+        CREATE STATISTICS public.s1 ON public.h(a), b FROM public.t;
+        ALTER STATISTICS public.s1 OWNER TO app_role;
+        ALTER STATISTICS public.s1 SET STATISTICS 20000;
+    ";
+    let violations = engine.analyze(valid_sql, &mut state).unwrap();
+    assert!(
+        !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+        "F1/F2/F3/F9/F10 valid statements must not conflict: {violations:?}"
+    );
+    // Note: CREATE AGGREGATE with definition taints because transition state validation is server-side;
+    // verify an isolated state for F1/F2/F3/F9/F10 stays Confidence::Exact!
+    let mut exact_state = AnalysisState::new(cache.clone());
+    let exact_violations = engine
+        .analyze(
+            "CREATE TABLE public.t (a int, b text);
+             CREATE FUNCTION public.srf1() RETURNS SETOF int LANGUAGE sql
+                 ROWS 10 COST 20 PARALLEL SAFE STRICT LEAKPROOF
+                 SET statement_timeout = '5s' RESET statement_timeout
+                 AS 'SELECT a FROM public.t';
+             ALTER FUNCTION public.srf1() RENAME TO srf2;
+             ALTER ROUTINE public.srf2() OWNER TO app_role;
+             ALTER FUNCTION public.srf2() SUPPORT pg_catalog.generate_series_int4_support;
+             ALTER FUNCTION public.srf2() SUPPORT generate_series_int4_support;
+             ALTER FUNCTION public.srf2() PARALLEL RESTRICTED ROWS 50 COST 100 SET work_mem = '8MB' RESET work_mem;
+             ANALYZE pg_class;
+             ANALYZE pg_catalog.pg_class;
+             CREATE FUNCTION public.h(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x;
+             CREATE STATISTICS public.s1 ON public.h(a), b FROM public.t;
+             ALTER STATISTICS public.s1 OWNER TO app_role;
+             ALTER STATISTICS public.s1 SET STATISTICS 20000;",
+            &mut exact_state,
+        )
+        .unwrap();
+    assert!(
+        !exact_violations
+            .iter()
+            .any(|v| v.rule_id == "chain-conflict"),
+        "expected no conflict: {exact_violations:?}"
+    );
+    assert_eq!(
+        exact_state.local.confidence,
+        Confidence::Exact,
+        "F1/F2/F3/F9/F10 operations must preserve Confidence::Exact"
+    );
+
+    // F1 (options on aggregate), F5, F6, F7, F9 (r18, r25, r47): invalid forms must conflict
+    for bad_sql in [
+        "ALTER FUNCTION public.agg9(int) IMMUTABLE;",
+        "DROP FUNCTION public.h(int);",
+        "CREATE FUNCTION public.bad_tbl() RETURNS int BEGIN ATOMIC SELECT a FROM public.no_such_tbl; END;",
+        "CREATE FUNCTION public.bad_col() RETURNS int BEGIN ATOMIC SELECT no_such_col FROM public.t; END;",
+        "CREATE FUNCTION public.bad_fn() RETURNS int BEGIN ATOMIC SELECT public.no_such_fn(a) FROM public.t; END;",
+        "CREATE FUNCTION public.bad_ret1() RETURNS int RETURN 'not_an_int';",
+        "CREATE FUNCTION public.bad_ret2() RETURNS int BEGIN ATOMIC SELECT b FROM public.t; END;",
+        "CREATE FUNCTION public.bad_str_col() RETURNS int LANGUAGE sql AS 'SELECT no_such_col FROM public.t';",
+        "CREATE FUNCTION public.bad_str_ret() RETURNS int LANGUAGE sql AS 'SELECT b FROM public.t';",
+        "ANALYZE (BOGUS) public.t;",
+        "ANALYZE (VERBOSE foo) public.t;",
+        "ANALYZE (BUFFER_USAGE_LIMIT 'bad') public.t;",
+        "ANALYZE public.t (a, a);",
+        "ALTER FUNCTION public.srf1() SET statement_timeout = 'abc';",
+        "ALTER FUNCTION public.srf1() SUPPORT no_such_support;",
+        "DROP ROLE app_role;",
+    ] {
+        let mut s = state.clone();
+        let v = engine.analyze(bad_sql, &mut s).unwrap();
+        assert!(
+            v.iter().any(|f| f.rule_id == "chain-conflict"),
+            "expected chain-conflict for `{bad_sql}`, got: {v:?}"
+        );
+    }
+
+    // F4: synced SQL-standard function dependencies hydrated from Cache V12.1
+    let mut f4_cache = cache_with_table("public", "t", None);
+    let tbl_id = object_id("public", "t");
+    if let Some(rel) = f4_cache.relations.get_mut(&tbl_id) {
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "a".into(),
+                data_type: Some("integer".into()),
+                not_null: false,
+                default: None,
+            },
+        );
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "b".into(),
+                data_type: Some("text".into()),
+                not_null: false,
+                default: None,
+            },
+        );
+    }
+    let fn_id = object_id("public", "uses_ta()");
+    f4_cache.functions.insert(
+        fn_id.clone(),
+        FunctionState::with_inputs(fn_id.clone(), RoutineKind::Function, Vec::new()),
+    );
+    f4_cache.routine_dependencies.push(RoutineDependencyCache {
+        dependent: fn_id,
+        target: RoutineDependencyTarget::Relation {
+            relation: tbl_id,
+            column: Some("a".to_string()),
+        },
+    });
+    let f4_state = AnalysisState::new(f4_cache);
+    for f4_sql in [
+        "DROP TABLE public.t;",
+        "ALTER TABLE public.t DROP COLUMN a;",
+        "ALTER TABLE public.t ALTER COLUMN a TYPE bigint;",
+    ] {
+        let mut s = f4_state.clone();
+        let v = engine.analyze(f4_sql, &mut s).unwrap();
+        assert!(
+            v.iter().any(|f| f.rule_id == "chain-conflict"),
+            "F4 expected chain-conflict for `{f4_sql}` on hydrated routine dependency, got: {v:?}"
+        );
+    }
+
+    // F8: V12.0 cache without full cast coverage taints CREATE CAST and DROP FUNCTION
+    let mut v12_0_cache = synced_cache();
+    let cast_fn = object_id("public", "cast_fn(integer)");
+    let mut fn_state = FunctionState::with_inputs(
+        cast_fn.clone(),
+        RoutineKind::Function,
+        vec!["integer".into()],
+    );
+    fn_state.return_type = "text".into();
+    v12_0_cache.functions.insert(cast_fn, fn_state);
+    let mut partial_casts = CastCatalogue::fallback();
+    partial_casts.insert_cast(CastEntry {
+        source: "smallint".into(),
+        target: "integer".into(),
+        context: CastContextFact::Implicit,
+        method: CastEntryMethod::WithoutFunction,
+    });
+    v12_0_cache.casts = Some(partial_casts);
+    let hydrated_v12_0 = DbCacheVersioned::V12(Box::new(v12_0_cache))
+        .into_cache()
+        .unwrap();
+    assert!(
+        !hydrated_v12_0
+            .casts
+            .as_ref()
+            .unwrap()
+            .has_full_cast_coverage()
+    );
+
+    let mut s_cast = AnalysisState::new(hydrated_v12_0.clone());
+    engine
+        .analyze("CREATE TYPE public.src_t AS (x int); CREATE TYPE public.dst_t AS (x int); CREATE CAST (public.src_t AS public.dst_t) WITH INOUT;", &mut s_cast)
+        .unwrap();
+    assert_eq!(
+        s_cast.local.confidence,
+        Confidence::Tainted,
+        "F8: CREATE CAST against a V12.0 cache must taint"
+    );
+
+    let mut s_drop = AnalysisState::new(hydrated_v12_0);
+    engine
+        .analyze("DROP FUNCTION public.cast_fn(integer);", &mut s_drop)
+        .unwrap();
+    assert_eq!(
+        s_drop.local.confidence,
+        Confidence::Tainted,
+        "F8: DROP FUNCTION against a V12.0 cache must taint"
+    );
+
+    // Built-in pg_catalog routine: ALTER FUNCTION OWNER TO is accepted (tainted), while DROP FUNCTION is rejected
+    let mut s_pg_alter = state.clone();
+    let alter_pg = engine
+        .analyze(
+            "ALTER FUNCTION pg_catalog.abs(int) OWNER TO app_role;",
+            &mut s_pg_alter,
+        )
+        .unwrap();
+    assert!(
+        !alter_pg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "ALTER FUNCTION pg_catalog.abs(int) OWNER TO must not conflict: {alter_pg:?}"
+    );
+
+    let mut s_pg_drop = state.clone();
+    let drop_pg = engine
+        .analyze("DROP FUNCTION pg_catalog.abs(int);", &mut s_pg_drop)
+        .unwrap();
+    assert!(
+        drop_pg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP FUNCTION pg_catalog.abs(int) must conflict: {drop_pg:?}"
+    );
+
+    let mut s_pg_missing = state.clone();
+    let missing_pg = engine
+        .analyze(
+            "ALTER FUNCTION pg_catalog.no_such_builtin_fn(int) OWNER TO app_role;",
+            &mut s_pg_missing,
+        )
+        .unwrap();
+    assert!(
+        missing_pg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "ALTER FUNCTION on nonexistent pg_catalog routine must conflict: {missing_pg:?}"
+    );
+
+    // #07: table column takes precedence over same-named SQL function parameter
+    let mut s_shadow = AnalysisState::new(synced_cache());
+    let shadow_ok = engine
+        .analyze(
+            "CREATE TABLE public.t_shadow (x int, y int);
+             CREATE FUNCTION public.f_col_wins_str(x text) RETURNS int LANGUAGE sql AS $$ SELECT x FROM public.t_shadow; $$;
+             CREATE FUNCTION public.f_col_wins(x text) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT x FROM public.t_shadow; END;
+             CREATE FUNCTION public.f_param_fallback(z int) RETURNS int LANGUAGE sql AS $$ SELECT z FROM public.t_shadow; $$;",
+            &mut s_shadow,
+        )
+        .unwrap();
+    assert!(
+        !shadow_ok.iter().any(|v| v.rule_id == "chain-conflict"),
+        "table column precedence and parameter fallback must both succeed: {shadow_ok:?}"
+    );
+    let drop_x = engine
+        .analyze("ALTER TABLE public.t_shadow DROP COLUMN x;", &mut s_shadow)
+        .unwrap();
+    assert!(
+        drop_x.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping shadowed table column x referenced by f_col_wins must conflict: {drop_x:?}"
+    );
+
+    // #73: version-gated pg_catalog relations (pg_aios is PG 18+)
+    let mut pg17_cache = synced_cache();
+    pg17_cache.pg_version_num = Some(170_000);
+    let mut s_pg17 = AnalysisState::new(pg17_cache);
+    let pg17_aios = engine
+        .analyze("ANALYZE pg_catalog.pg_aios;", &mut s_pg17)
+        .unwrap();
+    assert!(
+        pg17_aios.iter().any(|v| v.rule_id == "chain-conflict"),
+        "ANALYZE pg_catalog.pg_aios must conflict on PG 17: {pg17_aios:?}"
     );
 }

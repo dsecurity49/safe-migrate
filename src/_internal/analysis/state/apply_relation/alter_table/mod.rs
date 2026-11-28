@@ -1,5 +1,6 @@
 use super::*;
 use crate::_internal::analysis::mutations::AlterTable;
+use crate::_internal::model::relation::Persistence;
 
 mod finish;
 
@@ -19,6 +20,7 @@ struct AlterTableContext {
     drop_column_statistics: HashSet<ObjectId>,
     cascade_generated_columns: HashSet<String>,
     cascade_view_roots: HashSet<ObjectId>,
+    cascade_routine_roots: HashSet<ObjectId>,
 }
 
 impl AnalysisState {
@@ -36,51 +38,24 @@ impl AnalysisState {
         } else {
             Vec::new()
         };
-        if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
-            let resolved_alter_id = self.local.graph.resolve_rename(&alter.id);
-            let closure_set: HashSet<&ObjectId> = recursive_rename_descendants
-                .iter()
-                .map(|id| self.local.graph.resolve_rename(id))
-                .collect();
-            for descendant in &recursive_rename_descendants {
-                let Some(RelationOverlay::Present(relation)) = self.local.relations.get(descendant)
-                else {
-                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-                };
-                if relation.has_column(to) {
-                    return MutationResult::conflict(format!(
-                        "column '{}' already exists on relation '{}'",
-                        to, descendant
-                    ));
-                }
-                if relation.generated_columns.values().any(|generated| {
-                    generated.expression.as_deref().is_none_or(|source| {
-                        crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
-                            source,
-                            &descendant.name,
-                            from,
-                            to,
-                        )
-                        .is_none()
-                    })
-                }) {
-                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-                }
-                let Some(provenance) = relation.column_inheritance.get(from) else {
-                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-                };
-                let expected_parents = self
-                    .local
-                    .graph
-                    .inheritance_parents_of(descendant)
-                    .into_iter()
-                    .filter(|&parent| parent == resolved_alter_id || closure_set.contains(parent))
-                    .count() as u32;
-                if provenance.parent_count > expected_parents {
-                    return MutationResult::conflict(format!(
-                        "cannot rename inherited column '{}'",
-                        from
-                    ));
+        if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action
+            && let Some(result) = self.validate_rename_column_descendants(
+                &alter.id,
+                from,
+                to,
+                &recursive_rename_descendants,
+            )
+        {
+            return result;
+        }
+        if let AlterTableActionMutation::SetType { column, .. } = &alter.action {
+            let mut targets = vec![alter.id.clone()];
+            if !alter.only {
+                targets.extend(self.inherited_descendants(&alter.id));
+            }
+            for target in &targets {
+                if let Some(result) = self.check_column_set_type_dependents(target, column) {
+                    return result;
                 }
             }
         }
@@ -144,10 +119,37 @@ impl AnalysisState {
         let Some((kind, partitioned)) = target else {
             return self.unresolved(EvidenceCode::UnknownObjectState);
         };
-        if !alter_table_action_permits(&alter.action, &kind, partitioned) {
+        if !alter_table_action_permits(&alter.action, &kind, partitioned)
+            || (partitioned
+                && matches!(
+                    alter.action,
+                    AlterTableActionMutation::SetPersistence { .. }
+                )
+                && self.pg_version_num.unwrap_or(180_000) >= 180_000)
+        {
             return MutationResult::conflict(format!(
                 "ALTER action cannot be performed on relation '{}'",
                 alter.id
+            ));
+        }
+        if matches!(
+            alter.action,
+            AlterTableActionMutation::SetAccessMethod { .. }
+        ) && let Some(version) = self.pg_version().num()
+            && version < 150_000
+        {
+            return MutationResult::conflict(format!(
+                "SET ACCESS METHOD requires PostgreSQL 15 or later, but the baseline reports {version}"
+            ));
+        }
+        if matches!(
+            alter.action,
+            AlterTableActionMutation::SetGeneratedExpression { .. }
+        ) && let Some(version) = self.pg_version().num()
+            && version < 170_000
+        {
+            return MutationResult::conflict(format!(
+                "SET EXPRESSION requires PostgreSQL 17 or later, but the baseline reports {version}"
             ));
         }
 
@@ -414,11 +416,31 @@ impl AnalysisState {
                 return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
             }
             AlterTableActionMutation::SetGeneratedExpression { column, expr, .. } => {
-                if !relation.generated_columns.contains_key(column) {
+                let Some(generated) = relation.generated_columns.get(column) else {
                     return MutationResult::conflict(format!(
                         "column '{}.{}' is not a generated column",
                         alter.id, column
                     ));
+                };
+                if generated.kind == crate::_internal::model::relation::GeneratedColumnKind::Virtual
+                {
+                    if self
+                        .local
+                        .constraints
+                        .iter()
+                        .any(|((table_id, _), constraint)| {
+                            table_id == &alter.id && constraint.kind == ConstraintKind::Check
+                        })
+                    {
+                        return MutationResult::conflict(
+                            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables with check constraints",
+                        );
+                    }
+                    if self.relation_is_in_any_publication(&alter.id) {
+                        return MutationResult::conflict(
+                            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables that are part of a publication",
+                        );
+                    }
                 }
                 let Some(references) = expr.referenced_columns() else {
                     return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
@@ -431,6 +453,61 @@ impl AnalysisState {
                         "generated expression for '{}.{}' references invalid column '{}'",
                         alter.id, column, reference
                     ));
+                }
+            }
+            AlterTableActionMutation::SetPersistence { persistence } => {
+                if relation.persistence == Persistence::Temporary {
+                    return MutationResult::conflict(format!(
+                        "cannot change logged status of table \"{}\" because it is temporary",
+                        alter.id
+                    ));
+                }
+                if relation.persistence == *persistence
+                    || (partitioned && self.pg_version_num.unwrap_or(180_000) < 180_000)
+                {
+                    return MutationResult::NoOp;
+                }
+                if *persistence == Persistence::Unlogged
+                    && self.relation_is_in_any_publication(&alter.id)
+                {
+                    return MutationResult::conflict(format!(
+                        "cannot change table \"{}\" to unlogged because it is part of a publication",
+                        alter.id
+                    ));
+                }
+                let resolved_self = self.local.graph.resolve_rename(&alter.id);
+                for edge in self.local.graph.edges() {
+                    if !self.dependency_edge_is_current(edge)
+                        || !matches!(edge.kind, DependencyKind::ForeignKey { .. })
+                    {
+                        continue;
+                    }
+                    let dependent = self.local.graph.resolve_rename(&edge.dependent);
+                    let referenced = self.local.graph.resolve_rename(&edge.referenced);
+                    if dependent == referenced {
+                        continue;
+                    }
+                    if *persistence == Persistence::Unlogged && referenced == resolved_self {
+                        if let Some(RelationOverlay::Present(other)) =
+                            self.local.relations.get(dependent)
+                            && other.persistence == Persistence::Permanent
+                        {
+                            return MutationResult::conflict(format!(
+                                "could not change table \"{}\" to unlogged because it references logged table \"{}\"",
+                                alter.id, dependent
+                            ));
+                        }
+                    } else if *persistence == Persistence::Permanent
+                        && dependent == resolved_self
+                        && let Some(RelationOverlay::Present(other)) =
+                            self.local.relations.get(referenced)
+                        && other.persistence == Persistence::Unlogged
+                    {
+                        return MutationResult::conflict(format!(
+                            "could not change table \"{}\" to logged because it references unlogged table \"{}\"",
+                            alter.id, referenced
+                        ));
+                    }
                 }
             }
             AlterTableActionMutation::DropGeneratedExpression { column, if_exists }
@@ -1508,6 +1585,7 @@ impl AnalysisState {
         let mut drop_column_statistics: HashSet<ObjectId> = HashSet::new();
         let mut cascade_generated_columns: HashSet<String> = HashSet::new();
         let mut cascade_view_roots: HashSet<ObjectId> = HashSet::new();
+        let mut cascade_routine_roots: HashSet<ObjectId> = HashSet::new();
         if let AlterTableActionMutation::DropColumn { name, cascade, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
             // The same rule as DROP TABLE: an unproven dependency set widens what the
@@ -1528,16 +1606,12 @@ impl AnalysisState {
             }
             let mut unknown_dependency = false;
             let mut known_dependency = false;
-            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get(&alter.id) {
-                for statistics in relation.extended_statistics.values() {
-                    if statistics.columns.iter().any(|column| column == name) {
-                        known_dependency = true;
-                        if *cascade {
-                            drop_column_statistics.insert(statistics.id.clone());
-                        }
-                    }
-                }
-            }
+            self.collect_dropped_column_statistics(
+                &alter.id,
+                std::slice::from_ref(name),
+                &mut drop_column_statistics,
+                &mut unknown_dependency,
+            );
             for edge in self.local.graph.edges() {
                 if !self.dependency_edge_is_current(edge) {
                     continue;
@@ -1650,6 +1724,21 @@ impl AnalysisState {
                         Some(_) => {}
                         None => unknown_dependency = true,
                     },
+                    DependencyKind::RoutineUsesRelation {
+                        referenced_column: Some(column),
+                    } if referenced == &resolved_table && column == name => {
+                        if matches!(
+                            self.local.functions.get(dependent),
+                            Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                _
+                            ))
+                        ) {
+                            known_dependency = true;
+                            if *cascade {
+                                cascade_routine_roots.insert(dependent.clone());
+                            }
+                        }
+                    }
                     DependencyKind::ConstraintDependency {
                         constraint_name,
                         columns,
@@ -1717,6 +1806,14 @@ impl AnalysisState {
             // operation conservative rather than dropping a column while
             // retaining a typed foreign-key/constraint edge.
             if !cascade_generated_columns.is_empty() {
+                let cascaded_cols: Vec<String> =
+                    cascade_generated_columns.iter().cloned().collect();
+                self.collect_dropped_column_statistics(
+                    &alter.id,
+                    &cascaded_cols,
+                    &mut drop_column_statistics,
+                    &mut unknown_dependency,
+                );
                 for edge in self.local.graph.edges() {
                     if !self.dependency_edge_is_current(edge) {
                         continue;
@@ -1747,6 +1844,19 @@ impl AnalysisState {
                             Some(_) => {}
                             None => unknown_dependency = true,
                         },
+                        DependencyKind::RoutineUsesRelation {
+                            referenced_column: Some(column),
+                        } if referenced == &resolved_table
+                            && cascade_generated_columns.contains(column)
+                            && matches!(
+                                self.local.functions.get(dependent),
+                                Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                    _
+                                ))
+                            ) =>
+                        {
+                            cascade_routine_roots.insert(dependent.clone());
+                        }
                         DependencyKind::ForeignKey {
                             constraint_name,
                             from_columns,
@@ -1865,6 +1975,7 @@ impl AnalysisState {
             drop_column_statistics,
             cascade_generated_columns,
             cascade_view_roots,
+            cascade_routine_roots,
         };
         self.alter_table_finish(alter, context)
     }

@@ -415,6 +415,89 @@ impl Rule for DriftDetectionRule {
                     }
                 }
             }
+            Mutation::AlterRoutine(r) if !pre_state.functions.contains_key(&r.id) => {
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    object_kind: ObjectKind::Function,
+                    object_name: r.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs routine \"{}\" which does not exist in the production baseline",
+                        r.id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                    sql: None,
+                });
+            }
+            Mutation::AlterStatistics(a)
+                if !a.if_exists
+                    && !pre_state
+                        .relations
+                        .values()
+                        .any(|rel| rel.extended_statistics.contains_key(&a.id)) =>
+            {
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    object_kind: ObjectKind::Table,
+                    object_name: a.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs statistics object \"{}\" which does not exist in the production baseline",
+                        a.id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                    sql: None,
+                });
+            }
+            Mutation::DropStatistics(d) if !d.if_exists => {
+                for id in &d.ids {
+                    if !pre_state
+                        .relations
+                        .values()
+                        .any(|rel| rel.extended_statistics.contains_key(id))
+                    {
+                        violations.push(Violation {
+                            source_range: None,
+                            rule_id: self.id(),
+                            object_kind: ObjectKind::Table,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs statistics object \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::DropRoutine(d) => {
+                for sig in &d.signatures {
+                    let id = state.routine_signature_id(sig);
+                    if !d.if_exists && !pre_state.functions.contains_key(&id) {
+                        violations.push(Violation {
+                            source_range: None,
+                            rule_id: self.id(),
+                            object_kind: ObjectKind::Function,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs routine \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                        });
+                    }
+                }
+            }
             Mutation::AlterProcedure(procedure) => {
                 let procedure_exists =
                     pre_state

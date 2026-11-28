@@ -115,6 +115,10 @@ impl AnalysisState {
     /// Record a configured version, used only when the cache carries none.
     pub(crate) fn with_asserted_pg_version(mut self, version: Option<u32>) -> Self {
         self.asserted_pg_version_num = version;
+        if self.pg_version_num.is_none() && !self.baseline_available {
+            self.local.aggregates =
+                AggregateCatalogue::fallback_for_version(self.asserted_pg_version_num);
+        }
         self
     }
 
@@ -566,5 +570,14 @@ impl AnalysisState {
 
     pub(crate) fn mark_transaction_aborted(&mut self) {
         self.local.transaction_aborted = true;
+    }
+}
+
+impl AnalysisState {
+    pub(crate) fn extended_statistics_is_present(&self, id: &ObjectId) -> bool {
+        self.local.relations.values().any(|overlay| match overlay {
+            RelationOverlay::Present(rel) => rel.extended_statistics.contains_key(id),
+            RelationOverlay::Dropped => false,
+        })
     }
 }

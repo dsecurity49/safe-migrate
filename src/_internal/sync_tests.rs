@@ -411,8 +411,12 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V12(deserialized) = decoded else {
-            panic!("Expected the current cache format");
+        assert_eq!(decoded.format_version(), 12);
+        assert_eq!(decoded.minor_version(), 1);
+        let deserialized = match decoded {
+            crate::_internal::db::cache::DbCacheVersioned::V12(c)
+            | crate::_internal::db::cache::DbCacheVersioned::V12_1(c, _) => c,
+            _ => panic!("Expected the current cache format"),
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -517,8 +521,12 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V12(deserialized) = decoded else {
-            panic!("Expected the current cache format");
+        assert_eq!(decoded.format_version(), 12);
+        assert_eq!(decoded.minor_version(), 1);
+        let deserialized = match decoded {
+            crate::_internal::db::cache::DbCacheVersioned::V12(c)
+            | crate::_internal::db::cache::DbCacheVersioned::V12_1(c, _) => c,
+            _ => panic!("Expected the current cache format"),
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));

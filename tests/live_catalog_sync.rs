@@ -92,10 +92,10 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V12(cache) = versioned else {
+    let Ok(cache) = versioned.into_cache() else {
         panic!("catalog sync must encode the V8 cache variant");
     };
-    (*cache, payload)
+    (cache, payload)
 }
 
 fn live_database(database_url: &str) -> (postgres::Config, String, i32) {
@@ -1020,9 +1020,15 @@ fn live_routine_and_replication_mutations_match_postgresql() {
 
     let alter_sql = format!(
         "ALTER FUNCTION {SCHEMA}.with_out(integer) STABLE;
+         ALTER ROUTINE {SCHEMA}.with_out(integer) COST 50 PARALLEL SAFE SET search_path = public RESET search_path;
          ALTER PROCEDURE {SCHEMA}.record_value(integer) RENAME TO record_value_renamed;
+         ALTER PROCEDURE {SCHEMA}.record_value_renamed(integer) SET work_mem = '4MB' RESET ALL;
          ALTER AGGREGATE {SCHEMA}.total(integer) RENAME TO total_renamed;
          ALTER FUNCTION {SCHEMA}.win_rank() STABLE;
+         CREATE STATISTICS {SCHEMA}.view_source_stats (dependencies, ndistinct) ON id, note FROM {SCHEMA}.view_source;
+         ALTER STATISTICS {SCHEMA}.view_source_stats SET STATISTICS 150;
+         ANALYZE {SCHEMA}.view_source (id, note);
+         DROP STATISTICS {SCHEMA}.view_source_stats;
          ALTER TABLE {SCHEMA}.entries
            ADD CONSTRAINT entries_score_check CHECK (score >= 0),
            ADD CONSTRAINT entries_period_excl EXCLUDE USING gist (period WITH &&);

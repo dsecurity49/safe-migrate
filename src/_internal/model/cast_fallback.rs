@@ -6,9 +6,11 @@
 //! Snapshot of PostgreSQL 18.6 (117 casts), used only on
 //! the `--no-cache` path. A synced baseline supersedes it.
 
-use super::cast::CastCatalogue;
+use super::cast::{CastCatalogue, CastEntry, CastEntryMethod};
+use crate::_internal::analysis::facts::CastContextFact;
 
 /// `(source, target)`, each a `format_type` spelling.
+#[cfg(test)]
 const EDGES: &[(&str, &str)] = &[
     ("\"char\"", "text"),
     ("bigint", "double precision"),
@@ -129,17 +131,304 @@ const EDGES: &[(&str, &str)] = &[
     ("timestamp without time zone", "timestamp without time zone"),
 ];
 
+const ALL_CASTS: &[(&str, &str, &str, &str)] = &[
+    ("\"char\"", "character", "a", "f"),
+    ("\"char\"", "character varying", "a", "f"),
+    ("\"char\"", "integer", "e", "f"),
+    ("\"char\"", "text", "i", "f"),
+    ("bigint", "bit", "e", "f"),
+    ("bigint", "bytea", "e", "f"),
+    ("bigint", "double precision", "i", "f"),
+    ("bigint", "integer", "a", "f"),
+    ("bigint", "money", "a", "f"),
+    ("bigint", "numeric", "i", "f"),
+    ("bigint", "oid", "i", "f"),
+    ("bigint", "real", "i", "f"),
+    ("bigint", "regclass", "i", "f"),
+    ("bigint", "regcollation", "i", "f"),
+    ("bigint", "regconfig", "i", "f"),
+    ("bigint", "regdictionary", "i", "f"),
+    ("bigint", "regnamespace", "i", "f"),
+    ("bigint", "regoper", "i", "f"),
+    ("bigint", "regoperator", "i", "f"),
+    ("bigint", "regproc", "i", "f"),
+    ("bigint", "regprocedure", "i", "f"),
+    ("bigint", "regrole", "i", "f"),
+    ("bigint", "regtype", "i", "f"),
+    ("bigint", "smallint", "a", "f"),
+    ("bit", "bigint", "e", "f"),
+    ("bit", "bit", "i", "f"),
+    ("bit", "bit varying", "i", "b"),
+    ("bit", "integer", "e", "f"),
+    ("bit varying", "bit", "i", "b"),
+    ("bit varying", "bit varying", "i", "f"),
+    ("boolean", "character", "a", "f"),
+    ("boolean", "character varying", "a", "f"),
+    ("boolean", "integer", "e", "f"),
+    ("boolean", "text", "a", "f"),
+    ("box", "circle", "e", "f"),
+    ("box", "lseg", "e", "f"),
+    ("box", "point", "e", "f"),
+    ("box", "polygon", "a", "f"),
+    ("bytea", "bigint", "e", "f"),
+    ("bytea", "integer", "e", "f"),
+    ("bytea", "smallint", "e", "f"),
+    ("character", "\"char\"", "a", "f"),
+    ("character", "character", "i", "f"),
+    ("character", "character varying", "i", "f"),
+    ("character", "name", "i", "f"),
+    ("character", "text", "i", "f"),
+    ("character", "xml", "e", "f"),
+    ("character varying", "\"char\"", "a", "f"),
+    ("character varying", "character", "i", "b"),
+    ("character varying", "character varying", "i", "f"),
+    ("character varying", "name", "i", "f"),
+    ("character varying", "regclass", "i", "f"),
+    ("character varying", "text", "i", "b"),
+    ("character varying", "xml", "e", "f"),
+    ("cidr", "character", "a", "f"),
+    ("cidr", "character varying", "a", "f"),
+    ("cidr", "inet", "i", "b"),
+    ("cidr", "text", "a", "f"),
+    ("circle", "box", "e", "f"),
+    ("circle", "point", "e", "f"),
+    ("circle", "polygon", "e", "f"),
+    ("date", "timestamp with time zone", "i", "f"),
+    ("date", "timestamp without time zone", "i", "f"),
+    ("daterange", "datemultirange", "e", "f"),
+    ("double precision", "bigint", "a", "f"),
+    ("double precision", "integer", "a", "f"),
+    ("double precision", "numeric", "a", "f"),
+    ("double precision", "real", "a", "f"),
+    ("double precision", "smallint", "a", "f"),
+    ("inet", "character", "a", "f"),
+    ("inet", "character varying", "a", "f"),
+    ("inet", "cidr", "a", "f"),
+    ("inet", "text", "a", "f"),
+    ("int4range", "int4multirange", "e", "f"),
+    ("int8range", "int8multirange", "e", "f"),
+    ("integer", "\"char\"", "e", "f"),
+    ("integer", "bigint", "i", "f"),
+    ("integer", "bit", "e", "f"),
+    ("integer", "boolean", "e", "f"),
+    ("integer", "bytea", "e", "f"),
+    ("integer", "double precision", "i", "f"),
+    ("integer", "money", "a", "f"),
+    ("integer", "numeric", "i", "f"),
+    ("integer", "oid", "i", "b"),
+    ("integer", "real", "i", "f"),
+    ("integer", "regclass", "i", "b"),
+    ("integer", "regcollation", "i", "b"),
+    ("integer", "regconfig", "i", "b"),
+    ("integer", "regdictionary", "i", "b"),
+    ("integer", "regnamespace", "i", "b"),
+    ("integer", "regoper", "i", "b"),
+    ("integer", "regoperator", "i", "b"),
+    ("integer", "regproc", "i", "b"),
+    ("integer", "regprocedure", "i", "b"),
+    ("integer", "regrole", "i", "b"),
+    ("integer", "regtype", "i", "b"),
+    ("integer", "smallint", "a", "f"),
+    ("interval", "interval", "i", "f"),
+    ("interval", "time without time zone", "a", "f"),
+    ("json", "jsonb", "a", "i"),
+    ("jsonb", "bigint", "e", "f"),
+    ("jsonb", "boolean", "e", "f"),
+    ("jsonb", "double precision", "e", "f"),
+    ("jsonb", "integer", "e", "f"),
+    ("jsonb", "json", "a", "i"),
+    ("jsonb", "numeric", "e", "f"),
+    ("jsonb", "real", "e", "f"),
+    ("jsonb", "smallint", "e", "f"),
+    ("lseg", "point", "e", "f"),
+    ("macaddr", "macaddr8", "i", "f"),
+    ("macaddr8", "macaddr", "i", "f"),
+    ("money", "numeric", "a", "f"),
+    ("name", "character", "a", "f"),
+    ("name", "character varying", "a", "f"),
+    ("name", "text", "i", "f"),
+    ("numeric", "bigint", "a", "f"),
+    ("numeric", "double precision", "i", "f"),
+    ("numeric", "integer", "a", "f"),
+    ("numeric", "money", "a", "f"),
+    ("numeric", "numeric", "i", "f"),
+    ("numeric", "real", "i", "f"),
+    ("numeric", "smallint", "a", "f"),
+    ("numrange", "nummultirange", "e", "f"),
+    ("oid", "bigint", "a", "f"),
+    ("oid", "integer", "a", "b"),
+    ("oid", "regclass", "i", "b"),
+    ("oid", "regcollation", "i", "b"),
+    ("oid", "regconfig", "i", "b"),
+    ("oid", "regdictionary", "i", "b"),
+    ("oid", "regnamespace", "i", "b"),
+    ("oid", "regoper", "i", "b"),
+    ("oid", "regoperator", "i", "b"),
+    ("oid", "regproc", "i", "b"),
+    ("oid", "regprocedure", "i", "b"),
+    ("oid", "regrole", "i", "b"),
+    ("oid", "regtype", "i", "b"),
+    ("path", "polygon", "a", "f"),
+    ("pg_dependencies", "bytea", "i", "b"),
+    ("pg_dependencies", "text", "i", "i"),
+    ("pg_mcv_list", "bytea", "i", "b"),
+    ("pg_mcv_list", "text", "i", "i"),
+    ("pg_ndistinct", "bytea", "i", "b"),
+    ("pg_ndistinct", "text", "i", "i"),
+    ("pg_node_tree", "text", "i", "b"),
+    ("point", "box", "a", "f"),
+    ("polygon", "box", "e", "f"),
+    ("polygon", "circle", "e", "f"),
+    ("polygon", "path", "a", "f"),
+    ("polygon", "point", "e", "f"),
+    ("real", "bigint", "a", "f"),
+    ("real", "double precision", "i", "f"),
+    ("real", "integer", "a", "f"),
+    ("real", "numeric", "a", "f"),
+    ("real", "smallint", "a", "f"),
+    ("regclass", "bigint", "a", "f"),
+    ("regclass", "integer", "a", "b"),
+    ("regclass", "oid", "i", "b"),
+    ("regcollation", "bigint", "a", "f"),
+    ("regcollation", "integer", "a", "b"),
+    ("regcollation", "oid", "i", "b"),
+    ("regconfig", "bigint", "a", "f"),
+    ("regconfig", "integer", "a", "b"),
+    ("regconfig", "oid", "i", "b"),
+    ("regdictionary", "bigint", "a", "f"),
+    ("regdictionary", "integer", "a", "b"),
+    ("regdictionary", "oid", "i", "b"),
+    ("regnamespace", "bigint", "a", "f"),
+    ("regnamespace", "integer", "a", "b"),
+    ("regnamespace", "oid", "i", "b"),
+    ("regoper", "bigint", "a", "f"),
+    ("regoper", "integer", "a", "b"),
+    ("regoper", "oid", "i", "b"),
+    ("regoper", "regoperator", "i", "b"),
+    ("regoperator", "bigint", "a", "f"),
+    ("regoperator", "integer", "a", "b"),
+    ("regoperator", "oid", "i", "b"),
+    ("regoperator", "regoper", "i", "b"),
+    ("regproc", "bigint", "a", "f"),
+    ("regproc", "integer", "a", "b"),
+    ("regproc", "oid", "i", "b"),
+    ("regproc", "regprocedure", "i", "b"),
+    ("regprocedure", "bigint", "a", "f"),
+    ("regprocedure", "integer", "a", "b"),
+    ("regprocedure", "oid", "i", "b"),
+    ("regprocedure", "regproc", "i", "b"),
+    ("regrole", "bigint", "a", "f"),
+    ("regrole", "integer", "a", "b"),
+    ("regrole", "oid", "i", "b"),
+    ("regtype", "bigint", "a", "f"),
+    ("regtype", "integer", "a", "b"),
+    ("regtype", "oid", "i", "b"),
+    ("smallint", "bigint", "i", "f"),
+    ("smallint", "bytea", "e", "f"),
+    ("smallint", "double precision", "i", "f"),
+    ("smallint", "integer", "i", "f"),
+    ("smallint", "numeric", "i", "f"),
+    ("smallint", "oid", "i", "f"),
+    ("smallint", "real", "i", "f"),
+    ("smallint", "regclass", "i", "f"),
+    ("smallint", "regcollation", "i", "f"),
+    ("smallint", "regconfig", "i", "f"),
+    ("smallint", "regdictionary", "i", "f"),
+    ("smallint", "regnamespace", "i", "f"),
+    ("smallint", "regoper", "i", "f"),
+    ("smallint", "regoperator", "i", "f"),
+    ("smallint", "regproc", "i", "f"),
+    ("smallint", "regprocedure", "i", "f"),
+    ("smallint", "regrole", "i", "f"),
+    ("smallint", "regtype", "i", "f"),
+    ("text", "\"char\"", "a", "f"),
+    ("text", "character", "i", "b"),
+    ("text", "character varying", "i", "b"),
+    ("text", "name", "i", "f"),
+    ("text", "regclass", "i", "f"),
+    ("text", "xml", "e", "f"),
+    ("time with time zone", "time with time zone", "i", "f"),
+    ("time with time zone", "time without time zone", "a", "f"),
+    ("time without time zone", "interval", "i", "f"),
+    ("time without time zone", "time with time zone", "i", "f"),
+    ("time without time zone", "time without time zone", "i", "f"),
+    ("timestamp with time zone", "date", "a", "f"),
+    ("timestamp with time zone", "time with time zone", "a", "f"),
+    (
+        "timestamp with time zone",
+        "time without time zone",
+        "a",
+        "f",
+    ),
+    (
+        "timestamp with time zone",
+        "timestamp with time zone",
+        "i",
+        "f",
+    ),
+    (
+        "timestamp with time zone",
+        "timestamp without time zone",
+        "a",
+        "f",
+    ),
+    ("timestamp without time zone", "date", "a", "f"),
+    (
+        "timestamp without time zone",
+        "time without time zone",
+        "a",
+        "f",
+    ),
+    (
+        "timestamp without time zone",
+        "timestamp with time zone",
+        "i",
+        "f",
+    ),
+    (
+        "timestamp without time zone",
+        "timestamp without time zone",
+        "i",
+        "f",
+    ),
+    ("tsrange", "tsmultirange", "e", "f"),
+    ("tstzrange", "tstzmultirange", "e", "f"),
+    ("xid8", "xid", "e", "f"),
+    ("xml", "character", "a", "b"),
+    ("xml", "character varying", "a", "b"),
+    ("xml", "text", "a", "b"),
+];
+
+pub(crate) fn is_builtin_cast(source: &str, target: &str) -> bool {
+    ALL_CASTS
+        .binary_search_by_key(&(source, target), |(s, t, _, _)| (*s, *t))
+        .is_ok()
+}
+
 pub(crate) fn catalogue() -> CastCatalogue {
-    CastCatalogue::new(
-        EDGES
-            .iter()
-            .map(|(source, target)| ((*source).to_string(), (*target).to_string())),
-    )
+    CastCatalogue::from_entries(ALL_CASTS.iter().map(|(source, target, ctx, method)| {
+        let context = match *ctx {
+            "i" => CastContextFact::Implicit,
+            "a" => CastContextFact::Assignment,
+            _ => CastContextFact::Explicit,
+        };
+        let method = match *method {
+            "b" => CastEntryMethod::WithoutFunction,
+            "i" => CastEntryMethod::WithInout,
+            _ => CastEntryMethod::WithFunction(None),
+        };
+        CastEntry {
+            source: (*source).to_string(),
+            target: (*target).to_string(),
+            context,
+            method,
+        }
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::EDGES;
+    use super::{ALL_CASTS, EDGES};
     use crate::_internal::model::cast::CastCatalogue;
 
     #[test]
@@ -149,11 +438,19 @@ mod tests {
             EDGES.windows(2).all(|pair| pair[0] < pair[1]),
             "entries must be sorted and unique by (source, target)"
         );
+        assert!(!ALL_CASTS.is_empty(), "ALL_CASTS must not be empty");
+        assert!(
+            ALL_CASTS
+                .windows(2)
+                .all(|pair| (pair[0].0, pair[0].1) < (pair[1].0, pair[1].1)),
+            "ALL_CASTS must be sorted and unique by (source, target)"
+        );
     }
 
     #[test]
     fn a_widening_cast_is_present_and_a_narrowing_one_is_absent() {
         let catalogue = CastCatalogue::fallback();
+        assert!(catalogue.coerces_implicitly("smallint", "integer"));
         assert!(catalogue.coerces_implicitly("integer", "bigint"));
         assert!(!catalogue.coerces_implicitly("bigint", "integer"));
     }

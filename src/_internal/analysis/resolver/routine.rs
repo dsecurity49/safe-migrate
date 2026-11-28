@@ -1,13 +1,18 @@
 use super::Resolver;
 use crate::_internal::analysis::facts::{
-    AlterAggregateFact, AlterFunctionFact, AlterProcedureFact, CreateAggregateFact,
-    CreateFunctionFact, CreateProcedureFact, DropAggregateFact, DropFunctionFact,
-    DropProcedureFact, FunctionSigFact,
+    AlterAggregateFact, AlterFunctionFact, AlterProcedureFact, AlterRoutineFact,
+    AlterStatisticsFact, AnalyzeFact, CastMethodFact, CreateAggregateFact, CreateCastFact,
+    CreateFunctionFact, CreateProcedureFact, CreateStatisticsFact, DropAggregateFact, DropCastFact,
+    DropFunctionFact, DropProcedureFact, DropRoutineFact, DropStatisticsFact, FunctionSigFact,
+    RoutineBodyDependenciesFact, RoutineReturnExprFact,
 };
 use crate::_internal::analysis::mutations::{
-    AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, CreateAggregateMutation,
-    CreateFunctionMutation, CreateProcedureMutation, DropAggregateMutation, DropFunctionMutation,
-    DropProcedureMutation, Mutation,
+    AlterAggregateMutation, AlterFunctionMutation, AlterProcedureMutation, AlterRoutineMutation,
+    AlterStatisticsMutation, AnalyzeMutation, AnalyzeTargetMutation, CastMethodMutation,
+    CreateAggregateMutation, CreateCastMutation, CreateFunctionMutation, CreateProcedureMutation,
+    CreateStatisticsMutation, DropAggregateMutation, DropCastMutation, DropFunctionMutation,
+    DropProcedureMutation, DropRoutineMutation, DropStatisticsMutation, Mutation,
+    RoutineBodyDependencies, RoutineRelationDependency, RoutineReturnExprMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 
@@ -22,6 +27,14 @@ impl Resolver {
             params: fact.params.clone(),
             return_type: fact.return_type.clone(),
             options: fact.options.clone(),
+            body_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.body_dependencies,
+                state,
+            ),
+            validation_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.validation_dependencies,
+                state,
+            ),
         })
     }
 
@@ -55,6 +68,14 @@ impl Resolver {
             or_replace: fact.or_replace,
             params: fact.params.clone(),
             options: fact.options.clone(),
+            body_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.body_dependencies,
+                state,
+            ),
+            validation_dependencies: Self::resolve_routine_body_dependencies(
+                &fact.validation_dependencies,
+                state,
+            ),
         })
     }
 
@@ -114,6 +135,81 @@ impl Resolver {
         })
     }
 
+    pub(super) fn resolve_alter_routine(
+        fact: &AlterRoutineFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::AlterRoutine(AlterRoutineMutation {
+            id: Self::resolve_routine_lookup_name(&fact.name, &fact.params, state),
+            action: fact.action.clone(),
+        })
+    }
+
+    pub(super) fn resolve_drop_routine(fact: &DropRoutineFact, state: &AnalysisState) -> Mutation {
+        Mutation::DropRoutine(DropRoutineMutation {
+            signatures: Self::normalize_signatures(&fact.signatures, state),
+            if_exists: fact.if_exists,
+            cascade: fact.cascade,
+        })
+    }
+
+    fn resolve_routine_body_dependencies(
+        deps: &RoutineBodyDependenciesFact,
+        state: &AnalysisState,
+    ) -> RoutineBodyDependencies {
+        let mut relations: Vec<RoutineRelationDependency> = Vec::new();
+        for rel in &deps.relations {
+            let resolved = RoutineRelationDependency {
+                relation: Self::resolve_relation_lookup_name(&rel.relation, state),
+                column: rel.column.clone(),
+            };
+            if !relations.contains(&resolved) {
+                relations.push(resolved);
+            }
+        }
+        let single_source = {
+            let mut distinct_rels: Vec<&crate::_internal::ast::identifiers::ObjectId> = Vec::new();
+            for r in &relations {
+                if !distinct_rels.contains(&&r.relation) {
+                    distinct_rels.push(&r.relation);
+                }
+            }
+            (distinct_rels.len() == 1).then(|| distinct_rels[0].clone())
+        };
+        let return_expr = deps.return_expr.as_ref().map(|expr| match expr {
+            RoutineReturnExprFact::LiteralType(ty) => {
+                RoutineReturnExprMutation::LiteralType(ty.clone())
+            }
+            RoutineReturnExprFact::ExplicitCast(ty) => {
+                RoutineReturnExprMutation::ExplicitCast(ty.clone())
+            }
+            RoutineReturnExprFact::Column { relation, column } => {
+                RoutineReturnExprMutation::Column {
+                    relation: relation
+                        .as_ref()
+                        .map(|r| Self::resolve_relation_lookup_name(r, state))
+                        .or_else(|| single_source.clone()),
+                    column: column.clone(),
+                }
+            }
+            RoutineReturnExprFact::ParameterType(ty) => {
+                RoutineReturnExprMutation::ParameterType(ty.clone())
+            }
+            RoutineReturnExprFact::RoutineCall(qname) => RoutineReturnExprMutation::RoutineCall(
+                Self::resolve_routine_namespace_name(qname, state),
+            ),
+            RoutineReturnExprFact::MultiColumn => RoutineReturnExprMutation::MultiColumn,
+        });
+        RoutineBodyDependencies {
+            relations,
+            routines: Self::resolve_view_routines(&deps.routines, single_source.as_ref(), state),
+            types: Self::resolve_cast_types(&deps.types, state),
+            unqualified_columns: deps.unqualified_columns.clone(),
+            return_expr,
+            has_syntax_error: deps.has_syntax_error,
+        }
+    }
+
     fn normalize_signatures(
         signatures: &[FunctionSigFact],
         state: &AnalysisState,
@@ -130,5 +226,108 @@ impl Resolver {
                 signature
             })
             .collect()
+    }
+    pub(super) fn resolve_create_cast(fact: &CreateCastFact, state: &AnalysisState) -> Mutation {
+        let method = match &fact.method {
+            CastMethodFact::WithoutFunction => CastMethodMutation::WithoutFunction,
+            CastMethodFact::WithInout => CastMethodMutation::WithInout,
+            CastMethodFact::WithFunction(sig) => {
+                let id = if sig.params.is_empty() {
+                    let base = Self::resolve_routine_namespace_name(&sig.name, state);
+                    let candidates: Vec<_> =
+                        state.routine_overloads_under(&base).cloned().collect();
+                    if candidates.len() == 1 {
+                        candidates[0].clone()
+                    } else {
+                        Self::resolve_routine_lookup_name(&sig.name, &sig.params, state)
+                    }
+                } else {
+                    Self::resolve_routine_lookup_name(&sig.name, &sig.params, state)
+                };
+                CastMethodMutation::WithFunction(id)
+            }
+        };
+        Mutation::CreateCast(CreateCastMutation {
+            source_type: Self::resolve_cast_type_identity(&fact.source_type, state),
+            target_type: Self::resolve_cast_type_identity(&fact.target_type, state),
+            method,
+            context: fact.context,
+        })
+    }
+
+    pub(super) fn resolve_drop_cast(fact: &DropCastFact, state: &AnalysisState) -> Mutation {
+        Mutation::DropCast(DropCastMutation {
+            source_type: Self::resolve_cast_type_identity(&fact.source_type, state),
+            target_type: Self::resolve_cast_type_identity(&fact.target_type, state),
+            if_exists: fact.if_exists,
+            cascade: fact.cascade,
+        })
+    }
+
+    pub(super) fn resolve_create_statistics(
+        fact: &CreateStatisticsFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::CreateStatistics(CreateStatisticsMutation {
+            id: fact
+                .name
+                .as_ref()
+                .map(|name| Self::resolve_creation_name(name, state)),
+            if_not_exists: fact.if_not_exists,
+            kinds: fact.kinds.clone(),
+            columns: fact.columns.clone(),
+            expression_columns: fact.expression_columns.clone(),
+            expressions: fact.expressions.clone(),
+            expression_count: fact.expression_count,
+            expressions_sql: fact.expressions_sql.clone(),
+            expression_routines: Self::resolve_view_routines(
+                &fact.expression_routines,
+                Some(&Self::resolve_relation_lookup_name(&fact.table, state)),
+                state,
+            ),
+            expression_types: Self::resolve_cast_types(&fact.expression_types, state),
+            table: Self::resolve_relation_lookup_name(&fact.table, state),
+        })
+    }
+
+    pub(super) fn resolve_alter_statistics(
+        fact: &AlterStatisticsFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::AlterStatistics(AlterStatisticsMutation {
+            id: Self::resolve_statistics_lookup_name(&fact.name, state),
+            if_exists: fact.if_exists,
+            action: fact.action.clone(),
+        })
+    }
+
+    pub(super) fn resolve_drop_statistics(
+        fact: &DropStatisticsFact,
+        state: &AnalysisState,
+    ) -> Mutation {
+        Mutation::DropStatistics(DropStatisticsMutation {
+            ids: fact
+                .names
+                .iter()
+                .map(|name| Self::resolve_statistics_lookup_name(name, state))
+                .collect(),
+            if_exists: fact.if_exists,
+            cascade: fact.cascade,
+        })
+    }
+
+    pub(super) fn resolve_analyze(fact: &AnalyzeFact, state: &AnalysisState) -> Mutation {
+        Mutation::Analyze(AnalyzeMutation {
+            options: fact.options.clone(),
+            targets: fact
+                .targets
+                .iter()
+                .map(|t| AnalyzeTargetMutation {
+                    table_id: Self::resolve_relation_lookup_name(&t.relation, state),
+                    is_unqualified: t.relation.schema.is_none(),
+                    columns: t.columns.clone(),
+                })
+                .collect(),
+        })
     }
 }

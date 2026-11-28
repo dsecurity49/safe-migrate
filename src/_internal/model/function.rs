@@ -105,9 +105,30 @@ pub(crate) struct FunctionState {
     pub internal_type_owner: Option<ObjectId>,
     /// `pg_aggregate` facts. `None` for every non-aggregate routine.
     pub aggregate: Option<crate::_internal::model::aggregate::AggregateMetadata>,
+    #[serde(skip)]
+    pub owner: Option<ObjectId>,
+    #[serde(skip)]
+    pub dependent_extensions: std::collections::BTreeSet<String>,
+    #[serde(skip)]
+    pub support_function: Option<ObjectId>,
 }
 
 impl FunctionState {
+    pub(crate) fn effective_return_type(&self) -> &str {
+        if !self.return_type.is_empty() {
+            return &self.return_type;
+        }
+        let mut outputs = self.parameters.iter().filter(|p| p.mode.is_output());
+        let Some(first) = outputs.next() else {
+            return "void";
+        };
+        if outputs.next().is_some() {
+            "record"
+        } else {
+            &first.ty
+        }
+    }
+
     /// A routine that declares `arg_types` as unnamed inputs and carries the
     /// catalog defaults for everything else. Deriving `parameters` here keeps
     /// the two from disagreeing about which parameters are inputs.
@@ -143,6 +164,9 @@ impl FunctionState {
             security: SecurityMode::Invoker,
             internal_type_owner: None,
             aggregate,
+            owner: None,
+            dependent_extensions: std::collections::BTreeSet::new(),
+            support_function: None,
         }
     }
 }

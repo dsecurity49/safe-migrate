@@ -1806,3 +1806,253 @@ fn drop_table_still_rejects_a_foreign_table() {
         "the server answers DROP TABLE with 'is not a table'"
     );
 }
+
+#[test]
+fn create_table_rejects_duplicate_columns_and_merges_typed_and_partition_options() {
+    let engine = setup_engine();
+    let mut state = setup_state();
+
+    let duplicate = engine
+        .analyze("CREATE TABLE public.dup_t (x int, x int);", &mut state)
+        .unwrap();
+    assert!(
+        duplicate.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("column \"x\" specified more than once")
+        }),
+        "duplicate columns must report a chain conflict without panicking: {duplicate:?}"
+    );
+
+    let typed = engine
+        .analyze(
+            "CREATE TYPE public.comp_opts AS (x int, y text);
+             CREATE TABLE public.typed_opts OF public.comp_opts (x WITH OPTIONS NOT NULL DEFAULT 1);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !typed.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid typed table WITH OPTIONS must succeed: {typed:?}"
+    );
+    let Some(RelationOverlay::Present(typed_rel)) = state
+        .local
+        .relations
+        .get(&object_id("public", "typed_opts"))
+    else {
+        panic!("typed_opts relation must exist");
+    };
+    let x_col = typed_rel.get_column("x").expect("column x must exist");
+    assert!(!x_col.is_nullable, "WITH OPTIONS NOT NULL must apply to x");
+    assert!(
+        x_col.default.is_some(),
+        "WITH OPTIONS DEFAULT must apply to x"
+    );
+
+    let missing_typed = engine
+        .analyze(
+            "CREATE TABLE public.typed_bad OF public.comp_opts (missing_col WITH OPTIONS NOT NULL);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        missing_typed.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("column \"missing_col\" does not exist")
+        }),
+        "WITH OPTIONS on a nonexistent composite attribute must conflict: {missing_typed:?}"
+    );
+
+    let partition_opts = engine
+        .analyze(
+            "CREATE TABLE public.p_opts (x int, y text) PARTITION BY LIST (x);
+             CREATE TABLE public.c_opts PARTITION OF public.p_opts (y WITH OPTIONS NOT NULL) FOR VALUES IN (1);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !partition_opts.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid partition WITH OPTIONS must succeed: {partition_opts:?}"
+    );
+    let Some(RelationOverlay::Present(part_rel)) =
+        state.local.relations.get(&object_id("public", "c_opts"))
+    else {
+        panic!("c_opts relation must exist");
+    };
+    assert!(
+        !part_rel.get_column("y").expect("column y").is_nullable,
+        "partition WITH OPTIONS NOT NULL must mark column y non-null"
+    );
+}
+
+#[test]
+fn set_access_method_is_rejected_on_postgresql_14_and_accepted_on_15_plus() {
+    let engine = setup_engine();
+    let mut pg14_cache = synced_cache();
+    pg14_cache.pg_version_num = Some(140_000);
+    let mut pg14_state = crate::_internal::analysis::state::AnalysisState::new(pg14_cache);
+    let pg14_findings = engine
+        .analyze(
+            "CREATE TABLE public.am_t (id int);
+             ALTER TABLE public.am_t SET ACCESS METHOD heap;",
+            &mut pg14_state,
+        )
+        .unwrap();
+    assert!(
+        pg14_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("SET ACCESS METHOD requires PostgreSQL 15 or later")
+        }),
+        "PG 14 must reject SET ACCESS METHOD: {pg14_findings:?}"
+    );
+
+    let mut pg15_cache = synced_cache();
+    pg15_cache.pg_version_num = Some(150_000);
+    let mut pg15_state = crate::_internal::analysis::state::AnalysisState::new(pg15_cache);
+    let pg15_findings = engine
+        .analyze(
+            "CREATE TABLE public.am_t (id int);
+             ALTER TABLE public.am_t SET ACCESS METHOD heap;",
+            &mut pg15_state,
+        )
+        .unwrap();
+    assert!(
+        !pg15_findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "PG 15 must accept SET ACCESS METHOD: {pg15_findings:?}"
+    );
+}
+
+#[test]
+fn set_generated_expression_validates_version_gate_and_virtual_constraints() {
+    let engine = setup_engine();
+    let mut pg16_cache = synced_cache();
+    pg16_cache.pg_version_num = Some(160_000);
+    let mut pg16_state = crate::_internal::analysis::state::AnalysisState::new(pg16_cache);
+    let pg16_findings = engine
+        .analyze(
+            "CREATE TABLE public.gen_t (a int, b int GENERATED ALWAYS AS (a + 1) STORED);
+             ALTER TABLE public.gen_t ALTER COLUMN b SET EXPRESSION AS (a + 2);",
+            &mut pg16_state,
+        )
+        .unwrap();
+    assert!(
+        pg16_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("SET EXPRESSION requires PostgreSQL 17 or later")
+        }),
+        "PG 16 must reject SET EXPRESSION: {pg16_findings:?}"
+    );
+
+    let mut pg18_cache = synced_cache();
+    pg18_cache.pg_version_num = Some(180_000);
+    let mut pg18_state = crate::_internal::analysis::state::AnalysisState::new(pg18_cache);
+    let virtual_check_findings = engine
+        .analyze(
+            "CREATE TABLE public.v_gen_t (
+                 a int,
+                 b int GENERATED ALWAYS AS (a + 1) VIRTUAL,
+                 CONSTRAINT b_pos CHECK (b > 0)
+             );
+             ALTER TABLE public.v_gen_t ALTER COLUMN b SET EXPRESSION AS (a + 2);",
+            &mut pg18_state,
+        )
+        .unwrap();
+    assert!(
+        virtual_check_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables with check constraints")
+        }),
+        "SET EXPRESSION on virtual generated column with CHECK constraint must conflict: {virtual_check_findings:?}"
+    );
+}
+
+#[test]
+fn set_persistence_enforces_foreign_key_and_publication_invariants() {
+    let engine = setup_engine();
+    let mut pub_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let pub_findings = engine
+        .analyze(
+            "CREATE TABLE public.pub_t (id int PRIMARY KEY);
+             CREATE PUBLICATION p1 FOR TABLE public.pub_t;
+             ALTER TABLE public.pub_t SET UNLOGGED;",
+            &mut pub_state,
+        )
+        .unwrap();
+    assert!(
+        pub_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains("cannot change table \"public.pub_t\" to unlogged because it is part of a publication")
+        }),
+        "SET UNLOGGED on a published table must conflict: {pub_findings:?}"
+    );
+
+    let mut fk_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let fk_findings = engine
+        .analyze(
+            "CREATE TABLE public.parent_logged (id int PRIMARY KEY);
+             CREATE TABLE public.child_logged (id int REFERENCES public.parent_logged(id));
+             ALTER TABLE public.parent_logged SET UNLOGGED;",
+            &mut fk_state,
+        )
+        .unwrap();
+    assert!(
+        fk_findings.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason
+                    .contains("could not change table \"public.parent_logged\" to unlogged")
+        }),
+        "SET UNLOGGED on a table referenced by a permanent foreign key must conflict: {fk_findings:?}"
+    );
+}
+
+#[test]
+fn create_alter_drop_statistics_and_analyze_update_relation_state() {
+    let engine = setup_engine();
+    let mut state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
+    let findings = engine
+        .analyze(
+            "CREATE TABLE public.stats_t (a int, b int, c text);
+             CREATE STATISTICS public.s_ab (dependencies, ndistinct) ON a, b FROM public.stats_t;
+             CREATE STATISTICS IF NOT EXISTS public.s_ab (dependencies) ON a, b FROM public.stats_t;
+             ALTER STATISTICS public.s_ab SET STATISTICS 250;
+             ALTER STATISTICS public.s_ab RENAME TO s_ab_renamed;
+             ANALYZE public.stats_t(a, b);",
+            &mut state,
+        )
+        .unwrap();
+    assert!(
+        !findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "valid CREATE/ALTER STATISTICS and ANALYZE must not conflict: {findings:?}"
+    );
+    let Some(RelationOverlay::Present(rel)) =
+        state.local.relations.get(&object_id("public", "stats_t"))
+    else {
+        panic!("stats_t must exist");
+    };
+    let stat = rel
+        .extended_statistics
+        .get(&object_id("public", "s_ab_renamed"))
+        .expect("s_ab_renamed must be present on stats_t");
+    assert_eq!(stat.kinds, vec!["f".to_string(), "d".to_string()]);
+    assert_eq!(stat.columns, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(stat.target, Some(250));
+    assert!(
+        !rel.is_stale(),
+        "ANALYZE public.stats_t must clear stale statistics state"
+    );
+
+    let drop_findings = engine
+        .analyze("DROP STATISTICS public.s_ab_renamed;", &mut state)
+        .unwrap();
+    assert!(
+        !drop_findings.iter().any(|v| v.rule_id == "chain-conflict"),
+        "DROP STATISTICS must succeed: {drop_findings:?}"
+    );
+    let Some(RelationOverlay::Present(rel_after)) =
+        state.local.relations.get(&object_id("public", "stats_t"))
+    else {
+        panic!("stats_t must exist");
+    };
+    assert!(rel_after.extended_statistics.is_empty());
+}
