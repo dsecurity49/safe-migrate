@@ -416,12 +416,31 @@ impl CastCatalogue {
                 updated.push(cloned);
             }
         }
-        let changed = !updated.is_empty();
+        let mut changed = !updated.is_empty();
         for (s, t) in to_remove {
             self.remove_cast(&s, &t);
         }
         for entry in updated {
             self.insert_cast(entry);
+        }
+        if !self.full_coverage {
+            let mut new_implicit = BTreeMap::new();
+            for (src, targets) in std::mem::take(&mut self.implicit) {
+                let mapped_src = remap(&src);
+                if mapped_src.is_some() {
+                    changed = true;
+                }
+                let final_src = mapped_src.unwrap_or(src);
+                let entry_targets = new_implicit.entry(final_src).or_insert_with(BTreeSet::new);
+                for dst in targets {
+                    let mapped_dst = remap(&dst);
+                    if mapped_dst.is_some() {
+                        changed = true;
+                    }
+                    entry_targets.insert(mapped_dst.unwrap_or(dst));
+                }
+            }
+            self.implicit = new_implicit;
         }
         changed
     }
@@ -461,12 +480,31 @@ impl CastCatalogue {
                 updated.push(cloned);
             }
         }
-        let changed = !updated.is_empty();
+        let mut changed = !updated.is_empty();
         for (s, t) in to_remove {
             self.remove_cast(&s, &t);
         }
         for entry in updated {
             self.insert_cast(entry);
+        }
+        if !self.full_coverage {
+            let mut new_implicit = BTreeMap::new();
+            for (src, targets) in std::mem::take(&mut self.implicit) {
+                let mapped_src = remap_type(&src);
+                if mapped_src.is_some() {
+                    changed = true;
+                }
+                let final_src = mapped_src.unwrap_or(src);
+                let entry_targets = new_implicit.entry(final_src).or_insert_with(BTreeSet::new);
+                for dst in targets {
+                    let mapped_dst = remap_type(&dst);
+                    if mapped_dst.is_some() {
+                        changed = true;
+                    }
+                    entry_targets.insert(mapped_dst.unwrap_or(dst));
+                }
+            }
+            self.implicit = new_implicit;
         }
         changed
     }

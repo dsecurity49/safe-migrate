@@ -127,6 +127,8 @@ impl AnalysisState {
             return true;
         }
         self.local.casts.is_binary_coercible(&from_base, &to_canon)
+            || (!self.local.casts.has_full_cast_coverage()
+                && self.local.casts.coerces_implicitly(&from_base, &to_canon))
     }
 
     fn builtin_base_physical_layout(&self, type_name: &str) -> Option<(i16, bool, char)> {
@@ -261,27 +263,29 @@ impl AnalysisState {
                                 "array data types are not binary-compatible".to_string(),
                             ));
                         }
-                        if let Some(like_type) = &options.like {
+                        let inherited = if let Some(like_type) = &options.like {
                             let canon_like = self.canonical_cast_type(like_type);
-                            return self.validate_binary_compatible_cast_type(&canon_like);
-                        }
-                        let typlen = match &options.internallength {
-                            Some(crate::_internal::model::types::BaseTypeLength::Variable)
-                            | None => -1,
-                            Some(crate::_internal::model::types::BaseTypeLength::Fixed(n)) => *n,
+                            self.validate_binary_compatible_cast_type(&canon_like)?
+                        } else {
+                            None
                         };
-                        let typbyval = options.passed_by_value.unwrap_or(false);
-                        let typalign = match options
-                            .alignment
-                            .as_deref()
-                            .unwrap_or("int4")
-                            .to_ascii_lowercase()
-                            .as_str()
-                        {
-                            "char" => 'c',
-                            "int2" => 's',
-                            "double" => 'd',
-                            _ => 'i',
+                        let typlen = match &options.internallength {
+                            Some(crate::_internal::model::types::BaseTypeLength::Variable) => -1,
+                            Some(crate::_internal::model::types::BaseTypeLength::Fixed(n)) => *n,
+                            None => inherited.map(|(l, _, _)| l).unwrap_or(-1),
+                        };
+                        let typbyval = options
+                            .passed_by_value
+                            .or_else(|| inherited.map(|(_, b, _)| b))
+                            .unwrap_or(false);
+                        let typalign = match options.alignment.as_deref() {
+                            Some(align) => match align.to_ascii_lowercase().as_str() {
+                                "char" => 'c',
+                                "int2" => 's',
+                                "double" => 'd',
+                                _ => 'i',
+                            },
+                            None => inherited.map(|(_, _, a)| a).unwrap_or('i'),
                         };
                         Ok(Some((typlen, typbyval, typalign)))
                     }

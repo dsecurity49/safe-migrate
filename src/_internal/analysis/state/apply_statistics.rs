@@ -311,7 +311,13 @@ impl AnalysisState {
             }
         }
         for routine_ref in &create.expression_routines {
-            let known = self.routine_call_reference_exists(&routine_ref.name);
+            let known = if let Some(ref sig) = routine_ref.signature {
+                self.routine_is_present(sig)
+                    || (sig.schema == "pg_catalog"
+                        && self.routine_call_reference_exists(&routine_ref.name))
+            } else {
+                self.routine_call_reference_exists(&routine_ref.name)
+            };
             if !known
                 && (routine_ref.name.schema == "pg_catalog"
                     || self.baseline_covers_family_object(
@@ -612,7 +618,7 @@ impl AnalysisState {
                     .trim_matches('"')
                     .to_ascii_lowercase()
                     .as_str(),
-                "true" | "false" | "1" | "0" | "on" | "off" | "yes" | "no" | "t" | "f" | "y" | "n"
+                "true" | "false" | "1" | "0" | "on" | "off"
             ),
         }
     }
@@ -622,25 +628,26 @@ impl AnalysisState {
         if s == "0" {
             return Some(0);
         }
-        let idx = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let idx = s
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(s.len());
         if idx == 0 {
             return None;
         }
-        let num = s[..idx].parse::<u64>().ok()?;
+        let num: f64 = s[..idx].parse().ok()?;
+        if !num.is_finite() || num < 0.0 {
+            return None;
+        }
         let unit = s[idx..].trim();
-        let kb = match unit {
-            "" | "kB" | "kb" | "KB" => num,
-            "B" | "b" => {
-                if num % 1024 != 0 {
-                    return None;
-                }
-                num / 1024
-            }
-            "MB" | "mb" | "Mb" => num.checked_mul(1024)?,
-            "GB" | "gb" | "Gb" => num.checked_mul(1024 * 1024)?,
-            "TB" | "tb" | "Tb" => num.checked_mul(1024 * 1024 * 1024)?,
+        let factor_kb: f64 = match unit {
+            "" | "kB" => 1.0,
+            "B" => 1.0 / 1024.0,
+            "MB" => 1024.0,
+            "GB" => 1024.0 * 1024.0,
+            "TB" => 1024.0 * 1024.0 * 1024.0,
             _ => return None,
         };
+        let kb = (num * factor_kb).round() as u64;
         if kb == 0 || (128..=16_777_216).contains(&kb) {
             Some(kb)
         } else {
@@ -705,9 +712,7 @@ impl AnalysisState {
                     crate::_internal::model::relation::RelationOverlay::Present(rel)
                         if matches!(
                             rel.kind,
-                            RelationKind::Table
-                                | RelationKind::MaterializedView
-                                | RelationKind::ForeignTable
+                            RelationKind::Table | RelationKind::MaterializedView
                         ) =>
                     {
                         Some(id.clone())
@@ -737,8 +742,9 @@ impl AnalysisState {
                 }
             }
             if target.table_id.schema == "pg_catalog" {
-                if crate::_internal::model::builtin_routine::is_pg_catalog_relation_name(
+                if crate::_internal::model::builtin_routine::is_pg_catalog_relation_name_for_version(
                     &target.table_id.name,
+                    self.pg_version_num,
                 ) {
                     if !target.columns.is_empty() {
                         self.taint(
@@ -795,8 +801,9 @@ impl AnalysisState {
                         ))
                     ) => {}
                 None if target.is_unqualified
-                    && crate::_internal::model::builtin_routine::is_pg_catalog_relation_name(
+                    && crate::_internal::model::builtin_routine::is_pg_catalog_relation_name_for_version(
                         &target.table_id.name,
+                        self.pg_version_num,
                     ) =>
                 {
                     if !target.columns.is_empty() {

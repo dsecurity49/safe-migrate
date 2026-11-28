@@ -496,13 +496,30 @@ fn create_statistics_enforces_max_dimensions_btree_opclass_and_expression_column
         );
     }
 
-    let ok = engine
+    let created = engine
         .analyze(
             "CREATE STATISTICS s_valid_single_expr ON ((c1 + 1)) FROM stats_probe;
-             CREATE STATISTICS s_valid_expr_and_col ON ((c1 + c2)), c3 FROM stats_probe;
-             ALTER TABLE stats_probe DROP COLUMN c2;",
+             CREATE STATISTICS s_valid_expr_and_col ON ((c1 + c2)), c3 FROM stats_probe;",
             &mut state,
         )
+        .unwrap();
+    assert!(
+        !created.iter().any(|f| f.rule_id == "chain-conflict"),
+        "creating expression statistics must succeed: {created:?}"
+    );
+    assert!(
+        state
+            .get_relation(&object_id("public", "stats_probe"))
+            .is_some_and(|r| match r {
+                RelationOverlay::Present(rel) => rel
+                    .extended_statistics
+                    .contains_key(&object_id("public", "s_valid_expr_and_col")),
+                RelationOverlay::Dropped => false,
+            }),
+        "s_valid_expr_and_col must exist before dropping c2"
+    );
+    let ok = engine
+        .analyze("ALTER TABLE stats_probe DROP COLUMN c2;", &mut state)
         .unwrap();
     assert!(
         !ok.iter().any(|f| f.rule_id == "chain-conflict"),

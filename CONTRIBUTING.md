@@ -49,7 +49,7 @@ cargo clippy --all-targets --locked -- -D warnings
   `cargo test --locked --test grammar_action_lists`.
 - Run the offline fixture suite and contract checks:
   ```bash
-  cd live_tests && ./run.sh
+  (cd live_tests && ./run.sh)
   sh scripts/test-action-contract
   sh scripts/test-install-dry-run
   scripts/fuzz

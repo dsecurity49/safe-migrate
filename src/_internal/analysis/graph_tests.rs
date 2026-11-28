@@ -52,6 +52,11 @@ fn a_definition_update_keeps_the_edge_set_in_step() {
     // The updated edge is the one now in the graph, so re-adding it must be
     // rejected as a duplicate rather than inserted beside itself.
     let updated = graph.edges()[0].clone();
+    if let DependencyKind::IndexOnRelation { definition, .. } = &updated.kind {
+        assert!(definition.valid && definition.ready);
+    } else {
+        panic!("expected IndexOnRelation edge");
+    }
     graph.add_edge(updated);
     assert_eq!(graph.edge_count(), 1);
     // A definition payload is not part of the derived lookup structure, so

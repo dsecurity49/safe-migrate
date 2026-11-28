@@ -462,11 +462,24 @@ fn enum_value_rename_rolls_back_with_the_transaction() {
         .analyze(
             "CREATE TYPE mood AS ENUM ('old', 'stable');
                  BEGIN;
-                 ALTER TYPE mood RENAME VALUE 'old' TO 'temporary';
-                 ROLLBACK;",
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'temporary';",
             &mut state,
         )
         .unwrap();
+    assert_eq!(
+        state
+            .local
+            .types
+            .get(&object_id("public", "mood"))
+            .and_then(|o| match o {
+                TypeOverlay::Present(s) => Some(&s.kind),
+                _ => None,
+            }),
+        Some(&TypeKind::Enum {
+            variants: vec!["temporary".into(), "stable".into()]
+        })
+    );
+    engine.analyze("ROLLBACK;", &mut state).unwrap();
 
     let Some(TypeOverlay::Present(type_state)) =
         state.local.types.get(&object_id("public", "mood"))
@@ -1048,7 +1061,7 @@ fn base_type_shell_completion_and_options_work() {
 
     engine
         .analyze(
-            "CREATE TYPE widget_t (INPUT = widget_in, OUTPUT = widget_out, INTERNALLENGTH = 16, PASSEDBYVALUE);",
+            "CREATE TYPE widget_t (INPUT = widget_in, OUTPUT = widget_out, INTERNALLENGTH = 4, PASSEDBYVALUE);",
             &mut state,
         )
         .unwrap();
@@ -1064,7 +1077,7 @@ fn base_type_shell_completion_and_options_work() {
         assert_eq!(options.output.as_deref(), Some("widget_out"));
         assert_eq!(
             options.internallength,
-            Some(crate::_internal::model::types::BaseTypeLength::Fixed(16))
+            Some(crate::_internal::model::types::BaseTypeLength::Fixed(4))
         );
         assert_eq!(options.passed_by_value, Some(true));
     } else {
@@ -1270,17 +1283,17 @@ fn schema_rename_remaps_type_and_routine_identity_links() {
     else {
         panic!("range should be present");
     };
-    for id in [
+    for slot in [
         subtype_id,
         multirange,
         collation_id,
         opclass_id,
         canonical_id,
         subtype_diff_id,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ] {
+        let id = slot
+            .as_ref()
+            .expect("seeded range link must remain Some after schema rename");
         assert_eq!(id.schema, "modern", "{id} was not remapped");
     }
     let TypeOverlay::Present(TypeState {
@@ -1603,6 +1616,27 @@ fn alter_composite_attribute_type_rejects_direct_and_transitive_table_column_dep
         }),
         "transitive composite/array column dependency must reject ALTER ATTRIBUTE TYPE even with CASCADE: {transitive:?}"
     );
+
+    let mut state3 = setup_state();
+    let domain_transitive = engine
+        .analyze(
+            "CREATE TYPE public.inner_c AS (x int);
+             CREATE TYPE public.outer_c AS (inner_val public.inner_c);
+             CREATE DOMAIN public.outer_domain AS public.outer_c[];
+             CREATE TABLE public.outer_holder_domain (id int, payload public.outer_domain);
+             ALTER TYPE public.inner_c ALTER ATTRIBUTE x TYPE bigint CASCADE;",
+            &mut state3,
+        )
+        .unwrap();
+    assert!(
+        domain_transitive.iter().any(|v| {
+            v.rule_id == "chain-conflict"
+                && v.reason.contains(
+                    "cannot alter type \"inner_c\" because column \"outer_holder_domain.payload\" uses it",
+                )
+        }),
+        "domain over composite array must also reject ALTER ATTRIBUTE TYPE: {domain_transitive:?}"
+    );
 }
 
 #[test]
@@ -1621,20 +1655,44 @@ fn drop_attribute_if_exists_missing_is_a_noop_and_cascade_propagates_to_typed_ta
     assert!(
         !noop_findings
             .iter()
-            .any(|v| v.rule_id == "irreversible-migration"),
-        "DROP ATTRIBUTE IF EXISTS on a missing attribute must be a NoOp and not fire irreversible-migration: {noop_findings:?}"
+            .any(|v| v.rule_id == "irreversible-migration" || v.rule_id == "chain-conflict"),
+        "DROP ATTRIBUTE IF EXISTS on a missing attribute must be a NoOp and not conflict: {noop_findings:?}"
     );
+    if let Some(TypeOverlay::Present(TypeState {
+        kind: TypeKind::Composite { fields },
+        ..
+    })) = state.local.types.get(&object_id("public", "comp_noop"))
+    {
+        assert_eq!(fields.len(), 2);
+    } else {
+        panic!("expected comp_noop to remain present");
+    }
 
     let mut state2 = setup_state();
-    let cascade_findings = engine
+    engine
         .analyze(
             "CREATE TYPE public.comp_casc AS (x int, y text);
              CREATE TABLE public.typed_casc OF public.comp_casc;
-             CREATE INDEX typed_casc_x_idx ON public.typed_casc (x);
-             ALTER TYPE public.comp_casc DROP ATTRIBUTE x CASCADE;
-             DROP INDEX public.typed_casc_x_idx;",
+             CREATE INDEX typed_casc_x_idx ON public.typed_casc (x);",
             &mut state2,
         )
+        .unwrap();
+    assert!(
+        state2.index_is_present(&object_id("public", "typed_casc_x_idx")),
+        "typed_casc_x_idx must exist before ALTER TYPE DROP ATTRIBUTE CASCADE"
+    );
+    engine
+        .analyze(
+            "ALTER TYPE public.comp_casc DROP ATTRIBUTE x CASCADE;",
+            &mut state2,
+        )
+        .unwrap();
+    assert!(
+        !state2.index_is_present(&object_id("public", "typed_casc_x_idx")),
+        "typed_casc_x_idx must be dropped by ALTER TYPE DROP ATTRIBUTE CASCADE"
+    );
+    let cascade_findings = engine
+        .analyze("DROP INDEX public.typed_casc_x_idx;", &mut state2)
         .unwrap();
     assert!(
         cascade_findings
@@ -1739,5 +1797,27 @@ fn create_and_drop_cast_update_implicit_coercion_catalogue_and_rollback() {
             .casts()
             .coerces_implicitly("public.cast_src", "public.cast_dst"),
         "DROP CAST must remove implicit cast from CastCatalogue"
+    );
+
+    let mut tx_state = state.clone();
+    engine
+        .analyze(
+            "BEGIN;
+             DROP CAST (public.cast_src AS public.cast_dst);",
+            &mut tx_state,
+        )
+        .unwrap();
+    assert!(
+        !tx_state
+            .casts()
+            .coerces_implicitly("public.cast_src", "public.cast_dst"),
+        "DROP CAST inside transaction must remove implicit coercion"
+    );
+    engine.analyze("ROLLBACK;", &mut tx_state).unwrap();
+    assert!(
+        tx_state
+            .casts()
+            .coerces_implicitly("public.cast_src", "public.cast_dst"),
+        "ROLLBACK must restore implicit cast in CastCatalogue"
     );
 }

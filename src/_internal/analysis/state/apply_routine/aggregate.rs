@@ -348,8 +348,17 @@ impl AnalysisState {
                 )),
                 owner: self
                     .local
-                    .current_role_known
-                    .then(|| ObjectId::new("", &self.local.current_role)),
+                    .functions
+                    .get(&aggregate.id)
+                    .and_then(|overlay| match overlay {
+                        FunctionOverlay::Present(existing) => Some(existing.owner.clone()),
+                        FunctionOverlay::Dropped => None,
+                    })
+                    .unwrap_or_else(|| {
+                        self.local
+                            .current_role_known
+                            .then(|| ObjectId::new("", &self.local.current_role))
+                    }),
                 dependent_extensions: std::collections::BTreeSet::new(),
                 support_function: None,
             }),
@@ -532,9 +541,14 @@ impl AnalysisState {
                 }
             }
             self.snapshot_graph_full();
-            self.local
-                .graph
-                .retain_edges(|edge| !stats_to_drop.contains(&edge.dependent));
+            self.local.graph.retain_edges(|edge| {
+                !(stats_to_drop.contains(&edge.dependent)
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::StatisticsUsesRoutine { .. }
+                            | DependencyKind::StatisticsUsesType { .. }
+                    ))
+            });
         }
 
         // A name-only view reference is definitely cleared by this statement
@@ -822,9 +836,14 @@ impl AnalysisState {
                         }
                     }
                     self.snapshot_graph_full();
-                    self.local
-                        .graph
-                        .retain_edges(|edge| !stats_to_drop.contains(&edge.dependent));
+                    self.local.graph.retain_edges(|edge| {
+                        !(stats_to_drop.contains(&edge.dependent)
+                            && matches!(
+                                edge.kind,
+                                DependencyKind::StatisticsUsesRoutine { .. }
+                                    | DependencyKind::StatisticsUsesType { .. }
+                            ))
+                    });
                 }
             }
         }
@@ -902,6 +921,7 @@ impl AnalysisState {
     fn resolve_routine_return_expr_type(
         &self,
         expr: &crate::_internal::analysis::mutations::RoutineReturnExprMutation,
+        params: &[crate::_internal::analysis::facts::ParamFact],
     ) -> Option<String> {
         use crate::_internal::analysis::mutations::RoutineReturnExprMutation;
         match expr {
@@ -915,7 +935,16 @@ impl AnalysisState {
                 let Some(RelationOverlay::Present(rel)) = self.local.relations.get(rel_id) else {
                     return None;
                 };
-                rel.get_column(column).and_then(|c| c.data_type.clone())
+                if let Some(col) = rel.get_column(column) {
+                    return col.data_type.clone();
+                }
+                if rel.columns_complete {
+                    return params
+                        .iter()
+                        .find(|p| p.name.as_deref() == Some(column.as_str()))
+                        .map(|p| p.ty.clone());
+                }
+                None
             }
             RoutineReturnExprMutation::Column { relation: None, .. } => None,
             RoutineReturnExprMutation::RoutineCall(name_id) => {
@@ -957,6 +986,7 @@ impl AnalysisState {
                     if let Some(ref col) = rel_dep.column
                         && rel.columns_complete
                         && !rel.has_column(col)
+                        && !params.iter().any(|p| p.name.as_deref() == Some(col.as_str()))
                         && !matches!(
                             col.as_str(),
                             "ctid" | "xmin" | "xmax" | "cmin" | "cmax" | "tableoid"
@@ -975,8 +1005,9 @@ impl AnalysisState {
                 }
                 None => {
                     if rel_dep.relation.schema == "pg_catalog" {
-                        if !crate::_internal::model::builtin_routine::is_pg_catalog_relation_name(
+                        if !crate::_internal::model::builtin_routine::is_pg_catalog_relation_name_for_version(
                             &rel_dep.relation.name,
+                            self.pg_version_num,
                         ) {
                             return Err(MutationResult::conflict(format!(
                                 "relation \"{}\" does not exist",
@@ -987,8 +1018,9 @@ impl AnalysisState {
                         &rel_dep.relation,
                         crate::_internal::db::cache::CatalogFamily::Relations,
                     )
-                        && !crate::_internal::model::builtin_routine::is_pg_catalog_relation_name(
+                        && !crate::_internal::model::builtin_routine::is_pg_catalog_relation_name_for_version(
                             &rel_dep.relation.name,
+                            self.pg_version_num,
                         )
                     {
                         return Err(MutationResult::conflict(format!(
@@ -1078,7 +1110,7 @@ impl AnalysisState {
                         }
                         if let Some(ref ret_expr) = deps.return_expr
                             && let Some(actual_raw) =
-                                self.resolve_routine_return_expr_type(ret_expr)
+                                self.resolve_routine_return_expr_type(ret_expr, params)
                         {
                             let canon_actual = self.unwrap_domain_to_canonical_type(&actual_raw);
                             if !self
@@ -1493,9 +1525,14 @@ impl AnalysisState {
                         }
                     }
                     self.snapshot_graph_full();
-                    self.local
-                        .graph
-                        .retain_edges(|edge| !stats_to_drop.contains(&edge.dependent));
+                    self.local.graph.retain_edges(|edge| {
+                        !(stats_to_drop.contains(&edge.dependent)
+                            && matches!(
+                                edge.kind,
+                                DependencyKind::StatisticsUsesRoutine { .. }
+                                    | DependencyKind::StatisticsUsesType { .. }
+                            ))
+                    });
                 }
             }
         }

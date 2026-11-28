@@ -978,6 +978,14 @@ impl AnalysisState {
                     {
                         transitive_types.insert(id.clone());
                         grew = true;
+                    } else if let TypeKind::Domain { base_type_id, .. } = &state.kind
+                        && Self::type_reference_matches_victims(
+                            base_type_id.as_ref(),
+                            &transitive_types,
+                        )
+                    {
+                        transitive_types.insert(id.clone());
+                        grew = true;
                     }
                 }
                 if !grew {

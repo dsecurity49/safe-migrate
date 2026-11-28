@@ -716,14 +716,13 @@ impl AnalysisState {
 
         // Ownership by a type is a property of the routine's identity, so a
         // replacement keeps it rather than dropping the fact.
-        let internal_type_owner =
-            self.local
-                .functions
-                .get(&function.id)
-                .and_then(|overlay| match overlay {
-                    FunctionOverlay::Present(existing) => existing.internal_type_owner.clone(),
-                    FunctionOverlay::Dropped => None,
-                });
+        let (internal_type_owner, existing_owner) = match self.local.functions.get(&function.id) {
+            Some(FunctionOverlay::Present(existing)) => (
+                existing.internal_type_owner.clone(),
+                Some(existing.owner.clone()),
+            ),
+            _ => (None, None),
+        };
         let parameters = Self::routine_parameters(&function.params, function.return_type.as_ref());
         self.local.functions.insert(
             function.id.clone(),
@@ -758,10 +757,11 @@ impl AnalysisState {
                 language,
                 security,
                 aggregate: None,
-                owner: self
-                    .local
-                    .current_role_known
-                    .then(|| ObjectId::new("", &self.local.current_role)),
+                owner: existing_owner.unwrap_or_else(|| {
+                    self.local
+                        .current_role_known
+                        .then(|| ObjectId::new("", &self.local.current_role))
+                }),
                 dependent_extensions: std::collections::BTreeSet::new(),
                 support_function: support_functions.last().cloned(),
             }),
@@ -1363,8 +1363,17 @@ impl AnalysisState {
                 aggregate: None,
                 owner: self
                     .local
-                    .current_role_known
-                    .then(|| ObjectId::new("", &self.local.current_role)),
+                    .functions
+                    .get(&procedure.id)
+                    .and_then(|overlay| match overlay {
+                        FunctionOverlay::Present(existing) => Some(existing.owner.clone()),
+                        FunctionOverlay::Dropped => None,
+                    })
+                    .unwrap_or_else(|| {
+                        self.local
+                            .current_role_known
+                            .then(|| ObjectId::new("", &self.local.current_role))
+                    }),
                 dependent_extensions: std::collections::BTreeSet::new(),
                 support_function: None,
             }),

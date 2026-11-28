@@ -279,20 +279,16 @@ impl AnalysisState {
                 collation,
                 collation_id,
                 ..
-            }
-            | TypeKind::Range {
-                collation,
-                collation_id,
-                ..
             } => (collation.clone(), collation_id.clone()),
             TypeKind::Base { options, .. } => match options.collatable {
                 Some(true) => default_collation(),
                 Some(false) => (None, None),
                 None => return None,
             },
-            TypeKind::Enum { .. } | TypeKind::Composite { .. } | TypeKind::Multirange { .. } => {
-                (None, None)
-            }
+            TypeKind::Range { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::Composite { .. }
+            | TypeKind::Multirange { .. } => (None, None),
         })
     }
 
@@ -602,7 +598,12 @@ impl AnalysisState {
                     "not_null",
                     &mut reserved,
                 );
-                if self.namespace_constraint_name_is_taken(&alter.id.schema, &generated) {
+                let name_taken = if name.is_some() {
+                    self.domain_constraint_name_is_taken(&alter.id, &generated)
+                } else {
+                    self.namespace_constraint_name_is_taken(&alter.id.schema, &generated)
+                };
+                if name_taken {
                     return MutationResult::conflict(format!(
                         "constraint '{}' for domain '{}' already exists",
                         generated, alter.id
@@ -965,7 +966,13 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
         }
-        let dependent = present.iter().find(|id| self.has_type_dependents(id));
+        let saved_co_dropped = self.co_dropped_objects.clone();
+        self.co_dropped_objects.extend(present.iter().cloned());
+        let dependent = present
+            .iter()
+            .find(|id| self.has_type_dependents(id))
+            .cloned();
+        self.co_dropped_objects = saved_co_dropped;
         if let Some(dependent) = dependent
             && !cascade
         {

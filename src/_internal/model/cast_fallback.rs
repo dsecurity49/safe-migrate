@@ -428,7 +428,7 @@ pub(crate) fn catalogue() -> CastCatalogue {
 
 #[cfg(test)]
 mod tests {
-    use super::EDGES;
+    use super::{ALL_CASTS, EDGES};
     use crate::_internal::model::cast::CastCatalogue;
 
     #[test]
@@ -437,6 +437,13 @@ mod tests {
         assert!(
             EDGES.windows(2).all(|pair| pair[0] < pair[1]),
             "entries must be sorted and unique by (source, target)"
+        );
+        assert!(!ALL_CASTS.is_empty(), "ALL_CASTS must not be empty");
+        assert!(
+            ALL_CASTS
+                .windows(2)
+                .all(|pair| (pair[0].0, pair[0].1) < (pair[1].0, pair[1].1)),
+            "ALL_CASTS must be sorted and unique by (source, target)"
         );
     }
 

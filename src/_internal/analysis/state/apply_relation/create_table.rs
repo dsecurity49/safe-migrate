@@ -285,6 +285,10 @@ impl AnalysisState {
                     // LIKE copies the statistics definition, while PostgreSQL
                     // initializes the new object's target independently.
                     cloned.target = None;
+                    cloned.owner = self
+                        .local
+                        .current_role_known
+                        .then(|| ObjectId::new("", &self.local.current_role));
                     like_extended_statistics.push(cloned);
                 }
             }
@@ -965,7 +969,7 @@ impl AnalysisState {
                     create
                         .columns
                         .iter()
-                        .find(|candidate| candidate.name == *column)
+                        .find(|candidate| candidate.name == *column && candidate.ty.is_some())
                         .map(|state| {
                             (
                                 state
@@ -992,7 +996,7 @@ impl AnalysisState {
                         create
                             .columns
                             .iter()
-                            .find(|candidate| candidate.name == *column)
+                            .find(|candidate| candidate.name == *column && candidate.ty.is_some())
                             .map(|state| {
                                 (
                                     state
@@ -1491,6 +1495,11 @@ impl AnalysisState {
             .flatten()
             .collect();
 
+        for column in &mut rel_state.columns {
+            if pk_columns.contains(column.name.as_str()) {
+                column.is_nullable = false;
+            }
+        }
         let mut not_null_columns: Vec<String> = rel_state
             .columns
             .iter()

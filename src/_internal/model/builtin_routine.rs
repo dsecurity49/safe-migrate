@@ -40,6 +40,34 @@ pub(crate) fn is_pg_catalog_relation_name(name: &str) -> bool {
     BUILTIN_PG_CATALOG_RELATIONS.binary_search(&name).is_ok()
 }
 
+pub(crate) fn is_pg_catalog_relation_name_for_version(
+    name: &str,
+    pg_version_num: Option<u32>,
+) -> bool {
+    if !is_pg_catalog_relation_name(name) {
+        return false;
+    }
+    let version = pg_version_num.unwrap_or(180_000);
+    let min_version = match name {
+        "pg_ident_file_mappings"
+        | "pg_parameter_acl"
+        | "pg_parameter_acl_oid_index"
+        | "pg_parameter_acl_parname_index"
+        | "pg_publication_namespace"
+        | "pg_publication_namespace_oid_index"
+        | "pg_publication_namespace_pnnspid_pnpubid_index"
+        | "pg_publication_rel_prpubid_index"
+        | "pg_stat_recovery_prefetch"
+        | "pg_stat_subscription_stats"
+        | "pg_statistic_ext_data_stxoid_inh_index" => 150_000,
+        "pg_auth_members_grantor_index" | "pg_auth_members_oid_index" | "pg_stat_io" => 160_000,
+        "pg_stat_checkpointer" | "pg_wait_events" => 170_000,
+        "pg_aios" | "pg_shmem_allocations_numa" => 180_000,
+        _ => 140_000,
+    };
+    version >= min_version
+}
+
 #[rustfmt::skip]
 const BUILTIN_PG_CATALOG_SUPPORTS: &[&str] = &[
     // rustfmt-packed sorted lookup table

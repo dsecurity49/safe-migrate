@@ -364,6 +364,11 @@ impl AnalysisState {
         // a table-drop path.
         self.snapshot_graph_full();
         self.local.graph.retain_edges(|edge| {
+            if let DependencyKind::StatisticsUsesRoutine { table_id, .. }
+            | DependencyKind::StatisticsUsesType { table_id } = &edge.kind
+            {
+                return !dropped_relations.contains(&resolve(table_id));
+            }
             let dependent = resolve(&edge.dependent);
             let referenced = resolve(&edge.referenced);
             !dropped_relations.contains(&dependent)

@@ -380,13 +380,17 @@ impl AstVisitor {
                     None
                 } else if ident == "true" || ident == "false" {
                     Some(RoutineReturnExprFact::LiteralType("boolean".to_string()))
-                } else if let Some(pty) = param_types.get(&ident) {
-                    Some(RoutineReturnExprFact::ParameterType(pty.clone()))
-                } else {
-                    single_binding.map(|rel| RoutineReturnExprFact::Column {
+                } else if !ident.starts_with('$')
+                    && let Some(rel) = single_binding
+                {
+                    Some(RoutineReturnExprFact::Column {
                         relation: Some(rel.clone()),
                         column: ident,
                     })
+                } else {
+                    param_types
+                        .get(&ident)
+                        .map(|pty| RoutineReturnExprFact::ParameterType(pty.clone()))
                 }
             }
             ast::Expr::FieldExpr(fe) => {
@@ -681,7 +685,7 @@ impl AstVisitor {
                             continue;
                         }
                         let col_name = Self::resolve_name_ref(&name_ref);
-                        if param_names.contains(&col_name)
+                        if col_name.starts_with('$')
                             || cte_names.contains(&col_name)
                             || target_aliases.contains(&col_name)
                             || binding_aliases.contains(&col_name)

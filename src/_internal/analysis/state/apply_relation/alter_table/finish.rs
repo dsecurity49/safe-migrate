@@ -1,6 +1,55 @@
 use super::*;
 
 impl AnalysisState {
+    pub(super) fn collect_dropped_column_statistics(
+        &self,
+        table_id: &ObjectId,
+        columns: &[String],
+        drop_column_statistics: &mut HashSet<ObjectId>,
+        unknown_dependency: &mut bool,
+    ) {
+        let Some(RelationOverlay::Present(relation)) = self.local.relations.get(table_id) else {
+            return;
+        };
+        for statistics in relation.extended_statistics.values() {
+            if statistics
+                .columns
+                .iter()
+                .any(|col| columns.iter().any(|c| c == col))
+            {
+                drop_column_statistics.insert(statistics.id.clone());
+                continue;
+            }
+            let Some(raw_exprs) = statistics.expressions.as_deref() else {
+                continue;
+            };
+            let Some(exprs) =
+                crate::_internal::analysis::expr_visitor::ExprVisitor::parse_expression_list(
+                    raw_exprs,
+                )
+            else {
+                *unknown_dependency = true;
+                continue;
+            };
+            let mut matched = false;
+            let mut opaque = false;
+            for expr in &exprs {
+                match expr.referenced_columns() {
+                    Some(cols) if cols.iter().any(|col| columns.iter().any(|c| c == col)) => {
+                        matched = true;
+                    }
+                    Some(_) => {}
+                    None => opaque = true,
+                }
+            }
+            if matched {
+                drop_column_statistics.insert(statistics.id.clone());
+            } else if opaque {
+                *unknown_dependency = true;
+            }
+        }
+    }
+
     pub(super) fn validate_rename_column_descendants(
         &mut self,
         alter_id: &ObjectId,

@@ -255,21 +255,11 @@ impl AnalysisState {
         if old_schema.as_deref() == Some(new_schema) {
             return MutationResult::NoOp;
         }
-        let mut members = extension
+        let members = extension
             .members
             .iter()
             .map(|member| self.resolve_extension_member(member))
             .collect::<BTreeSet<_>>();
-        for (routine_id, overlay) in &self.local.functions {
-            if let FunctionOverlay::Present(func) = overlay
-                && func.dependent_extensions.contains(&extension.name)
-            {
-                members.insert(ExtensionMember {
-                    kind: ExtensionMemberKind::Routine,
-                    id: routine_id.clone(),
-                });
-            }
-        }
         let members_complete = extension.members_complete;
         let relocatable_unknown = extension.relocatable.is_none();
         let Some(old_schema) = old_schema else {

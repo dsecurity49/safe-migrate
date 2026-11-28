@@ -301,13 +301,21 @@ impl AnalysisState {
                 self.local.sequences.insert(id, SequenceOverlay::Dropped);
             }
 
-            let functions_to_drop: std::collections::HashSet<ObjectId> = self
+            let mut functions_to_drop: std::collections::HashSet<ObjectId> = self
                 .local
                 .functions
                 .keys()
                 .filter(|id| dropped_schema_names.contains(&id.schema))
                 .cloned()
                 .collect();
+            for edge in self.local.graph.edges() {
+                if matches!(edge.kind, DependencyKind::RoutineUsesRelation { .. })
+                    && all_dropped_relations
+                        .contains(self.local.graph.resolve_rename(&edge.referenced))
+                {
+                    functions_to_drop.insert(edge.dependent.clone());
+                }
+            }
             for id in &functions_to_drop {
                 self.drop_routine_with_edges(id);
             }

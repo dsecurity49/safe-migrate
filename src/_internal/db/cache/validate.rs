@@ -1928,7 +1928,10 @@ impl DbCache {
             match &dep.target {
                 RoutineDependencyTarget::Relation { relation, column } => {
                     validate_id("routine dependency relation identity", relation, true)?;
-                    if !self.relations.contains_key(relation) && !omitted_schema(&relation.schema) {
+                    if !self.relations.contains_key(relation)
+                        && !self.sequences.contains_key(relation)
+                        && !omitted_schema(&relation.schema)
+                    {
                         return Err(format!(
                             "routine dependency '{} -> {}' references a missing relation",
                             dep.dependent, relation

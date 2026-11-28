@@ -1682,10 +1682,15 @@ fn v12_1_validates_extension_casts_against_base_implicit_map_and_preserves_routi
     use crate::_internal::analysis::facts::CastContextFact;
     use crate::_internal::model::cast::{CastCatalogue, CastEntry, CastEntryMethod};
 
-    // C1: empty V12.1 extension still marks full_coverage = true when base implicit map is empty
+    // C1: empty V12.1 extension still marks full_coverage = true after encode/decode when base implicit map is empty
     let mut empty_cache = synced_cache();
     empty_cache.casts = Some(CastCatalogue::from_entries(Vec::new()));
-    let decoded_empty = DbCacheVersioned::current(empty_cache)
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded_empty =
+        bincode::serde::encode_to_vec(DbCacheVersioned::current(empty_cache), config).unwrap();
+    let (decoded_empty_ver, _): (DbCacheVersioned, _) =
+        bincode::serde::decode_from_slice(&encoded_empty, config).unwrap();
+    let decoded_empty = decoded_empty_ver
         .into_cache()
         .expect("empty V12.1 cast catalogue must validate");
     assert!(

@@ -48,10 +48,16 @@ impl AnalysisState {
         {
             return result;
         }
-        if let AlterTableActionMutation::SetType { column, .. } = &alter.action
-            && let Some(result) = self.check_column_set_type_dependents(&alter.id, column)
-        {
-            return result;
+        if let AlterTableActionMutation::SetType { column, .. } = &alter.action {
+            let mut targets = vec![alter.id.clone()];
+            if !alter.only {
+                targets.extend(self.inherited_descendants(&alter.id));
+            }
+            for target in &targets {
+                if let Some(result) = self.check_column_set_type_dependents(target, column) {
+                    return result;
+                }
+            }
         }
         if alter.only
             && matches!(alter.action, AlterTableActionMutation::RenameColumn { .. })
@@ -1600,25 +1606,12 @@ impl AnalysisState {
             }
             let mut unknown_dependency = false;
             let mut known_dependency = false;
-            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get(&alter.id) {
-                for statistics in relation.extended_statistics.values() {
-                    let refs_expr = statistics
-                        .expressions
-                        .as_deref()
-                        .and_then(
-                            crate::_internal::analysis::expr_visitor::ExprVisitor::parse_expression_list,
-                        )
-                        .is_some_and(|exprs| {
-                            exprs.iter().any(|expr| {
-                                expr.referenced_columns()
-                                    .is_some_and(|cols| cols.contains(name))
-                            })
-                        });
-                    if statistics.columns.iter().any(|column| column == name) || refs_expr {
-                        drop_column_statistics.insert(statistics.id.clone());
-                    }
-                }
-            }
+            self.collect_dropped_column_statistics(
+                &alter.id,
+                std::slice::from_ref(name),
+                &mut drop_column_statistics,
+                &mut unknown_dependency,
+            );
             for edge in self.local.graph.edges() {
                 if !self.dependency_edge_is_current(edge) {
                     continue;
@@ -1813,33 +1806,14 @@ impl AnalysisState {
             // operation conservative rather than dropping a column while
             // retaining a typed foreign-key/constraint edge.
             if !cascade_generated_columns.is_empty() {
-                if let Some(RelationOverlay::Present(relation)) =
-                    self.local.relations.get(&alter.id)
-                {
-                    for statistics in relation.extended_statistics.values() {
-                        let refs_expr = statistics
-                            .expressions
-                            .as_deref()
-                            .and_then(
-                                crate::_internal::analysis::expr_visitor::ExprVisitor::parse_expression_list,
-                            )
-                            .is_some_and(|exprs| {
-                                exprs.iter().any(|expr| {
-                                    expr.referenced_columns().is_some_and(|cols| {
-                                        cols.iter().any(|c| cascade_generated_columns.contains(c))
-                                    })
-                                })
-                            });
-                        if statistics
-                            .columns
-                            .iter()
-                            .any(|column| cascade_generated_columns.contains(column))
-                            || refs_expr
-                        {
-                            drop_column_statistics.insert(statistics.id.clone());
-                        }
-                    }
-                }
+                let cascaded_cols: Vec<String> =
+                    cascade_generated_columns.iter().cloned().collect();
+                self.collect_dropped_column_statistics(
+                    &alter.id,
+                    &cascaded_cols,
+                    &mut drop_column_statistics,
+                    &mut unknown_dependency,
+                );
                 for edge in self.local.graph.edges() {
                     if !self.dependency_edge_is_current(edge) {
                         continue;
@@ -1870,6 +1844,19 @@ impl AnalysisState {
                             Some(_) => {}
                             None => unknown_dependency = true,
                         },
+                        DependencyKind::RoutineUsesRelation {
+                            referenced_column: Some(column),
+                        } if referenced == &resolved_table
+                            && cascade_generated_columns.contains(column)
+                            && matches!(
+                                self.local.functions.get(dependent),
+                                Some(crate::_internal::model::function::FunctionOverlay::Present(
+                                    _
+                                ))
+                            ) =>
+                        {
+                            cascade_routine_roots.insert(dependent.clone());
+                        }
                         DependencyKind::ForeignKey {
                             constraint_name,
                             from_columns,

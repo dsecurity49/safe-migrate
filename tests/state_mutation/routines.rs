@@ -346,7 +346,7 @@ fn a_baseline_replacement_compares_canonical_type_spellings() {
             ..FunctionState::with_inputs(id.clone(), RoutineKind::Function, vec!["integer".into()])
         },
     );
-    let mut state = AnalysisState::new(cache);
+    let mut state = AnalysisState::new(cache.clone());
     assert_eq!(
         conflict_reason(
             &engine,
@@ -1546,15 +1546,15 @@ fn alter_and_drop_routine_dispatch_across_functions_procedures_and_aggregates() 
 
     let findings = engine
         .analyze(
-            "CREATE FUNCTION public.r_fn(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
-             ALTER ROUTINE public.r_fn(int) IMMUTABLE;
-             ALTER ROUTINE public.r_fn(int) RENAME TO r_fn2;
+            "CREATE FUNCTION public.r_fn(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             ALTER ROUTINE public.r_fn(int, int) IMMUTABLE;
+             ALTER ROUTINE public.r_fn(int, int) RENAME TO r_fn2;
              CREATE PROCEDURE public.r_proc(int) LANGUAGE sql AS 'SELECT $1';
              ALTER ROUTINE public.r_proc(int) RENAME TO r_proc2;
              CREATE AGGREGATE public.r_agg(int) (sfunc = r_fn2, stype = int);
              ALTER ROUTINE public.r_agg(int) RENAME TO r_agg2;
              DROP ROUTINE public.r_agg2(int);
-             DROP ROUTINE public.r_fn2(int), public.r_proc2(int);",
+             DROP ROUTINE public.r_fn2(int, int), public.r_proc2(int);",
             &mut state,
         )
         .unwrap();
@@ -1643,16 +1643,27 @@ fn create_aggregate_tracks_dependencies_and_validates_or_replace_and_hypothetica
     );
 
     let mut replace_state = crate::_internal::analysis::state::AnalysisState::new(synced_cache());
-    let replace_conflict = engine
+    let init_agg = engine
         .analyze(
             "CREATE FUNCTION public.rep_os_sf1(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+             CREATE FUNCTION public.rep_os_sf1(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1';
              CREATE FUNCTION public.rep_os_ff1(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE FUNCTION public.rep_os_ff1(int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
              CREATE AGGREGATE public.rep_agg(int ORDER BY int, int) (
                  sfunc = rep_os_sf1,
                  stype = int,
                  finalfunc = rep_os_ff1
-             );
-             CREATE OR REPLACE AGGREGATE public.rep_agg(int, int ORDER BY int) (
+             );",
+            &mut replace_state,
+        )
+        .unwrap();
+    assert!(
+        !init_agg.iter().any(|v| v.rule_id == "chain-conflict"),
+        "initial ordered-set aggregate must apply cleanly: {init_agg:?}"
+    );
+    let replace_conflict = engine
+        .analyze(
+            "CREATE OR REPLACE AGGREGATE public.rep_agg(int, int ORDER BY int) (
                  sfunc = rep_os_sf1,
                  stype = int,
                  finalfunc = rep_os_ff1
@@ -1806,7 +1817,7 @@ fn routine_options_owner_extension_and_support_dependencies_match_postgresql() {
 
     let violations = engine
         .analyze(
-            "CREATE FUNCTION public.my_support(internal) RETURNS internal LANGUAGE internal AS 'int4_support';
+            "CREATE FUNCTION public.my_support(internal) RETURNS internal LANGUAGE internal AS 'generate_series_int4_support';
              CREATE FUNCTION public.set_fn() RETURNS SETOF int LANGUAGE sql
                  COST 50 ROWS 25 PARALLEL SAFE SUPPORT public.my_support
                  SET search_path = public RESET search_path RESET ALL
@@ -1951,7 +1962,7 @@ fn differential_audit_f1_to_f10_regression_suite() {
             generation: 0,
         },
     );
-    let mut state = AnalysisState::new(cache);
+    let mut state = AnalysisState::new(cache.clone());
 
     // F1, F2, F3, F9, F10: valid forms execute without conflict AND remain Confidence::Exact
     let valid_sql = "
@@ -1982,17 +1993,23 @@ fn differential_audit_f1_to_f10_regression_suite() {
     );
     // Note: CREATE AGGREGATE with definition taints because transition state validation is server-side;
     // verify an isolated state for F1/F2/F3/F9/F10 stays Confidence::Exact!
-    let mut exact_state = state.clone();
-    exact_state.local.confidence = Confidence::Exact;
+    let mut exact_state = AnalysisState::new(cache.clone());
     let exact_violations = engine
         .analyze(
-            "ALTER FUNCTION public.agg9(int) RENAME TO agg10;
-             ALTER ROUTINE public.agg10(int) OWNER TO app_role;
-             ALTER FUNCTION public.srf1() SUPPORT pg_catalog.generate_series_int4_support;
-             ALTER FUNCTION public.srf1() SUPPORT generate_series_int4_support;
-             ALTER FUNCTION public.srf1() PARALLEL RESTRICTED ROWS 50 COST 100 SET work_mem = '8MB' RESET work_mem;
+            "CREATE TABLE public.t (a int, b text);
+             CREATE FUNCTION public.srf1() RETURNS SETOF int LANGUAGE sql
+                 ROWS 10 COST 20 PARALLEL SAFE STRICT LEAKPROOF
+                 SET statement_timeout = '5s' RESET statement_timeout
+                 AS 'SELECT a FROM public.t';
+             ALTER FUNCTION public.srf1() RENAME TO srf2;
+             ALTER ROUTINE public.srf2() OWNER TO app_role;
+             ALTER FUNCTION public.srf2() SUPPORT pg_catalog.generate_series_int4_support;
+             ALTER FUNCTION public.srf2() SUPPORT generate_series_int4_support;
+             ALTER FUNCTION public.srf2() PARALLEL RESTRICTED ROWS 50 COST 100 SET work_mem = '8MB' RESET work_mem;
              ANALYZE pg_class;
              ANALYZE pg_catalog.pg_class;
+             CREATE FUNCTION public.h(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x;
+             CREATE STATISTICS public.s1 ON public.h(a), b FROM public.t;
              ALTER STATISTICS public.s1 OWNER TO app_role;
              ALTER STATISTICS public.s1 SET STATISTICS 20000;",
             &mut exact_state,
@@ -2165,5 +2182,40 @@ fn differential_audit_f1_to_f10_regression_suite() {
     assert!(
         missing_pg.iter().any(|v| v.rule_id == "chain-conflict"),
         "ALTER FUNCTION on nonexistent pg_catalog routine must conflict: {missing_pg:?}"
+    );
+
+    // #07: table column takes precedence over same-named SQL function parameter
+    let mut s_shadow = AnalysisState::new(synced_cache());
+    let shadow_ok = engine
+        .analyze(
+            "CREATE TABLE public.t_shadow (x int, y int);
+             CREATE FUNCTION public.f_col_wins_str(x text) RETURNS int LANGUAGE sql AS $$ SELECT x FROM public.t_shadow; $$;
+             CREATE FUNCTION public.f_col_wins(x text) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT x FROM public.t_shadow; END;
+             CREATE FUNCTION public.f_param_fallback(z int) RETURNS int LANGUAGE sql AS $$ SELECT z FROM public.t_shadow; $$;",
+            &mut s_shadow,
+        )
+        .unwrap();
+    assert!(
+        !shadow_ok.iter().any(|v| v.rule_id == "chain-conflict"),
+        "table column precedence and parameter fallback must both succeed: {shadow_ok:?}"
+    );
+    let drop_x = engine
+        .analyze("ALTER TABLE public.t_shadow DROP COLUMN x;", &mut s_shadow)
+        .unwrap();
+    assert!(
+        drop_x.iter().any(|v| v.rule_id == "chain-conflict"),
+        "dropping shadowed table column x referenced by f_col_wins must conflict: {drop_x:?}"
+    );
+
+    // #73: version-gated pg_catalog relations (pg_aios is PG 18+)
+    let mut pg17_cache = synced_cache();
+    pg17_cache.pg_version_num = Some(170_000);
+    let mut s_pg17 = AnalysisState::new(pg17_cache);
+    let pg17_aios = engine
+        .analyze("ANALYZE pg_catalog.pg_aios;", &mut s_pg17)
+        .unwrap();
+    assert!(
+        pg17_aios.iter().any(|v| v.rule_id == "chain-conflict"),
+        "ANALYZE pg_catalog.pg_aios must conflict on PG 17: {pg17_aios:?}"
     );
 }

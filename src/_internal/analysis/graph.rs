@@ -1112,6 +1112,12 @@ impl DependencyGraph {
                     || hit(&plan.triggers, trigger_id)
                     || hit(&plan.routines, function_id)
             }
+            DependencyKind::StatisticsUsesRoutine { table_id, .. } => {
+                hit(&plan.relations, table_id) || hit(&plan.routines, &edge.referenced)
+            }
+            DependencyKind::StatisticsUsesType { table_id } => {
+                hit(&plan.relations, table_id) || hit(&plan.types, &edge.referenced)
+            }
             _ => {
                 hit(&plan.relations, &edge.dependent)
                     || hit(&plan.relations, &edge.referenced)
@@ -1331,6 +1337,10 @@ impl DependencyGraph {
                 }
                 | DependencyKind::RoutineUsesRoutine {
                     unresolved_name: Some(reference),
+                }
+                | DependencyKind::StatisticsUsesRoutine {
+                    unresolved_name: Some(reference),
+                    ..
                 } if reference == name
             )
         })
@@ -1350,6 +1360,10 @@ impl DependencyGraph {
                 }
                 | DependencyKind::RoutineUsesRoutine {
                     unresolved_name: Some(reference),
+                }
+                | DependencyKind::StatisticsUsesRoutine {
+                    unresolved_name: Some(reference),
+                    ..
                 } if reference == old_name => {
                     *reference = new_name.clone();
                     edge.referenced = new_name.clone();

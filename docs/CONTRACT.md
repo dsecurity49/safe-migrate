@@ -57,8 +57,8 @@ mutually exclusive; combining them exits `2`.
 {
   "schema_version": 3,
   "confidence": "Exact",
-  "verdict": "SAFE",
-  "summary": { "total": 0, "tier1": 0, "tier2": 0, "tier3": 0 },
+  "verdict": "HALT",
+  "summary": { "total": 1, "tier1": 1, "tier2": 0, "tier3": 0 },
   "evidence": [
     {
       "code": "unknown_object_state",

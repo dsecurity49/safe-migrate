@@ -396,7 +396,7 @@ pub(super) fn load_routine_dependencies(
         WHERE d.classid = 'pg_proc'::regclass
           AND d.refclassid = 'pg_class'::regclass
           AND d.deptype = 'n'
-          AND rc.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND rc.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
           AND pn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND pn.nspname <> 'information_schema'
           AND rn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
@@ -441,9 +441,9 @@ pub(super) fn load_routine_dependencies(
                    FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
                    ORDER BY n
                )::text[] AS obj_args,
-               'pg_type'::text AS ref_kind,
+               CASE WHEN tc.oid IS NOT NULL THEN 'pg_class'::text ELSE 'pg_type'::text END AS ref_kind,
                tn.nspname AS ref_schema,
-               t.typname AS ref_name,
+               COALESCE(tc.relname, et.typname, t.typname) AS ref_name,
                NULL::text AS ref_column,
                NULL::text[] AS ref_args
         FROM pg_depend d
@@ -451,6 +451,10 @@ pub(super) fn load_routine_dependencies(
         JOIN pg_namespace pn ON pn.oid = p.pronamespace
         JOIN pg_type t ON t.oid = d.refobjid
         JOIN pg_namespace tn ON tn.oid = t.typnamespace
+        LEFT JOIN pg_type et ON t.typelem <> 0 AND t.typlen = -1 AND et.oid = t.typelem
+        LEFT JOIN pg_class tc
+          ON tc.oid = COALESCE(NULLIF(t.typrelid, 0), NULLIF(et.typrelid, 0))
+         AND tc.relkind IN ('r', 'p', 'v', 'm', 'f')
         WHERE d.classid = 'pg_proc'::regclass
           AND d.refclassid = 'pg_type'::regclass
           AND d.deptype = 'n'
